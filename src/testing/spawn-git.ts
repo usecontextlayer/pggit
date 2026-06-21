@@ -10,6 +10,8 @@ export type SpawnGitResult = {
 
 export type SpawnGitOptions = {
 	cwd?: string
+	/** Bytes to write to git's stdin (e.g. rev-list args for `pack-objects --revs`). */
+	input?: Buffer | string
 }
 
 /**
@@ -86,6 +88,9 @@ export async function spawnGit(
 			cwd: opts.cwd,
 			env: buildGitEnv(),
 		})
+		if (opts.input !== undefined) child.stdin.write(opts.input)
+		child.stdin.end()
+
 		const stdout: Buffer[] = []
 		const stderr: Buffer[] = []
 

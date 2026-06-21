@@ -54,12 +54,12 @@ export function createObjectStore(db: Kysely<Database>) {
 		},
 
 		/**
-		 * Ingest a received pack: parse it (resolving in-pack deltas) and re-store
-		 * every object as one self-contained, undeltified pack. Thin packs with
-		 * external delta bases are an M2 follow-up (readPack throws on them).
+		 * Ingest a received pack: parse it — resolving in-pack deltas, and thin-pack
+		 * REF_DELTA bases against objects already in this repo's store — then re-store
+		 * every object as one self-contained, undeltified pack.
 		 */
 		async ingestPack(repoId: string, packBytes: Buffer): Promise<{ oids: string[] }> {
-			const parsed = await readPack(packBytes)
+			const parsed = await readPack(packBytes, (oid) => store.getObject(repoId, oid))
 			const { oids } = await store.putPack(
 				repoId,
 				parsed.map((p) => ({ content: p.content, type: p.type })),

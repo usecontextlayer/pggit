@@ -106,9 +106,14 @@ export function encodeReportStatus(
 export type ReceiveBackend = {
 	ingest: (pack: Buffer) => Promise<void>
 	createRef: (name: string, newOid: string) => Promise<boolean>
+	updateRef: (name: string, oldOid: string, newOid: string) => Promise<boolean>
 }
 
-/** Apply one ref command via CAS. M2 (first push) handles create (zero→new). */
+/**
+ * Apply one ref command via CAS against the client's advertised old oid. Create
+ * (zero→new) and update (old→new) are handled; delete is M2 follow-up. Non-ff is
+ * accepted by default — CAS guards concurrency, not ancestry (spec §3.6).
+ */
 async function applyCommand(
 	backend: ReceiveBackend,
 	cmd: RefCommand,
@@ -119,7 +124,13 @@ async function applyCommand(
 			? { ok: true, ref: cmd.ref }
 			: { ok: false, reason: "ref already exists", ref: cmd.ref }
 	}
-	return { ok: false, reason: "update/delete not yet implemented", ref: cmd.ref }
+	if (isZero(cmd.newOid)) {
+		return { ok: false, reason: "delete not yet implemented", ref: cmd.ref }
+	}
+	const updated = await backend.updateRef(cmd.ref, cmd.oldOid, cmd.newOid)
+	return updated
+		? { ok: true, ref: cmd.ref }
+		: { ok: false, reason: "stale ref (compare-and-swap failed)", ref: cmd.ref }
 }
 
 /**

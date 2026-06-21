@@ -45,6 +45,8 @@ function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 		ingest: async (pack) => {
 			await deps.objects.ingestPack(repoId, pack)
 		},
+		updateRef: (name, oldOid, newOid) =>
+			deps.refs.updateRef(repoId, name, oldOid, newOid),
 	}
 }
 

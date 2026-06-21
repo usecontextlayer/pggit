@@ -73,5 +73,22 @@ export function createRefStore(db: Kysely<Database>) {
 				)
 				.execute()
 		},
+		/** CAS update (old→new): true iff exactly the expected old oid was replaced. */
+		async updateRef(
+			repoId: string,
+			name: string,
+			oldOid: string,
+			newOid: string,
+		): Promise<boolean> {
+			const rows = await db
+				.updateTable("refs")
+				.set({ oid: newOid, symref_target: null })
+				.where("repo_id", "=", repoId as RefsRepoId)
+				.where("name", "=", name as RefsName)
+				.where("oid", "=", oldOid)
+				.returningAll()
+				.execute()
+			return rows.length === 1
+		},
 	}
 }

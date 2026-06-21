@@ -66,11 +66,15 @@ function readOffsetVarint(
 
 /**
  * Parse a v2 packfile into its objects, resolving OFS_DELTA and REF_DELTA
- * (including delta chains) against bases present in the same pack. A REF_DELTA
- * whose base is NOT in the pack (a thin pack — push ingest) is rejected here;
- * external-base resolution against the Postgres store lands with M2.
+ * (including delta chains). Bases come from the same pack; a REF_DELTA whose base
+ * is NOT in the pack — a thin pack, as `git push` sends by default — is resolved
+ * via `resolveExternalBase` (the Postgres store on push ingest). Without a
+ * resolver, an external base is a hard error.
  */
-export async function readPack(pack: Buffer): Promise<ParsedObject[]> {
+export async function readPack(
+	pack: Buffer,
+	resolveExternalBase?: (oid: string) => Promise<Resolved | null>,
+): Promise<ParsedObject[]> {
 	if (pack.subarray(0, 4).toString("latin1") !== "PACK") {
 		throw new Error("pack: bad magic")
 	}
@@ -125,12 +129,14 @@ export async function readPack(pack: Buffer): Promise<ParsedObject[]> {
 		)
 	}
 
-	// Pass 2 — resolve deltas against in-pack bases (memoized, cycle-guarded).
+	// Pass 2 — resolve deltas (memoized, cycle-guarded). Bases come from the pack;
+	// a REF_DELTA base absent from the pack is fetched once via the external
+	// resolver (the store, on thin-pack push ingest) and memoized by OID.
 	const byOffset = new Map<number, ParsedObject>()
 	const byOid = new Map<string, Resolved>()
 	const inProgress = new Set<number>()
 
-	function resolveOffset(off: number): ParsedObject {
+	async function resolveOffset(off: number): Promise<ParsedObject> {
 		const memo = byOffset.get(off)
 		if (memo) return memo
 		if (inProgress.has(off)) throw new Error("pack: cyclic delta chain")
@@ -143,10 +149,10 @@ export async function readPack(pack: Buffer): Promise<ParsedObject[]> {
 		if (entry.kind === "base") {
 			resolved = { content: entry.content, type: entry.type }
 		} else if (entry.kind === "ofs") {
-			const base = resolveOffset(entry.baseOffset)
+			const base = await resolveOffset(entry.baseOffset)
 			resolved = { content: applyDelta(base.content, entry.delta), type: base.type }
 		} else {
-			const base = resolveOid(entry.baseOid)
+			const base = await resolveOid(entry.baseOid)
 			resolved = { content: applyDelta(base.content, entry.delta), type: base.type }
 		}
 
@@ -161,19 +167,32 @@ export async function readPack(pack: Buffer): Promise<ParsedObject[]> {
 		return result
 	}
 
-	function resolveOid(oid: string): Resolved {
+	async function resolveOid(oid: string): Promise<Resolved> {
 		const memo = byOid.get(oid)
 		if (memo) return memo
 		for (const off of order) {
-			if (resolveOffset(off).oid === oid) {
+			// Skip offsets on the current resolution stack: an in-progress entry
+			// cannot be our base, and resolving it would falsely trip the cycle
+			// guard when the real base is external (thin pack).
+			if (inProgress.has(off)) continue
+			if ((await resolveOffset(off)).oid === oid) {
 				const found = byOid.get(oid)
 				if (found) return found
 			}
 		}
-		throw new Error(
-			`pack: ref-delta base ${oid} not in pack (thin pack not yet supported)`,
-		)
+		if (resolveExternalBase) {
+			const external = await resolveExternalBase(oid)
+			if (external) {
+				byOid.set(oid, external)
+				return external
+			}
+		}
+		throw new Error(`pack: ref-delta base ${oid} not found in pack or store`)
 	}
 
-	return order.map((off) => resolveOffset(off))
+	const result: ParsedObject[] = []
+	for (const off of order) {
+		result.push(await resolveOffset(off))
+	}
+	return result
 }
