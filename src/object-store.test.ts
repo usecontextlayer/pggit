@@ -2,7 +2,7 @@ import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { computeOid } from "@/object"
 import { createObjectStore } from "@/object-store"
-import type { PackInputObject } from "@/pack/write-pack"
+import { type PackInputObject, writePack } from "@/pack/write-pack"
 import { createIsolatedSchema, startPostgres } from "@/testing/pg"
 
 describe("object store", () => {
@@ -43,6 +43,47 @@ describe("object store", () => {
 			expect(await store.getObject("repo1", "0".repeat(40))).toBeNull()
 			// repo isolation: repo2 cannot see repo1's objects
 			expect(await store.hasObject("repo2", someOid)).toBe(false)
+		} finally {
+			await db.drop()
+		}
+	})
+
+	// Re-ingest runs on every incremental push (overlapping objects). If the objects
+	// insert ever regressed from onConflict-doNothing to an error, every second push
+	// would 500 — so pin the idempotency at the unit level.
+	it("putPack is idempotent — re-storing the same objects neither errors nor changes the set", async () => {
+		const db = await createIsolatedSchema(container.getConnectionUri())
+		try {
+			const store = createObjectStore(db.db)
+			const objects: PackInputObject[] = [
+				{ content: Buffer.from("dup-a\n"), type: "blob" },
+				{ content: Buffer.from("dup-b\n"), type: "blob" },
+			]
+			const first = await store.putPack("repo", objects)
+			const second = await store.putPack("repo", objects) // same objects again
+			expect(second.oids.sort()).toEqual(first.oids.sort())
+			for (const oid of first.oids) {
+				expect(await store.hasObject("repo", oid)).toBe(true)
+			}
+		} finally {
+			await db.drop()
+		}
+	})
+
+	it("ingesting two overlapping packs yields the union, each object present", async () => {
+		const db = await createIsolatedSchema(container.getConnectionUri())
+		try {
+			const store = createObjectStore(db.db)
+			const a = { content: Buffer.from("only-a\n"), type: "blob" as const }
+			const shared = { content: Buffer.from("shared\n"), type: "blob" as const }
+			const c = { content: Buffer.from("only-c\n"), type: "blob" as const }
+			await store.ingestPack("repo", writePack([a, shared]))
+			await store.ingestPack("repo", writePack([shared, c])) // `shared` overlaps
+			for (const obj of [a, shared, c]) {
+				expect(await store.hasObject("repo", computeOid(obj.type, obj.content))).toBe(
+					true,
+				)
+			}
 		} finally {
 			await db.drop()
 		}
