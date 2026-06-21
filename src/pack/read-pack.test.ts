@@ -50,4 +50,45 @@ describe("readPack", () => {
 			rmSync(dir, { force: true, recursive: true })
 		}
 	})
+
+	it("reads a real git pack containing OFS deltas, recovering all objects", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pggit-rp-delta-"))
+		try {
+			await spawnGit(["init", "-q"], { cwd: dir })
+			const big = "lorem ipsum dolor sit amet\n".repeat(400)
+			writeFileSync(join(dir, "big.txt"), big)
+			await spawnGit(["add", "."], { cwd: dir })
+			await spawnGit(["commit", "-q", "-m", "v1"], { cwd: dir })
+			// A near-identical large blob ⇒ git will deltify one against the other.
+			writeFileSync(join(dir, "big.txt"), `${big}one more line\n`)
+			await spawnGit(["add", "."], { cwd: dir })
+			await spawnGit(["commit", "-q", "-m", "v2"], { cwd: dir })
+			await spawnGit(["repack", "-adq"], { cwd: dir }) // default ⇒ deltas ON
+
+			const packDir = join(dir, ".git/objects/pack")
+			const packName = readdirSync(packDir).find((f) => f.endsWith(".pack"))
+			if (!packName) throw new Error("no pack produced")
+			const idxName = packName.replace(/\.pack$/, ".idx")
+
+			// Guard against a vacuous test: confirm the pack actually has ≥1 delta.
+			// verify-pack delta lines carry a trailing base-OID; base objects don't.
+			const verify = await spawnGit(["verify-pack", "-v", join(packDir, idxName)], {
+				cwd: dir,
+			})
+			const deltaCount = verify.stdout
+				.split("\n")
+				.filter((l) => /^[0-9a-f]{40} \S.* [0-9a-f]{40}$/.test(l)).length
+			expect(deltaCount).toBeGreaterThan(0)
+
+			const parsed = await readPack(readFileSync(join(packDir, packName)))
+			const list = await spawnGit(
+				["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+				{ cwd: dir },
+			)
+			const expected = list.stdout.trim().split("\n").sort()
+			expect(parsed.map((p) => p.oid).sort()).toEqual(expected)
+		} finally {
+			rmSync(dir, { force: true, recursive: true })
+		}
+	})
 })
