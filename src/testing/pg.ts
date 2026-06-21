@@ -3,12 +3,16 @@ import {
 	PostgreSqlContainer,
 	type StartedPostgreSqlContainer,
 } from "@testcontainers/postgresql"
+import type { Kysely } from "kysely"
 import postgres, { type Sql } from "postgres"
+import { type Database, initKysely } from "@/database"
+import { migrateToLatest } from "@/database/migrate"
 
 const DEFAULT_IMAGE = "postgres:18-alpine"
 
 export type IsolatedDb = {
 	sql: Sql
+	db: Kysely<Database>
 	schema: string
 	drop: () => Promise<void>
 }
@@ -21,9 +25,10 @@ export async function startPostgres(
 }
 
 /**
- * Carve an isolated schema out of a running container and return a porsager
- * client whose every pooled connection has `search_path` set to it — so tests
- * never collide. `drop()` tears the schema (and client) down.
+ * Carve an isolated schema out of a running container, migrate it to latest, and
+ * return both the raw porsager client (every pooled connection's `search_path`
+ * is set to the schema) and a typed Kysely bound to it — so tests never collide.
+ * `drop()` tears the schema (and clients) down.
  */
 export async function createIsolatedSchema(baseUrl: string): Promise<IsolatedDb> {
 	const schema = `t_${randomUUID().replaceAll("-", "")}`
@@ -33,10 +38,15 @@ export async function createIsolatedSchema(baseUrl: string): Promise<IsolatedDb>
 	await admin.end()
 
 	const sql = postgres(baseUrl, { connection: { search_path: schema }, max: 4 })
+	const db = initKysely<Database>(sql)
+	// Scope migration bookkeeping to this schema — many isolated schemas share one
+	// container, and Kysely's existence check would otherwise see a sibling's.
+	await migrateToLatest(db, schema)
 
 	return {
+		db,
 		drop: async () => {
-			await sql.end()
+			await db.destroy() // ends the shared porsager pool (`sql`)
 			const cleanup = postgres(baseUrl, { max: 1 })
 			await cleanup`drop schema ${cleanup(schema)} cascade`
 			await cleanup.end()

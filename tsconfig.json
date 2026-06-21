@@ -22,8 +22,7 @@
 		"skipLibCheck": true,
 		"strict": true,
 		"target": "ES2022",
-		"types": ["node"],
-		"verbatimModuleSyntax": true
+		"types": ["node"]
 	},
 	"exclude": ["node_modules", "dist", "dist-types", "vitest.config.ts"],
 	"include": ["src/**/*.ts"]

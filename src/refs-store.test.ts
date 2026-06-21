@@ -20,8 +20,7 @@ describe("ref store", () => {
 	it("stores, lists, updates direct refs and a HEAD symref", async () => {
 		const db = await createIsolatedSchema(container.getConnectionUri())
 		try {
-			const refs = createRefStore(db.sql)
-			await refs.migrate()
+			const refs = createRefStore(db.db)
 
 			await refs.setRef("r1", "refs/heads/master", A)
 			await refs.setRef("r1", "refs/tags/v1", B)

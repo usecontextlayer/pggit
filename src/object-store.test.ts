@@ -19,8 +19,7 @@ describe("object store", () => {
 	it("round-trips objects through Postgres (put pack, get by oid)", async () => {
 		const db = await createIsolatedSchema(container.getConnectionUri())
 		try {
-			const store = createObjectStore(db.sql)
-			await store.migrate()
+			const store = createObjectStore(db.db)
 
 			const objects: PackInputObject[] = [
 				{ content: Buffer.from("hello\n"), type: "blob" },

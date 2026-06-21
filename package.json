@@ -2,6 +2,8 @@
 	"dependencies": {
 		"@hono/node-server": "^1.19.14",
 		"hono": "^4.12.23",
+		"kysely": "^0.29.2",
+		"kysely-postgres-js": "^3.0.0",
 		"postgres": "^3.4.9",
 		"zod": "^4.4.3"
 	},
@@ -9,7 +11,10 @@
 		"@biomejs/biome": "latest",
 		"@testcontainers/postgresql": "^12.0.3",
 		"@types/node": "^25.9.1",
+		"commander": "^15.0.0",
 		"fast-check": "latest",
+		"kanel": "^4.0.2",
+		"kanel-kysely": "^4.0.0",
 		"tsdown": "latest",
 		"tsx": "latest",
 		"typescript": "latest",
@@ -37,6 +42,7 @@
 		"build": "npx tsdown",
 		"check": "pnpm run format.fix && pnpm run tsc && pnpm run test",
 		"clean": "rm -rf dist dist-types *.tsbuildinfo coverage .vitest-attachments node_modules",
+		"db.manage": "npx tsx ./manage.ts --sub=database",
 		"dev": "npx tsx src/main.ts",
 		"format.fix": "npx @biomejs/biome check --fix --error-on-warnings .",
 		"format.verify": "npx @biomejs/biome check --error-on-warnings .",

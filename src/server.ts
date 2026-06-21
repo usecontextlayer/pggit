@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server"
 import type { Hono } from "hono"
 import postgres from "postgres"
+import { type Database, initKysely } from "@/database"
 import { env } from "@/env"
 import { createGitApp } from "@/index"
 import { createObjectStore } from "@/object-store"
@@ -41,16 +42,16 @@ export async function startServer(
 	if (!databaseUrl) {
 		throw new Error("pggit: PGGIT_DATABASE_URL is required to serve")
 	}
-	const sql = postgres(databaseUrl)
+	const db = initKysely<Database>(postgres(databaseUrl))
 	const app = createGitApp({
-		objects: createObjectStore(sql),
-		refs: createRefStore(sql),
+		objects: createObjectStore(db),
+		refs: createRefStore(db),
 	})
 	const server = await serveOnPort(app, opts.port ?? env.PGGIT_PORT)
 	return {
 		close: async () => {
 			await server.close()
-			await sql.end()
+			await db.destroy()
 		},
 		port: server.port,
 	}
