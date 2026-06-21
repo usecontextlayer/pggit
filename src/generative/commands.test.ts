@@ -4,11 +4,11 @@ import { describe, expect, it } from "vitest"
 import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
 import { spawnGit } from "@/testing/spawn-git"
 
-// The generator is the reusable CORE of the §8.4 differential (spec §6). It must
+// The generator is the reusable CORE of the §8.4 differentials (spec §6). It must
 // produce only SENSIBLE git command sequences — replaying any generated list
 // must yield a valid (fsck-clean) repo and never run an invalid command (which
-// would make `git` exit non-zero and `spawnGit` throw). So this is green infra,
-// a normal `*.test.ts` on the gate — not a red-by-design `*.spec.test.ts`.
+// would make `git` exit non-zero and `spawnGit` throw). This guards that core
+// directly; the differentials in `*.spec.test.ts` consume it. All run on one gate.
 describe("repoCommands generator + buildRepoFromCommands replay", () => {
 	it("replays ANY generated command list into an fsck-clean repo whose model matches git", async () => {
 		await fc.assert(

@@ -1,14 +1,13 @@
 /**
  * §8.4 generative kernel differential — FULL CLONE (M0).
  *
- * SPEC-SUITE (`*.spec.test.ts`, off the default gate — `pnpm run test.spec`).
- * For each randomly generated repo (§6 generator), seed it into Postgres, serve
- * it, drive a real `git clone -c protocol.version=2`, and assert the clone is
- * INDISTINGUISHABLE from the source: same object set, `fsck` clean, same HEAD.
+ * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`).
+ * For each generated repo (§6 generator), seed it into Postgres, serve it, drive a
+ * real `git clone -c protocol.version=2`, and assert the clone is INDISTINGUISHABLE
+ * from the source: same object set, `fsck` clean, same HEAD.
  *
- * Most candidates pass (M0 is correct) — this codifies that and hunts the edge
- * cases the hand-written m0 test never tried. Per the three-phase rule, a failure
- * is shrunk + recorded for Phase 3, NOT fixed here.
+ * The fast-check seed is pinned for a deterministic gate (broad seed exploration
+ * happens during development); a failure here is a real kernel regression to fix.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -74,7 +73,7 @@ describe("§8.4 generative — full clone (M0) differential", () => {
 					rmSync(src, { force: true, recursive: true })
 				}
 			}),
-			{ numRuns: 15 },
+			{ numRuns: 15, seed: 424_242 },
 		)
 	})
 })

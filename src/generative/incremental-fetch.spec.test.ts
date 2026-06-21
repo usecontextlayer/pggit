@@ -7,8 +7,8 @@
  * we read the precise set that crossed the wire from the received pack itself
  * (`verify-pack -v`, with `fetch.unpackLimit=1` to keep it as a pack).
  *
- * SPEC-SUITE (`*.spec.test.ts`, off the default gate — `pnpm run test.spec`). A
- * failure is a Phase-3 negotiation bug.
+ * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
+ * A failure is a real negotiation bug.
  */
 import { mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -119,7 +119,7 @@ describe("§8.4 generative — incremental fetch (M1) differential", () => {
 					}
 				},
 			),
-			{ numRuns: 8 },
+			{ numRuns: 8, seed: 424_242 },
 		)
 	})
 })

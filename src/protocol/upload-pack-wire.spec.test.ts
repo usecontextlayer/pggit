@@ -2,10 +2,9 @@
  * §8.1 in-process pkt-line oracle — UPLOAD-PACK (fetch, protocol v2) wire goldens.
  *
  * SPEC-SUITE (`*.spec.test.ts`): authored as the executable spec of the desired
- * wire output BEFORE the implementation is made to conform (spec §3). Off the
- * default gate; run with `pnpm run test.spec`. Most assertions here already pass
- * because M0/M1 are correct — they codify that correctness and lock it against
- * regression; any that fail are Phase-3 worklist items (do NOT fix the impl here).
+ * wire output BEFORE the implementation was made to conform (spec §3), now on the
+ * default gate (`pnpm run check`). The goldens codify M0/M1 wire correctness and
+ * lock it against regression; a failure is a real regression to fix.
  *
  * Each golden is authored INDEPENDENTLY in git's grammar (spec §4.6 "the test
  * owns the canonical spec"), parametrized over OIDs/agent/algo (never frozen

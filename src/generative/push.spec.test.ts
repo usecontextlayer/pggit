@@ -7,8 +7,8 @@
  * tags, binary blobs). (`--all --tags` is rejected by git's CLI, so the wildcard
  * refspecs push both in one request.)
  *
- * SPEC-SUITE (`*.spec.test.ts`, off the default gate — `pnpm run test.spec`). A
- * failure is a Phase-3 ingest bug, not a test to weaken.
+ * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
+ * A failure is a real ingest bug, not a test to weaken.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -85,7 +85,7 @@ describe("§8.4 generative — push to an empty repo (M2) differential", () => {
 					rmSync(client, { force: true, recursive: true })
 				}
 			}),
-			{ numRuns: 10 },
+			{ numRuns: 10, seed: 424_242 },
 		)
 	})
 })

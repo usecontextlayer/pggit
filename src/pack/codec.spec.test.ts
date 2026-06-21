@@ -15,8 +15,8 @@
  *      THIN pack (base absent, supplied by the external resolver — the push-ingest
  *      seam, here a plain Map instead of Postgres).
  *
- * SPEC-SUITE (`*.spec.test.ts`, off the default gate — `pnpm run test.spec`). Green
- * by design: the codec is already correct, so a failure here is a Phase-3 bug.
+ * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
+ * A failure here is a real codec bug.
  */
 import { createHash } from "node:crypto"
 import { deflateSync } from "node:zlib"
@@ -179,7 +179,7 @@ describe("§8.4 codec round-trips (pure)", () => {
 					for (const p of parsed) expect(p.oid).toBe(computeOid(p.type, p.content))
 				},
 			),
-			{ numRuns: 100 },
+			{ numRuns: 100, seed: 424_242 },
 		)
 	})
 
@@ -194,7 +194,7 @@ describe("§8.4 codec round-trips (pure)", () => {
 					expect(applyDelta(base, delta).equals(target)).toBe(true)
 				},
 			),
-			{ numRuns: 200 },
+			{ numRuns: 200, seed: 424_242 },
 		)
 	})
 
@@ -233,7 +233,7 @@ describe("§8.4 codec round-trips (pure)", () => {
 					await expect(readPack(thin)).rejects.toThrow(/not found in pack or store/)
 				},
 			),
-			{ numRuns: 60 },
+			{ numRuns: 60, seed: 424_242 },
 		)
 	})
 })

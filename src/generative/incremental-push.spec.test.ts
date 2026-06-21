@@ -6,8 +6,8 @@
  * which the ingest path must resolve. After both pushes the server must hold
  * exactly the client's refs and full object closure, fsck-clean on clone-back.
  *
- * SPEC-SUITE (`*.spec.test.ts`, off the default gate — `pnpm run test.spec`). A
- * failure is a Phase-3 CAS / thin-pack-ingest bug.
+ * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
+ * A failure is a real CAS / thin-pack-ingest bug.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -96,7 +96,7 @@ describe("§8.4 generative — incremental push (M2) differential", () => {
 					}
 				},
 			),
-			{ numRuns: 8 },
+			{ numRuns: 8, seed: 424_242 },
 		)
 	})
 })

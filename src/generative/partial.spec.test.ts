@@ -1,11 +1,11 @@
 /**
  * §8.4 generative kernel differential — BLOBLESS PARTIAL CLONE (M1).
  *
- * SPEC-SUITE (`*.spec.test.ts`, off the default gate — `pnpm run test.spec`).
+ * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
  * For each generated repo: `clone --filter=blob:none --no-checkout` must transfer
  * EXACTLY the non-blob closure (commits + trees + tags, no blobs); then a real
  * `checkout` must lazily fault HEAD's blobs back from us (promisor) — proving
- * `allowAnySHA1InWant` serves bare blob wants. A failure is a Phase-3 item.
+ * `allowAnySHA1InWant` serves bare blob wants. A failure is a kernel regression.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -84,7 +84,7 @@ describe("§8.4 generative — blobless partial clone (M1) differential", () => 
 					rmSync(src, { force: true, recursive: true })
 				}
 			}),
-			{ numRuns: 12 },
+			{ numRuns: 12, seed: 424_242 },
 		)
 	})
 })

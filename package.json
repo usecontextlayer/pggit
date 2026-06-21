@@ -53,7 +53,6 @@
 		"format.verify": "npx @biomejs/biome check --error-on-warnings .",
 		"perf": "npx tsx perf/run.ts",
 		"test": "npx vitest run",
-		"test.spec": "npx vitest run --config vitest.spec.config.ts",
 		"tsc": "npx tsc -b tsconfig.json"
 	},
 	"type": "module",
