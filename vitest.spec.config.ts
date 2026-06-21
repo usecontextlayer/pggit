@@ -16,9 +16,14 @@ export default defineConfig({
 	resolve: { tsconfigPaths: true },
 	test: {
 		exclude: [...configDefaults.exclude],
+		// One shared Postgres container for the whole generative run (spec §7.3);
+		// each candidate carves its own isolated schema via createIsolatedSchema.
+		globalSetup: ["./src/testing/pg-global-setup.ts"],
 		include: ["**/*.spec.test.ts"],
 		name: "@usecontextlayer/pggit:spec",
 		root: projectRoot,
-		testTimeout: 60_000,
+		// Generative properties run many candidates per `it` (a fresh container
+		// schema + a real `git clone` each), so give them ample headroom.
+		testTimeout: 600_000,
 	},
 })
