@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { createInflate } from "node:zlib"
+import { count } from "@/instrument"
 import { computeOid, type GitObjectType } from "@/object"
 import { applyDelta } from "@/pack/delta"
 import { decodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
@@ -75,12 +76,13 @@ export async function readPack(
 	pack: Buffer,
 	resolveExternalBase?: (oid: string) => Promise<Resolved | null>,
 ): Promise<ParsedObject[]> {
+	count("readPackCalls")
 	if (pack.subarray(0, 4).toString("latin1") !== "PACK") {
 		throw new Error("pack: bad magic")
 	}
 	const version = pack.readUInt32BE(4)
 	if (version !== 2) throw new Error(`pack: unsupported version ${version}`)
-	const count = pack.readUInt32BE(8)
+	const objectCount = pack.readUInt32BE(8)
 
 	const trailerOffset = pack.length - 20
 	const actualTrailer = createHash("sha1")
@@ -94,7 +96,7 @@ export async function readPack(
 	const entries = new Map<number, RawEntry>()
 	const order: number[] = []
 	let offset = 12
-	for (let i = 0; i < count; i++) {
+	for (let i = 0; i < objectCount; i++) {
 		const start = offset
 		const { type, size, bytesRead } = decodeObjectHeader(pack, offset)
 		offset += bytesRead
@@ -103,18 +105,21 @@ export async function readPack(
 			const { value: negOffset, bytesRead: ob } = readOffsetVarint(pack, offset)
 			offset += ob
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
+			count("bytesInflated", data.length)
 			offset += compressedLength
 			entries.set(start, { baseOffset: start - negOffset, delta: data, kind: "ofs" })
 		} else if (type === PACK_OBJ_TYPE.REF_DELTA) {
 			const baseOid = pack.subarray(offset, offset + 20).toString("hex")
 			offset += 20
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
+			count("bytesInflated", data.length)
 			offset += compressedLength
 			entries.set(start, { baseOid, delta: data, kind: "ref" })
 		} else {
 			const typeName = CODE_TO_TYPE[type]
 			if (!typeName) throw new Error(`pack: unknown object type ${type}`)
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
+			count("bytesInflated", data.length)
 			if (data.length !== size) {
 				throw new Error(`pack: size mismatch (header ${size}, inflated ${data.length})`)
 			}

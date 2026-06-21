@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { deflateSync } from "node:zlib"
+import { count } from "@/instrument"
 import type { GitObjectType } from "@/object"
 import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/object-header"
 
@@ -28,10 +29,14 @@ export function writePack(objects: PackInputObject[]): Buffer {
 	header.writeUInt32BE(2, 4)
 	header.writeUInt32BE(objects.length, 8)
 
+	count("writePackCalls")
 	const parts: Buffer[] = [header]
 	for (const obj of objects) {
 		parts.push(encodeObjectHeader(TYPE_CODE[obj.type], obj.content.length))
-		parts.push(deflateSync(obj.content))
+		const deflated = deflateSync(obj.content)
+		count("deflateInputBytes", obj.content.length)
+		count("deflateOutputBytes", deflated.length)
+		parts.push(deflated)
 	}
 
 	const body = Buffer.concat(parts)

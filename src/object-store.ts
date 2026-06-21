@@ -1,6 +1,7 @@
 import type { Kysely } from "kysely"
 import type { Database } from "@/database"
 import type { ObjectsOid, ObjectsRepoId } from "@/database/models/public/Objects"
+import { count } from "@/instrument"
 import { computeOid, type GitObjectType, referencedOids } from "@/object"
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
@@ -24,6 +25,7 @@ export type ObjectStore = ReturnType<typeof createObjectStore>
 export function createObjectStore(db: Kysely<Database>) {
 	const store = {
 		async getObject(repoId: string, oid: string): Promise<StoredObject | null> {
+			count("getObjectCalls")
 			const objRow = await db
 				.selectFrom("objects")
 				.select("pack_id")
@@ -38,6 +40,7 @@ export function createObjectStore(db: Kysely<Database>) {
 				.where("id", "=", objRow.pack_id)
 				.executeTakeFirst()
 			if (!packRow) throw new Error(`object-store: pack ${objRow.pack_id} missing`)
+			count("packBytesRead", packRow.bytes.length)
 
 			const found = (await readPack(packRow.bytes)).find((p) => p.oid === oid)
 			return found ? { content: found.content, type: found.type } : null

@@ -1,6 +1,7 @@
 import { gunzipSync } from "node:zlib"
 import { type Context, Hono } from "hono"
 import { cors } from "hono/cors"
+import { runRequest } from "@/instrument"
 import type { ObjectStore } from "@/object-store"
 import { encodePkt, encodePktLine } from "@/pkt-line"
 import {
@@ -81,8 +82,16 @@ async function receivePackAdvertBody(deps: GitAppDeps, repoId: string): Promise<
  * a host app via `host.route("/git", createGitApp(deps))`; the host owns the
  * Postgres lifecycle behind `deps`.
  */
-export function createGitApp(deps: GitAppDeps): Hono {
+export function createGitApp(
+	deps: GitAppDeps,
+	opts: { instrument?: boolean } = {},
+): Hono {
 	const app = new Hono()
+	if (opts.instrument) {
+		app.use((c, next) =>
+			runRequest({ method: c.req.method, path: c.req.path }, () => next()),
+		)
+	}
 	app.use(cors())
 
 	app.get("/health", (c) => c.text("ok"))

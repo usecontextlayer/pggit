@@ -1,6 +1,7 @@
 import { Kysely } from "kysely"
 import { PostgresJSDialect } from "kysely-postgres-js"
 import type { Sql } from "postgres"
+import { recordQuery } from "@/instrument"
 
 // Mirrors web/postgres.ts: Kysely over the porsager `postgres` driver via
 // PostgresJSDialect. Unlike web, pggit does NOT keep a module-level singleton —
@@ -13,13 +14,13 @@ export function initKysely<T>(pg: Sql): Kysely<T> {
 	return new Kysely<T>({
 		dialect: new PostgresJSDialect({ postgres: pg }),
 		log(event) {
-			if (
-				(event.level === "query" || event.level === "error") &&
-				process.env.NODE_ENV === "development"
-			) {
-				console.debug(
-					`${EVENT_SIGNS[event.level]} ${event.queryDurationMillis}ms ${event.query.sql}`,
-				)
+			if (event.level === "query" || event.level === "error") {
+				recordQuery(event.query.sql, event.queryDurationMillis)
+				if (process.env.NODE_ENV === "development") {
+					console.debug(
+						`${EVENT_SIGNS[event.level]} ${event.queryDurationMillis}ms ${event.query.sql}`,
+					)
+				}
 			}
 		},
 	})

@@ -1,4 +1,5 @@
 import { graphWalk } from "@/graph-walk"
+import { count, label, withPhase } from "@/instrument"
 import { commitParents, type GitObjectType, referencedOids } from "@/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
 import {
@@ -43,41 +44,44 @@ async function peelTag(oid: string, backend: RepoBackend): Promise<string | unde
 }
 
 async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffer> {
-	const wantPeel = req.args.includes("peel")
-	const wantSymrefs = req.args.includes("symrefs")
-	const prefixes = req.args
-		.filter((a) => a.startsWith("ref-prefix "))
-		.map((a) => a.slice("ref-prefix ".length))
-	const matches = (name: string) =>
-		prefixes.length === 0 || prefixes.some((p) => name.startsWith(p))
+	label("ls-refs")
+	return withPhase("ref-advertise", async () => {
+		const wantPeel = req.args.includes("peel")
+		const wantSymrefs = req.args.includes("symrefs")
+		const prefixes = req.args
+			.filter((a) => a.startsWith("ref-prefix "))
+			.map((a) => a.slice("ref-prefix ".length))
+		const matches = (name: string) =>
+			prefixes.length === 0 || prefixes.some((p) => name.startsWith(p))
 
-	const refs = await backend.listRefs()
-	const byName = new Map(refs.map((r) => [r.name, r.oid]))
-	const entries: LsRefEntry[] = []
+		const refs = await backend.listRefs()
+		const byName = new Map(refs.map((r) => [r.name, r.oid]))
+		const entries: LsRefEntry[] = []
 
-	const headTarget = await backend.getSymref("HEAD")
-	if (headTarget && matches("HEAD")) {
-		const headOid = byName.get(headTarget)
-		if (headOid) {
-			entries.push({
-				name: "HEAD",
-				oid: headOid,
-				symrefTarget: wantSymrefs ? headTarget : undefined,
-			})
+		const headTarget = await backend.getSymref("HEAD")
+		if (headTarget && matches("HEAD")) {
+			const headOid = byName.get(headTarget)
+			if (headOid) {
+				entries.push({
+					name: "HEAD",
+					oid: headOid,
+					symrefTarget: wantSymrefs ? headTarget : undefined,
+				})
+			}
 		}
-	}
 
-	for (const ref of refs) {
-		if (!matches(ref.name)) continue
-		const entry: LsRefEntry = { name: ref.name, oid: ref.oid }
-		if (wantPeel) {
-			const peeled = await peelTag(ref.oid, backend)
-			if (peeled) entry.peeled = peeled
+		for (const ref of refs) {
+			if (!matches(ref.name)) continue
+			const entry: LsRefEntry = { name: ref.name, oid: ref.oid }
+			if (wantPeel) {
+				const peeled = await peelTag(ref.oid, backend)
+				if (peeled) entry.peeled = peeled
+			}
+			entries.push(entry)
 		}
-		entries.push(entry)
-	}
 
-	return encodeLsRefsResponse(entries)
+		return encodeLsRefsResponse(entries)
+	})
 }
 
 /** Translate the wire filter spec to a walk option; reject what we don't honor. */
@@ -146,21 +150,32 @@ async function buildDeltaPack(
 	backend: RepoBackend,
 ): Promise<Buffer> {
 	const read = (oid: string) => readOrThrow(backend, oid)
-	const wantClosure = await graphWalk(wants, read, { omitBlobs })
-	const haveClosure =
-		common.length > 0 ? await graphWalk(common, read, { omitBlobs }) : new Set<string>()
+	const { wantClosure, haveClosure } = await withPhase("graph-walk", async () => {
+		const wantClosure = await graphWalk(wants, read, { omitBlobs })
+		const haveClosure =
+			common.length > 0 ? await graphWalk(common, read, { omitBlobs }) : new Set<string>()
+		return { haveClosure, wantClosure }
+	})
 
 	const wantsSet = new Set(wants)
-	const objects: PackInputObject[] = []
-	for (const oid of wantClosure) {
-		if (haveClosure.has(oid) && !wantsSet.has(oid)) continue
-		const obj = await read(oid)
-		objects.push({ content: obj.content, type: obj.type })
-	}
-	return writePack(objects)
+	const objects = await withPhase("read-objects", async () => {
+		const objs: PackInputObject[] = []
+		for (const oid of wantClosure) {
+			if (haveClosure.has(oid) && !wantsSet.has(oid)) continue
+			const obj = await read(oid)
+			objs.push({ content: obj.content, type: obj.type })
+		}
+		return objs
+	})
+
+	const pack = await withPhase("write-pack", async () => writePack(objects))
+	count("objectsServed", objects.length)
+	count("packBytes", pack.length)
+	return pack
 }
 
 async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer> {
+	label("fetch")
 	const { wants, haves, done, filter } = parseFetch(req)
 	const omitBlobs = filterOmitsBlobs(filter)
 	const common = await commonHaves(haves, backend)
