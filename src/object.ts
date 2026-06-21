@@ -23,9 +23,12 @@ function headerOids(content: Buffer, keys: Set<string>): string[] {
 	return oids
 }
 
-export type TreeEntry = { mode: string; oid: string }
+/** One entry of a tree. `mode` is the raw stored value (`"40000"` for a subtree —
+ * git zero-pads to `"040000"` only for display); `name` is the entry's own path
+ * segment, not a full path. */
+export type TreeEntry = { mode: string; name: string; oid: string }
 
-/** A tree's entries — `<mode> <name>\0<20-byte oid>` repeated — with modes. */
+/** A tree's entries — `<mode> <name>\0<20-byte oid>` repeated. */
 export function treeEntries(content: Buffer): TreeEntry[] {
 	const entries: TreeEntry[] = []
 	let pos = 0
@@ -34,8 +37,9 @@ export function treeEntries(content: Buffer): TreeEntry[] {
 		const nul = content.indexOf(0x00, pos)
 		if (space < 0 || nul < 0 || space > nul) break
 		const mode = content.subarray(pos, space).toString("latin1")
+		const name = content.subarray(space + 1, nul).toString("utf8")
 		const oid = content.subarray(nul + 1, nul + 21).toString("hex")
-		entries.push({ mode, oid })
+		entries.push({ mode, name, oid })
 		pos = nul + 21
 	}
 	return entries
@@ -54,6 +58,13 @@ function treeEntryOids(content: Buffer): string[] {
 /** A commit's parent OIDs only (ancestry walk; excludes its tree). */
 export function commitParents(content: Buffer): string[] {
 	return headerOids(content, new Set(["parent"]))
+}
+
+/** A commit's root tree OID. Every commit has exactly one `tree` header. */
+export function commitTreeOid(content: Buffer): string {
+	const [tree] = headerOids(content, new Set(["tree"]))
+	if (!tree) throw new Error("commitTreeOid: commit has no tree header")
+	return tree
 }
 
 /**

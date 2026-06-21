@@ -12,10 +12,15 @@ import {
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { encodeAdvertisement } from "@/protocol/v2"
 import type { RefStore } from "@/refs-store"
+import { syncRefSnapshot } from "@/repo-view/rebuild"
+import type { SnapshotStore } from "@/repo-view/snapshot-store"
 
 export type GitAppDeps = {
 	objects: ObjectStore
 	refs: RefStore
+	/** Optional queryable-view layer. When provided, push maintains a `repo_view`
+	 * file snapshot per branch; when omitted, this is a plain git remote. */
+	snapshots?: SnapshotStore
 }
 
 // Smart-HTTP info/refs body: the `# service` preamble + flush, then the v2
@@ -57,7 +62,7 @@ function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 }
 
 function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
-	return {
+	const backend: ReceiveBackend = {
 		applyRefUpdates: (commands, atomic) =>
 			deps.refs.applyRefUpdates(repoId, commands, atomic),
 		ingest: async (pack) => {
@@ -65,6 +70,11 @@ function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 		},
 		isConnected: (oid) => deps.objects.isConnected(repoId, oid),
 	}
+	if (deps.snapshots) {
+		const sdeps = { objects: deps.objects, snapshots: deps.snapshots }
+		backend.syncRefSnapshot = (ref, newOid) => syncRefSnapshot(sdeps, repoId, ref, newOid)
+	}
+	return backend
 }
 
 /** v0 receive-pack ref advertisement body: the `# service` preamble + ref list. */

@@ -105,6 +105,9 @@ export type ReceiveBackend = {
 	applyRefUpdates: (commands: RefCommand[], atomic: boolean) => Promise<boolean[]>
 	/** Is every object reachable from `oid` present? (connectivity, spec §10). */
 	isConnected: (oid: string) => Promise<boolean>
+	/** Refresh the queryable file projection for a just-applied ref. Present only
+	 * when the (optional) queryable-view layer is wired; a plain remote omits it. */
+	syncRefSnapshot?: (ref: string, newOid: string) => Promise<void>
 }
 
 /**
@@ -179,5 +182,12 @@ export async function handleReceivePack(
 					ref: c.ref,
 				}
 	})
+
+	// Post-commit: refresh the queryable file projection for each applied ref. The
+	// view layer decides branch-filtering and build-vs-drop. Sequential — same-repo
+	// rebuilds must not race the shared-blob reaper.
+	for (const [i, c] of commands.entries()) {
+		if (results[i]?.ok) await backend.syncRefSnapshot?.(c.ref, c.newOid)
+	}
 	return encodeReportStatus(unpackStatus, results, useSideband)
 }

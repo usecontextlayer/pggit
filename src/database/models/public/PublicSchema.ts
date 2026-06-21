@@ -6,8 +6,12 @@ import type { default as KyselyMigrationLockTable } from "./KyselyMigrationLock"
 import type { default as ObjectsTable } from "./Objects"
 import type { default as PacksTable } from "./Packs"
 import type { default as RefsTable } from "./Refs"
+import type { default as RepoViewBlobsTable } from "./RepoViewBlobs"
+import type { default as RepoViewFilesTable } from "./RepoViewFiles"
 
 export default interface PublicSchema {
+	repo_view_blobs: RepoViewBlobsTable
+
 	kysely_migration_lock: KyselyMigrationLockTable
 
 	refs: RefsTable
@@ -17,4 +21,6 @@ export default interface PublicSchema {
 	kysely_migration: KyselyMigrationTable
 
 	packs: PacksTable
+
+	repo_view_files: RepoViewFilesTable
 }

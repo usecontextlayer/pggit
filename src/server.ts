@@ -6,6 +6,7 @@ import { env } from "@/env"
 import { createGitApp } from "@/index"
 import { createObjectStore } from "@/object-store"
 import { createRefStore } from "@/refs-store"
+import { createSnapshotStore } from "@/repo-view/snapshot-store"
 
 export type GitServer = {
 	port: number
@@ -46,6 +47,7 @@ export async function startServer(
 	const app = createGitApp({
 		objects: createObjectStore(db),
 		refs: createRefStore(db),
+		snapshots: createSnapshotStore(db),
 	})
 	const server = await serveOnPort(app, opts.port ?? env.PGGIT_PORT)
 	return {

@@ -20,6 +20,26 @@ export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
 	return objs
 }
 
+/** Parse `git ls-tree[-r]` output: `<mode> <type> <oid>\t<name-or-path>`. */
+export function parseLsTree(
+	stdout: string,
+): { mode: string; oid: string; path: string }[] {
+	return stdout
+		.trim()
+		.split("\n")
+		.filter((line) => line.length > 0)
+		.map((line) => {
+			const tab = line.indexOf("\t")
+			if (tab < 0) throw new Error(`unexpected ls-tree line: ${line}`)
+			const path = line.slice(tab + 1)
+			const [mode, , oid] = line.slice(0, tab).split(" ")
+			if (mode === undefined || oid === undefined) {
+				throw new Error(`unexpected ls-tree meta: ${line}`)
+			}
+			return { mode, oid, path }
+		})
+}
+
 /** Sorted list of every object OID in a real repo. */
 export async function allObjectOids(dir: string): Promise<string[]> {
 	const list = await spawnGit(
