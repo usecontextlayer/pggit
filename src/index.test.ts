@@ -5,6 +5,7 @@ import { createGitApp } from "@/index"
 import { createObjectStore } from "@/object-store"
 import { encodePkt, encodePktLine } from "@/pkt-line"
 import { createRefStore } from "@/refs-store"
+import { pktLineUnpack } from "@/testing/pkt-oracle"
 
 // A client that is never queried by /health, so no real Postgres is needed.
 const db = initKysely<Database>(postgres("postgres://unused:1/none"))
@@ -30,6 +31,21 @@ describe("createGitApp", () => {
 	it("rejects info/refs for an unsupported service", async () => {
 		const res = await app.request("/repo1/info/refs?service=git-upload-archive")
 		expect(res.status).toBe(403)
+	})
+
+	// The first byte-exchange of every clone/fetch: a strict client contract. git
+	// refuses the connection if the Content-Type or the `# service` framing is wrong.
+	it("serves the upload-pack info/refs advert with the smart-HTTP preamble + Content-Type", async () => {
+		const res = await app.request("/repo1/info/refs?service=git-upload-pack")
+		expect(res.status).toBe(200)
+		expect(res.headers.get("Content-Type")).toBe(
+			"application/x-git-upload-pack-advertisement",
+		)
+		expect(res.headers.get("Cache-Control")).toBe("no-cache")
+		const unpacked = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
+		expect(unpacked.startsWith("# service=git-upload-pack\n0000\nversion 2\n")).toBe(true)
+		expect(unpacked).toContain("ls-refs=unborn\n")
+		expect(unpacked.endsWith("object-format=sha1\n0000\n")).toBe(true)
 	})
 })
 
