@@ -41,13 +41,11 @@ function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 
 function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 	return {
-		createRef: (name, newOid) => deps.refs.createRef(repoId, name, newOid),
-		deleteRef: (name, oldOid) => deps.refs.deleteRef(repoId, name, oldOid),
+		applyRefUpdates: (commands, atomic) =>
+			deps.refs.applyRefUpdates(repoId, commands, atomic),
 		ingest: async (pack) => {
 			await deps.objects.ingestPack(repoId, pack)
 		},
-		updateRef: (name, oldOid, newOid) =>
-			deps.refs.updateRef(repoId, name, oldOid, newOid),
 	}
 }
 

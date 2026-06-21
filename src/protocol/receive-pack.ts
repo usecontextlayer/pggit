@@ -22,10 +22,6 @@ export type RefCommand = { oldOid: string; newOid: string; ref: string }
 export type ReceiveRequest = { commands: RefCommand[]; caps: string[]; pack: Buffer }
 export type CommandResult = { ref: string; ok: boolean; reason?: string }
 
-function isZero(oid: string): boolean {
-	return /^0{40}$/.test(oid)
-}
-
 /**
  * v0 ref advertisement for receive-pack (push). An empty repo — the dominant
  * first-push state — emits the synthetic `0{40} capabilities^{}` line so the
@@ -105,41 +101,16 @@ export function encodeReportStatus(
 /** Everything receive-pack needs from a single repo's storage. */
 export type ReceiveBackend = {
 	ingest: (pack: Buffer) => Promise<void>
-	createRef: (name: string, newOid: string) => Promise<boolean>
-	updateRef: (name: string, oldOid: string, newOid: string) => Promise<boolean>
-	deleteRef: (name: string, oldOid: string) => Promise<boolean>
+	/** Apply ref CAS updates; `atomic` ⇒ all-or-nothing. Per-command success flags. */
+	applyRefUpdates: (commands: RefCommand[], atomic: boolean) => Promise<boolean[]>
 }
 
 /**
- * Apply one ref command via CAS against the client's advertised old oid: create
- * (zero→new), update (old→new), or delete (old→zero). Non-ff is accepted by
- * default — CAS guards concurrency, not ancestry (spec §3.6).
- */
-async function applyCommand(
-	backend: ReceiveBackend,
-	cmd: RefCommand,
-): Promise<CommandResult> {
-	if (isZero(cmd.oldOid)) {
-		const created = await backend.createRef(cmd.ref, cmd.newOid)
-		return created
-			? { ok: true, ref: cmd.ref }
-			: { ok: false, reason: "ref already exists", ref: cmd.ref }
-	}
-	if (isZero(cmd.newOid)) {
-		const deleted = await backend.deleteRef(cmd.ref, cmd.oldOid)
-		return deleted
-			? { ok: true, ref: cmd.ref }
-			: { ok: false, reason: "stale ref (compare-and-swap failed)", ref: cmd.ref }
-	}
-	const updated = await backend.updateRef(cmd.ref, cmd.oldOid, cmd.newOid)
-	return updated
-		? { ok: true, ref: cmd.ref }
-		: { ok: false, reason: "stale ref (compare-and-swap failed)", ref: cmd.ref }
-}
-
-/**
- * Handle a receive-pack POST: ingest the pack (if any), then apply each ref
- * command under CAS, and report status. A failed unpack fails every ref.
+ * Handle a receive-pack POST: ingest the pack (if any), then apply the ref
+ * commands under CAS — atomically when the client negotiated `atomic` — and
+ * report status. A failed unpack fails every ref; an atomic failure ng's every
+ * ref (none applied). Non-ff is accepted by default (CAS guards concurrency, not
+ * ancestry — spec §3.6).
  */
 export async function handleReceivePack(
 	body: Buffer,
@@ -147,6 +118,7 @@ export async function handleReceivePack(
 ): Promise<Buffer> {
 	const { commands, caps, pack } = parseReceivePack(body)
 	const useSideband = caps.includes("side-band-64k")
+	const atomic = caps.includes("atomic")
 
 	let unpackStatus = "ok"
 	if (pack.length > 0) {
@@ -160,13 +132,26 @@ export async function handleReceivePack(
 		}
 	}
 
-	const results: CommandResult[] = []
-	for (const cmd of commands) {
-		if (unpackStatus !== "ok") {
-			results.push({ ok: false, reason: "unpacker error", ref: cmd.ref })
-			continue
-		}
-		results.push(await applyCommand(backend, cmd))
+	if (unpackStatus !== "ok") {
+		const failed = commands.map((c) => ({
+			ok: false,
+			reason: "unpacker error",
+			ref: c.ref,
+		}))
+		return encodeReportStatus(unpackStatus, failed, useSideband)
 	}
+
+	const oks = await backend.applyRefUpdates(commands, atomic)
+	const results: CommandResult[] = commands.map((c, i) =>
+		oks[i]
+			? { ok: true, ref: c.ref }
+			: {
+					ok: false,
+					reason: atomic
+						? "atomic transaction failed"
+						: "stale ref (compare-and-swap failed)",
+					ref: c.ref,
+				},
+	)
 	return encodeReportStatus(unpackStatus, results, useSideband)
 }
