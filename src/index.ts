@@ -1,4 +1,5 @@
-import { Hono } from "hono"
+import { gunzipSync } from "node:zlib"
+import { type Context, Hono } from "hono"
 import { cors } from "hono/cors"
 import type { ObjectStore } from "@/object-store"
 import { encodePkt, encodePktLine } from "@/pkt-line"
@@ -30,6 +31,21 @@ function toArrayBuffer(buf: Buffer): ArrayBuffer {
 }
 
 const ADVERTISEMENT_BODY = toArrayBuffer(UPLOAD_PACK_ADVERTISEMENT)
+
+/**
+ * Read a smart-HTTP POST body, honoring `Content-Encoding`. Git compresses the
+ * upload-pack/receive-pack request body with gzip once it is large enough
+ * (`remote-curl.c`), exactly as `git http-backend` decompresses on the server
+ * side — so we must too. Any other declared encoding is a hard error, never fed
+ * raw to the pkt-line parser.
+ */
+async function readRequestBody(c: Context): Promise<Buffer> {
+	const raw = Buffer.from(await c.req.arrayBuffer())
+	const encoding = c.req.header("content-encoding")?.toLowerCase()
+	if (encoding === undefined || encoding === "identity") return raw
+	if (encoding === "gzip" || encoding === "x-gzip") return gunzipSync(raw)
+	throw new Error(`unsupported request Content-Encoding: ${JSON.stringify(encoding)}`)
+}
 
 function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	return {
@@ -90,7 +106,7 @@ export function createGitApp(deps: GitAppDeps): Hono {
 	})
 
 	app.post("/:repo/git-upload-pack", async (c) => {
-		const body = Buffer.from(await c.req.arrayBuffer())
+		const body = await readRequestBody(c)
 		const out = await handleUploadPack(body, backendFor(deps, c.req.param("repo")))
 		return c.body(toArrayBuffer(out), 200, {
 			"Cache-Control": "no-cache",
@@ -99,7 +115,7 @@ export function createGitApp(deps: GitAppDeps): Hono {
 	})
 
 	app.post("/:repo/git-receive-pack", async (c) => {
-		const body = Buffer.from(await c.req.arrayBuffer())
+		const body = await readRequestBody(c)
 		const out = await handleReceivePack(
 			body,
 			receiveBackendFor(deps, c.req.param("repo")),
