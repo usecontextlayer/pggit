@@ -1,6 +1,6 @@
 import { decodePktStream, encodePkt, encodePktLine } from "@/pkt-line"
 
-const AGENT = "pggit/0.0.0"
+export const AGENT = "pggit/0.0.0"
 const SIDEBAND_DATA = 0x01
 // band byte + pack data must fit the pkt-line writer cap (65515).
 const MAX_BAND_DATA = 65514

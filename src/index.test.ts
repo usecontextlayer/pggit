@@ -19,8 +19,8 @@ describe("createGitApp", () => {
 		expect(await res.text()).toBe("ok")
 	})
 
-	it("rejects info/refs for an unknown service", async () => {
-		const res = await app.request("/repo1/info/refs?service=git-receive-pack")
+	it("rejects info/refs for an unsupported service", async () => {
+		const res = await app.request("/repo1/info/refs?service=git-upload-archive")
 		expect(res.status).toBe(403)
 	})
 })

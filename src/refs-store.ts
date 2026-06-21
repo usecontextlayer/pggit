@@ -16,6 +16,16 @@ export type RefStore = ReturnType<typeof createRefStore>
  */
 export function createRefStore(db: Kysely<Database>) {
 	return {
+		/** CAS create (zero→new): true iff a row was inserted (ref did not exist). */
+		async createRef(repoId: string, name: string, oid: string): Promise<boolean> {
+			const rows = await db
+				.insertInto("refs")
+				.values({ name: name as RefsName, oid, repo_id: repoId as RefsRepoId })
+				.onConflict((oc) => oc.doNothing())
+				.returningAll()
+				.execute()
+			return rows.length === 1
+		},
 		async getSymref(repoId: string, name: string): Promise<string | null> {
 			const row = await db
 				.selectFrom("refs")

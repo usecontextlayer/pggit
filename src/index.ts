@@ -2,6 +2,11 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import type { ObjectStore } from "@/object-store"
 import { encodePkt, encodePktLine } from "@/pkt-line"
+import {
+	encodeReceivePackAdvertisement,
+	handleReceivePack,
+	type ReceiveBackend,
+} from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { encodeAdvertisement } from "@/protocol/v2"
 import type { RefStore } from "@/refs-store"
@@ -34,6 +39,25 @@ function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	}
 }
 
+function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
+	return {
+		createRef: (name, newOid) => deps.refs.createRef(repoId, name, newOid),
+		ingest: async (pack) => {
+			await deps.objects.ingestPack(repoId, pack)
+		},
+	}
+}
+
+/** v0 receive-pack ref advertisement body: the `# service` preamble + ref list. */
+async function receivePackAdvertBody(deps: GitAppDeps, repoId: string): Promise<Buffer> {
+	const refs = await deps.refs.listRefs(repoId)
+	return Buffer.concat([
+		encodePktLine(Buffer.from("# service=git-receive-pack\n")),
+		encodePkt({ type: "flush" }),
+		encodeReceivePackAdvertisement(refs),
+	])
+}
+
 /**
  * Build the git-remote Hono app (smart-HTTP, protocol v2 fetch). Mountable into
  * a host app via `host.route("/git", createGitApp(deps))`; the host owns the
@@ -45,14 +69,22 @@ export function createGitApp(deps: GitAppDeps): Hono {
 
 	app.get("/health", (c) => c.text("ok"))
 
-	app.get("/:repo/info/refs", (c) => {
-		if (c.req.query("service") !== "git-upload-pack") {
-			return c.text("only git-upload-pack is supported", 403)
+	app.get("/:repo/info/refs", async (c) => {
+		const service = c.req.query("service")
+		if (service === "git-upload-pack") {
+			return c.body(ADVERTISEMENT_BODY, 200, {
+				"Cache-Control": "no-cache",
+				"Content-Type": "application/x-git-upload-pack-advertisement",
+			})
 		}
-		return c.body(ADVERTISEMENT_BODY, 200, {
-			"Cache-Control": "no-cache",
-			"Content-Type": "application/x-git-upload-pack-advertisement",
-		})
+		if (service === "git-receive-pack") {
+			const body = await receivePackAdvertBody(deps, c.req.param("repo"))
+			return c.body(toArrayBuffer(body), 200, {
+				"Cache-Control": "no-cache",
+				"Content-Type": "application/x-git-receive-pack-advertisement",
+			})
+		}
+		return c.text(`unsupported service ${JSON.stringify(service)}`, 403)
 	})
 
 	app.post("/:repo/git-upload-pack", async (c) => {
@@ -61,6 +93,18 @@ export function createGitApp(deps: GitAppDeps): Hono {
 		return c.body(toArrayBuffer(out), 200, {
 			"Cache-Control": "no-cache",
 			"Content-Type": "application/x-git-upload-pack-result",
+		})
+	})
+
+	app.post("/:repo/git-receive-pack", async (c) => {
+		const body = Buffer.from(await c.req.arrayBuffer())
+		const out = await handleReceivePack(
+			body,
+			receiveBackendFor(deps, c.req.param("repo")),
+		)
+		return c.body(toArrayBuffer(out), 200, {
+			"Cache-Control": "no-cache",
+			"Content-Type": "application/x-git-receive-pack-result",
 		})
 	})
 

@@ -22,7 +22,7 @@ export type ObjectStore = ReturnType<typeof createObjectStore>
  * ids and OIDs are cast to their generated branded column types here.
  */
 export function createObjectStore(db: Kysely<Database>) {
-	return {
+	const store = {
 		async getObject(repoId: string, oid: string): Promise<StoredObject | null> {
 			const objRow = await db
 				.selectFrom("objects")
@@ -51,6 +51,20 @@ export function createObjectStore(db: Kysely<Database>) {
 				.where("oid", "=", oid as ObjectsOid)
 				.executeTakeFirst()
 			return row !== undefined
+		},
+
+		/**
+		 * Ingest a received pack: parse it (resolving in-pack deltas) and re-store
+		 * every object as one self-contained, undeltified pack. Thin packs with
+		 * external delta bases are an M2 follow-up (readPack throws on them).
+		 */
+		async ingestPack(repoId: string, packBytes: Buffer): Promise<{ oids: string[] }> {
+			const parsed = await readPack(packBytes)
+			const { oids } = await store.putPack(
+				repoId,
+				parsed.map((p) => ({ content: p.content, type: p.type })),
+			)
+			return { oids }
 		},
 
 		/** Persist objects as one self-contained pack + index its contents. */
@@ -84,4 +98,6 @@ export function createObjectStore(db: Kysely<Database>) {
 			return { oids: rows.map((r) => r.oid), packId: String(packId) }
 		},
 	}
+
+	return store
 }
