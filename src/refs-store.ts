@@ -26,6 +26,17 @@ export function createRefStore(db: Kysely<Database>) {
 				.execute()
 			return rows.length === 1
 		},
+		/** CAS delete (old→zero): true iff exactly the expected old oid was removed. */
+		async deleteRef(repoId: string, name: string, oldOid: string): Promise<boolean> {
+			const rows = await db
+				.deleteFrom("refs")
+				.where("repo_id", "=", repoId as RefsRepoId)
+				.where("name", "=", name as RefsName)
+				.where("oid", "=", oldOid)
+				.returningAll()
+				.execute()
+			return rows.length === 1
+		},
 		async getSymref(repoId: string, name: string): Promise<string | null> {
 			const row = await db
 				.selectFrom("refs")

@@ -107,12 +107,13 @@ export type ReceiveBackend = {
 	ingest: (pack: Buffer) => Promise<void>
 	createRef: (name: string, newOid: string) => Promise<boolean>
 	updateRef: (name: string, oldOid: string, newOid: string) => Promise<boolean>
+	deleteRef: (name: string, oldOid: string) => Promise<boolean>
 }
 
 /**
- * Apply one ref command via CAS against the client's advertised old oid. Create
- * (zero→new) and update (old→new) are handled; delete is M2 follow-up. Non-ff is
- * accepted by default — CAS guards concurrency, not ancestry (spec §3.6).
+ * Apply one ref command via CAS against the client's advertised old oid: create
+ * (zero→new), update (old→new), or delete (old→zero). Non-ff is accepted by
+ * default — CAS guards concurrency, not ancestry (spec §3.6).
  */
 async function applyCommand(
 	backend: ReceiveBackend,
@@ -125,7 +126,10 @@ async function applyCommand(
 			: { ok: false, reason: "ref already exists", ref: cmd.ref }
 	}
 	if (isZero(cmd.newOid)) {
-		return { ok: false, reason: "delete not yet implemented", ref: cmd.ref }
+		const deleted = await backend.deleteRef(cmd.ref, cmd.oldOid)
+		return deleted
+			? { ok: true, ref: cmd.ref }
+			: { ok: false, reason: "stale ref (compare-and-swap failed)", ref: cmd.ref }
 	}
 	const updated = await backend.updateRef(cmd.ref, cmd.oldOid, cmd.newOid)
 	return updated

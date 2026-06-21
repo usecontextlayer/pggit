@@ -18,7 +18,8 @@ export default defineConfig({
 		name: "@usecontextlayer/pggit",
 		root: projectRoot,
 		// The oracle rig spins up real `git` + a real Postgres and round-trips
-		// packfiles; cold runs can exceed the 5s default. Raise per-suite if needed.
-		// testTimeout: 120_000,
+		// packfiles; under parallel load a single round-trip easily exceeds the 5s
+		// default, so give each integration test ample headroom.
+		testTimeout: 60_000,
 	},
 })
