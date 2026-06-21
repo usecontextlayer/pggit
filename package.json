@@ -1,0 +1,48 @@
+{
+	"dependencies": {
+		"@hono/node-server": "^1.19.14",
+		"hono": "^4.12.23",
+		"postgres": "^3.4.9",
+		"zod": "^4.4.3"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "latest",
+		"@types/node": "^25.9.1",
+		"fast-check": "latest",
+		"tsdown": "latest",
+		"tsx": "latest",
+		"typescript": "latest",
+		"vitest": "latest"
+	},
+	"engines": {
+		"node": ">=20.0.0"
+	},
+	"exports": {
+		".": {
+			"import": "./dist/index.mjs",
+			"types": "./dist/index.d.mts"
+		}
+	},
+	"main": "./dist/index.mjs",
+	"name": "@usecontextlayer/pggit",
+	"packageManager": "pnpm@10.34.1",
+	"pnpm": {
+		"onlyBuiltDependencies": [
+			"esbuild"
+		]
+	},
+	"private": true,
+	"scripts": {
+		"build": "npx tsdown",
+		"check": "pnpm run format.fix && pnpm run tsc && pnpm run test",
+		"clean": "rm -rf dist dist-types *.tsbuildinfo coverage .vitest-attachments node_modules",
+		"dev": "npx tsx src/main.ts",
+		"format.fix": "npx @biomejs/biome check --fix --error-on-warnings .",
+		"format.verify": "npx @biomejs/biome check --error-on-warnings .",
+		"test": "npx vitest run",
+		"tsc": "npx tsc -b tsconfig.json"
+	},
+	"type": "module",
+	"types": "./dist/index.d.mts",
+	"version": "0.0.0"
+}

@@ -1,0 +1,11 @@
+node_modules/
+.turbo/
+dist/
+dist-npm/
+dist-types/
+coverage/
+*.tsbuildinfo
+
+.DS_Store
+
+.vitest-attachments/
