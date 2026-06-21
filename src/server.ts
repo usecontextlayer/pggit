@@ -1,6 +1,10 @@
 import { serve } from "@hono/node-server"
+import type { Hono } from "hono"
+import postgres from "postgres"
 import { env } from "@/env"
 import { createGitApp } from "@/index"
+import { createObjectStore } from "@/object-store"
+import { createRefStore } from "@/refs-store"
 
 export type GitServer = {
 	port: number
@@ -8,36 +12,46 @@ export type GitServer = {
 }
 
 /**
- * Builds the git app and serves it over Node HTTP. Mirrors slate-bridge's boot
- * sequence — serve(), await "listening", recover the actually-bound port (so
- * `port: 0` works for the oracle harness, which needs an ephemeral free port).
- *
- * This module has NO import-time side effects: importing it (e.g. from the test
- * harness) does not start a server. The standalone boot lives in `src/main.ts`.
+ * Serve a Hono app over Node HTTP. Awaits "listening" and recovers the bound
+ * port (so `port: 0` yields an ephemeral free port — used by the oracle harness).
+ * No import-time side effects; the standalone boot lives in `src/main.ts`.
  */
-export async function startServer(
-	opts: { port?: number; databaseUrl?: string } = {},
-): Promise<GitServer> {
-	const port = opts.port ?? env.PGGIT_PORT
-	const app = createGitApp({
-		databaseUrl: opts.databaseUrl ?? env.PGGIT_DATABASE_URL,
-	})
-
+export async function serveOnPort(app: Hono, port: number): Promise<GitServer> {
 	const server = serve({ fetch: app.fetch, port })
-
 	await new Promise<void>((resolve, reject) => {
 		server.once("listening", () => resolve())
 		server.once("error", reject)
 	})
-
 	const address = server.address()
 	const boundPort = typeof address === "object" && address ? address.port : port
-
 	return {
 		close: () =>
 			new Promise<void>((resolve, reject) => {
 				server.close((err) => (err ? reject(err) : resolve()))
 			}),
 		port: boundPort,
+	}
+}
+
+/** Build the Postgres-backed git app and serve it. */
+export async function startServer(
+	opts: { port?: number; databaseUrl?: string } = {},
+): Promise<GitServer> {
+	const databaseUrl = opts.databaseUrl ?? env.PGGIT_DATABASE_URL
+	if (!databaseUrl) {
+		throw new Error("pggit: PGGIT_DATABASE_URL is required to serve")
+	}
+	const sql = postgres(databaseUrl)
+	const app = createGitApp({
+		objects: createObjectStore(sql),
+		refs: createRefStore(sql),
+	})
+	const server = await serveOnPort(app, opts.port ?? env.PGGIT_PORT)
+	return {
+		close: async () => {
+			await server.close()
+			await sql.end()
+		},
+		port: server.port,
 	}
 }
