@@ -3,6 +3,8 @@ import { spawn } from "node:child_process"
 export type SpawnGitResult = {
 	code: number
 	stdout: string
+	/** Raw stdout bytes — use this for binary git output (packs, tree objects). */
+	stdoutBytes: Buffer
 	stderr: string
 }
 
@@ -92,13 +94,14 @@ export async function spawnGit(
 		child.on("error", reject)
 		child.on("close", (rawCode) => {
 			const code = rawCode ?? 0
-			const out = Buffer.concat(stdout).toString("utf8")
+			const outBytes = Buffer.concat(stdout)
+			const out = outBytes.toString("utf8")
 			const err = Buffer.concat(stderr).toString("utf8")
 			if (code !== 0) {
 				reject(new GitCommandError(args, code, out, err))
 				return
 			}
-			resolve({ code, stderr: err, stdout: out })
+			resolve({ code, stderr: err, stdout: out, stdoutBytes: outBytes })
 		})
 	})
 }

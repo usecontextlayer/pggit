@@ -39,4 +39,21 @@ describe("spawnGit", () => {
 		// scrub) under test: any drift changes this OID and fails loudly.
 		expect(oid1).toBe("f9e04c8901355c29cbc098d23b165655c9aa107a")
 	})
+
+	it("captures raw stdout bytes faithfully (binary-safe)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pggit-spawn-bin-"))
+		try {
+			const binary = Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x80, 0x0a, 0x7f])
+			const file = join(dir, "bin")
+			writeFileSync(file, binary)
+			await spawnGit(["init", "-q"], { cwd: dir })
+			const { stdout: oid } = await spawnGit(["hash-object", "-w", "-t", "blob", file], {
+				cwd: dir,
+			})
+			const res = await spawnGit(["cat-file", "blob", oid.trim()], { cwd: dir })
+			expect(res.stdoutBytes).toEqual(binary)
+		} finally {
+			rmSync(dir, { force: true, recursive: true })
+		}
+	})
 })
