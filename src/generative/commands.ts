@@ -227,7 +227,20 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 }
 
 /**
- * Replay a generated command list into a real git repo on disk. Returns the repo
+ * Replay more commands onto an ALREADY-BUILT repo, advancing its model in place.
+ * This is the composable seam the incremental differentials need: build a base
+ * repo, clone/push it, then `extend` it to diverge the source (incremental fetch)
+ * or the client (incremental push) before the second exchange.
+ */
+export async function extendRepoFromCommands(
+	model: RepoModel,
+	commands: GenCommand[],
+): Promise<void> {
+	for (const cmd of commands) await step(model, cmd)
+}
+
+/**
+ * Replay a generated command list into a fresh git repo on disk. Returns the repo
  * directory and the final model. The CALLER owns cleanup of `dir` (and seeding it
  * into Postgres for the differential).
  */
@@ -245,6 +258,6 @@ export async function buildRepoFromCommands(
 		existingBranches: new Set(),
 		tags: new Set(),
 	}
-	for (const cmd of commands) await step(model, cmd)
+	await extendRepoFromCommands(model, commands)
 	return { dir, model }
 }
