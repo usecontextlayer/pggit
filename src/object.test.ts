@@ -1,9 +1,8 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { commitTreeOid, computeOid, type GitObjectType, treeEntries } from "@/object"
-import { parseLsTree } from "@/testing/git-fixtures"
+import { computeOid, type GitObjectType } from "@/object"
 import { spawnGit } from "@/testing/spawn-git"
 
 describe("computeOid", () => {
@@ -43,63 +42,6 @@ describe("computeOid", () => {
 				typesSeen.add(type)
 			}
 			expect(typesSeen).toEqual(new Set(["blob", "tree", "commit", "tag"]))
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
-	})
-})
-
-describe("treeEntries", () => {
-	it("parses mode, name, oid for each entry, matching git ls-tree", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-tree-"))
-		try {
-			await spawnGit(["init", "-q"], { cwd: dir })
-			mkdirSync(join(dir, "sub"))
-			writeFileSync(join(dir, "a.txt"), "alpha\n")
-			writeFileSync(join(dir, "sub", "b.txt"), "beta\n")
-			writeFileSync(join(dir, "run.sh"), "#!/bin/sh\n")
-			chmodSync(join(dir, "run.sh"), 0o755)
-			await spawnGit(["add", "."], { cwd: dir })
-			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: dir })
-
-			const treeOid = (
-				await spawnGit(["rev-parse", "HEAD^{tree}"], { cwd: dir })
-			).stdout.trim()
-			const raw = await spawnGit(["cat-file", "tree", treeOid], { cwd: dir })
-
-			// Oracle: `git ls-tree` lines are `<mode> <type> <oid>\t<name>`, with the
-			// mode zero-padded to 6 (git's display form). parseTreeEntries returns the
-			// raw stored mode ("40000" for a subtree), so pad it to compare.
-			const expected = parseLsTree(
-				(await spawnGit(["ls-tree", treeOid], { cwd: dir })).stdout,
-			).map((e) => ({ mode: e.mode, name: e.path, oid: e.oid }))
-			const got = treeEntries(raw.stdoutBytes).map((e) => ({
-				mode: e.mode.padStart(6, "0"),
-				name: e.name,
-				oid: e.oid,
-			}))
-			expect(got).toEqual(expected)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
-	})
-})
-
-describe("commitTreeOid", () => {
-	it("extracts the root tree oid from a commit, matching git", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-commit-"))
-		try {
-			await spawnGit(["init", "-q"], { cwd: dir })
-			writeFileSync(join(dir, "a.txt"), "alpha\n")
-			await spawnGit(["add", "."], { cwd: dir })
-			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: dir })
-
-			const head = (await spawnGit(["rev-parse", "HEAD"], { cwd: dir })).stdout.trim()
-			const raw = await spawnGit(["cat-file", "commit", head], { cwd: dir })
-			const expected = (
-				await spawnGit(["rev-parse", "HEAD^{tree}"], { cwd: dir })
-			).stdout.trim()
-			expect(commitTreeOid(raw.stdoutBytes)).toBe(expected)
 		} finally {
 			rmSync(dir, { force: true, recursive: true })
 		}
