@@ -1,12 +1,14 @@
 /**
  * §10 mid-serve failure contract. The spec reserves side-band band-3 for an error
  * that arises AFTER the packfile section has started streaming. pggit's serve path
- * MATERIALIZES the whole pack (`buildDeltaPack` returns a complete Buffer) BEFORE
- * `encodePackfileResponse` frames the first byte — so a read failure throws before
- * any response byte exists. There is no mid-stream window, hence no band-3 to emit;
- * the failure must surface as a clean rejection (→ the HTTP boundary's 500), never
- * a truncated band-1 stream. These tests pin that contract (band-3 stays deferred
- * until serving becomes streaming — see the gap analysis).
+ * MATERIALIZES the whole pack (`handleFetch` returns `encodePackfileResponse(await
+ * buildDeltaPack(...))` — a complete Buffer) BEFORE the HTTP layer sends a byte, so
+ * the no-partial-stream property is structural (the `Promise<Buffer>` return type),
+ * not something a test can observe directly. What these tests DO assert is the
+ * observable consequence: a mid-serve read failure REJECTS (no Buffer is returned)
+ * rather than being swallowed into an empty/partial pack — so it reaches the HTTP
+ * boundary's 500. (band-3 stays deferred until serving becomes streaming — see the
+ * gap analysis; there is no mid-stream window to signal on today.)
  */
 import { describe, expect, it } from "vitest"
 import { encodePkt, encodePktLine } from "@/pkt-line"

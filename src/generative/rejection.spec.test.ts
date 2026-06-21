@@ -78,7 +78,7 @@ describe("§8.4 generative — connectivity rejection over random graphs", () =>
 					rmSync(dir, { force: true, recursive: true })
 				}
 			}),
-			{ numRuns: 8, seed: 424_242 },
+			{ numRuns: 25, seed: 424_242 },
 		)
 	})
 })

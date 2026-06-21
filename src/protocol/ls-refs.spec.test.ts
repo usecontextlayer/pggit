@@ -79,6 +79,14 @@ describe("ls-refs handler — unborn HEAD (empty repo)", () => {
 		expect(await lsRefs(EMPTY, ["symrefs"])).toBe("0000\n")
 	})
 
+	it("suppresses the unborn HEAD when a ref-prefix excludes it (matches git's prefix filter)", async () => {
+		// git runs HEAD through the same ref_match as any ref (ls-refs.c send_ref),
+		// so an unborn HEAD under a non-covering prefix must NOT be emitted.
+		expect(await lsRefs(EMPTY, ["unborn", "symrefs", "ref-prefix refs/tags/"])).toBe(
+			"0000\n",
+		)
+	})
+
 	it("a populated HEAD is a normal oid line even when unborn is requested", async () => {
 		expect(await lsRefs(POPULATED, ["unborn", "symrefs"])).toBe(
 			`${MAIN} HEAD symref-target:refs/heads/main\n` +

@@ -74,6 +74,11 @@ describe("M3 — at-rest repack invariant", () => {
 		}
 	}
 
+	// A regression FLOOR for the at-rest contract: it pins that consolidating a
+	// repo's history into one pack and re-ingesting it is idempotent at the served
+	// layer (object set + refs unchanged, clone stays fsck-clean). It does NOT yet
+	// prove reaper-specific behavior — that is the it.todo below; this guards
+	// against an ingest regression that drops/duplicates/corrupts on re-consolidation.
 	it("re-ingesting a consolidated pack preserves the served object set and refs", async () => {
 		const objectsBefore = await cloneBackObjects()
 		const refsBefore = await refs.listRefs("repo")

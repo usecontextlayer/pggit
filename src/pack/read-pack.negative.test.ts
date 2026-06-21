@@ -77,7 +77,9 @@ describe("readPack — malformed input fails loud", () => {
 	it("throws when the object count is larger than the body", async () => {
 		const p = Buffer.from(validBlobPack)
 		p.writeUInt32BE(2, 8) // claim 2 objects; only 1 present
-		await expect(readPack(reseal(p))).rejects.toThrow()
+		// The phantom 2nd object decodes the 20-byte trailer as a bogus header, then
+		// inflates into the buffer end — a deterministic zlib underrun, not a hang.
+		await expect(readPack(reseal(p))).rejects.toThrow(/unexpected end of file/)
 	})
 
 	it("throws on an unknown object type code", async () => {

@@ -1,9 +1,9 @@
 /**
- * §10 boundary: object-format negotiation + the no-want guard. pggit is SHA-1
+ * §10 boundary: object-format negotiation + the zero-want case. pggit is SHA-1
  * only (the charter). A SHA-256 client must get a CLEAN rejection — not a
  * mid-parse failure from 40-hex/20-byte width assumptions hitting 64-hex OIDs.
- * Likewise a fetch with zero wants is malformed and must fail loud rather than
- * silently serving a valid empty pack.
+ * A zero-want fetch, by contrast, is NOT malformed: git treats it as a no-op, so
+ * we match the oracle (empty pack) rather than rejecting.
  */
 import { describe, expect, it } from "vitest"
 import { encodePkt, encodePktLine } from "@/pkt-line"
@@ -11,6 +11,7 @@ import { GitProtocolError } from "@/protocol/errors"
 import { handleReceivePack, type ReceiveBackend } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { assertSupportedObjectFormat } from "@/protocol/v2"
+import { sidebandDemux } from "@/testing/pkt-oracle"
 
 const A = "a".repeat(40)
 const Z = "0".repeat(40)
@@ -70,16 +71,24 @@ describe("receive-pack rejects a SHA-256 client cleanly", () => {
 	})
 })
 
-describe("fetch with zero wants fails loud", () => {
-	it("throws GitProtocolError instead of serving an empty pack", async () => {
+describe("fetch with zero wants is a no-op (matches git's oracle)", () => {
+	it("returns an empty packfile rather than erroring", async () => {
+		// git's upload-pack treats a wantless fetch as a no-op (upload-pack.c:
+		// "they didn't want anything") and returns an empty pack — pggit must NOT
+		// diverge from the oracle by rejecting it.
+		const backend: RepoBackend = {
+			getObject: async () => null,
+			getSymref: async () => null,
+			listRefs: async () => [],
+		}
 		const body = Buffer.concat([
 			encodePktLine(Buffer.from("command=fetch\n")),
 			encodePkt({ type: "delim" }),
 			encodePktLine(Buffer.from("done\n")),
 			encodePkt({ type: "flush" }),
 		])
-		await expect(handleUploadPack(body, untouchedUpload)).rejects.toThrow(
-			GitProtocolError,
-		)
+		const out = await handleUploadPack(body, backend)
+		// An empty but valid pack rides band 1 (PACK magic, zero objects).
+		expect(sidebandDemux(out).band1.subarray(0, 4).toString("latin1")).toBe("PACK")
 	})
 })

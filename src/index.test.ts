@@ -80,4 +80,20 @@ describe("createGitApp — server-boundary error responses", () => {
 		expect(res.status).toBe(400)
 		expect(await res.text()).toMatch(/Content-Encoding/)
 	})
+
+	// An INTERNAL failure (here: the unused DB connection fails on a real query
+	// during the want-walk) is NOT a GitProtocolError, so it must map to a clean
+	// 500 with a generic body — never a 400 and never a leaked stack.
+	it("500s on an internal backend error, not 400", async () => {
+		const body = Buffer.concat([
+			encodePktLine(Buffer.from("command=fetch\n")),
+			encodePkt({ type: "delim" }),
+			encodePktLine(Buffer.from(`want ${A}\n`)),
+			encodePktLine(Buffer.from("done\n")),
+			encodePkt({ type: "flush" }),
+		])
+		const res = await post("/repo1/git-upload-pack", body)
+		expect(res.status).toBe(500)
+		expect(await res.text()).toBe("internal server error")
+	})
 })

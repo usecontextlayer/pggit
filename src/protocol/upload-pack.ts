@@ -185,11 +185,9 @@ async function buildDeltaPack(
 async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer> {
 	label("fetch")
 	const { wants, haves, done, filter } = parseFetch(req)
-	if (wants.length === 0) {
-		throw new GitProtocolError(
-			"fetch: no want lines — a fetch must request at least one object",
-		)
-	}
+	// A zero-want fetch is NOT an error: git's upload-pack treats it as a no-op
+	// ("they didn't want anything", upload-pack.c) and returns an empty pack. We
+	// match the oracle and let it fall through rather than rejecting.
 	const omitBlobs = filterOmitsBlobs(filter)
 	const common = await commonHaves(haves, backend)
 
