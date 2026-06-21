@@ -1,5 +1,6 @@
 import { decodePktStream, encodePkt, encodePktLine } from "@/pkt-line"
-import { AGENT } from "@/protocol/v2"
+import { GitProtocolError } from "@/protocol/errors"
+import { AGENT, assertSupportedObjectFormat } from "@/protocol/v2"
 
 const ZERO_OID = "0".repeat(40)
 const SIDEBAND_DATA = 0x01
@@ -65,8 +66,17 @@ export function parseReceivePack(body: Buffer): ReceiveRequest {
 				.filter(Boolean)
 			line = line.slice(0, nul)
 		}
-		const [oldOid, newOid, ref] = line.split(" ")
-		if (oldOid && newOid && ref) commands.push({ newOid, oldOid, ref })
+		// Fail loud: a command line is exactly `<old> <new> <ref>`. Anything else is
+		// malformed — reject it rather than silently drop it (which would apply a
+		// partial command set with no diagnostic).
+		const parts = line.split(" ")
+		const [oldOid, newOid, ref] = parts
+		if (parts.length !== 3 || !oldOid || !newOid || !ref) {
+			throw new GitProtocolError(
+				`receive-pack: malformed command line ${JSON.stringify(line)}`,
+			)
+		}
+		commands.push({ newOid, oldOid, ref })
 	}
 	return { caps, commands, pack: rest }
 }
@@ -122,6 +132,7 @@ export async function handleReceivePack(
 	backend: ReceiveBackend,
 ): Promise<Buffer> {
 	const { commands, caps, pack } = parseReceivePack(body)
+	assertSupportedObjectFormat(caps)
 	const useSideband = caps.includes("side-band-64k")
 	const atomic = caps.includes("atomic")
 

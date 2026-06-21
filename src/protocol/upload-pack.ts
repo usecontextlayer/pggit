@@ -2,7 +2,9 @@ import { graphWalk } from "@/graph-walk"
 import { count, label, withPhase } from "@/instrument"
 import { commitParents, type GitObjectType, referencedOids } from "@/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
+import { GitProtocolError } from "@/protocol/errors"
 import {
+	assertSupportedObjectFormat,
 	encodeAcknowledgments,
 	encodeLsRefsResponse,
 	encodePackfileResponse,
@@ -58,6 +60,7 @@ async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffe
 		const byName = new Map(refs.map((r) => [r.name, r.oid]))
 		const entries: LsRefEntry[] = []
 
+		const wantUnborn = req.args.includes("unborn")
 		const headTarget = await backend.getSymref("HEAD")
 		if (headTarget && matches("HEAD")) {
 			const headOid = byName.get(headTarget)
@@ -67,6 +70,11 @@ async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffe
 					oid: headOid,
 					symrefTarget: wantSymrefs ? headTarget : undefined,
 				})
+			} else if (wantUnborn && wantSymrefs) {
+				// Empty repo: HEAD points at a branch with no commit yet. git emits the
+				// unborn HEAD only when the client asked for both `unborn` and `symrefs`
+				// (ls-refs.c send_possibly_unborn_head), propagating the default branch.
+				entries.push({ name: "HEAD", symrefTarget: headTarget, unborn: true })
 			}
 		}
 
@@ -88,7 +96,7 @@ async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffe
 function filterOmitsBlobs(filter: string | undefined): boolean {
 	if (filter === undefined) return false
 	if (filter === "blob:none") return true
-	throw new Error(`upload-pack: unsupported filter ${JSON.stringify(filter)}`)
+	throw new GitProtocolError(`upload-pack: unsupported filter ${JSON.stringify(filter)}`)
 }
 
 /** The subset of `haves` the server actually has — the common negotiation set. */
@@ -177,6 +185,11 @@ async function buildDeltaPack(
 async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer> {
 	label("fetch")
 	const { wants, haves, done, filter } = parseFetch(req)
+	if (wants.length === 0) {
+		throw new GitProtocolError(
+			"fetch: no want lines — a fetch must request at least one object",
+		)
+	}
 	const omitBlobs = filterOmitsBlobs(filter)
 	const common = await commonHaves(haves, backend)
 
@@ -204,7 +217,10 @@ export async function handleUploadPack(
 	backend: RepoBackend,
 ): Promise<Buffer> {
 	const req = parseV2Request(body)
+	assertSupportedObjectFormat(req.capabilities)
 	if (req.command === "ls-refs") return handleLsRefs(req, backend)
 	if (req.command === "fetch") return handleFetch(req, backend)
-	throw new Error(`upload-pack: unsupported command ${JSON.stringify(req.command)}`)
+	throw new GitProtocolError(
+		`upload-pack: unsupported command ${JSON.stringify(req.command)}`,
+	)
 }

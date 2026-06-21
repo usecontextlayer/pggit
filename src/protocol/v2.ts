@@ -1,6 +1,23 @@
 import { decodePktStream, encodePkt, encodePktLine } from "@/pkt-line"
+import { GitProtocolError } from "@/protocol/errors"
 
 export const AGENT = "pggit/0.0.0"
+
+/**
+ * Reject a client negotiating a non-sha1 object hash. pggit is SHA-1 only (the
+ * charter) and assumes 40-hex / 20-byte OIDs everywhere; a sha256 client would
+ * otherwise fail deep in the parser on a 64-hex OID. Catch it at the boundary
+ * with a clear message. An absent `object-format` cap defaults to sha1 (git's
+ * default), so it is accepted.
+ */
+export function assertSupportedObjectFormat(caps: string[]): void {
+	const fmt = caps.find((c) => c.startsWith("object-format="))
+	if (fmt !== undefined && fmt !== "object-format=sha1") {
+		throw new GitProtocolError(
+			`unsupported ${fmt} — only object-format=sha1 is supported`,
+		)
+	}
+}
 const SIDEBAND_DATA = 0x01
 // band byte + pack data must fit the pkt-line writer cap (65515).
 const MAX_BAND_DATA = 65514
@@ -75,19 +92,21 @@ export function parseFetch(req: V2Request): FetchRequest {
 	return { done, filter, haves, wants }
 }
 
-export type LsRefEntry = {
-	oid: string
-	name: string
-	symrefTarget?: string
-	peeled?: string
-}
+/**
+ * One ls-refs line. A normal ref leads with its oid; an `unborn` ref (an empty
+ * repo's HEAD, which has no commit yet) leads with the literal `unborn` token
+ * instead — exactly git's `ls-refs.c send_ref` shape.
+ */
+export type LsRefEntry =
+	| { name: string; oid: string; symrefTarget?: string; peeled?: string }
+	| { name: string; unborn: true; symrefTarget?: string }
 
 /** ls-refs response: one line per ref (+ symref-target / peeled), then flush. */
 export function encodeLsRefsResponse(entries: LsRefEntry[]): Buffer {
 	const lines = entries.map((e) => {
-		let line = `${e.oid} ${e.name}`
+		let line = "unborn" in e ? `unborn ${e.name}` : `${e.oid} ${e.name}`
 		if (e.symrefTarget) line += ` symref-target:${e.symrefTarget}`
-		if (e.peeled) line += ` peeled:${e.peeled}`
+		if ("peeled" in e && e.peeled) line += ` peeled:${e.peeled}`
 		return encodePktLine(Buffer.from(`${line}\n`))
 	})
 	return Buffer.concat([...lines, encodePkt({ type: "flush" })])

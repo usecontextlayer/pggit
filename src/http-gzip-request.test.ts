@@ -149,9 +149,10 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 	})
 
 	// Fail loud: an encoding we do not implement must be rejected, never fed raw
-	// to the pkt-line parser as if it were plaintext.
-	it("rejects an unsupported Content-Encoding instead of parsing it raw", async () => {
+	// to the pkt-line parser as if it were plaintext. It is a client-caused error
+	// (a `GitProtocolError`), so the boundary returns a clean 400, not a 500.
+	it("rejects an unsupported Content-Encoding with a clean 400", async () => {
 		const res = await postUploadPack(server.port, gzipSync(LS_REFS_REQUEST), "deflate")
-		expect(res.status).toBe(500)
+		expect(res.status).toBe(400)
 	})
 })

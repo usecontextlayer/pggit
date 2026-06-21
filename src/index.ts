@@ -4,6 +4,7 @@ import { cors } from "hono/cors"
 import { runRequest } from "@/instrument"
 import type { ObjectStore } from "@/object-store"
 import { encodePkt, encodePktLine } from "@/pkt-line"
+import { GitProtocolError } from "@/protocol/errors"
 import {
 	encodeReceivePackAdvertisement,
 	handleReceivePack,
@@ -50,7 +51,9 @@ async function readRequestBody(c: Context): Promise<Buffer> {
 	const encoding = c.req.header("content-encoding")?.toLowerCase()
 	if (encoding === undefined || encoding === "identity") return raw
 	if (encoding === "gzip" || encoding === "x-gzip") return gunzipSync(raw)
-	throw new Error(`unsupported request Content-Encoding: ${JSON.stringify(encoding)}`)
+	throw new GitProtocolError(
+		`unsupported request Content-Encoding: ${JSON.stringify(encoding)}`,
+	)
 }
 
 function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
@@ -103,6 +106,14 @@ export function createGitApp(
 		)
 	}
 	app.use(cors())
+
+	// A client-caused boundary error (malformed request, unsupported capability) is
+	// a clean 400 with its message; anything else is an internal 500, logged loud.
+	app.onError((err, c) => {
+		if (err instanceof GitProtocolError) return c.text(err.message, 400)
+		console.error(err)
+		return c.text("internal server error", 500)
+	})
 
 	app.get("/health", (c) => c.text("ok"))
 
