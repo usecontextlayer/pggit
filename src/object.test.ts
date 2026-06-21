@@ -2,8 +2,19 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { computeOid, type GitObjectType } from "@/object"
+import {
+	commitTreeOid,
+	computeOid,
+	type GitObjectType,
+	referencedOids,
+	treeEntries,
+} from "@/object"
 import { spawnGit } from "@/testing/spawn-git"
+
+/** A well-formed tree entry: `<mode> <name>\0<20-byte oid>`. */
+function treeEntry(mode: string, name: string, oidByte: number): Buffer {
+	return Buffer.concat([Buffer.from(`${mode} ${name}\0`), Buffer.alloc(20, oidByte)])
+}
 
 describe("computeOid", () => {
 	it("computes a blob OID matching git hash-object", async () => {
@@ -45,5 +56,61 @@ describe("computeOid", () => {
 		} finally {
 			rmSync(dir, { force: true, recursive: true })
 		}
+	})
+})
+
+describe("treeEntries", () => {
+	it("parses a well-formed tree (single + multiple entries)", () => {
+		const tree = Buffer.concat([
+			treeEntry("100644", "a.txt", 0xab),
+			treeEntry("40000", "sub", 0xcd),
+		])
+		expect(treeEntries(tree)).toEqual([
+			{ mode: "100644", name: "a.txt", oid: "ab".repeat(20) },
+			{ mode: "40000", name: "sub", oid: "cd".repeat(20) },
+		])
+	})
+
+	it("returns no entries for the empty tree", () => {
+		expect(treeEntries(Buffer.alloc(0))).toEqual([])
+	})
+
+	it("names containing a space are split at the NUL, not the first space", () => {
+		const tree = treeEntry("100644", "my file.txt", 0x11)
+		expect(treeEntries(tree)).toEqual([
+			{ mode: "100644", name: "my file.txt", oid: "11".repeat(20) },
+		])
+	})
+
+	// Fail loud (CLAUDE.md): a malformed/truncated tree must THROW, not silently
+	// return a short list — a short list would make `isConnected` report a corrupt
+	// object connected, silently accepting bad data.
+	it("throws on an entry with no NUL terminator", () => {
+		expect(() => treeEntries(Buffer.from("100644 a.txt"))).toThrow(/malformed/)
+	})
+
+	it("throws on a truncated trailing OID (fewer than 20 bytes)", () => {
+		const truncated = Buffer.concat([
+			Buffer.from("100644 a.txt\0"),
+			Buffer.alloc(5, 0xab),
+		])
+		expect(() => treeEntries(truncated)).toThrow(/malformed/)
+	})
+
+	it("throws on trailing garbage after a complete entry", () => {
+		const tree = Buffer.concat([treeEntry("100644", "a.txt", 0xab), Buffer.from("xx")])
+		expect(() => treeEntries(tree)).toThrow(/malformed/)
+	})
+})
+
+describe("commitTreeOid / referencedOids fail loud", () => {
+	it("commitTreeOid throws on a commit with no tree header", () => {
+		expect(() => commitTreeOid(Buffer.from("parent abc\n\nmsg\n"))).toThrow(
+			/no tree header/,
+		)
+	})
+
+	it("referencedOids of a tree propagates the malformed-tree throw", () => {
+		expect(() => referencedOids("tree", Buffer.from("100644 a.txt"))).toThrow(/malformed/)
 	})
 })

@@ -35,7 +35,13 @@ export function treeEntries(content: Buffer): TreeEntry[] {
 	while (pos < content.length) {
 		const space = content.indexOf(0x20, pos)
 		const nul = content.indexOf(0x00, pos)
-		if (space < 0 || nul < 0 || space > nul) break
+		// Fail loud: a tree is `<mode> <name>\0<20-byte oid>` repeated exactly. Any
+		// missing separator or a trailing OID shorter than 20 bytes is corruption —
+		// throw rather than return a short list (which would let `isConnected` report
+		// a truncated object as connected and silently accept bad data).
+		if (space < 0 || nul < 0 || space > nul || nul + 21 > content.length) {
+			throw new Error(`tree: malformed entry at offset ${pos}`)
+		}
 		const mode = content.subarray(pos, space).toString("latin1")
 		const name = content.subarray(space + 1, nul).toString("utf8")
 		const oid = content.subarray(nul + 1, nul + 21).toString("hex")
