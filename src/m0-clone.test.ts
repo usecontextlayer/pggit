@@ -11,37 +11,13 @@ import { join } from "node:path"
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createGitApp } from "@/index"
-import type { GitObjectType } from "@/object"
 import { createObjectStore } from "@/object-store"
-import type { PackInputObject } from "@/pack/write-pack"
 import { createRefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
+import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema, startPostgres } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-		{ cwd: dir },
-	)
-	const objs: PackInputObject[] = []
-	for (const line of list.stdout.trim().split("\n")) {
-		const [oid, type] = line.split(" ")
-		if (!oid || !type) continue
-		const raw = await spawnGit(["cat-file", type, oid], { cwd: dir })
-		objs.push({ content: raw.stdoutBytes, type: type as GitObjectType })
-	}
-	return objs
-}
-
-async function allObjectOids(dir: string): Promise<string[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-		{ cwd: dir },
-	)
-	return list.stdout.trim().split("\n").sort()
-}
 
 describe("M0 — full clone over smart-HTTP v2 (real git)", () => {
 	let container: StartedPostgreSqlContainer
@@ -68,16 +44,7 @@ describe("M0 — full clone over smart-HTTP v2 (real git)", () => {
 		await spawnGit(["commit", "-q", "-m", "c2"], { cwd: src })
 		await spawnGit(["tag", "-a", "v1", "-m", "rel"], { cwd: src })
 
-		// Seed objects + refs into Postgres.
-		await objects.putPack("repo1", await loadAllObjects(src))
-		const showRef = await spawnGit(["show-ref"], { cwd: src })
-		for (const line of showRef.stdout.trim().split("\n")) {
-			const [oid, name] = line.split(" ")
-			if (oid && name) await refs.setRef("repo1", name, oid)
-		}
-		const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
-		await refs.setSymref("repo1", "HEAD", head)
-
+		await seedRepoIntoStore("repo1", src, { objects, refs })
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
 	}, 180_000)
 
