@@ -134,70 +134,64 @@ export async function readPack(
 		)
 	}
 
-	// Pass 2 — resolve deltas (memoized, cycle-guarded). Bases come from the pack;
-	// a REF_DELTA base absent from the pack is fetched once via the external
-	// resolver (the store, on thin-pack push ingest) and memoized by OID.
-	const byOffset = new Map<number, ParsedObject>()
-	const byOid = new Map<string, Resolved>()
-	const inProgress = new Set<number>()
+	// Pass 2 — resolve deltas by base availability (git's index-pack approach). Each
+	// pass resolves every still-pending delta whose base is now known: by offset
+	// (OFS_DELTA), by OID from an already-resolved pack object (REF_DELTA), or from
+	// the external resolver (a thin pack's store-resident base, fetched once). A
+	// REF_DELTA base may itself be another in-pack delta's OUTPUT, so we cannot index
+	// OIDs up front — we iterate to a fixpoint instead, which also handles arbitrary
+	// chains and pack orderings. A pass that resolves nothing while entries remain ⇒
+	// a genuinely missing base or a cycle.
+	const resolved = new Map<number, ParsedObject>()
+	const byOid = new Map<string, ParsedObject>()
+	const externalCache = new Map<string, Resolved | null>()
 
-	async function resolveOffset(off: number): Promise<ParsedObject> {
-		const memo = byOffset.get(off)
-		if (memo) return memo
-		if (inProgress.has(off)) throw new Error("pack: cyclic delta chain")
-		inProgress.add(off)
-
-		const entry = entries.get(off)
-		if (!entry) throw new Error(`pack: no entry at offset ${off}`)
-
-		let resolved: Resolved
-		if (entry.kind === "base") {
-			resolved = { content: entry.content, type: entry.type }
-		} else if (entry.kind === "ofs") {
-			const base = await resolveOffset(entry.baseOffset)
-			resolved = { content: applyDelta(base.content, entry.delta), type: base.type }
-		} else {
-			const base = await resolveOid(entry.baseOid)
-			resolved = { content: applyDelta(base.content, entry.delta), type: base.type }
-		}
-
-		const result: ParsedObject = {
-			content: resolved.content,
-			oid: computeOid(resolved.type, resolved.content),
-			type: resolved.type,
-		}
-		byOffset.set(off, result)
-		byOid.set(result.oid, resolved)
-		inProgress.delete(off)
-		return result
+	const fetchExternal = async (oid: string): Promise<Resolved | null> => {
+		const cached = externalCache.get(oid)
+		if (cached !== undefined) return cached
+		const fetched = resolveExternalBase ? await resolveExternalBase(oid) : null
+		externalCache.set(oid, fetched)
+		return fetched
 	}
 
-	async function resolveOid(oid: string): Promise<Resolved> {
-		const memo = byOid.get(oid)
-		if (memo) return memo
-		for (const off of order) {
-			// Skip offsets on the current resolution stack: an in-progress entry
-			// cannot be our base, and resolving it would falsely trip the cycle
-			// guard when the real base is external (thin pack).
-			if (inProgress.has(off)) continue
-			if ((await resolveOffset(off)).oid === oid) {
-				const found = byOid.get(oid)
-				if (found) return found
-			}
-		}
-		if (resolveExternalBase) {
-			const external = await resolveExternalBase(oid)
-			if (external) {
-				byOid.set(oid, external)
-				return external
-			}
-		}
-		throw new Error(`pack: ref-delta base ${oid} not found in pack or store`)
+	const record = (off: number, type: GitObjectType, content: Buffer): void => {
+		const obj: ParsedObject = { content, oid: computeOid(type, content), type }
+		resolved.set(off, obj)
+		byOid.set(obj.oid, obj)
 	}
 
-	const result: ParsedObject[] = []
 	for (const off of order) {
-		result.push(await resolveOffset(off))
+		const entry = entries.get(off)
+		if (entry?.kind === "base") record(off, entry.type, entry.content)
 	}
-	return result
+
+	let pending = order.filter((off) => !resolved.has(off))
+	while (pending.length > 0) {
+		const stillPending: number[] = []
+		for (const off of pending) {
+			const entry = entries.get(off)
+			if (!entry || entry.kind === "base") continue
+			const base: Resolved | null =
+				entry.kind === "ofs"
+					? (resolved.get(entry.baseOffset) ?? null)
+					: (byOid.get(entry.baseOid) ?? (await fetchExternal(entry.baseOid)))
+			if (!base) {
+				stillPending.push(off)
+				continue
+			}
+			record(off, base.type, applyDelta(base.content, entry.delta))
+		}
+		if (stillPending.length === pending.length) {
+			const off = stillPending[0] as number
+			const entry = entries.get(off)
+			const base =
+				entry?.kind === "ref"
+					? entry.baseOid
+					: `offset ${entry?.kind === "ofs" ? entry.baseOffset : "?"}`
+			throw new Error(`pack: ref-delta base ${base} not found in pack or store`)
+		}
+		pending = stillPending
+	}
+
+	return order.map((off) => resolved.get(off) as ParsedObject)
 }
