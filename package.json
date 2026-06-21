@@ -7,6 +7,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "latest",
+		"@testcontainers/postgresql": "^12.0.3",
 		"@types/node": "^25.9.1",
 		"fast-check": "latest",
 		"tsdown": "latest",
