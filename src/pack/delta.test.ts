@@ -31,4 +31,18 @@ describe("applyDelta", () => {
 		const delta = Buffer.from([0x05, 0x01]) // header says source size 5
 		expect(() => applyDelta(base, delta)).toThrow(/base size/)
 	})
+
+	it("throws on the reserved opcode 0x00", () => {
+		const base = Buffer.from("abc") // 3 bytes
+		// header: sourceSize=3, targetSize=5, then the reserved instruction byte 0x00.
+		const delta = Buffer.from([0x03, 0x05, 0x00])
+		expect(() => applyDelta(base, delta)).toThrow(/reserved opcode/)
+	})
+
+	it("throws when the instruction stream under-produces the declared target size", () => {
+		const base = Buffer.from("abc") // 3 bytes
+		// header: sourceSize=3, targetSize=10, then INSERT only 3 literal bytes (< 10).
+		const delta = Buffer.from([0x03, 0x0a, 0x03, ...Buffer.from("xyz")])
+		expect(() => applyDelta(base, delta)).toThrow(/produced .* bytes/)
+	})
 })
