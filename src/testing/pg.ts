@@ -6,7 +6,7 @@ import {
 import type { Kysely } from "kysely"
 import postgres, { type Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
-import { migrateToLatest } from "@/database/migrate"
+import { applyMigrations } from "@/database/migrate"
 
 const DEFAULT_IMAGE = "postgres:18-alpine"
 
@@ -43,9 +43,11 @@ export async function createIsolatedSchema(baseUrl: string): Promise<IsolatedDb>
 		onnotice: () => {},
 	})
 	const db = initKysely<Database>(sql)
-	// Scope migration bookkeeping to this schema — many isolated schemas share one
-	// container, and Kysely's existence check would otherwise see a sibling's.
-	await migrateToLatest(db, schema)
+	// Apply migrations directly, not via Kysely's Migrator: its migration-table
+	// existence check introspects EVERY schema on the shared container and throws
+	// when it races a sibling's `drop schema cascade`. A fresh schema just needs
+	// each `up()` run once (see applyMigrations).
+	await applyMigrations(db)
 
 	return {
 		db,
