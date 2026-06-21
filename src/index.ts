@@ -19,6 +19,13 @@ const UPLOAD_PACK_ADVERTISEMENT = Buffer.concat([
 	encodeAdvertisement(),
 ])
 
+// Hono's body types want an ArrayBuffer, not a Node Buffer (a Uint8Array view).
+function toArrayBuffer(buf: Buffer): ArrayBuffer {
+	return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+}
+
+const ADVERTISEMENT_BODY = toArrayBuffer(UPLOAD_PACK_ADVERTISEMENT)
+
 function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	return {
 		getObject: (oid) => deps.objects.getObject(repoId, oid),
@@ -42,7 +49,7 @@ export function createGitApp(deps: GitAppDeps): Hono {
 		if (c.req.query("service") !== "git-upload-pack") {
 			return c.text("only git-upload-pack is supported", 403)
 		}
-		return c.body(UPLOAD_PACK_ADVERTISEMENT, 200, {
+		return c.body(ADVERTISEMENT_BODY, 200, {
 			"Cache-Control": "no-cache",
 			"Content-Type": "application/x-git-upload-pack-advertisement",
 		})
@@ -51,7 +58,7 @@ export function createGitApp(deps: GitAppDeps): Hono {
 	app.post("/:repo/git-upload-pack", async (c) => {
 		const body = Buffer.from(await c.req.arrayBuffer())
 		const out = await handleUploadPack(body, backendFor(deps, c.req.param("repo")))
-		return c.body(out, 200, {
+		return c.body(toArrayBuffer(out), 200, {
 			"Cache-Control": "no-cache",
 			"Content-Type": "application/x-git-upload-pack-result",
 		})
