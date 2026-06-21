@@ -9,3 +9,5 @@ coverage/
 .DS_Store
 
 .vitest-attachments/
+
+perf/runs/

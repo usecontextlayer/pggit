@@ -33,11 +33,15 @@ export async function startPostgres(
 export async function createIsolatedSchema(baseUrl: string): Promise<IsolatedDb> {
 	const schema = `t_${randomUUID().replaceAll("-", "")}`
 
-	const admin = postgres(baseUrl, { max: 1 })
+	const admin = postgres(baseUrl, { max: 1, onnotice: () => {} })
 	await admin`create schema ${admin(schema)}`
 	await admin.end()
 
-	const sql = postgres(baseUrl, { connection: { search_path: schema }, max: 4 })
+	const sql = postgres(baseUrl, {
+		connection: { search_path: schema },
+		max: 4,
+		onnotice: () => {},
+	})
 	const db = initKysely<Database>(sql)
 	// Scope migration bookkeeping to this schema — many isolated schemas share one
 	// container, and Kysely's existence check would otherwise see a sibling's.
@@ -47,7 +51,7 @@ export async function createIsolatedSchema(baseUrl: string): Promise<IsolatedDb>
 		db,
 		drop: async () => {
 			await db.destroy() // ends the shared porsager pool (`sql`)
-			const cleanup = postgres(baseUrl, { max: 1 })
+			const cleanup = postgres(baseUrl, { max: 1, onnotice: () => {} })
 			await cleanup`drop schema ${cleanup(schema)} cascade`
 			await cleanup.end()
 		},

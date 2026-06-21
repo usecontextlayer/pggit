@@ -16,6 +16,7 @@
 		"ignoreUnknown": true,
 		"includes": [
 			"**",
+			"!!**/perf/runs",
 			"!!**/node_modules",
 			"!!**/dist",
 			"!!**/dist-types",
