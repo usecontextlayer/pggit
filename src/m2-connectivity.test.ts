@@ -1,0 +1,108 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
+import type { Hono } from "hono"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { createGitApp } from "@/index"
+import { createObjectStore, type ObjectStore } from "@/object-store"
+import { encodePkt, encodePktLine } from "@/pkt-line"
+import { createRefStore, type RefStore } from "@/refs-store"
+import type { IsolatedDb } from "@/testing/pg"
+import { createIsolatedSchema, startPostgres } from "@/testing/pg"
+import { spawnGit } from "@/testing/spawn-git"
+
+const ZERO = "0".repeat(40)
+
+describe("M2 — connectivity check rejects an incomplete push (spec §10)", () => {
+	let container: StartedPostgreSqlContainer
+	let db: IsolatedDb
+	let app: Hono
+	let objects: ObjectStore
+	let refs: RefStore
+
+	beforeAll(async () => {
+		container = await startPostgres()
+		db = await createIsolatedSchema(container.getConnectionUri())
+		objects = createObjectStore(db.db)
+		refs = createRefStore(db.db)
+		app = createGitApp({ objects, refs })
+	}, 180_000)
+
+	afterAll(async () => {
+		await db?.drop()
+		await container?.stop()
+	})
+
+	it("ng's a push whose pack omits a referenced blob, leaving the ref unset", async () => {
+		const src = mkdtempSync(join(tmpdir(), "pggit-conn-"))
+		try {
+			await spawnGit(["init", "-q"], { cwd: src })
+			writeFileSync(join(src, "a.txt"), "alpha\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: src })
+			const commit = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+			const tree = (
+				await spawnGit(["rev-parse", "HEAD^{tree}"], { cwd: src })
+			).stdout.trim()
+
+			// Pack ONLY the commit + tree (omit the blob the tree references).
+			const incompletePack = (
+				await spawnGit(["pack-objects", "--stdout"], {
+					cwd: src,
+					input: `${commit}\n${tree}\n`,
+				})
+			).stdoutBytes
+
+			// Hand-build a (non-sideband) receive-pack request: one create command,
+			// flush, then the incomplete pack.
+			const body = Buffer.concat([
+				encodePktLine(
+					Buffer.from(`${ZERO} ${commit} refs/heads/broken\0report-status\n`),
+				),
+				encodePkt({ type: "flush" }),
+				incompletePack,
+			])
+			const res = await app.request("/repo-broken/git-receive-pack", {
+				body,
+				method: "POST",
+			})
+			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+
+			// The pack unpacked, but connectivity fails → the ref is rejected, unset.
+			expect(report).toContain("unpack ok")
+			expect(report).toContain("ng refs/heads/broken missing necessary objects")
+			expect(await refs.listRefs("repo-broken")).toEqual([])
+
+			// Direct: the commit is not connected (blob missing); the bare tree's blob
+			// is likewise absent, but the tree object itself is present.
+			expect(await objects.isConnected("repo-broken", commit)).toBe(false)
+		} finally {
+			rmSync(src, { force: true, recursive: true })
+		}
+	})
+
+	it("reports connected once every reachable object is stored", async () => {
+		const src = mkdtempSync(join(tmpdir(), "pggit-conn-ok-"))
+		try {
+			await spawnGit(["init", "-q"], { cwd: src })
+			writeFileSync(join(src, "a.txt"), "alpha\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: src })
+			const commit = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+
+			// A complete pack (default pack-objects over the revs) carries everything.
+			const fullPack = (
+				await spawnGit(["pack-objects", "--stdout", "--revs"], {
+					cwd: src,
+					input: `${commit}\n`,
+				})
+			).stdoutBytes
+			await objects.ingestPack("repo-ok", fullPack)
+
+			expect(await objects.isConnected("repo-ok", commit)).toBe(true)
+		} finally {
+			rmSync(src, { force: true, recursive: true })
+		}
+	})
+})

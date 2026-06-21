@@ -46,6 +46,7 @@ function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 		ingest: async (pack) => {
 			await deps.objects.ingestPack(repoId, pack)
 		},
+		isConnected: (oid) => deps.objects.isConnected(repoId, oid),
 	}
 }
 

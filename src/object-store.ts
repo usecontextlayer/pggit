@@ -1,7 +1,7 @@
 import type { Kysely } from "kysely"
 import type { Database } from "@/database"
 import type { ObjectsOid, ObjectsRepoId } from "@/database/models/public/Objects"
-import { computeOid, type GitObjectType } from "@/object"
+import { computeOid, type GitObjectType, referencedOids } from "@/object"
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
 
@@ -65,6 +65,27 @@ export function createObjectStore(db: Kysely<Database>) {
 				parsed.map((p) => ({ content: p.content, type: p.type })),
 			)
 			return { oids }
+		},
+
+		/**
+		 * Connectivity check (spec §10/M13): is every object reachable from `oid`
+		 * present in this repo's store? A push whose new tip fails this references an
+		 * object the pack neither carried nor delta-resolved, and must be rejected.
+		 */
+		async isConnected(repoId: string, oid: string): Promise<boolean> {
+			const seen = new Set<string>()
+			const queue = [oid]
+			while (queue.length > 0) {
+				const cur = queue.pop()
+				if (cur === undefined || seen.has(cur)) continue
+				seen.add(cur)
+				const obj = await store.getObject(repoId, cur)
+				if (!obj) return false
+				for (const ref of referencedOids(obj.type, obj.content)) {
+					if (!seen.has(ref)) queue.push(ref)
+				}
+			}
+			return true
 		},
 
 		/** Persist objects as one self-contained pack + index its contents. */

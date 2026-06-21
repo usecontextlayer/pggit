@@ -103,6 +103,8 @@ export type ReceiveBackend = {
 	ingest: (pack: Buffer) => Promise<void>
 	/** Apply ref CAS updates; `atomic` ⇒ all-or-nothing. Per-command success flags. */
 	applyRefUpdates: (commands: RefCommand[], atomic: boolean) => Promise<boolean[]>
+	/** Is every object reachable from `oid` present? (connectivity, spec §10). */
+	isConnected: (oid: string) => Promise<boolean>
 }
 
 /**
@@ -141,9 +143,33 @@ export async function handleReceivePack(
 		return encodeReportStatus(unpackStatus, failed, useSideband)
 	}
 
-	const oks = await backend.applyRefUpdates(commands, atomic)
-	const results: CommandResult[] = commands.map((c, i) =>
-		oks[i]
+	// Connectivity (spec §10): a create/update must leave its new tip fully
+	// reachable in the store; a delete (newOid zero) needs no objects.
+	const connected = await Promise.all(
+		commands.map((c) =>
+			c.newOid === ZERO_OID ? Promise.resolve(true) : backend.isConnected(c.newOid),
+		),
+	)
+	if (atomic && !connected.every(Boolean)) {
+		const failed = commands.map((c) => ({
+			ok: false,
+			reason: "missing necessary objects",
+			ref: c.ref,
+		}))
+		return encodeReportStatus(unpackStatus, failed, useSideband)
+	}
+
+	// Apply only the connected commands; a disconnected one never touches a ref.
+	const oks = await backend.applyRefUpdates(
+		commands.filter((_, i) => connected[i]),
+		atomic,
+	)
+	let applied = 0
+	const results: CommandResult[] = commands.map((c, i) => {
+		if (!connected[i]) {
+			return { ok: false, reason: "missing necessary objects", ref: c.ref }
+		}
+		return oks[applied++]
 			? { ok: true, ref: c.ref }
 			: {
 					ok: false,
@@ -151,7 +177,7 @@ export async function handleReceivePack(
 						? "atomic transaction failed"
 						: "stale ref (compare-and-swap failed)",
 					ref: c.ref,
-				},
-	)
+				}
+	})
 	return encodeReportStatus(unpackStatus, results, useSideband)
 }
