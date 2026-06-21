@@ -23,17 +23,37 @@ function headerOids(content: Buffer, keys: Set<string>): string[] {
 	return oids
 }
 
-/** OIDs of a tree's entries — `<mode> <name>\0<20-byte oid>` repeated. */
-function treeEntryOids(content: Buffer): string[] {
-	const oids: string[] = []
+export type TreeEntry = { mode: string; oid: string }
+
+/** A tree's entries — `<mode> <name>\0<20-byte oid>` repeated — with modes. */
+export function treeEntries(content: Buffer): TreeEntry[] {
+	const entries: TreeEntry[] = []
 	let pos = 0
 	while (pos < content.length) {
+		const space = content.indexOf(0x20, pos)
 		const nul = content.indexOf(0x00, pos)
-		if (nul < 0) break
-		oids.push(content.subarray(nul + 1, nul + 21).toString("hex"))
+		if (space < 0 || nul < 0 || space > nul) break
+		const mode = content.subarray(pos, space).toString("latin1")
+		const oid = content.subarray(nul + 1, nul + 21).toString("hex")
+		entries.push({ mode, oid })
 		pos = nul + 21
 	}
-	return oids
+	return entries
+}
+
+/** A tree entry's mode marks a subtree (directory), not a blob or gitlink. */
+export function isTreeEntryMode(mode: string): boolean {
+	return mode === "40000"
+}
+
+/** OIDs of a tree's entries (all kinds), in tree order. */
+function treeEntryOids(content: Buffer): string[] {
+	return treeEntries(content).map((e) => e.oid)
+}
+
+/** A commit's parent OIDs only (ancestry walk; excludes its tree). */
+export function commitParents(content: Buffer): string[] {
+	return headerOids(content, new Set(["parent"]))
 }
 
 /**

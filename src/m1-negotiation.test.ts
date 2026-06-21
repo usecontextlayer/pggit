@@ -1,0 +1,110 @@
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { createGitApp } from "@/index"
+import { createObjectStore } from "@/object-store"
+import { createRefStore } from "@/refs-store"
+import { type GitServer, serveOnPort } from "@/server"
+import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
+import type { IsolatedDb } from "@/testing/pg"
+import { createIsolatedSchema, startPostgres } from "@/testing/pg"
+import { spawnGit } from "@/testing/spawn-git"
+
+const PACK_DIR = ".git/objects/pack"
+
+function packFiles(dir: string): string[] {
+	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
+}
+
+/** The OIDs inside one pack, per `git verify-pack -v` (the bytes git received). */
+async function packObjectOids(dir: string, packFile: string): Promise<string[]> {
+	const idx = join(dir, PACK_DIR, packFile.replace(/\.pack$/, ".idx"))
+	const out = await spawnGit(["verify-pack", "-v", idx], { cwd: dir })
+	const oids: string[] = []
+	for (const line of out.stdout.split("\n")) {
+		const m = line.match(/^([0-9a-f]{40}) (commit|tree|blob|tag) /)
+		if (m?.[1]) oids.push(m[1])
+	}
+	return oids.sort()
+}
+
+describe("M1 — incremental fetch negotiation (real git)", () => {
+	let container: StartedPostgreSqlContainer
+	let db: IsolatedDb
+	let server: GitServer
+	let src: string
+	let objects: ReturnType<typeof createObjectStore>
+	let refs: ReturnType<typeof createRefStore>
+
+	beforeAll(async () => {
+		container = await startPostgres()
+		db = await createIsolatedSchema(container.getConnectionUri())
+		objects = createObjectStore(db.db)
+		refs = createRefStore(db.db)
+
+		src = mkdtempSync(join(tmpdir(), "pggit-m1neg-src-"))
+		await spawnGit(["init", "-q"], { cwd: src })
+		writeFileSync(join(src, "a.txt"), "alpha\n")
+		writeFileSync(join(src, "keep.txt"), "keep\n")
+		await spawnGit(["add", "."], { cwd: src })
+		await spawnGit(["commit", "-q", "-m", "c1"], { cwd: src })
+		writeFileSync(join(src, "a.txt"), "alpha2\n")
+		await spawnGit(["add", "."], { cwd: src })
+		await spawnGit(["commit", "-q", "-m", "c2"], { cwd: src })
+
+		await seedRepoIntoStore("repo1", src, { objects, refs })
+		server = await serveOnPort(createGitApp({ objects, refs }), 0)
+	}, 180_000)
+
+	afterAll(async () => {
+		await server?.close()
+		await db?.drop()
+		await container?.stop()
+		if (src) rmSync(src, { force: true, recursive: true })
+	})
+
+	it("transfers only the delta on incremental fetch (have-closure subtracted)", async () => {
+		const dest = mkdtempSync(join(tmpdir(), "pggit-m1neg-dest-"))
+		try {
+			await spawnGit([
+				"clone",
+				"-c",
+				"protocol.version=2",
+				"--quiet",
+				`http://127.0.0.1:${server.port}/repo1`,
+				dest,
+			])
+			const haveAfterClone = await allObjectOids(dest)
+			const packsAfterClone = new Set(packFiles(dest))
+
+			// Server advances: a new commit c3 changing a.txt (keep.txt unchanged, so
+			// its blob + the unchanged subtree are reused — NOT part of the delta).
+			writeFileSync(join(src, "a.txt"), "alpha3\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "c3"], { cwd: src })
+			await seedRepoIntoStore("repo1", src, { objects, refs })
+
+			// Incremental fetch; keep the received objects as a pack so we can read
+			// exactly what crossed the wire (unpackLimit=1 defeats loose-unpacking).
+			await spawnGit(
+				["-c", "protocol.version=2", "-c", "fetch.unpackLimit=1", "fetch", "origin"],
+				{ cwd: dest },
+			)
+
+			const newPacks = packFiles(dest).filter((p) => !packsAfterClone.has(p))
+			expect(newPacks.length).toBe(1)
+			const transferred = await packObjectOids(dest, newPacks[0] as string)
+
+			// The delta = everything reachable from c3 that the clone did not have.
+			const delta = (await allObjectOids(src)).filter((o) => !haveAfterClone.includes(o))
+			expect(delta.length).toBe(3) // c3 commit + new root tree + new a.txt blob
+			expect(transferred).toEqual(delta)
+
+			await spawnGit(["fsck", "--full"], { cwd: dest })
+		} finally {
+			rmSync(dest, { force: true, recursive: true })
+		}
+	})
+})

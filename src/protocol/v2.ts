@@ -7,15 +7,17 @@ const MAX_BAND_DATA = 65514
 
 /**
  * The v2 capability advertisement (GET info/refs body, minus HTTP framing).
- * We advertise ONLY what we honor (spec §4): ls-refs (with `unborn`) and a basic
- * fetch — no shallow / filter / ref-in-want in M0.
+ * We advertise ONLY what we honor (spec §4): ls-refs (with `unborn`) and fetch
+ * with the `filter` feature (partial clone). No shallow / ref-in-want — those
+ * have no milestone owner and advertising them flips clients onto unimplemented
+ * paths.
  */
 export function encodeAdvertisement(): Buffer {
 	const caps = [
 		"version 2",
 		`agent=${AGENT}`,
 		"ls-refs=unborn",
-		"fetch",
+		"fetch=filter",
 		"object-format=sha1",
 	]
 	return Buffer.concat([
@@ -55,18 +57,22 @@ export type FetchRequest = {
 	wants: string[]
 	haves: string[]
 	done: boolean
+	/** Partial-clone filter spec (e.g. `blob:none`), if the client sent one. */
+	filter?: string
 }
 
 export function parseFetch(req: V2Request): FetchRequest {
 	const wants: string[] = []
 	const haves: string[] = []
 	let done = false
+	let filter: string | undefined
 	for (const arg of req.args) {
 		if (arg.startsWith("want ")) wants.push(arg.slice(5))
 		else if (arg.startsWith("have ")) haves.push(arg.slice(5))
+		else if (arg.startsWith("filter ")) filter = arg.slice("filter ".length)
 		else if (arg === "done") done = true
 	}
-	return { done, haves, wants }
+	return { done, filter, haves, wants }
 }
 
 export type LsRefEntry = {
@@ -85,6 +91,40 @@ export function encodeLsRefsResponse(entries: LsRefEntry[]): Buffer {
 		return encodePktLine(Buffer.from(`${line}\n`))
 	})
 	return Buffer.concat([...lines, encodePkt({ type: "flush" })])
+}
+
+/** The `acknowledgments` section lines: header, ACKs / NAK, optional `ready`. */
+function acknowledgmentLines(common: string[], ready: boolean): Buffer {
+	const lines: Buffer[] = [encodePktLine(Buffer.from("acknowledgments\n"))]
+	if (common.length === 0 && !ready) {
+		lines.push(encodePktLine(Buffer.from("NAK\n")))
+	} else {
+		for (const oid of common) lines.push(encodePktLine(Buffer.from(`ACK ${oid}\n`)))
+		if (ready) lines.push(encodePktLine(Buffer.from("ready\n")))
+	}
+	return Buffer.concat(lines)
+}
+
+/**
+ * fetch `acknowledgments` response for a negotiation round that is NOT yet ready
+ * (no `done`): the section + flush, no pack. The client sends more haves or
+ * `done` (spec §4 shape b).
+ */
+export function encodeAcknowledgments(common: string[], ready: boolean): Buffer {
+	return Buffer.concat([acknowledgmentLines(common, ready), encodePkt({ type: "flush" })])
+}
+
+/**
+ * fetch response when the server becomes `ready` mid-negotiation: the
+ * acknowledgments section (with `ready`), a delim-pkt, then the packfile — git
+ * requires the pack to follow `ready` in the same response (not a later round).
+ */
+export function encodeReadyWithPack(common: string[], pack: Buffer): Buffer {
+	return Buffer.concat([
+		acknowledgmentLines(common, true),
+		encodePkt({ type: "delim" }),
+		encodePackfileResponse(pack),
+	])
 }
 
 /**
