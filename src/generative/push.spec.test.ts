@@ -20,27 +20,9 @@ import { createGitApp } from "@/index"
 import { createObjectStore } from "@/object-store"
 import { createRefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { allObjectOids, refsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-/** A repo's local branches + tags as {name, oid} — annotated tags point at the tag object. */
-async function refsOf(dir: string): Promise<{ name: string; oid: string }[]> {
-	const out = await spawnGit(
-		["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/"],
-		{ cwd: dir },
-	)
-	return out.stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => {
-			const [oid, name] = line.split(" ")
-			if (!oid || !name) throw new Error(`bad for-each-ref line: ${line}`)
-			return { name, oid }
-		})
-		.sort((a, b) => a.name.localeCompare(b.name))
-}
 
 describe("§8.4 generative — push to an empty repo (M2) differential", () => {
 	it("ingests every pushed branch, tag, and object from a random client repo", async () => {

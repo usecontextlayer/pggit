@@ -30,6 +30,28 @@ export async function allObjectOids(dir: string): Promise<string[]> {
 }
 
 /**
+ * A repo's local branches + tags as sorted {name, oid} pairs — matching what the
+ * RefStore stores (an annotated tag's ref points at the tag object). For asserting
+ * a push landed exactly the client's refs.
+ */
+export async function refsOf(dir: string): Promise<{ name: string; oid: string }[]> {
+	const out = await spawnGit(
+		["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/"],
+		{ cwd: dir },
+	)
+	return out.stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			const [oid, name] = line.split(" ")
+			if (!oid || !name) throw new Error(`bad for-each-ref line: ${line}`)
+			return { name, oid }
+		})
+		.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/**
  * Mirror a real repo's full object set + refs (+ HEAD symref) into the Postgres
  * store under `repoId`. The differential harness seeds with this, then drives
  * real `git` against the served result.
