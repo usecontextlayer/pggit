@@ -1,6 +1,3 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import {
@@ -10,7 +7,6 @@ import {
 	type Pkt,
 	WRITER_MAX_PAYLOAD,
 } from "@/pkt-line"
-import { spawnGit } from "@/testing/spawn-git"
 
 const arbPkt: fc.Arbitrary<Pkt> = fc.oneof(
 	// Payload sizes 0..2000 span the empty (0004) and DEFAULT_PACKET_MAX (1000) edges.
@@ -22,26 +18,10 @@ const arbPkt: fc.Arbitrary<Pkt> = fc.oneof(
 	fc.constant({ type: "response-end" as const }),
 )
 
-describe("encodePktLine", () => {
-	it("frames a data packet with a 4-hex length prefix (length includes the prefix)", () => {
-		const out = encodePktLine(Buffer.from("hello\n"))
-		// 6 payload bytes + 4 prefix = 10 = 0x000a
-		expect(out.toString("latin1")).toBe("000ahello\n")
-	})
-})
-
-describe("encodePkt", () => {
-	it("encodes the three special zero-payload packets", () => {
-		expect(encodePkt({ type: "flush" }).toString("latin1")).toBe("0000")
-		expect(encodePkt({ type: "delim" }).toString("latin1")).toBe("0001")
-		expect(encodePkt({ type: "response-end" }).toString("latin1")).toBe("0002")
-	})
-
-	it("encodes a data packet identically to encodePktLine", () => {
-		const payload = Buffer.from("hello\n")
-		expect(encodePkt({ payload, type: "data" })).toEqual(encodePktLine(payload))
-	})
-})
+// The literal-byte goldens for encodePktLine/encodePkt (000ahello\n, 0000/0001/
+// 0002, near-cap widths) and the real-git advertisement round-trip live in the
+// §8.3 framing.spec corpus — the deliberate home for byte literals. This file owns
+// the encode↔decode round-trip, bounds, and generative coverage instead.
 
 describe("decodePktStream", () => {
 	it("decodes a stream of data + special packets, leaving no remainder", () => {
@@ -124,33 +104,6 @@ describe("pkt-line generative round-trip (fast-check)", () => {
 			const { packets, rest } = decodePktStream(encodePktLine(payload))
 			expect(rest.length).toBe(0)
 			expect(packets).toEqual([{ payload, type: "data" }])
-		}
-	})
-})
-
-describe("pkt-line against real-git framing (oracle)", () => {
-	it("decodes a real git ref advertisement byte-identically", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-pktfix-"))
-		try {
-			await spawnGit(["init", "-q"], { cwd: dir })
-			writeFileSync(join(dir, "a.txt"), "hello\n")
-			await spawnGit(["add", "a.txt"], { cwd: dir })
-			await spawnGit(["commit", "-q", "-m", "seed"], { cwd: dir })
-
-			const res = await spawnGit(["upload-pack", "--advertise-refs", dir])
-			// The v0 advertisement is pure ASCII (hex lengths, hex OIDs, caps).
-			const adv = Buffer.from(res.stdout, "utf8")
-			expect(adv.length).toBeGreaterThan(0)
-
-			const { packets, rest } = decodePktStream(adv)
-			expect(rest.length).toBe(0)
-			// Byte-identical re-encode ⇒ our framing matches canonical git's.
-			expect(Buffer.concat(packets.map(encodePkt))).toEqual(adv)
-			// Structural sanity: terminates with a flush, carries ref data.
-			expect(packets.at(-1)).toEqual({ type: "flush" })
-			expect(packets.some((p) => p.type === "data")).toBe(true)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
 		}
 	})
 })

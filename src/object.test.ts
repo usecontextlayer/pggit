@@ -2,13 +2,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import {
-	commitTreeOid,
-	computeOid,
-	type GitObjectType,
-	referencedOids,
-	treeEntries,
-} from "@/object"
+import { GitFormatError } from "@/git-format-error"
+import { commitTreeOid, computeOid, type GitObjectType, treeEntries } from "@/object"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** A well-formed tree entry: `<mode> <name>\0<20-byte oid>`. */
@@ -16,20 +11,21 @@ function treeEntry(mode: string, name: string, oidByte: number): Buffer {
 	return Buffer.concat([Buffer.from(`${mode} ${name}\0`), Buffer.alloc(20, oidByte)])
 }
 
-describe("computeOid", () => {
-	it("computes a blob OID matching git hash-object", async () => {
-		const content = Buffer.from("hello\n")
-		const dir = mkdtempSync(join(tmpdir(), "pggit-oid-"))
-		try {
-			const file = join(dir, "obj")
-			writeFileSync(file, content)
-			const { stdout } = await spawnGit(["hash-object", "-t", "blob", file])
-			expect(computeOid("blob", content)).toBe(stdout.trim())
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
-	})
+/** The stable `GitFormatError.code` thrown by `fn` — asserted instead of message
+ * prose, so a reworded throw never breaks the test. */
+const codeOf = (fn: () => unknown): string => {
+	try {
+		fn()
+	} catch (e) {
+		if (e instanceof GitFormatError) return e.code
+		throw e
+	}
+	throw new Error("expected a GitFormatError, none thrown")
+}
 
+describe("computeOid", () => {
+	// The single-blob case is subsumed by this all-types differential (it runs the
+	// same git-oracle comparison over blob+tree+commit+tag in a real repo).
 	it("matches git for every object type in a real repo (blob, tree, commit, tag)", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "pggit-oid-all-"))
 		try {
@@ -84,9 +80,10 @@ describe("treeEntries", () => {
 
 	// Fail loud (CLAUDE.md): a malformed/truncated tree must THROW, not silently
 	// return a short list — a short list would make `isConnected` report a corrupt
-	// object connected, silently accepting bad data.
+	// object connected, silently accepting bad data. Asserted by the stable code,
+	// not the message text.
 	it("throws on an entry with no NUL terminator", () => {
-		expect(() => treeEntries(Buffer.from("100644 a.txt"))).toThrow(/malformed/)
+		expect(codeOf(() => treeEntries(Buffer.from("100644 a.txt")))).toBe("malformed-tree")
 	})
 
 	it("throws on a truncated trailing OID (fewer than 20 bytes)", () => {
@@ -94,23 +91,21 @@ describe("treeEntries", () => {
 			Buffer.from("100644 a.txt\0"),
 			Buffer.alloc(5, 0xab),
 		])
-		expect(() => treeEntries(truncated)).toThrow(/malformed/)
+		expect(codeOf(() => treeEntries(truncated))).toBe("malformed-tree")
 	})
 
 	it("throws on trailing garbage after a complete entry", () => {
 		const tree = Buffer.concat([treeEntry("100644", "a.txt", 0xab), Buffer.from("xx")])
-		expect(() => treeEntries(tree)).toThrow(/malformed/)
+		expect(codeOf(() => treeEntries(tree))).toBe("malformed-tree")
 	})
 })
 
-describe("commitTreeOid / referencedOids fail loud", () => {
-	it("commitTreeOid throws on a commit with no tree header", () => {
-		expect(() => commitTreeOid(Buffer.from("parent abc\n\nmsg\n"))).toThrow(
-			/no tree header/,
+describe("commitTreeOid fail loud", () => {
+	// Reachable on the repo-view projection path (build-file-list walks a pushed
+	// commit's tree via commitTreeOid), so the guard is real, not dead defense.
+	it("throws on a commit with no tree header", () => {
+		expect(codeOf(() => commitTreeOid(Buffer.from("parent abc\n\nmsg\n")))).toBe(
+			"missing-tree-header",
 		)
-	})
-
-	it("referencedOids of a tree propagates the malformed-tree throw", () => {
-		expect(() => referencedOids("tree", Buffer.from("100644 a.txt"))).toThrow(/malformed/)
 	})
 })

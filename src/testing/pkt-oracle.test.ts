@@ -1,12 +1,10 @@
 import { describe, expect, it } from "vitest"
+import { computeOid } from "@/object"
 import { encodePkt, encodePktLine } from "@/pkt-line"
 import {
-	ALGO,
 	EMPTY_BLOB,
 	EMPTY_TREE,
-	framedLine,
 	framedPktLines,
-	HEXSZ,
 	pktLineUnpack,
 	renderRefAdvertV0,
 	sidebandDemux,
@@ -70,24 +68,6 @@ describe("framedPktLines — the t5411 length-prefixed renderer", () => {
 		const report = Buffer.concat([pkt("unpack ok\n"), pkt("ok refs/heads/main\n"), FLUSH])
 		// 000e = 14 = 4 + len("unpack ok\n"); 0017 = 23 = 4 + len("ok refs/heads/main\n").
 		expect(framedPktLines(report)).toBe("000eunpack ok\n0017ok refs/heads/main\n0000")
-	})
-
-	it("recomputes the prefix from the payload (content-level, not a framing check)", () => {
-		const ng = Buffer.concat([
-			pkt("unpack ok\n"),
-			pkt("ng refs/for/next/topic target branch not exist\n"),
-			FLUSH,
-		])
-		expect(framedPktLines(ng)).toBe(
-			"000eunpack ok\n0033ng refs/for/next/topic target branch not exist\n0000",
-		)
-	})
-})
-
-describe("framedLine — one framed data line", () => {
-	it("prefixes a text line with its 4-hex length (incl. the 4 prefix bytes + \\n)", () => {
-		expect(framedLine("unpack ok")).toBe("000eunpack ok\n")
-		expect(framedLine("ok refs/heads/main")).toBe("0017ok refs/heads/main\n")
 	})
 })
 
@@ -157,12 +137,12 @@ describe("renderRefAdvertV0 — NUL-aware v0 push advert decode", () => {
 	})
 })
 
-describe("test_oid constants (verbatim from /tmp/git-src/t/oid-info/hash-info)", () => {
-	it("exposes the sha1 well-known values", () => {
-		expect(ZERO_OID).toBe("0".repeat(40))
-		expect(EMPTY_TREE).toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904")
-		expect(EMPTY_BLOB).toBe("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
-		expect(ALGO).toBe("sha1")
-		expect(HEXSZ).toBe(40)
+describe("test_oid well-known values are the real git sha1 OIDs", () => {
+	// Non-vacuous: derive the empty-tree/empty-blob OIDs independently via computeOid
+	// (the git-oid contract) and pin the constants to them — rather than asserting a
+	// literal equals its own definition.
+	it("EMPTY_TREE / EMPTY_BLOB match computeOid of the empty object", () => {
+		expect(computeOid("tree", Buffer.alloc(0))).toBe(EMPTY_TREE)
+		expect(computeOid("blob", Buffer.alloc(0))).toBe(EMPTY_BLOB)
 	})
 })

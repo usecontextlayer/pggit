@@ -230,7 +230,7 @@ describe("§8.4 codec round-trips (pure)", () => {
 					expect(resolved[0]?.content.equals(target)).toBe(true)
 
 					// (3) thin pack with NO resolver → hard error, never a silent miss.
-					await expect(readPack(thin)).rejects.toThrow(/not found in pack or store/)
+					await expect(readPack(thin)).rejects.toMatchObject({ code: "unresolved-base" })
 				},
 			),
 			{ numRuns: 60, seed: 424_242 },

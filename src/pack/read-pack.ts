@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { createInflate } from "node:zlib"
+import { GitFormatError } from "@/git-format-error"
 import { count } from "@/instrument"
 import { computeOid, type GitObjectType } from "@/object"
 import { applyDelta } from "@/pack/delta"
@@ -40,7 +41,14 @@ function inflateOne(buf: Buffer): Promise<{ data: Buffer; compressedLength: numb
 		inf.on("end", () =>
 			resolve({ compressedLength: inf.bytesWritten, data: Buffer.concat(chunks) }),
 		)
-		inf.on("error", reject)
+		inf.on("error", (e) =>
+			reject(
+				new GitFormatError(
+					"inflate-failed",
+					`pack: zlib inflate failed: ${e instanceof Error ? e.message : String(e)}`,
+				),
+			),
+		)
 		inf.end(buf)
 	})
 }
@@ -78,10 +86,15 @@ export async function readPack(
 ): Promise<ParsedObject[]> {
 	count("readPackCalls")
 	if (pack.subarray(0, 4).toString("latin1") !== "PACK") {
-		throw new Error("pack: bad magic")
+		throw new GitFormatError("bad-magic", "pack: bad magic")
 	}
 	const version = pack.readUInt32BE(4)
-	if (version !== 2) throw new Error(`pack: unsupported version ${version}`)
+	if (version !== 2) {
+		throw new GitFormatError(
+			"unsupported-version",
+			`pack: unsupported version ${version}`,
+		)
+	}
 	const objectCount = pack.readUInt32BE(8)
 
 	const trailerOffset = pack.length - 20
@@ -89,7 +102,7 @@ export async function readPack(
 		.update(pack.subarray(0, trailerOffset))
 		.digest()
 	if (!pack.subarray(trailerOffset).equals(actualTrailer)) {
-		throw new Error("pack: trailer SHA-1 mismatch")
+		throw new GitFormatError("trailer-mismatch", "pack: trailer SHA-1 mismatch")
 	}
 
 	// Pass 1 — parse every entry's raw form, keyed by its start offset.
@@ -117,11 +130,19 @@ export async function readPack(
 			entries.set(start, { baseOid, delta: data, kind: "ref" })
 		} else {
 			const typeName = CODE_TO_TYPE[type]
-			if (!typeName) throw new Error(`pack: unknown object type ${type}`)
+			if (!typeName) {
+				throw new GitFormatError(
+					"unknown-object-type",
+					`pack: unknown object type ${type}`,
+				)
+			}
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
 			count("bytesInflated", data.length)
 			if (data.length !== size) {
-				throw new Error(`pack: size mismatch (header ${size}, inflated ${data.length})`)
+				throw new GitFormatError(
+					"size-mismatch",
+					`pack: size mismatch (header ${size}, inflated ${data.length})`,
+				)
 			}
 			offset += compressedLength
 			entries.set(start, { content: data, kind: "base", type: typeName })
@@ -129,7 +150,8 @@ export async function readPack(
 		order.push(start)
 	}
 	if (offset !== trailerOffset) {
-		throw new Error(
+		throw new GitFormatError(
+			"trailing-bytes",
 			`pack: consumed ${offset} bytes, expected ${trailerOffset} before trailer`,
 		)
 	}
@@ -188,7 +210,10 @@ export async function readPack(
 				entry?.kind === "ref"
 					? entry.baseOid
 					: `offset ${entry?.kind === "ofs" ? entry.baseOffset : "?"}`
-			throw new Error(`pack: ref-delta base ${base} not found in pack or store`)
+			throw new GitFormatError(
+				"unresolved-base",
+				`pack: ref-delta base ${base} not found in pack or store`,
+			)
 		}
 		pending = stillPending
 	}

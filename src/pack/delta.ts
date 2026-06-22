@@ -1,3 +1,5 @@
+import { GitFormatError } from "@/git-format-error"
+
 /**
  * Apply a git delta to its base, producing the target object. The delta begins
  * with two LEB128 varints (source size, target size), then a stream of
@@ -25,7 +27,10 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 	const sourceSize = readVarint()
 	const targetSize = readVarint()
 	if (base.length !== sourceSize) {
-		throw new Error(`delta: base size ${base.length} ≠ declared ${sourceSize}`)
+		throw new GitFormatError(
+			"delta-base-size-mismatch",
+			`delta: base size ${base.length} ≠ declared ${sourceSize}`,
+		)
 	}
 
 	const out = Buffer.alloc(targetSize)
@@ -54,12 +59,15 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 			outPos += op
 			pos += op
 		} else {
-			throw new Error("delta: reserved opcode 0x00")
+			throw new GitFormatError("delta-reserved-opcode", "delta: reserved opcode 0x00")
 		}
 	}
 
 	if (outPos !== targetSize) {
-		throw new Error(`delta: produced ${outPos} bytes, declared ${targetSize}`)
+		throw new GitFormatError(
+			"delta-target-size-mismatch",
+			`delta: produced ${outPos} bytes, declared ${targetSize}`,
+		)
 	}
 	return out
 }

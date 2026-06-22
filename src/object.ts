@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { GitFormatError } from "@/git-format-error"
 
 /** The four addressable git object types (deltas resolve into one of these). */
 export type GitObjectType = "blob" | "commit" | "tree" | "tag"
@@ -40,7 +41,7 @@ export function treeEntries(content: Buffer): TreeEntry[] {
 		// throw rather than return a short list (which would let `isConnected` report
 		// a truncated object as connected and silently accept bad data).
 		if (space < 0 || nul < 0 || space > nul || nul + 21 > content.length) {
-			throw new Error(`tree: malformed entry at offset ${pos}`)
+			throw new GitFormatError("malformed-tree", `tree: malformed entry at offset ${pos}`)
 		}
 		const mode = content.subarray(pos, space).toString("latin1")
 		const name = content.subarray(space + 1, nul).toString("utf8")
@@ -69,7 +70,12 @@ export function commitParents(content: Buffer): string[] {
 /** A commit's root tree OID. Every commit has exactly one `tree` header. */
 export function commitTreeOid(content: Buffer): string {
 	const [tree] = headerOids(content, new Set(["tree"]))
-	if (!tree) throw new Error("commitTreeOid: commit has no tree header")
+	if (!tree) {
+		throw new GitFormatError(
+			"missing-tree-header",
+			"commitTreeOid: commit has no tree header",
+		)
+	}
 	return tree
 }
 

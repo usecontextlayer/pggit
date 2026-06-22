@@ -2,9 +2,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
+import type { Hono } from "hono"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createGitApp } from "@/index"
 import { createObjectStore, type ObjectStore } from "@/object-store"
+import { encodePkt, encodePktLine } from "@/pkt-line"
 import { createRefStore, type RefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
 import type { IsolatedDb } from "@/testing/pg"
@@ -12,17 +14,12 @@ import { createIsolatedSchema, startPostgres } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const ZERO = "0".repeat(40)
-const A = "a".repeat(40)
-const B = "b".repeat(40)
-const C = "c".repeat(40)
-
-function oidOf(repo: RefStore, repoId: string, name: string) {
-	return repo.listRefs(repoId).then((rs) => rs.find((r) => r.name === name)?.oid)
-}
+const WRONG = "f".repeat(40) // a deliberately stale advertised old-oid
 
 describe("M2 — atomic vs non-atomic ref updates", () => {
 	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
+	let app: Hono
 	let server: GitServer
 	let objects: ObjectStore
 	let refs: RefStore
@@ -32,7 +29,8 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 		db = await createIsolatedSchema(container.getConnectionUri())
 		objects = createObjectStore(db.db)
 		refs = createRefStore(db.db)
-		server = await serveOnPort(createGitApp({ objects, refs }), 0)
+		app = createGitApp({ objects, refs })
+		server = await serveOnPort(app, 0)
 	}, 180_000)
 
 	afterAll(async () => {
@@ -70,48 +68,69 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 		}
 	})
 
-	it("rolls the whole batch back when an atomic update has a stale CAS", async () => {
-		await refs.applyRefUpdates(
-			"atomic-fail",
-			[{ newOid: A, oldOid: ZERO, ref: "refs/heads/main" }],
-			false,
-		)
+	// The atomic-rollback CAS semantics are pinned at the wire: a hand-built
+	// receive-pack with one valid create + one stale update must report `ng` on
+	// BOTH refs and apply NEITHER. (The store-level CAS post-state — non-atomic
+	// partial application, create/delete sentinels — is unit-covered in
+	// refs-store.test.ts; here we assert the observable push outcome end to end.)
+	it("atomic: a stale CAS in the batch ng's every ref and applies none", async () => {
+		const src = mkdtempSync(join(tmpdir(), "pggit-atomic-wire-"))
+		try {
+			await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
+			writeFileSync(join(src, "a.txt"), "one\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: src })
+			const c1 = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 
-		// feature is a valid create; main's update is stale (main is A, not C).
-		const result = await refs.applyRefUpdates(
-			"atomic-fail",
-			[
-				{ newOid: B, oldOid: ZERO, ref: "refs/heads/feature" },
-				{ newOid: B, oldOid: C, ref: "refs/heads/main" },
-			],
-			true,
-		)
+			// Seed main=c1 with a real push.
+			await spawnGit(
+				[
+					"push",
+					`http://127.0.0.1:${server.port}/repo-atomic-wire`,
+					"HEAD:refs/heads/main",
+				],
+				{ cwd: src },
+			)
 
-		expect(result).toEqual([false, false])
-		// Nothing applied: feature was never created and main is untouched.
-		expect(await oidOf(refs, "atomic-fail", "refs/heads/feature")).toBeUndefined()
-		expect(await oidOf(refs, "atomic-fail", "refs/heads/main")).toBe(A)
-	})
+			// A second commit, packed with its full closure (re-ingesting c1 is
+			// idempotent) so both new tips pass the connectivity check.
+			writeFileSync(join(src, "a.txt"), "two\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "c2"], { cwd: src })
+			const c2 = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+			const pack = (
+				await spawnGit(["pack-objects", "--stdout", "--revs"], {
+					cwd: src,
+					input: `${c2}\n`,
+				})
+			).stdoutBytes
 
-	it("applies the good refs and rejects only the stale one when non-atomic", async () => {
-		await refs.applyRefUpdates(
-			"nonatomic",
-			[{ newOid: A, oldOid: ZERO, ref: "refs/heads/main" }],
-			false,
-		)
+			// Atomic batch: a valid create (feature) + an update whose advertised old-oid
+			// is stale (main is c1, not WRONG). Caps (incl. `atomic`) ride the first line.
+			const body = Buffer.concat([
+				encodePktLine(
+					Buffer.from(`${ZERO} ${c2} refs/heads/feature\0report-status atomic\n`),
+				),
+				encodePktLine(Buffer.from(`${WRONG} ${c2} refs/heads/main\n`)),
+				encodePkt({ type: "flush" }),
+				pack,
+			])
+			const res = await app.request("/repo-atomic-wire/git-receive-pack", {
+				body,
+				method: "POST",
+			})
+			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
 
-		const result = await refs.applyRefUpdates(
-			"nonatomic",
-			[
-				{ newOid: B, oldOid: ZERO, ref: "refs/heads/feature" },
-				{ newOid: B, oldOid: C, ref: "refs/heads/main" },
-			],
-			false,
-		)
-
-		expect(result).toEqual([true, false])
-		// The valid create landed; the stale update did not.
-		expect(await oidOf(refs, "nonatomic", "refs/heads/feature")).toBe(B)
-		expect(await oidOf(refs, "nonatomic", "refs/heads/main")).toBe(A)
+			// The pack unpacked, but the atomic batch rolls back wholesale: both ng.
+			expect(report).toContain("unpack ok")
+			expect(report).toContain("ng refs/heads/feature")
+			expect(report).toContain("ng refs/heads/main")
+			// Nothing applied: feature never created, main still c1.
+			expect(await refs.listRefs("repo-atomic-wire")).toEqual([
+				{ name: "refs/heads/main", oid: c1 },
+			])
+		} finally {
+			rmSync(src, { force: true, recursive: true })
+		}
 	})
 })

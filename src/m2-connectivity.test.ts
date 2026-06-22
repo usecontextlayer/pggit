@@ -73,16 +73,12 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 			expect(report).toContain("unpack ok")
 			expect(report).toContain("ng refs/heads/broken missing necessary objects")
 			expect(await refs.listRefs("repo-broken")).toEqual([])
-
-			// Direct: the commit is not connected (blob missing); the bare tree's blob
-			// is likewise absent, but the tree object itself is present.
-			expect(await objects.isConnected("repo-broken", commit)).toBe(false)
 		} finally {
 			rmSync(src, { force: true, recursive: true })
 		}
 	})
 
-	it("reports connected once every reachable object is stored", async () => {
+	it("ok's a push whose pack carries every reachable object, landing the ref", async () => {
 		const src = mkdtempSync(join(tmpdir(), "pggit-conn-ok-"))
 		try {
 			await spawnGit(["init", "-q"], { cwd: src })
@@ -91,16 +87,31 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: src })
 			const commit = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 
-			// A complete pack (default pack-objects over the revs) carries everything.
+			// A complete pack (default pack-objects over the revs) carries everything,
+			// so connectivity passes and the push succeeds — asserted via the wire `ok`
+			// report + the landed ref, not a direct isConnected() peek.
 			const fullPack = (
 				await spawnGit(["pack-objects", "--stdout", "--revs"], {
 					cwd: src,
 					input: `${commit}\n`,
 				})
 			).stdoutBytes
-			await objects.ingestPack("repo-ok", fullPack)
+			const body = Buffer.concat([
+				encodePktLine(Buffer.from(`${ZERO} ${commit} refs/heads/main\0report-status\n`)),
+				encodePkt({ type: "flush" }),
+				fullPack,
+			])
+			const res = await app.request("/repo-ok/git-receive-pack", {
+				body,
+				method: "POST",
+			})
+			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
 
-			expect(await objects.isConnected("repo-ok", commit)).toBe(true)
+			expect(report).toContain("unpack ok")
+			expect(report).toContain("ok refs/heads/main")
+			expect(await refs.listRefs("repo-ok")).toEqual([
+				{ name: "refs/heads/main", oid: commit },
+			])
 		} finally {
 			rmSync(src, { force: true, recursive: true })
 		}

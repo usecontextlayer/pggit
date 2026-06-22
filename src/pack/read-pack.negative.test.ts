@@ -2,9 +2,10 @@
  * Adversarial malformed-pack parse paths. `readPack` runs on attacker-controlled
  * push bytes, so every validation throw is a security boundary: a swallowed,
  * mis-framed, or HUNG parse on corrupt input is a DoS/corruption vector. Each
- * case asserts the SPECIFIC throw the kernel already has but never exercised —
- * and the truncated-zlib case proves a corrupt stream throws rather than hangs
- * (the test would time out if it hung).
+ * case asserts the SPECIFIC rejection by its stable `GitFormatError.code` (not the
+ * message prose, which is free to be reworded) — so the test pins "rejected for
+ * THIS reason" without coupling to the wording. The truncated-zlib case proves a
+ * corrupt stream throws rather than hangs (the test would time out if it hung).
  */
 import { createHash } from "node:crypto"
 import { deflateSync } from "node:zlib"
@@ -48,20 +49,20 @@ describe("readPack — malformed input fails loud", () => {
 	it("throws on bad magic", async () => {
 		const p = Buffer.from(validBlobPack)
 		p.write("XACK", 0, "latin1")
-		await expect(readPack(p)).rejects.toThrow(/bad magic/)
+		await expect(readPack(p)).rejects.toMatchObject({ code: "bad-magic" })
 	})
 
 	it("throws on an unsupported version", async () => {
 		const p = Buffer.from(validBlobPack)
 		p.writeUInt32BE(3, 4)
-		await expect(readPack(p)).rejects.toThrow(/unsupported version 3/)
+		await expect(readPack(p)).rejects.toMatchObject({ code: "unsupported-version" })
 	})
 
 	it("throws on a flipped trailer byte (SHA-1 mismatch)", async () => {
 		const p = Buffer.from(validBlobPack)
 		const last = p.length - 1
 		p.writeUInt8(p.readUInt8(last) ^ 0xff, last)
-		await expect(readPack(p)).rejects.toThrow(/trailer SHA-1 mismatch/)
+		await expect(readPack(p)).rejects.toMatchObject({ code: "trailer-mismatch" })
 	})
 
 	it("throws when the object count is smaller than the body (leftover bytes)", async () => {
@@ -71,20 +72,21 @@ describe("readPack — malformed input fails loud", () => {
 		])
 		const p = Buffer.from(twoObjects)
 		p.writeUInt32BE(1, 8) // claim 1 object; a second object's bytes remain
-		await expect(readPack(reseal(p))).rejects.toThrow(/consumed .* expected/)
+		await expect(readPack(reseal(p))).rejects.toMatchObject({ code: "trailing-bytes" })
 	})
 
 	it("throws when the object count is larger than the body", async () => {
 		const p = Buffer.from(validBlobPack)
 		p.writeUInt32BE(2, 8) // claim 2 objects; only 1 present
 		// The phantom 2nd object decodes the 20-byte trailer as a bogus header, then
-		// inflates into the buffer end — a deterministic zlib underrun, not a hang.
-		await expect(readPack(reseal(p))).rejects.toThrow(/unexpected end of file/)
+		// inflates into the buffer end — a deterministic zlib underrun (wrapped as a
+		// typed inflate failure), not a hang.
+		await expect(readPack(reseal(p))).rejects.toMatchObject({ code: "inflate-failed" })
 	})
 
 	it("throws on an unknown object type code", async () => {
 		const p = packOf([{ deflated: deflateSync(Buffer.from("x")), size: 1, type: 5 }])
-		await expect(readPack(p)).rejects.toThrow(/unknown object type 5/)
+		await expect(readPack(p)).rejects.toMatchObject({ code: "unknown-object-type" })
 	})
 
 	it("throws (does not hang) on a truncated final zlib stream", async () => {
@@ -100,6 +102,6 @@ describe("readPack — malformed input fails loud", () => {
 			full.subarray(0, Math.floor(full.length / 2)), // cut the zlib stream in half
 		])
 		const pack = Buffer.concat([body, createHash("sha1").update(body).digest()])
-		await expect(readPack(pack)).rejects.toThrow()
+		await expect(readPack(pack)).rejects.toMatchObject({ code: "inflate-failed" })
 	})
 })

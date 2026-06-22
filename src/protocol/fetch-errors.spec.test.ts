@@ -46,6 +46,9 @@ describe("fetch — a mid-serve read failure rejects before any pack byte", () =
 			getSymref: async () => null,
 			listRefs: async () => [],
 		}
-		await expect(handleUploadPack(cloneFetch(), backend)).rejects.toThrow(/not found/)
+		// The contract is "rejects rather than returning a partial/empty pack"; the
+		// message is an internal-invariant string (free to reword). The fully-
+		// controlled backend means the missing want is the only rejection path.
+		await expect(handleUploadPack(cloneFetch(), backend)).rejects.toThrow()
 	})
 })

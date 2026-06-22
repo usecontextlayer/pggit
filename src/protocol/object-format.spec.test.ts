@@ -10,40 +10,41 @@ import { encodePkt, encodePktLine } from "@/pkt-line"
 import { GitProtocolError } from "@/protocol/errors"
 import { handleReceivePack, type ReceiveBackend } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
-import { assertSupportedObjectFormat } from "@/protocol/v2"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 
 const A = "a".repeat(40)
 const Z = "0".repeat(40)
 
-const untouchedUpload = new Proxy({} as RepoBackend, {
-	get() {
-		throw new Error("upload backend must not be reached on a format rejection")
-	},
-})
-const untouchedReceive = new Proxy({} as ReceiveBackend, {
-	get() {
-		throw new Error("receive backend must not be reached on a format rejection")
-	},
-})
+/** A benign read-only upload backend (no mutating methods to guard). */
+const stubUpload: RepoBackend = {
+	getObject: async () => null,
+	getSymref: async () => null,
+	listRefs: async () => [],
+}
 
-describe("assertSupportedObjectFormat", () => {
-	it("accepts sha1 or an absent object-format cap", () => {
-		expect(() =>
-			assertSupportedObjectFormat(["object-format=sha1", "agent=x"]),
-		).not.toThrow()
-		expect(() => assertSupportedObjectFormat([])).not.toThrow()
-	})
-
-	it("rejects a non-sha1 object-format", () => {
-		expect(() => assertSupportedObjectFormat(["object-format=sha256"])).toThrow(
-			GitProtocolError,
-		)
-	})
-})
+/** A receive backend that records whether its MUTATING methods ran, so the test
+ * can assert the real safety contract: a sha256 push must reject before ingesting
+ * (ingesting a pack of 64-hex OIDs would corrupt the sha1 store). */
+function recordingReceive() {
+	const calls = { applyRefUpdates: 0, ingest: 0, isConnected: 0 }
+	const backend: ReceiveBackend = {
+		applyRefUpdates: async (cmds) => {
+			calls.applyRefUpdates++
+			return cmds.map(() => true)
+		},
+		ingest: async () => {
+			calls.ingest++
+		},
+		isConnected: async () => {
+			calls.isConnected++
+			return true
+		},
+	}
+	return { backend, calls }
+}
 
 describe("upload-pack rejects a SHA-256 client cleanly", () => {
-	it("throws GitProtocolError before touching the backend", async () => {
+	it("throws GitProtocolError (a clean rejection, not a mid-parse width failure)", async () => {
 		const body = Buffer.concat([
 			encodePktLine(Buffer.from("command=fetch\n")),
 			encodePktLine(Buffer.from("object-format=sha256\n")),
@@ -51,23 +52,23 @@ describe("upload-pack rejects a SHA-256 client cleanly", () => {
 			encodePktLine(Buffer.from(`want ${A}\n`)),
 			encodePkt({ type: "flush" }),
 		])
-		await expect(handleUploadPack(body, untouchedUpload)).rejects.toThrow(
-			GitProtocolError,
-		)
+		await expect(handleUploadPack(body, stubUpload)).rejects.toThrow(GitProtocolError)
 	})
 })
 
 describe("receive-pack rejects a SHA-256 client cleanly", () => {
-	it("throws GitProtocolError before touching the backend", async () => {
+	it("throws GitProtocolError and never ingests the pack", async () => {
 		const body = Buffer.concat([
 			encodePktLine(
 				Buffer.from(`${Z} ${A} refs/heads/main\0report-status object-format=sha256`),
 			),
 			encodePkt({ type: "flush" }),
 		])
-		await expect(handleReceivePack(body, untouchedReceive)).rejects.toThrow(
-			GitProtocolError,
-		)
+		const { backend, calls } = recordingReceive()
+		await expect(handleReceivePack(body, backend)).rejects.toThrow(GitProtocolError)
+		// The real contract: no side effect — the pack is never ingested, no ref touched.
+		expect(calls.ingest).toBe(0)
+		expect(calls.applyRefUpdates).toBe(0)
 	})
 })
 

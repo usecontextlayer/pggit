@@ -135,7 +135,12 @@ describe("§8.1 upload-pack wire — surface 4: ready + packfile (same response)
 })
 
 describe("§8.1 upload-pack wire — surface 5: packfile section", () => {
-	it("emits a `packfile\\n` header, then band-1 sideband, then flush", () => {
+	// We assert only what a git client observes: a `packfile\n` header, a trailing
+	// flush, and a band-1 stream that REASSEMBLES to the exact pack. The number and
+	// boundaries of sideband packets (chunk size, band interleaving) are internal
+	// multiplexing the client never sees — pinning them would fail a behavior-
+	// preserving packetization refactor (a streaming writer, a different chunk size).
+	it("emits a `packfile\\n` header, then a band-1 stream, then flush", () => {
 		const pack = Buffer.from([0x50, 0x41, 0x43, 0x4b, 0x00, 0x01, 0xff, 0x00])
 		const out = encodePackfileResponse(pack)
 		const { packets } = decodePktStream(out)
@@ -143,23 +148,15 @@ describe("§8.1 upload-pack wire — surface 5: packfile section", () => {
 			(packets[0] as { type: "data"; payload: Buffer }).payload.toString("utf8"),
 		).toBe("packfile\n")
 		expect(packets.at(-1)?.type).toBe("flush")
-		// Every band packet rides band 1; demux recovers the pack byte-identical.
-		const bands = packets.slice(1, -1) as { type: "data"; payload: Buffer }[]
-		expect(bands.every((p) => p.payload[0] === 1)).toBe(true)
-		expect(sidebandDemux(out).band1).toEqual(pack)
+		expect(sidebandDemux(out).band1).toEqual(pack) // demux recovers the pack byte-identical
 	})
 
-	it("splits a pack larger than the band payload cap into multiple band-1 packets", () => {
-		// MAX_BAND_DATA = 65514 (band byte + data must fit the 65515 writer cap).
-		const big = Buffer.alloc(70_000)
+	it("reassembles a pack larger than the band payload cap, binary-safe", () => {
+		const big = Buffer.alloc(70_000) // exceeds one band packet; spans several
 		for (let i = 0; i < big.length; i++) big[i] = i % 256
 		const out = encodePackfileResponse(big)
-		const { packets } = decodePktStream(out)
-		const bands = packets.filter(
-			(p): p is { type: "data"; payload: Buffer } =>
-				p.type === "data" && p.payload[0] === 1,
-		)
-		expect(bands.length).toBeGreaterThanOrEqual(2) // multi-chunk
-		expect(sidebandDemux(out).band1).toEqual(big) // reassembles, binary-safe
+		// The observable contract: however it is chunked, band 1 reassembles to the
+		// exact bytes (binary-safe, no boundary corruption).
+		expect(sidebandDemux(out).band1).toEqual(big)
 	})
 })

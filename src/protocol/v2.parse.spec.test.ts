@@ -27,12 +27,14 @@ function receiveBody(lines: string[]): Buffer {
 	])
 }
 
-/** A backend that throws if touched — proves a decode rejection happens FIRST. */
-const untouchedBackend = new Proxy({} as RepoBackend, {
-	get() {
-		throw new Error("backend must not be reached on a decode rejection")
-	},
-})
+/** A benign read-only stub. (upload-pack's backend has no mutating methods, so
+ * "no side effect" is structural; we assert the observable contract — an
+ * unsupported command rejects with GitProtocolError — not internal call ordering.) */
+const stubBackend: RepoBackend = {
+	getObject: async () => null,
+	getSymref: async () => null,
+	listRefs: async () => [],
+}
 
 describe("parseFetch — keeps valid args, ignores unknown ones", () => {
 	it("ignores an unknown arg but keeps wants/haves/done", () => {
@@ -92,14 +94,12 @@ describe("parseReceivePack — command-list decode", () => {
 })
 
 describe("handleUploadPack — command dispatch", () => {
-	it("throws GitProtocolError on an unsupported command, before touching the backend", async () => {
+	it("throws GitProtocolError on an unsupported command", async () => {
 		const body = Buffer.concat([
 			encodePktLine(Buffer.from("command=frobnicate\n")),
 			encodePkt({ type: "delim" }),
 			encodePkt({ type: "flush" }),
 		])
-		await expect(handleUploadPack(body, untouchedBackend)).rejects.toThrow(
-			GitProtocolError,
-		)
+		await expect(handleUploadPack(body, stubBackend)).rejects.toThrow(GitProtocolError)
 	})
 })

@@ -286,9 +286,10 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			await commitAll(dir, "c2")
 			await push(dir, "backfill", "HEAD:refs/heads/dev")
 
-			// Simulate drift: wipe the projection out from under the refs/objects.
-			await db.sql`delete from repo_view_files where repo_id = ${"backfill"}`
-			await db.sql`delete from repo_view_blobs where repo_id = ${"backfill"}`
+			// Simulate drift: wipe the projection via the public clearRepo (clean slate),
+			// not raw table DELETEs — so the test is coupled to the documented store API,
+			// not to the projection's internal table set.
+			await snapshots.clearRepo("backfill")
 			expect(await queryFiles("backfill", "refs/heads/main")).toEqual([])
 
 			await rebuildAllSnapshots({ objects, refs, snapshots }, "backfill")
