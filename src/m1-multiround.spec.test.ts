@@ -87,7 +87,6 @@ describe("M1 multi-round negotiation", () => {
 			buildPack: (wants, haves, omitBlobs) =>
 				objects.buildPack("repo", wants, haves, omitBlobs),
 			commonHaves: (haves) => objects.commonHaves("repo", haves),
-			getObject: (oid) => objects.getObject("repo", oid),
 			getSymref: (name) => refs.getSymref("repo", name),
 			listRefs: () => refs.listRefs("repo"),
 			readyToGiveUp: (wants, common) => objects.readyToGiveUp("repo", wants, common),

@@ -31,13 +31,13 @@ const T = "d".repeat(40)
 
 describe("§8.1 upload-pack wire — surface 1: v2 capability advertisement", () => {
 	// The canonical advert, authored in git's grammar (serve.c order), with OUR
-	// honored cap set: `fetch=filter`, not git's `fetch=shallow wait-for-done`
-	// (§4.2.3 — advertise only what we honor). Template over agent + algo.
+	// honored cap set: `fetch=filter include-tag`, not git's `fetch=shallow
+	// wait-for-done` (§4.2.3 — advertise only what we honor). Template over agent + algo.
 	const advert = (agent: string, algo: string) =>
 		`version 2\n` +
 		`agent=${agent}\n` +
 		`ls-refs=unborn\n` +
-		`fetch=filter\n` +
+		`fetch=filter include-tag\n` +
 		`object-format=${algo}\n` +
 		`0000\n`
 

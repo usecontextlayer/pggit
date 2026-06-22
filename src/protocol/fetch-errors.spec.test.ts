@@ -35,7 +35,6 @@ function failingServe(message: string): RepoBackend {
 			throw new Error(message)
 		},
 		commonHaves: async () => [],
-		getObject: async () => null,
 		getSymref: async () => null,
 		listRefs: async () => [],
 		readyToGiveUp: async () => false,

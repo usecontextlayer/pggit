@@ -1,24 +1,23 @@
 import { commitTreeOid, type GitObjectType, isTreeEntryMode, treeEntries } from "@/object"
 
 /** Reads a stored object's type + content by OID — the snapshot builder's view of
- * the object store (formerly shared with the now-deleted app-side graph walk). */
+ * the object store. */
 export type ObjectReader = (
 	oid: string,
 ) => Promise<{ type: GitObjectType; content: Buffer }>
 
 export type FileEntry = { path: string; mode: string; blobOid: string }
-export type BlobEntry = { oid: string; content: Buffer }
-export type FileList = { files: FileEntry[]; blobs: BlobEntry[] }
+export type FileList = { files: FileEntry[] }
 
 /** Gitlink/submodule entries point at a commit in another repo — no blob here. */
 const GITLINK_MODE = "160000"
 
 /**
- * The flat file list of a commit's tree: one FileEntry per blob (full path from
- * the root, raw mode, blob oid) plus the deduped blob contents. It is the
- * `git ls-tree -r` of a commit, read straight from the object store — no
- * checkout. Subtrees are recursed; gitlinks (submodules) are skipped (they have
- * no blob in this repo). Blobs are deduped by oid (identical content stored once).
+ * The flat path→blob index of a commit's tree (the `git ls-tree -r` of a commit,
+ * read straight from the object store): one FileEntry per blob — full path from the
+ * root, raw mode, blob oid. Subtrees are recursed; gitlinks (submodules) are skipped
+ * (no blob in this repo). Blob CONTENT is NOT read — it lives in git_object and is
+ * joined at query time (§4.5 collapse), so this walk touches only commits + trees.
  */
 export async function buildFileList(
 	read: ObjectReader,
@@ -26,7 +25,6 @@ export async function buildFileList(
 ): Promise<FileList> {
 	const commit = await read(commitOid)
 	const files: FileEntry[] = []
-	const blobs = new Map<string, Buffer>()
 
 	const walk = async (treeOid: string, prefix: string): Promise<void> => {
 		const tree = await read(treeOid)
@@ -36,14 +34,10 @@ export async function buildFileList(
 				await walk(entry.oid, `${path}/`)
 			} else if (entry.mode !== GITLINK_MODE) {
 				files.push({ blobOid: entry.oid, mode: entry.mode, path })
-				if (!blobs.has(entry.oid)) blobs.set(entry.oid, (await read(entry.oid)).content)
 			}
 		}
 	}
 
 	await walk(commitTreeOid(commit.content), "")
-	return {
-		blobs: [...blobs].map(([oid, content]) => ({ content, oid })),
-		files,
-	}
+	return { files }
 }

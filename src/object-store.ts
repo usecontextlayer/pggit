@@ -84,6 +84,7 @@ export function createObjectStore(db: Kysely<Database>) {
 			wants: string[],
 			haves: string[],
 			omitBlobs: boolean,
+			includeTag = false,
 		): Promise<Buffer> {
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null || wants.length === 0) return writePack([])
@@ -105,6 +106,7 @@ export function createObjectStore(db: Kysely<Database>) {
 				const set = new Set<string>()
 				for (const o of want.present) if (!have.present.has(o)) set.add(o)
 				for (const w of wants) if (want.present.has(w)) set.add(w)
+				if (includeTag) await augmentWithTags(id, set)
 				return [...set]
 			})
 
@@ -402,6 +404,42 @@ export function createObjectStore(db: Kysely<Database>) {
 			) as reached
 		`.execute(db)
 		return result.rows[0]?.reached ?? false
+	}
+
+	/**
+	 * include-tag augmentation (§6.5): annotated tags whose peeled target is in the
+	 * served set get their tag OBJECTS added — transitively over `kind=5`, so a
+	 * tag-of-tag chain ships every tag object in it (each must be present for the
+	 * client's fsck). Annotated tags are few, so we fetch them all and filter by
+	 * served membership app-side rather than feeding the whole served set into SQL.
+	 * Mutates `served`. Peeled targets are already in `served` (they qualified the
+	 * tag), so re-adding the chain's terminal commit is a no-op.
+	 */
+	async function augmentWithTags(id: ReposId, served: Set<string>): Promise<void> {
+		const tagRefs = await db
+			.selectFrom("git_ref")
+			.select(["oid", "peeled_oid"])
+			.where("repo_id", "=", id)
+			.where("oid", "is not", null)
+			.where("peeled_oid", "is not", null)
+			.execute()
+		const qualifying = tagRefs
+			.filter((r) => r.peeled_oid !== null && served.has(r.peeled_oid.toString("hex")))
+			.map((r) => (r.oid as Buffer).toString("hex"))
+		if (qualifying.length === 0) return
+
+		const seed = sql.join(qualifying.map((r) => sql`(${Buffer.from(r, "hex")}::bytea)`))
+		const chain = await sql<{ oid: Buffer }>`
+			with recursive tags(oid) as (
+				select oid from (values ${seed}) as roots(oid)
+				union
+				select e.child from git_edge e
+					join tags t on e.parent = t.oid
+					where e.repo_id = ${id}::bigint and e.kind = ${EDGE_KIND.TAG_TARGET}
+			)
+			select oid from tags
+		`.execute(db)
+		for (const r of chain.rows) served.add(r.oid.toString("hex"))
 	}
 
 	return store

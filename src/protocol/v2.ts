@@ -25,16 +25,16 @@ const MAX_BAND_DATA = 65514
 /**
  * The v2 capability advertisement (GET info/refs body, minus HTTP framing).
  * We advertise ONLY what we honor (spec §4): ls-refs (with `unborn`) and fetch
- * with the `filter` feature (partial clone). No shallow / ref-in-want — those
- * have no milestone owner and advertising them flips clients onto unimplemented
- * paths.
+ * with the `filter` (partial clone) and `include-tag` (auto-follow annotated tags)
+ * features. No shallow / ref-in-want — those have no milestone owner and
+ * advertising them flips clients onto unimplemented paths.
  */
 export function encodeAdvertisement(): Buffer {
 	const caps = [
 		"version 2",
 		`agent=${AGENT}`,
 		"ls-refs=unborn",
-		"fetch=filter",
+		"fetch=filter include-tag",
 		"object-format=sha1",
 	]
 	return Buffer.concat([
@@ -76,6 +76,9 @@ export type FetchRequest = {
 	done: boolean
 	/** Partial-clone filter spec (e.g. `blob:none`), if the client sent one. */
 	filter?: string
+	/** Client asked the server to auto-include annotated tags pointing into the
+	 * fetched set (the `include-tag` capability). */
+	includeTag: boolean
 }
 
 export function parseFetch(req: V2Request): FetchRequest {
@@ -83,13 +86,15 @@ export function parseFetch(req: V2Request): FetchRequest {
 	const haves: string[] = []
 	let done = false
 	let filter: string | undefined
+	let includeTag = false
 	for (const arg of req.args) {
 		if (arg.startsWith("want ")) wants.push(arg.slice(5))
 		else if (arg.startsWith("have ")) haves.push(arg.slice(5))
 		else if (arg.startsWith("filter ")) filter = arg.slice("filter ".length)
+		else if (arg === "include-tag") includeTag = true
 		else if (arg === "done") done = true
 	}
-	return { done, filter, haves, wants }
+	return { done, filter, haves, includeTag, wants }
 }
 
 /**

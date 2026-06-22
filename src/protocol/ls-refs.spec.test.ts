@@ -20,7 +20,6 @@ function backend(refs: { name: string; oid: string }[], head?: string): RepoBack
 	return {
 		buildPack: async () => Buffer.alloc(0),
 		commonHaves: async () => [],
-		getObject: async () => null,
 		getSymref: async (name) => (name === "HEAD" && head ? head : null),
 		listRefs: async () => refs,
 		readyToGiveUp: async () => false,

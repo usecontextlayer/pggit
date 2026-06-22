@@ -1,5 +1,4 @@
 import { label, withPhase } from "@/instrument"
-import { type GitObjectType, referencedOids } from "@/object"
 import { GitProtocolError } from "@/protocol/errors"
 import {
 	assertSupportedObjectFormat,
@@ -13,40 +12,31 @@ import {
 	type V2Request,
 } from "@/protocol/v2"
 
-export type BackendObject = { type: GitObjectType; content: Buffer }
+/** A ref advertised by the store: its oid, plus the peeled tag target when it is
+ * an annotated tag (computed at ref-write, §5.3). */
+export type AdvertisedRef = { name: string; oid: string; peeled?: string }
 
 /**
  * Everything the upload-pack service needs from a single repo's storage. The graph
  * logic lives in the store now (set-based SQL over the row+edge model), so this is
- * a thin set-oriented interface — not the object-at-a-time walk interface of the
- * old app-side enumeration. `getObject` survives only for `ls-refs` tag peeling,
- * and goes when `peeled_oid` lands (Chunk 5).
+ * a thin set-oriented interface — no object-at-a-time walk. Tag peeling is read
+ * straight off the ref (`peeled`), so there is no object-fetch on the serve path.
  */
 export type RepoBackend = {
-	listRefs: () => Promise<{ name: string; oid: string }[]>
+	listRefs: () => Promise<AdvertisedRef[]>
 	getSymref: (name: string) => Promise<string | null>
-	getObject: (oid: string) => Promise<BackendObject | null>
 	/** The subset of `haves` the repo has — the negotiation common set. */
 	commonHaves: (haves: string[]) => Promise<string[]>
 	/** git's ok_to_give_up: does every want reach a common have by ancestry? */
 	readyToGiveUp: (wants: string[], common: string[]) => Promise<boolean>
-	/** The served pack: want-closure minus have-closure, plus the explicit wants. */
-	buildPack: (wants: string[], haves: string[], omitBlobs: boolean) => Promise<Buffer>
-}
-
-/** Follow a tag chain to its non-tag target; undefined if `oid` is not a tag. */
-async function peelTag(oid: string, backend: RepoBackend): Promise<string | undefined> {
-	let cur = oid
-	let sawTag = false
-	for (let i = 0; i < 16; i++) {
-		const obj = await backend.getObject(cur)
-		if (obj?.type !== "tag") return sawTag ? cur : undefined
-		sawTag = true
-		const target = referencedOids("tag", obj.content)[0]
-		if (!target) return undefined
-		cur = target
-	}
-	throw new Error("upload-pack: tag chain too deep")
+	/** The served pack: want-closure minus have-closure, plus the explicit wants
+	 * (and, when `includeTag`, annotated tags pointing into the served set). */
+	buildPack: (
+		wants: string[],
+		haves: string[],
+		omitBlobs: boolean,
+		includeTag: boolean,
+	) => Promise<Buffer>
 }
 
 async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffer> {
@@ -85,10 +75,8 @@ async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffe
 		for (const ref of refs) {
 			if (!matches(ref.name)) continue
 			const entry: LsRefEntry = { name: ref.name, oid: ref.oid }
-			if (wantPeel) {
-				const peeled = await peelTag(ref.oid, backend)
-				if (peeled) entry.peeled = peeled
-			}
+			// Peeled target is precomputed at ref-write (§5.3) — no per-request walk.
+			if (wantPeel && ref.peeled) entry.peeled = ref.peeled
 			entries.push(entry)
 		}
 
@@ -105,7 +93,7 @@ function filterOmitsBlobs(filter: string | undefined): boolean {
 
 async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer> {
 	label("fetch")
-	const { wants, haves, done, filter } = parseFetch(req)
+	const { wants, haves, done, filter, includeTag } = parseFetch(req)
 	// A zero-want fetch is NOT an error: git's upload-pack treats it as a no-op
 	// (upload-pack.c) and returns an empty pack — buildPack produces one, so we let
 	// it fall through rather than rejecting.
@@ -119,12 +107,17 @@ async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer
 		if (!(await backend.readyToGiveUp(wants, common))) {
 			return encodeAcknowledgments(common, false)
 		}
-		return encodeReadyWithPack(common, await backend.buildPack(wants, common, omitBlobs))
+		return encodeReadyWithPack(
+			common,
+			await backend.buildPack(wants, common, omitBlobs, includeTag),
+		)
 	}
 
 	// `done` (spec §4 shapes a/c): pack the delta directly. A clone has no haves, so
 	// the subtrahend is empty and we pack the whole want-closure.
-	return encodePackfileResponse(await backend.buildPack(wants, common, omitBlobs))
+	return encodePackfileResponse(
+		await backend.buildPack(wants, common, omitBlobs, includeTag),
+	)
 }
 
 /** Dispatch a v2 upload-pack POST body to ls-refs or fetch. */

@@ -56,9 +56,10 @@ describe("§8.4 generative — push to an empty repo (M2) differential", () => {
 
 						// 2. The stored refs are EXACTLY the client's branches + tags. listRefs
 						//    order is unspecified, so sort both sides (refsOf already sorts).
-						const stored = (await refs.listRefs("repo")).sort((a, b) =>
-							a.name.localeCompare(b.name),
-						)
+						//    Compare name+oid only — `peeled` is derived metadata, not ref state.
+						const stored = (await refs.listRefs("repo"))
+							.map((r) => ({ name: r.name, oid: r.oid }))
+							.sort((a, b) => a.name.localeCompare(b.name))
 						expect(stored).toEqual(await refsOf(client))
 
 						// 3. Differential: a fresh git clones the server back to a byte-identical

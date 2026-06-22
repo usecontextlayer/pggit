@@ -21,11 +21,11 @@ import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/
 import { spawnGit } from "@/testing/spawn-git"
 
 // The EXTERNAL contract of the queryable file view, end to end: real `git push`
-// is the input; the documented SQL surface — `repo_view_files` joined to
-// `repo_view_blobs` — is the read interface (output); real git is the oracle.
-// Nothing here reaches into the decode / walk / store internals, so the
-// implementation behind this contract is free to be refactored. The table and
-// column names ARE the contract.
+// is the input; the documented SQL surface — `repo_file` joined to `git_object`
+// for content (resolving the wire repo name via `repos`) — is the read interface
+// (output); real git is the oracle. Nothing here reaches into the decode / walk /
+// store internals, so the implementation behind this contract is free to be
+// refactored. The table and column names ARE the contract.
 
 type FileRow = { path: string; mode: string; content: Buffer }
 
@@ -52,22 +52,26 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 		await container?.stop()
 	})
 
-	/** The documented external read surface: the canonical "files at a ref" query. */
+	/** The documented external read surface: the canonical "files at a ref" query —
+	 * the slim repo_file index joined to git_object for content. */
 	async function queryFiles(repoId: string, ref: string): Promise<FileRow[]> {
 		const rows = await db.sql<FileRow[]>`
-			select f.path, f.mode, b.content
-			from repo_view_files f
-			join repo_view_blobs b on b.repo_id = f.repo_id and b.oid = f.blob_oid
-			where f.repo_id = ${repoId} and f.ref_name = ${ref}
+			select f.path, f.mode, o.content
+			from repo_file f
+			join repos r on r.id = f.repo_id
+			join git_object o on o.repo_id = f.repo_id and o.oid = f.blob_oid
+			where r.name = ${repoId} and f.ref_name = ${ref}
 			order by f.path
 		`
 		return rows.map((r) => ({ content: r.content, mode: r.mode, path: r.path }))
 	}
 
-	/** Distinct stored blobs for a repo — the storage-bounded / dedup observable. */
-	async function blobCount(repoId: string): Promise<number> {
+	/** Index rows for a ref — the projection is tip-bounded, not history-bounded. */
+	async function fileRowCount(repoId: string, ref: string): Promise<number> {
 		const rows = await db.sql<{ n: number }[]>`
-			select count(*)::int as n from repo_view_blobs where repo_id = ${repoId}
+			select count(*)::int as n from repo_file f
+			join repos r on r.id = f.repo_id
+			where r.name = ${repoId} and f.ref_name = ${ref}
 		`
 		return rows[0]?.n ?? 0
 	}
@@ -229,7 +233,7 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 		}
 	})
 
-	it("rewriting a file across pushes keeps storage bounded (no historical blobs)", async () => {
+	it("the file index tracks only the tip across rewrites (one row, latest content)", async () => {
 		const dir = newRepo("rewrite")
 		try {
 			await spawnGit(["init", "-q"], { cwd: dir })
@@ -238,8 +242,9 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 				await commitAll(dir, v)
 				await push(dir, "rewrite", "HEAD:refs/heads/main")
 			}
-			// Three pushes, but the working tree holds one file → one stored blob.
-			expect(await blobCount("rewrite")).toBe(1)
+			// Three pushes, but the index holds exactly the tip's one file (the object
+			// store keeps history; the projection does not).
+			expect(await fileRowCount("rewrite", "refs/heads/main")).toBe(1)
 			expect(
 				(await queryFiles("rewrite", "refs/heads/main"))[0]?.content.toString(),
 			).toBe("three\n")
@@ -248,7 +253,7 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 		}
 	})
 
-	it("identical content across branches is stored once", async () => {
+	it("identical content across branches shares one content-addressed blob", async () => {
 		const dir = newRepo("dedup")
 		try {
 			await spawnGit(["init", "-q"], { cwd: dir })
@@ -262,13 +267,12 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			await commitAll(dir, "c2")
 			await push(dir, "dedup", "HEAD:refs/heads/dev")
 
-			expect(await blobCount("dedup")).toBe(1) // one "shared\n" blob, both refs point at it
-			expect((await queryFiles("dedup", "refs/heads/main")).map((f) => f.path)).toEqual([
-				"a.txt",
-			])
-			expect((await queryFiles("dedup", "refs/heads/dev")).map((f) => f.path)).toEqual([
-				"b.txt",
-			])
+			const main = await snapshots.listFiles("dedup", "refs/heads/main")
+			const dev = await snapshots.listFiles("dedup", "refs/heads/dev")
+			expect(main.map((f) => f.path)).toEqual(["a.txt"])
+			expect(dev.map((f) => f.path)).toEqual(["b.txt"])
+			// Same content → same OID → both index rows point at one git_object blob.
+			expect(main[0]?.blobOid).toBe(dev[0]?.blobOid)
 		} finally {
 			rmSync(dir, { force: true, recursive: true })
 		}

@@ -61,10 +61,11 @@ describe("§8.4 generative — incremental push (M2) differential", () => {
 							fc.pre(model.commitCount > baseCommitCount) // a real second push
 							await spawnGit(["push", url, ...REFSPEC], { cwd: client })
 
-							// 1. Stored refs are EXACTLY the client's branches + tags.
-							const stored = (await refs.listRefs("repo")).sort((a, b) =>
-								a.name.localeCompare(b.name),
-							)
+							// 1. Stored refs are EXACTLY the client's branches + tags (name+oid;
+							//    `peeled` is derived metadata, not ref state).
+							const stored = (await refs.listRefs("repo"))
+								.map((r) => ({ name: r.name, oid: r.oid }))
+								.sort((a, b) => a.name.localeCompare(b.name))
 							expect(stored).toEqual(await refsOf(client))
 
 							// 2. Every object reachable on the client is in the store.

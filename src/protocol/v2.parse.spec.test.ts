@@ -33,7 +33,6 @@ function receiveBody(lines: string[]): Buffer {
 const stubBackend: RepoBackend = {
 	buildPack: async () => Buffer.alloc(0),
 	commonHaves: async () => [],
-	getObject: async () => null,
 	getSymref: async () => null,
 	listRefs: async () => [],
 	readyToGiveUp: async () => false,

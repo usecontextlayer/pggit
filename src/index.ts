@@ -19,8 +19,8 @@ import type { SnapshotStore } from "@/repo-view/snapshot-store"
 export type GitAppDeps = {
 	objects: ObjectStore
 	refs: RefStore
-	/** Optional queryable-view layer. When provided, push maintains a `repo_view`
-	 * file snapshot per branch; when omitted, this is a plain git remote. */
+	/** Optional queryable-view layer. When provided, push maintains a `repo_file`
+	 * path→blob index per branch; when omitted, this is a plain git remote. */
 	snapshots?: SnapshotStore
 }
 
@@ -58,10 +58,9 @@ async function readRequestBody(c: Context): Promise<Buffer> {
 
 function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	return {
-		buildPack: (wants, haves, omitBlobs) =>
-			deps.objects.buildPack(repoId, wants, haves, omitBlobs),
+		buildPack: (wants, haves, omitBlobs, includeTag) =>
+			deps.objects.buildPack(repoId, wants, haves, omitBlobs, includeTag),
 		commonHaves: (haves) => deps.objects.commonHaves(repoId, haves),
-		getObject: (oid) => deps.objects.getObject(repoId, oid),
 		getSymref: (name) => deps.refs.getSymref(repoId, name),
 		listRefs: () => deps.refs.listRefs(repoId),
 		readyToGiveUp: (wants, common) => deps.objects.readyToGiveUp(repoId, wants, common),

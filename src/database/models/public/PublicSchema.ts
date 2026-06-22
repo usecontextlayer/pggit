@@ -6,24 +6,21 @@ import type { default as GitObjectTable } from "./GitObject"
 import type { default as GitRefTable } from "./GitRef"
 import type { default as KyselyMigrationTable } from "./KyselyMigration"
 import type { default as KyselyMigrationLockTable } from "./KyselyMigrationLock"
+import type { default as RepoFileTable } from "./RepoFile"
 import type { default as ReposTable } from "./Repos"
-import type { default as RepoViewBlobsTable } from "./RepoViewBlobs"
-import type { default as RepoViewFilesTable } from "./RepoViewFiles"
 
 export default interface PublicSchema {
-	repo_view_blobs: RepoViewBlobsTable
-
 	kysely_migration_lock: KyselyMigrationLockTable
 
 	git_edge: GitEdgeTable
 
 	git_ref: GitRefTable
 
+	repo_file: RepoFileTable
+
 	kysely_migration: KyselyMigrationTable
 
 	git_object: GitObjectTable
 
 	repos: ReposTable
-
-	repo_view_files: RepoViewFilesTable
 }
