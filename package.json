@@ -51,7 +51,7 @@
 		"dev": "npx tsx src/main.ts",
 		"format.fix": "npx @biomejs/biome check --fix --error-on-warnings .",
 		"format.verify": "npx @biomejs/biome check --error-on-warnings .",
-		"perf": "npx tsx perf/run.ts",
+		"perf": "NODE_OPTIONS=--expose-gc npx tsx perf/run.ts",
 		"test": "npx vitest run",
 		"tsc": "npx tsc -b tsconfig.json"
 	},

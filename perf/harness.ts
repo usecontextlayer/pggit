@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs"
+import { writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createGitApp } from "@/index"
@@ -11,6 +12,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { generateRepo } from "./fast-import"
+import { startMemorySampler } from "./memory"
 import { type PgHandle, startLatencyPg, startPlainPg } from "./pg-latency"
 import { collectProcessMetrics } from "./process-metrics"
 import { startProfile, stopProfile } from "./profile"
@@ -101,11 +103,15 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 			wallMsRuns.push(await cloneOnce(port, { verify: i === 0 }))
 		}
 
-		// One fully-instrumented run: the profiler window wraps ONLY the clone (no
-		// fsck/teardown), so the flamegraph is pure server work. Verify afterward.
-		const dest = mkdtempSync(join(tmpdir(), "pggit-perf-instr-"))
+		// Two separate instrumented clones so the measurements never contaminate each
+		// other. The PROFILER clone wraps ONLY the clone (no fsck/teardown) and runs no
+		// samplers, so its main-thread flamegraph is pure server work — a memory
+		// sampler's `setInterval` would otherwise dominate the hotspots of a short
+		// clone. The MEMORY clone runs the RSS/breakdown samplers without the profiler's
+		// sampling overhead. Both clones are deterministic (same repo), so the
+		// collectors, profile, and memory all describe the same workload.
+		const profDest = mkdtempSync(join(tmpdir(), "pggit-perf-prof-"))
 		resetCollected()
-		const proc = collectProcessMetrics()
 		const cpu0 = process.cpuUsage()
 		startProfile()
 		await spawnGit([
@@ -114,14 +120,38 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 			"protocol.version=2",
 			"--quiet",
 			`http://127.0.0.1:${port}/${REPO_ID}`,
-			dest,
+			profDest,
 		])
 		const profile = await stopProfile(opts.outDir)
 		const cpu = process.cpuUsage(cpu0)
-		const processMetrics = proc.stop()
 		const collectors = [...collectedRuns()]
-		await spawnGit(["fsck", "--full"], { cwd: dest })
-		rmSync(dest, { force: true, recursive: true })
+		await spawnGit(["fsck", "--full"], { cwd: profDest })
+		rmSync(profDest, { force: true, recursive: true })
+
+		const memDest = mkdtempSync(join(tmpdir(), "pggit-perf-mem-"))
+		const proc = collectProcessMetrics()
+		const memory = startMemorySampler()
+		await spawnGit([
+			"clone",
+			"-c",
+			"protocol.version=2",
+			"--quiet",
+			`http://127.0.0.1:${port}/${REPO_ID}`,
+			memDest,
+		])
+		// Stop the GC observer BEFORE the memory sampler forces a GC for its
+		// retained-set read, so the forced collection never pollutes the GC counts.
+		const processMetrics = proc.stop()
+		const memoryReport = await memory.stop()
+		await writeFile(
+			join(opts.outDir, "memory.json"),
+			JSON.stringify({
+				rssSeries: memoryReport.rssSeries,
+				sampler: memoryReport.sampler,
+			}),
+		)
+		await spawnGit(["fsck", "--full"], { cwd: memDest })
+		rmSync(memDest, { force: true, recursive: true })
 
 		// RTT sweep: clone wall at 0ms vs the requested latency (same repo, via proxy).
 		const rttSweep: { rttMs: number; wallMs: number }[] = []
@@ -137,6 +167,7 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 			collectors,
 			gitVersion: (await spawnGit(["--version"])).stdout.trim(),
 			hotspots: profile.hotspots,
+			memory: memoryReport,
 			objectsInRepo: objectCount,
 			outDir: opts.outDir,
 			process: processMetrics,

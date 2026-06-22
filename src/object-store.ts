@@ -1,10 +1,11 @@
 import type { Kysely } from "kysely"
 import type { Database } from "@/database"
-import type { ObjectsOid, ObjectsRepoId } from "@/database/models/public/Objects"
 import { count } from "@/instrument"
 import { computeOid, type GitObjectType, referencedOids } from "@/object"
+import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
-import { type PackInputObject, writePack } from "@/pack/write-pack"
+import type { PackInputObject } from "@/pack/write-pack"
+import { createRepoResolver } from "@/repo-store"
 
 export type StoredObject = {
 	type: GitObjectType
@@ -13,67 +14,95 @@ export type StoredObject = {
 
 export type ObjectStore = ReturnType<typeof createObjectStore>
 
+// `git_object.type` stores the pack object-type code (1 commit, 2 tree, 3 blob,
+// 4 tag) — so it maps straight to the pack header on serve. Mirrors the codec's
+// own private map (write-pack.ts), referencing the same constants; the codec
+// stays storage-independent and untouched.
+const TYPE_TO_CODE: Record<GitObjectType, number> = {
+	blob: PACK_OBJ_TYPE.BLOB,
+	commit: PACK_OBJ_TYPE.COMMIT,
+	tag: PACK_OBJ_TYPE.TAG,
+	tree: PACK_OBJ_TYPE.TREE,
+}
+
+const CODE_TO_TYPE = new Map<number, GitObjectType>([
+	[PACK_OBJ_TYPE.BLOB, "blob"],
+	[PACK_OBJ_TYPE.COMMIT, "commit"],
+	[PACK_OBJ_TYPE.TAG, "tag"],
+	[PACK_OBJ_TYPE.TREE, "tree"],
+])
+
+function typeFromCode(code: number): GitObjectType {
+	const type = CODE_TO_TYPE.get(code)
+	if (!type) throw new Error(`object-store: unknown git object type code ${code}`)
+	return type
+}
+
 /**
- * Postgres-backed git object store (JGit DFS lineage). Objects live inside
- * self-contained, undeltified packs; the `objects` index maps each OID to its
- * pack so `has`/type lookups never touch pack bytes. `getObject` currently reads
- * the whole pack — offset-targeted reads are a later optimization.
+ * Postgres-backed git object store. Each immutable object is one row in the
+ * per-repo, HASH-partitioned `git_object` (raw 20-byte `bytea` OID, pack type
+ * code, raw inflated body lz4-TOASTed Postgres-side) — packs are a transport
+ * encoding produced on serve and consumed on ingest, never stored. So a fetch is
+ * a primary-key point-read, not a whole-pack re-inflate.
  *
- * The store is the wire→DB boundary: callers speak plain hex strings, so repo
- * ids and OIDs are cast to their generated branded column types here.
+ * The store is the wire→DB boundary: callers speak hex OIDs and the wire repo
+ * name; OIDs are coerced hex↔raw here, and the repo name is resolved to its
+ * bigint surrogate (memoized) here.
  */
 export function createObjectStore(db: Kysely<Database>) {
+	const repos = createRepoResolver(db)
+
 	const store = {
 		async getObject(repoId: string, oid: string): Promise<StoredObject | null> {
 			count("getObjectCalls")
-			const objRow = await db
-				.selectFrom("objects")
-				.select("pack_id")
-				.where("repo_id", "=", repoId as ObjectsRepoId)
-				.where("oid", "=", oid as ObjectsOid)
-				.executeTakeFirst()
-			if (!objRow) return null
+			const id = await repos.resolveRepoId(repoId)
+			if (id === null) return null
 
-			const packRow = await db
-				.selectFrom("packs")
-				.select("bytes")
-				.where("id", "=", objRow.pack_id)
+			const row = await db
+				.selectFrom("git_object")
+				.select(["type", "content"])
+				.where("repo_id", "=", id)
+				.where("oid", "=", Buffer.from(oid, "hex"))
 				.executeTakeFirst()
-			if (!packRow) throw new Error(`object-store: pack ${objRow.pack_id} missing`)
-			count("packBytesRead", packRow.bytes.length)
+			if (!row) return null
 
-			const found = (await readPack(packRow.bytes)).find((p) => p.oid === oid)
-			return found ? { content: found.content, type: found.type } : null
+			count("objectBytesRead", row.content.length)
+			return { content: row.content, type: typeFromCode(row.type) }
 		},
 
 		async hasObject(repoId: string, oid: string): Promise<boolean> {
+			const id = await repos.resolveRepoId(repoId)
+			if (id === null) return false
 			const row = await db
-				.selectFrom("objects")
+				.selectFrom("git_object")
 				.select("oid")
-				.where("repo_id", "=", repoId as ObjectsRepoId)
-				.where("oid", "=", oid as ObjectsOid)
+				.where("repo_id", "=", id)
+				.where("oid", "=", Buffer.from(oid, "hex"))
 				.executeTakeFirst()
 			return row !== undefined
 		},
 
 		/**
 		 * Ingest a received pack: parse it — resolving in-pack deltas, and thin-pack
-		 * REF_DELTA bases against objects already in this repo's store — then re-store
-		 * every object as one self-contained, undeltified pack.
+		 * REF_DELTA bases against objects already in this repo — then insert every
+		 * resolved object as a row.
 		 */
 		async ingestPack(repoId: string, packBytes: Buffer): Promise<{ oids: string[] }> {
+			const id = await repos.ensureRepoId(repoId)
 			const parsed = await readPack(packBytes, (oid) => store.getObject(repoId, oid))
-			const { oids } = await store.putPack(
-				repoId,
+			const oids = await insertObjects(
+				id,
 				parsed.map((p) => ({ content: p.content, type: p.type })),
 			)
 			return { oids }
 		},
 
 		/**
-		 * Connectivity check (spec §10/M13): is every object reachable from `oid`
-		 * present in this repo's store? A push whose new tip fails this references an
-		 * object the pack neither carried nor delta-resolved, and must be rejected.
+		 * Connectivity check (spec §10): is every object reachable from `oid` present
+		 * in this repo? A push whose new tip fails this references an object the pack
+		 * neither carried nor delta-resolved, and must be rejected. App-side walk for
+		 * now (Chunk 3 replaces it with a server-side CTE); each hop is now an O(1)
+		 * point-read.
 		 */
 		async isConnected(repoId: string, oid: string): Promise<boolean> {
 			const seen = new Set<string>()
@@ -91,36 +120,45 @@ export function createObjectStore(db: Kysely<Database>) {
 			return true
 		},
 
-		/** Persist objects as one self-contained pack + index its contents. */
+		/** Seed objects directly (the differential harness + perf bench path): insert
+		 * each as a row, idempotently. Equivalent to `ingestPack` minus the pack codec. */
 		async putPack(
 			repoId: string,
 			objects: PackInputObject[],
-		): Promise<{ packId: string; oids: string[] }> {
-			const pack = writePack(objects)
-			const checksum = pack.subarray(pack.length - 20).toString("hex")
+		): Promise<{ oids: string[] }> {
+			const id = await repos.ensureRepoId(repoId)
+			const oids = await insertObjects(id, objects)
+			return { oids }
+		},
+	}
 
-			const packRow = await db
-				.insertInto("packs")
-				.values({ bytes: pack, checksum, repo_id: repoId })
-				.returning("id")
-				.executeTakeFirstOrThrow()
-			const packId = packRow.id
-
-			const rows = objects.map((obj) => ({
-				oid: computeOid(obj.type, obj.content) as ObjectsOid,
-				pack_id: packId,
-				repo_id: repoId as ObjectsRepoId,
-				size: String(obj.content.length),
-				type: obj.type,
-			}))
+	/** Insert objects as rows, idempotent (re-sent objects are skipped). Returns
+	 * every object's hex OID, in input order. */
+	async function insertObjects(
+		id: Awaited<ReturnType<typeof repos.ensureRepoId>>,
+		objects: PackInputObject[],
+	): Promise<string[]> {
+		const entries = objects.map((obj) => {
+			const hex = computeOid(obj.type, obj.content)
+			return {
+				hex,
+				row: {
+					content: obj.content,
+					oid: Buffer.from(hex, "hex"),
+					repo_id: id,
+					size: obj.content.length,
+					type: TYPE_TO_CODE[obj.type],
+				},
+			}
+		})
+		if (entries.length > 0) {
 			await db
-				.insertInto("objects")
-				.values(rows)
+				.insertInto("git_object")
+				.values(entries.map((e) => e.row))
 				.onConflict((oc) => oc.doNothing())
 				.execute()
-
-			return { oids: rows.map((r) => r.oid), packId: String(packId) }
-		},
+		}
+		return entries.map((e) => e.hex)
 	}
 
 	return store

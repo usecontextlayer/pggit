@@ -102,7 +102,7 @@ describe("§8.1 receive-pack wire — surface 7: report-status", () => {
 			framedPktLines(
 				encodeReportStatus("ok", [{ ok: false, ref: "refs/heads/x" }], false),
 			),
-		).toBe(framedLine("unpack ok") + framedLine("ng refs/heads/x failed") + "0000")
+		).toBe(`${framedLine("unpack ok") + framedLine("ng refs/heads/x failed")}0000`)
 	})
 
 	it("unpack failure → `unpack <error>` then every command `ng`", () => {
@@ -121,7 +121,7 @@ describe("§8.1 receive-pack wire — surface 7: report-status", () => {
 			framedPktLines(
 				encodeReportStatus("ok", [{ ok: true, ref: "refs/heads/gone" }], false),
 			),
-		).toBe(framedLine("unpack ok") + framedLine("ok refs/heads/gone") + "0000")
+		).toBe(`${framedLine("unpack ok") + framedLine("ok refs/heads/gone")}0000`)
 	})
 
 	it("sideband form → the whole report rides band 1; demux recovers the identical raw report", () => {
@@ -129,7 +129,7 @@ describe("§8.1 receive-pack wire — surface 7: report-status", () => {
 		const wrapped = encodeReportStatus("ok", results, true)
 		const raw = sidebandDemux(wrapped).band1
 		expect(framedPktLines(raw)).toBe(
-			framedLine("unpack ok") + framedLine("ok refs/heads/main") + "0000",
+			`${framedLine("unpack ok") + framedLine("ok refs/heads/main")}0000`,
 		)
 		// The raw (non-sideband) form is byte-identical to what band 1 carried.
 		expect(raw).toEqual(encodeReportStatus("ok", results, false))

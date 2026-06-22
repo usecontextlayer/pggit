@@ -1,10 +1,11 @@
 /**
- * M3 at-rest repack invariant (testing #10). The repack WORKER is deferred, but
- * the soft-delete schema (`packs.dead_at`) already ships, so pin the at-rest
- * contract a future reaper must preserve: re-ingesting a consolidated `git repack`
- * pack over the same history must leave the SERVED object set + refs byte-
- * identical and fsck-clean. The reader does not yet honor `dead_at` (no worker
- * sets it) — that step is an explicit pending obligation below.
+ * At-rest re-ingest invariant (testing #10). The Postgres-native redesign stores
+ * objects as rows and drops the pack-blob soft-delete model (`packs.dead_at`, the
+ * TTL reaper, the offline repack worker) entirely — GC becomes a reachability
+ * set-difference DELETE (redesign §7), a deferred follow-up. What still must hold
+ * here: re-ingesting a consolidated `git repack` pack over the same history is
+ * idempotent at the served layer — the SERVED object set + refs stay byte-
+ * identical and fsck-clean.
  */
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -74,11 +75,10 @@ describe("M3 — at-rest repack invariant", () => {
 		}
 	}
 
-	// A regression FLOOR for the at-rest contract: it pins that consolidating a
-	// repo's history into one pack and re-ingesting it is idempotent at the served
-	// layer (object set + refs unchanged, clone stays fsck-clean). It does NOT yet
-	// prove reaper-specific behavior — that is the it.todo below; this guards
-	// against an ingest regression that drops/duplicates/corrupts on re-consolidation.
+	// A regression FLOOR for the at-rest contract: consolidating a repo's history
+	// into one pack and re-ingesting it is idempotent at the served layer (object
+	// set + refs unchanged, clone stays fsck-clean) — guarding against an ingest
+	// regression that drops/duplicates/corrupts on re-consolidation.
 	it("re-ingesting a consolidated pack preserves the served object set and refs", async () => {
 		const objectsBefore = await cloneBackObjects()
 		const refsBefore = await refs.listRefs("repo")
@@ -95,8 +95,8 @@ describe("M3 — at-rest repack invariant", () => {
 		expect(await refs.listRefs("repo")).toEqual(refsBefore)
 	})
 
-	// The reaper that sets `packs.dead_at` and the reader-skip + connectivity-
-	// preserving GC are not built yet; pin them when the worker lands.
-	it.todo("getObject/listRefs skip dead_at packs once the repack reaper exists")
-	it.todo("a clone concurrent with a repack returns a consistent object set")
+	// GC in the redesign is a reachability set-difference DELETE with a grace
+	// window (redesign §7), a deferred follow-up; pin these when it lands.
+	it.todo("GC deletes unreachable objects while preserving ref-closure connectivity")
+	it.todo("a clone concurrent with GC returns a consistent object set")
 })

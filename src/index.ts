@@ -1,7 +1,7 @@
 import { gunzipSync } from "node:zlib"
 import { type Context, Hono } from "hono"
 import { cors } from "hono/cors"
-import { runRequest } from "@/instrument"
+import { count, runRequest } from "@/instrument"
 import type { ObjectStore } from "@/object-store"
 import { encodePkt, encodePktLine } from "@/pkt-line"
 import { GitProtocolError } from "@/protocol/errors"
@@ -138,6 +138,10 @@ export function createGitApp(
 	app.post("/:repo/git-upload-pack", async (c) => {
 		const body = await readRequestBody(c)
 		const out = await handleUploadPack(body, backendFor(deps, c.req.param("repo")))
+		// Layer-1 wire size, measured at the boundary where bytes actually leave —
+		// a no-op unless the perf harness activated a collector, so production pays
+		// nothing and the metric survives any restructure of the core.
+		count("wireBytes", out.length)
 		return c.body(toArrayBuffer(out), 200, {
 			"Cache-Control": "no-cache",
 			"Content-Type": "application/x-git-upload-pack-result",
