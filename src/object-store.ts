@@ -1,8 +1,8 @@
-import type { Kysely } from "kysely"
+import { type Kysely, sql } from "kysely"
 import type { Database } from "@/database"
 import { count } from "@/instrument"
-import { computeOid, type GitObjectType, referencedOids } from "@/object"
-import { deriveEdges } from "@/object-edges"
+import { computeOid, type GitObjectType } from "@/object"
+import { deriveEdges, treeBlobOids } from "@/object-edges"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import type { PackInputObject } from "@/pack/write-pack"
@@ -99,26 +99,72 @@ export function createObjectStore(db: Kysely<Database>) {
 		},
 
 		/**
-		 * Connectivity check (spec §10): is every object reachable from `oid` present
+		 * Connectivity check (spec §5.2): is every object reachable from `oid` present
 		 * in this repo? A push whose new tip fails this references an object the pack
-		 * neither carried nor delta-resolved, and must be rejected. App-side walk for
-		 * now (Chunk 3 replaces it with a server-side CTE); each hop is now an O(1)
-		 * point-read.
+		 * neither carried nor delta-resolved, and must be rejected. Three bounded
+		 * queries replace the old O(N) app-side walk:
+		 *
+		 * 1. A recursive CTE walks `git_edge` (kinds 1,2,3,5) for the closure of
+		 *    commits/trees/tags reachable from the tip; the LEFT JOIN reveals which are
+		 *    present + their type (selecting `type` never detoasts content). Any absent
+		 *    closure member ⇒ disconnected.
+		 * 2. Blobs are NOT edges (§4.3), so they cannot be found by the CTE — enumerate
+		 *    them from each present tree's content, mode-aware (skipping gitlinks).
+		 * 3. Anti-join those blobs against `git_object`; any absent ⇒ disconnected.
+		 *
+		 * Full-closure (re-verifies all reachable history each push, matching the old
+		 * walk's scope); the bounded "new objects only" form is a deferred optimization
+		 * (OQ-14). `::bigint`/`::bytea` casts pin types in the raw CTE where Kysely's
+		 * column knowledge doesn't apply.
 		 */
 		async isConnected(repoId: string, oid: string): Promise<boolean> {
-			const seen = new Set<string>()
-			const queue = [oid]
-			while (queue.length > 0) {
-				const cur = queue.pop()
-				if (cur === undefined || seen.has(cur)) continue
-				seen.add(cur)
-				const obj = await store.getObject(repoId, cur)
-				if (!obj) return false
-				for (const ref of referencedOids(obj.type, obj.content)) {
-					if (!seen.has(ref)) queue.push(ref)
-				}
+			const id = await repos.resolveRepoId(repoId)
+			if (id === null) return false
+			const tip = Buffer.from(oid, "hex")
+
+			const closure = await sql<{ oid: Buffer; type: number | null }>`
+				with recursive closure(oid) as (
+					select ${tip}::bytea
+					union
+					select e.child from git_edge e
+						join closure c on e.parent = c.oid
+						where e.repo_id = ${id}::bigint
+				)
+				select c.oid, o.type
+				from closure c
+				left join git_object o on o.repo_id = ${id}::bigint and o.oid = c.oid
+			`.execute(db)
+			if (closure.rows.some((r) => r.type === null)) return false
+
+			const treeOids = closure.rows
+				.filter((r) => r.type === PACK_OBJ_TYPE.TREE)
+				.map((r) => r.oid)
+			if (treeOids.length === 0) return true
+
+			// Kysely's `in` expands the bytea array into individual params (the porsager
+			// driver can't bind a raw `bytea[]`); the same applies to the blob check.
+			const trees = await db
+				.selectFrom("git_object")
+				.select("content")
+				.where("repo_id", "=", id)
+				.where("oid", "in", treeOids)
+				.execute()
+			const blobOids = new Set<string>()
+			for (const t of trees) {
+				for (const blob of treeBlobOids(t.content)) blobOids.add(blob)
 			}
-			return true
+			if (blobOids.size === 0) return true
+
+			const blobBufs = [...blobOids].map((hex) => Buffer.from(hex, "hex"))
+			const present = await db
+				.selectFrom("git_object")
+				.select("oid")
+				.where("repo_id", "=", id)
+				.where("oid", "in", blobBufs)
+				.execute()
+			// PK uniqueness ⇒ a present blob matches exactly one row; all present iff the
+			// counts agree.
+			return present.length === blobOids.size
 		},
 
 		/** Seed objects directly (the differential harness + perf bench path): insert

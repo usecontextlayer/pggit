@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { GitFormatError } from "@/git-format-error"
-import { deriveEdges, EDGE_KIND } from "@/object-edges"
+import { deriveEdges, EDGE_KIND, treeBlobOids } from "@/object-edges"
 
 /** A tree blob: `<mode> <name>\0<20-byte oid>` repeated. */
 function tree(entries: { mode: string; name: string; oid: Buffer }[]): Buffer {
@@ -77,5 +77,32 @@ describe("deriveEdges — the §4.3 standing rule", () => {
 			expect(e).toBeInstanceOf(GitFormatError)
 			expect((e as GitFormatError).code).toBe("malformed-oid")
 		}
+	})
+})
+
+describe("treeBlobOids — blobs from tree content (the standing rule's other half)", () => {
+	it("returns regular/exec/symlink blobs, excluding subtrees and gitlinks", () => {
+		const blob = oid(0x11)
+		const exe = oid(0x22)
+		const link = oid(0x33)
+		const t = tree([
+			{ mode: "40000", name: "dir", oid: oid(0x44) }, // subtree → edge, not a blob
+			{ mode: "100644", name: "a.txt", oid: blob },
+			{ mode: "100755", name: "run.sh", oid: exe },
+			{ mode: "120000", name: "ln", oid: link },
+			{ mode: "160000", name: "submodule", oid: oid(0x55) }, // gitlink → skipped
+		])
+		expect(treeBlobOids(t)).toEqual([
+			blob.toString("hex"),
+			exe.toString("hex"),
+			link.toString("hex"),
+		])
+	})
+
+	it("an empty tree and a subtree-only tree have no blobs", () => {
+		expect(treeBlobOids(Buffer.alloc(0))).toEqual([])
+		expect(treeBlobOids(tree([{ mode: "40000", name: "dir", oid: oid(0x11) }]))).toEqual(
+			[],
+		)
 	})
 })

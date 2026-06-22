@@ -22,6 +22,9 @@ export const EDGE_KIND = {
 
 export type DerivedEdge = { child: string; kind: number }
 
+/** A tree entry pointing at a commit in *another* repo — no blob, no edge here. */
+const GITLINK_MODE = "160000"
+
 const WELL_FORMED_OID = /^[0-9a-f]{40}$/
 
 /**
@@ -80,4 +83,18 @@ export function deriveEdges(type: GitObjectType, content: Buffer): DerivedEdge[]
 				.filter((e) => isTreeEntryMode(e.mode))
 				.map((e) => ({ child: e.oid, kind: EDGE_KIND.TREE_SUBTREE }))
 	}
+}
+
+/**
+ * The blob OIDs directly in a tree — the §4.3 standing rule's other half: blobs
+ * are enumerated from tree content, never stored as edges. A tree entry is a blob
+ * unless it is a subtree (`deriveEdges` covers those as kind-3 edges) or a gitlink
+ * (`160000`, a submodule commit living in another repo — neither blob nor edge).
+ * Connectivity uses this to find the blobs a present tree requires, since no
+ * tree→blob edge exists to anchor a missing one.
+ */
+export function treeBlobOids(content: Buffer): string[] {
+	return treeEntries(content)
+		.filter((e) => !isTreeEntryMode(e.mode) && e.mode !== GITLINK_MODE)
+		.map((e) => e.oid)
 }

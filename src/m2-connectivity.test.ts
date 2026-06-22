@@ -116,4 +116,92 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 			rmSync(src, { force: true, recursive: true })
 		}
 	})
+
+	it("ok's a push with a gitlink (submodule) entry — the submodule commit is not required", async () => {
+		const src = mkdtempSync(join(tmpdir(), "pggit-conn-gitlink-"))
+		try {
+			await spawnGit(["init", "-q"], { cwd: src })
+			writeFileSync(join(src, "a.txt"), "alpha\n")
+			await spawnGit(["add", "."], { cwd: src })
+			// Record a gitlink to a submodule commit that lives in another repo (so it
+			// is absent here) — a `160000` tree entry.
+			await spawnGit(
+				["update-index", "--add", "--cacheinfo", `160000,${"1".repeat(40)},sub`],
+				{ cwd: src },
+			)
+			await spawnGit(["commit", "-q", "-m", "with-submodule"], { cwd: src })
+			const commit = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+
+			// --revs packs the commit, its tree, and a.txt; the gitlink target is not in
+			// this repo, so it is naturally excluded from the pack.
+			const pack = (
+				await spawnGit(["pack-objects", "--stdout", "--revs"], {
+					cwd: src,
+					input: `${commit}\n`,
+				})
+			).stdoutBytes
+			const body = Buffer.concat([
+				encodePktLine(
+					Buffer.from(`${ZERO} ${commit} refs/heads/withsub\0report-status\n`),
+				),
+				encodePkt({ type: "flush" }),
+				pack,
+			])
+			const res = await app.request("/repo-gitlink/git-receive-pack", {
+				body,
+				method: "POST",
+			})
+			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+
+			// A gitlink is not a connectivity requirement (it lives in another repo), so
+			// the push lands despite the submodule commit being absent.
+			expect(report).toContain("unpack ok")
+			expect(report).toContain("ok refs/heads/withsub")
+			expect(await refs.listRefs("repo-gitlink")).toEqual([
+				{ name: "refs/heads/withsub", oid: commit },
+			])
+		} finally {
+			rmSync(src, { force: true, recursive: true })
+		}
+	})
+
+	it("ng's a push of an annotated tag whose target object is omitted", async () => {
+		const src = mkdtempSync(join(tmpdir(), "pggit-conn-tag-"))
+		try {
+			await spawnGit(["init", "-q"], { cwd: src })
+			writeFileSync(join(src, "a.txt"), "alpha\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: src })
+			await spawnGit(["tag", "-a", "v1", "-m", "rel"], { cwd: src })
+			const tagObj = (
+				await spawnGit(["rev-parse", "refs/tags/v1"], { cwd: src })
+			).stdout.trim()
+
+			// Pack ONLY the tag object (no --revs ⇒ no traversal), omitting its target
+			// commit and everything below it.
+			const pack = (
+				await spawnGit(["pack-objects", "--stdout"], {
+					cwd: src,
+					input: `${tagObj}\n`,
+				})
+			).stdoutBytes
+			const body = Buffer.concat([
+				encodePktLine(Buffer.from(`${ZERO} ${tagObj} refs/tags/v1\0report-status\n`)),
+				encodePkt({ type: "flush" }),
+				pack,
+			])
+			const res = await app.request("/repo-tag-missing/git-receive-pack", {
+				body,
+				method: "POST",
+			})
+			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+
+			// Connectivity descends the tag→target edge and finds the target absent.
+			expect(report).toContain("unpack ok")
+			expect(report).toContain("ng refs/tags/v1 missing necessary objects")
+			expect(await refs.listRefs("repo-tag-missing")).toEqual([])
+		} finally {
+			rmSync(src, { force: true, recursive: true })
+		}
+	})
 })
