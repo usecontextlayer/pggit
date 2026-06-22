@@ -26,6 +26,7 @@ export type GitFormatErrorCode =
 	| "delta-target-size-mismatch"
 	// git object content
 	| "malformed-tree"
+	| "malformed-oid"
 	| "missing-tree-header"
 
 export class GitFormatError extends Error {

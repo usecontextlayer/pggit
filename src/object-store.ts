@@ -2,6 +2,7 @@ import type { Kysely } from "kysely"
 import type { Database } from "@/database"
 import { count } from "@/instrument"
 import { computeOid, type GitObjectType, referencedOids } from "@/object"
+import { deriveEdges } from "@/object-edges"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import type { PackInputObject } from "@/pack/write-pack"
@@ -132,32 +133,54 @@ export function createObjectStore(db: Kysely<Database>) {
 		},
 	}
 
-	/** Insert objects as rows, idempotent (re-sent objects are skipped). Returns
-	 * every object's hex OID, in input order. */
+	/** Insert objects as rows + their derived edges, idempotent (re-sent objects are
+	 * skipped). Each object row and its complete edge set go in ONE transaction from
+	 * ONE derivation (§10.1) — so no object ever exists without its edges. Edge
+	 * derivation validates at the boundary and throws on malformed content (§5.1),
+	 * aborting the ingest before any row lands. Returns every object's hex OID, in
+	 * input order. */
 	async function insertObjects(
 		id: Awaited<ReturnType<typeof repos.ensureRepoId>>,
 		objects: PackInputObject[],
 	): Promise<string[]> {
 		const entries = objects.map((obj) => {
 			const hex = computeOid(obj.type, obj.content)
+			const oid = Buffer.from(hex, "hex")
 			return {
+				edges: deriveEdges(obj.type, obj.content).map((e) => ({
+					child: Buffer.from(e.child, "hex"),
+					kind: e.kind,
+					parent: oid,
+					repo_id: id,
+				})),
 				hex,
 				row: {
 					content: obj.content,
-					oid: Buffer.from(hex, "hex"),
+					oid,
 					repo_id: id,
 					size: obj.content.length,
 					type: TYPE_TO_CODE[obj.type],
 				},
 			}
 		})
-		if (entries.length > 0) {
-			await db
+		if (entries.length === 0) return []
+
+		const objectRows = entries.map((e) => e.row)
+		const edgeRows = entries.flatMap((e) => e.edges)
+		await db.transaction().execute(async (trx) => {
+			await trx
 				.insertInto("git_object")
-				.values(entries.map((e) => e.row))
+				.values(objectRows)
 				.onConflict((oc) => oc.doNothing())
 				.execute()
-		}
+			if (edgeRows.length > 0) {
+				await trx
+					.insertInto("git_edge")
+					.values(edgeRows)
+					.onConflict((oc) => oc.doNothing())
+					.execute()
+			}
+		})
 		return entries.map((e) => e.hex)
 	}
 
