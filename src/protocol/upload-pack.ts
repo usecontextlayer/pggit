@@ -1,7 +1,5 @@
-import { graphWalk } from "@/graph-walk"
-import { count, label, withPhase } from "@/instrument"
-import { commitParents, type GitObjectType, referencedOids } from "@/object"
-import { type PackInputObject, writePack } from "@/pack/write-pack"
+import { label, withPhase } from "@/instrument"
+import { type GitObjectType, referencedOids } from "@/object"
 import { GitProtocolError } from "@/protocol/errors"
 import {
 	assertSupportedObjectFormat,
@@ -17,17 +15,23 @@ import {
 
 export type BackendObject = { type: GitObjectType; content: Buffer }
 
-/** Everything the upload-pack service needs from a single repo's storage. */
+/**
+ * Everything the upload-pack service needs from a single repo's storage. The graph
+ * logic lives in the store now (set-based SQL over the row+edge model), so this is
+ * a thin set-oriented interface — not the object-at-a-time walk interface of the
+ * old app-side enumeration. `getObject` survives only for `ls-refs` tag peeling,
+ * and goes when `peeled_oid` lands (Chunk 5).
+ */
 export type RepoBackend = {
 	listRefs: () => Promise<{ name: string; oid: string }[]>
 	getSymref: (name: string) => Promise<string | null>
 	getObject: (oid: string) => Promise<BackendObject | null>
-}
-
-async function readOrThrow(backend: RepoBackend, oid: string): Promise<BackendObject> {
-	const obj = await backend.getObject(oid)
-	if (!obj) throw new Error(`upload-pack: object ${oid} not found`)
-	return obj
+	/** The subset of `haves` the repo has — the negotiation common set. */
+	commonHaves: (haves: string[]) => Promise<string[]>
+	/** git's ok_to_give_up: does every want reach a common have by ancestry? */
+	readyToGiveUp: (wants: string[], common: string[]) => Promise<boolean>
+	/** The served pack: want-closure minus have-closure, plus the explicit wants. */
+	buildPack: (wants: string[], haves: string[], omitBlobs: boolean) => Promise<Buffer>
 }
 
 /** Follow a tag chain to its non-tag target; undefined if `oid` is not a tag. */
@@ -99,114 +103,28 @@ function filterOmitsBlobs(filter: string | undefined): boolean {
 	throw new GitProtocolError(`upload-pack: unsupported filter ${JSON.stringify(filter)}`)
 }
 
-/** The subset of `haves` the server actually has — the common negotiation set. */
-async function commonHaves(haves: string[], backend: RepoBackend): Promise<string[]> {
-	const common: string[] = []
-	for (const h of haves) {
-		if (await backend.getObject(h)) common.push(h)
-	}
-	return common
-}
-
-/** Whether `start` reaches any common commit by ancestor walk (commit/tag links). */
-async function reachesCommon(
-	start: string,
-	common: Set<string>,
-	backend: RepoBackend,
-): Promise<boolean> {
-	const seen = new Set<string>()
-	const queue = [start]
-	while (queue.length > 0) {
-		const oid = queue.pop()
-		if (oid === undefined || seen.has(oid)) continue
-		seen.add(oid)
-		if (common.has(oid)) return true
-		const obj = await readOrThrow(backend, oid)
-		if (obj.type === "tag") queue.push(...referencedOids("tag", obj.content))
-		else if (obj.type === "commit") queue.push(...commitParents(obj.content))
-	}
-	return false
-}
-
-/**
- * git's `ok_to_give_up`: ready once every want reaches a common have by ancestry
- * — the haves form a cut below all wants, so the delta is well-defined.
- */
-async function readyToGiveUp(
-	wants: string[],
-	common: string[],
-	backend: RepoBackend,
-): Promise<boolean> {
-	if (common.length === 0) return false
-	const commonSet = new Set(common)
-	for (const want of wants) {
-		if (!(await reachesCommon(want, commonSet, backend))) return false
-	}
-	return true
-}
-
-/**
- * Build the delta pack: the want-closure minus the have-closure. Explicitly-
- * wanted OIDs are roots and always included, even when the have-closure covers
- * them — a promisor lazy-fetch wants a blob reachable from a tree it has but is
- * itself missing (partial clone), so it must not be subtracted.
- */
-async function buildDeltaPack(
-	wants: string[],
-	common: string[],
-	omitBlobs: boolean,
-	backend: RepoBackend,
-): Promise<Buffer> {
-	const read = (oid: string) => readOrThrow(backend, oid)
-	const { wantClosure, haveClosure } = await withPhase("graph-walk", async () => {
-		const wantClosure = await graphWalk(wants, read, { omitBlobs })
-		const haveClosure =
-			common.length > 0 ? await graphWalk(common, read, { omitBlobs }) : new Set<string>()
-		return { haveClosure, wantClosure }
-	})
-
-	const wantsSet = new Set(wants)
-	const objects = await withPhase("read-objects", async () => {
-		const objs: PackInputObject[] = []
-		for (const oid of wantClosure) {
-			if (haveClosure.has(oid) && !wantsSet.has(oid)) continue
-			const obj = await read(oid)
-			objs.push({ content: obj.content, type: obj.type })
-		}
-		return objs
-	})
-
-	const pack = await withPhase("write-pack", async () => writePack(objects))
-	count("objectsServed", objects.length)
-	count("packBytes", pack.length)
-	return pack
-}
-
 async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer> {
 	label("fetch")
 	const { wants, haves, done, filter } = parseFetch(req)
 	// A zero-want fetch is NOT an error: git's upload-pack treats it as a no-op
-	// ("they didn't want anything", upload-pack.c) and returns an empty pack. We
-	// match the oracle and let it fall through rather than rejecting.
+	// (upload-pack.c) and returns an empty pack — buildPack produces one, so we let
+	// it fall through rather than rejecting.
 	const omitBlobs = filterOmitsBlobs(filter)
-	const common = await commonHaves(haves, backend)
+	const common = await backend.commonHaves(haves)
 
 	if (!done) {
-		// Negotiation round (spec §4 shape b). Until the haves cut every want we
+		// Negotiation round (spec §4 shape b): until the haves cut every want we
 		// ACK/NAK and flush, no pack — the client sends more haves. Once ready, git
 		// requires the pack in this same response, after the `ready` line.
-		if (!(await readyToGiveUp(wants, common, backend))) {
+		if (!(await backend.readyToGiveUp(wants, common))) {
 			return encodeAcknowledgments(common, false)
 		}
-		return encodeReadyWithPack(
-			common,
-			await buildDeltaPack(wants, common, omitBlobs, backend),
-		)
+		return encodeReadyWithPack(common, await backend.buildPack(wants, common, omitBlobs))
 	}
 
-	// `done` (spec §4 shapes a/c): pack the delta directly. A clone has no haves,
-	// so the subtrahend is empty and we pack the whole want-closure.
-	return encodePackfileResponse(await buildDeltaPack(wants, common, omitBlobs, backend))
+	// `done` (spec §4 shapes a/c): pack the delta directly. A clone has no haves, so
+	// the subtrahend is empty and we pack the whole want-closure.
+	return encodePackfileResponse(await backend.buildPack(wants, common, omitBlobs))
 }
 
 /** Dispatch a v2 upload-pack POST body to ls-refs or fetch. */

@@ -31,9 +31,12 @@ function receiveBody(lines: string[]): Buffer {
  * "no side effect" is structural; we assert the observable contract — an
  * unsupported command rejects with GitProtocolError — not internal call ordering.) */
 const stubBackend: RepoBackend = {
+	buildPack: async () => Buffer.alloc(0),
+	commonHaves: async () => [],
 	getObject: async () => null,
 	getSymref: async () => null,
 	listRefs: async () => [],
+	readyToGiveUp: async () => false,
 }
 
 describe("parseFetch — keeps valid args, ignores unknown ones", () => {

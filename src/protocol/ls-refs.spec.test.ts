@@ -18,9 +18,12 @@ const V1 = "c".repeat(40)
 /** A minimal in-memory ls-refs backend: a ref list + an optional HEAD symref. */
 function backend(refs: { name: string; oid: string }[], head?: string): RepoBackend {
 	return {
+		buildPack: async () => Buffer.alloc(0),
+		commonHaves: async () => [],
 		getObject: async () => null,
 		getSymref: async (name) => (name === "HEAD" && head ? head : null),
 		listRefs: async () => refs,
+		readyToGiveUp: async () => false,
 	}
 }
 

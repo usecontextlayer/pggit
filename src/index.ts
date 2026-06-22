@@ -58,9 +58,13 @@ async function readRequestBody(c: Context): Promise<Buffer> {
 
 function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	return {
+		buildPack: (wants, haves, omitBlobs) =>
+			deps.objects.buildPack(repoId, wants, haves, omitBlobs),
+		commonHaves: (haves) => deps.objects.commonHaves(repoId, haves),
 		getObject: (oid) => deps.objects.getObject(repoId, oid),
 		getSymref: (name) => deps.refs.getSymref(repoId, name),
 		listRefs: () => deps.refs.listRefs(repoId),
+		readyToGiveUp: (wants, common) => deps.objects.readyToGiveUp(repoId, wants, common),
 	}
 }
 

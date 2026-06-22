@@ -6,6 +6,7 @@
  * we match the oracle (empty pack) rather than rejecting.
  */
 import { describe, expect, it } from "vitest"
+import { writePack } from "@/pack/write-pack"
 import { encodePkt, encodePktLine } from "@/pkt-line"
 import { GitProtocolError } from "@/protocol/errors"
 import { handleReceivePack, type ReceiveBackend } from "@/protocol/receive-pack"
@@ -17,9 +18,12 @@ const Z = "0".repeat(40)
 
 /** A benign read-only upload backend (no mutating methods to guard). */
 const stubUpload: RepoBackend = {
+	buildPack: async () => writePack([]),
+	commonHaves: async () => [],
 	getObject: async () => null,
 	getSymref: async () => null,
 	listRefs: async () => [],
+	readyToGiveUp: async () => false,
 }
 
 /** A receive backend that records whether its MUTATING methods ran, so the test
@@ -78,9 +82,12 @@ describe("fetch with zero wants is a no-op (matches git's oracle)", () => {
 		// "they didn't want anything") and returns an empty pack — pggit must NOT
 		// diverge from the oracle by rejecting it.
 		const backend: RepoBackend = {
+			buildPack: async () => writePack([]),
+			commonHaves: async () => [],
 			getObject: async () => null,
 			getSymref: async () => null,
 			listRefs: async () => [],
+			readyToGiveUp: async () => false,
 		}
 		const body = Buffer.concat([
 			encodePktLine(Buffer.from("command=fetch\n")),

@@ -1,5 +1,10 @@
-import type { ObjectReader } from "@/graph-walk"
-import { commitTreeOid, isTreeEntryMode, treeEntries } from "@/object"
+import { commitTreeOid, type GitObjectType, isTreeEntryMode, treeEntries } from "@/object"
+
+/** Reads a stored object's type + content by OID — the snapshot builder's view of
+ * the object store (formerly shared with the now-deleted app-side graph walk). */
+export type ObjectReader = (
+	oid: string,
+) => Promise<{ type: GitObjectType; content: Buffer }>
 
 export type FileEntry = { path: string; mode: string; blobOid: string }
 export type BlobEntry = { oid: string; content: Buffer }
