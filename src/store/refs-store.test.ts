@@ -1,6 +1,6 @@
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { createRefStore, type RefStore } from "@/refs-store"
+import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
 
 const A = "a".repeat(40)

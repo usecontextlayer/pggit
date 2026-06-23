@@ -28,23 +28,23 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
+import { encodePktLine } from "@/protocol/pkt-line"
 import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const ZERO = "0".repeat(40)
 
-function pkt(line: string): Buffer {
-	const payload = Buffer.from(line, "utf8")
-	const len = payload.length + 4
-	return Buffer.concat([Buffer.from(len.toString(16).padStart(4, "0")), payload])
-}
-
 function receiveBody(commands: string[], pack: Buffer): Buffer {
 	const lines = commands.map((c, i) =>
-		pkt(i === 0 ? `${c}\0report-status object-format=sha1\n` : `${c}\n`),
+		encodePktLine(
+			Buffer.from(
+				i === 0 ? `${c}\0report-status object-format=sha1\n` : `${c}\n`,
+				"utf8",
+			),
+		),
 	)
 	return Buffer.concat([...lines, Buffer.from("0000"), pack])
 }

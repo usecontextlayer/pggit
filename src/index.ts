@@ -2,9 +2,8 @@ import { gunzipSync } from "node:zlib"
 import { type Context, Hono } from "hono"
 import { cors } from "hono/cors"
 import { count, runRequest } from "@/instrument"
-import type { ObjectStore } from "@/object-store"
-import { encodePkt, encodePktLine } from "@/pkt-line"
 import { GitProtocolError } from "@/protocol/errors"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import {
 	encodeReceivePackAdvertisement,
 	handleReceivePack,
@@ -12,9 +11,10 @@ import {
 } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { encodeAdvertisement } from "@/protocol/v2"
-import type { RefStore } from "@/refs-store"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import type { SnapshotStore } from "@/repo-view/snapshot-store"
+import type { ObjectStore } from "@/store/object-store"
+import type { RefStore } from "@/store/refs-store"
 
 export type GitAppDeps = {
 	objects: ObjectStore

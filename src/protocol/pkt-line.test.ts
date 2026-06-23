@@ -6,7 +6,7 @@ import {
 	encodePktLine,
 	type Pkt,
 	WRITER_MAX_PAYLOAD,
-} from "@/pkt-line"
+} from "@/protocol/pkt-line"
 
 const arbPkt: fc.Arbitrary<Pkt> = fc.oneof(
 	// Payload sizes 0..2000 span the empty (0004) and DEFAULT_PACKET_MAX (1000) edges.

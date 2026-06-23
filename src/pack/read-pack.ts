@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
 import { createInflate } from "node:zlib"
-import { GitFormatError } from "@/git-format-error"
 import { count } from "@/instrument"
-import { computeOid, type GitObjectType } from "@/object"
+import { GitFormatError } from "@/object/format-error"
+import { computeOid, type GitObjectType } from "@/object/object"
 import { applyDelta } from "@/pack/delta"
 import { decodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 

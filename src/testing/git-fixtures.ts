@@ -1,7 +1,9 @@
-import type { GitObjectType } from "@/object"
-import type { ObjectStore } from "@/object-store"
+import { readdirSync } from "node:fs"
+import { join } from "node:path"
+import type { GitObjectType } from "@/object/object"
 import type { PackInputObject } from "@/pack/write-pack"
-import type { RefStore } from "@/refs-store"
+import type { ObjectStore } from "@/store/object-store"
+import type { RefStore } from "@/store/refs-store"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** Every object in a real repo, as pack inputs (content read binary-safe). */
@@ -89,4 +91,47 @@ export async function seedRepoIntoStore(
 	}
 	const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: srcDir })).stdout.trim()
 	await stores.refs.setSymref(repoId, "HEAD", head)
+}
+
+export const PACK_DIR = ".git/objects/pack"
+
+/** The `.pack` filenames in a real repo's pack dir. */
+export function packFiles(dir: string): string[] {
+	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
+}
+
+/** The OIDs inside one pack, per `git verify-pack -v` (the bytes git received). */
+export async function packObjectOids(dir: string, packFile: string): Promise<string[]> {
+	const idx = join(dir, PACK_DIR, packFile.replace(/\.pack$/, ".idx"))
+	const out = await spawnGit(["verify-pack", "-v", idx], { cwd: dir })
+	const oids: string[] = []
+	for (const line of out.stdout.split("\n")) {
+		const m = line.match(/^([0-9a-f]{40}) (commit|tree|blob|tag) /)
+		if (m?.[1]) oids.push(m[1])
+	}
+	return oids.sort()
+}
+
+/** Every object in a real repo as `{oid, type}` (one `cat-file --batch-all-objects`
+ * scan). */
+export async function objectsByType(
+	dir: string,
+): Promise<{ oid: string; type: GitObjectType }[]> {
+	const list = await spawnGit(
+		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+		{ cwd: dir },
+	)
+	const out: { oid: string; type: GitObjectType }[] = []
+	for (const line of list.stdout.trim().split("\n")) {
+		const [oid, type] = line.split(" ")
+		if (oid && type) out.push({ oid, type: type as GitObjectType })
+	}
+	return out
+}
+
+/** A deterministic 400-line repo-content fixture; `changedLine` replaces line 200. */
+export function bigFile(changedLine: string): string {
+	const lines = Array.from({ length: 400 }, (_, i) => `line ${i}`)
+	lines[200] = changedLine
+	return `${lines.join("\n")}\n`
 }

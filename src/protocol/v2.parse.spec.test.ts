@@ -9,8 +9,8 @@
  * dropped (which would apply a partial command set with no diagnostic).
  */
 import { describe, expect, it } from "vitest"
-import { encodePkt, encodePktLine } from "@/pkt-line"
 import { GitProtocolError } from "@/protocol/errors"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { parseReceivePack } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { parseFetch, parseV2Request } from "@/protocol/v2"

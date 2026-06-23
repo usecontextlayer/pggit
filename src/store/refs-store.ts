@@ -3,9 +3,9 @@ import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
 import type { GitRefName } from "@/database/models/public/GitRef"
 import type { ReposId } from "@/database/models/public/Repos"
-import { EDGE_KIND } from "@/object-edges"
+import { EDGE_KIND } from "@/object/edges"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
-import { createRepoResolver } from "@/repo-store"
+import { createRepoResolver } from "@/store/repo-resolver"
 
 export type RefRow = { name: string; oid: string; peeled?: string }
 

@@ -20,9 +20,9 @@ import {
 	repoCommands,
 } from "@/generative/commands"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { allObjectOids, refsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"

@@ -1,9 +1,9 @@
 import postgres from "postgres"
 import { describe, expect, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { encodePkt, encodePktLine } from "@/pkt-line"
-import { createRefStore } from "@/refs-store"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 
 // A client that is never queried by /health, so no real Postgres is needed.

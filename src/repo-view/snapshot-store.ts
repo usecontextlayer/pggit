@@ -2,8 +2,8 @@ import { sql } from "kysely"
 import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
 import { type CopyValue, copyInsert } from "@/database/copy-insert"
-import { createRepoResolver } from "@/repo-store"
 import type { FileList } from "@/repo-view/build-file-list"
+import { createRepoResolver } from "@/store/repo-resolver"
 
 export type SnapshotFile = { path: string; mode: string; blobOid: string }
 export type SnapshotFileContent = { path: string; mode: string; content: Buffer }

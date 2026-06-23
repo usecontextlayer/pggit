@@ -1,4 +1,4 @@
-import { GitFormatError } from "@/git-format-error"
+import { GitFormatError } from "@/object/format-error"
 import {
 	commitParents,
 	commitTreeOid,
@@ -6,7 +6,7 @@ import {
 	isTreeEntryMode,
 	referencedOids,
 	treeEntries,
-} from "@/object"
+} from "@/object/object"
 
 /**
  * Edge kinds stored in `git_edge.kind`. tree→blob (would be `4`) is deliberately

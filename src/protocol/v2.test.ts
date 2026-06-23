@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { decodePktStream, encodePkt, encodePktLine, type Pkt } from "@/pkt-line"
+import { decodePktStream, encodePkt, encodePktLine, type Pkt } from "@/protocol/pkt-line"
 import {
 	encodeAdvertisement,
 	encodeLsRefsResponse,

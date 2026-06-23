@@ -11,27 +11,16 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { computeOid } from "@/object"
-import { createObjectStore } from "@/object-store"
+import { computeOid } from "@/object/object"
 import { readPack } from "@/pack/read-pack"
-import { encodePkt, encodePktLine } from "@/pkt-line"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
-import { createRefStore } from "@/refs-store"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
-
-function fetchBody(wants: string[], includeTag: boolean): Buffer {
-	return Buffer.concat([
-		encodePktLine(Buffer.from("command=fetch\n")),
-		encodePkt({ type: "delim" }),
-		...wants.map((w) => encodePktLine(Buffer.from(`want ${w}\n`))),
-		...(includeTag ? [encodePktLine(Buffer.from("include-tag\n"))] : []),
-		encodePktLine(Buffer.from("done\n")),
-		encodePkt({ type: "flush" }),
-	])
-}
+import { fetchRequest } from "@/testing/wire-fetch"
 
 describe("include-tag augmentation", () => {
 	let container: StartedPostgreSqlContainer
@@ -85,14 +74,24 @@ describe("include-tag augmentation", () => {
 	}
 
 	it("includes an annotated tag whose peeled target is served, but not one pointing outside it", async () => {
-		const oids = await servedOids(await handleUploadPack(fetchBody([c1], true), backend))
+		const oids = await servedOids(
+			await handleUploadPack(
+				fetchRequest({ done: true, includeTag: true, wants: [c1] }),
+				backend,
+			),
+		)
 		expect(oids.has(c1)).toBe(true)
 		expect(oids.has(av)).toBe(true) // av → c1 (served) ⇒ included
 		expect(oids.has(av2)).toBe(false) // av2 → c2 (not served) ⇒ excluded
 	})
 
 	it("includes no tag when the client did not request include-tag", async () => {
-		const oids = await servedOids(await handleUploadPack(fetchBody([c1], false), backend))
+		const oids = await servedOids(
+			await handleUploadPack(
+				fetchRequest({ done: true, includeTag: false, wants: [c1] }),
+				backend,
+			),
+		)
 		expect(oids.has(c1)).toBe(true)
 		expect(oids.has(av)).toBe(false)
 		expect(oids.has(av2)).toBe(false)

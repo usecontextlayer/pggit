@@ -1,8 +1,8 @@
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { computeOid } from "@/object"
-import { createObjectStore } from "@/object-store"
+import { computeOid } from "@/object/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
+import { createObjectStore } from "@/store/object-store"
 import { createIsolatedSchema, startPostgres } from "@/testing/pg"
 
 describe("object store", () => {

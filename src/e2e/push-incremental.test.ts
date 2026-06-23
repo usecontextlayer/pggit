@@ -4,19 +4,13 @@ import { join } from "node:path"
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore, type ObjectStore } from "@/object-store"
-import { createRefStore, type RefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { createObjectStore, type ObjectStore } from "@/store/object-store"
+import { createRefStore, type RefStore } from "@/store/refs-store"
+import { allObjectOids, bigFile } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema, startPostgres } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-function bigFile(changedLine: string): string {
-	const lines = Array.from({ length: 400 }, (_, i) => `line ${i}`)
-	lines[200] = changedLine
-	return `${lines.join("\n")}\n`
-}
 
 describe("M2 — incremental push: CAS update of an existing ref (real git)", () => {
 	let container: StartedPostgreSqlContainer

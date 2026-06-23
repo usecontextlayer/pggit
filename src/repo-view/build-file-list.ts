@@ -1,4 +1,9 @@
-import { commitTreeOid, type GitObjectType, isTreeEntryMode, treeEntries } from "@/object"
+import {
+	commitTreeOid,
+	type GitObjectType,
+	isTreeEntryMode,
+	treeEntries,
+} from "@/object/object"
 
 /** Reads a stored object's type + content by OID — the snapshot builder's view of
  * the object store. */

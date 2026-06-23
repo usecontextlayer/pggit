@@ -7,8 +7,8 @@
  */
 import { describe, expect, it } from "vitest"
 import { writePack } from "@/pack/write-pack"
-import { encodePkt, encodePktLine } from "@/pkt-line"
 import { GitProtocolError } from "@/protocol/errors"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { handleReceivePack, type ReceiveBackend } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { sidebandDemux } from "@/testing/pkt-oracle"

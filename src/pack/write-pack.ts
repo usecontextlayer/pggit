@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { deflateSync } from "node:zlib"
 import { count } from "@/instrument"
-import type { GitObjectType } from "@/object"
+import type { GitObjectType } from "@/object/object"
 import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/object-header"
 
 export type PackInputObject = {

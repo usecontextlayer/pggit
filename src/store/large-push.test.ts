@@ -9,7 +9,7 @@
  */
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { createObjectStore, type ObjectStore } from "@/object-store"
+import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
 
 describe("M2 — large push exceeding the bind-parameter ceiling", () => {

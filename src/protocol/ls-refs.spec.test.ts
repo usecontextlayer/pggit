@@ -7,7 +7,7 @@
  * `unborn` and `symrefs` args, exactly as git does).
  */
 import { describe, expect, it } from "vitest"
-import { encodePkt, encodePktLine } from "@/pkt-line"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 

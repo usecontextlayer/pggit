@@ -4,27 +4,13 @@ import { join } from "node:path"
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
+import { allObjectOids, objectsByType, seedRepoIntoStore } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema, startPostgres } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-/** Every object OID in `dir`, split by inflated type. */
-async function objectsByType(dir: string): Promise<{ oid: string; type: string }[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-		{ cwd: dir },
-	)
-	const out: { oid: string; type: string }[] = []
-	for (const line of list.stdout.trim().split("\n")) {
-		const [oid, type] = line.split(" ")
-		if (oid && type) out.push({ oid, type })
-	}
-	return out
-}
 
 describe("M1 — blobless partial clone (real git)", () => {
 	let container: StartedPostgreSqlContainer

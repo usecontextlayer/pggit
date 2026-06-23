@@ -12,9 +12,9 @@
  * importing AGENT from the handler — it is an external input, not the spec.
  */
 import { describe, expect, it } from "vitest"
-import { decodePktStream } from "@/pkt-line"
+import { AGENT } from "@/protocol/capabilities"
+import { decodePktStream } from "@/protocol/pkt-line"
 import {
-	AGENT,
 	encodeAcknowledgments,
 	encodeAdvertisement,
 	encodeLsRefsResponse,

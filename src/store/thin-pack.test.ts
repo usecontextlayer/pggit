@@ -3,17 +3,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { createObjectStore, type ObjectStore } from "@/object-store"
-import { allObjectOids, loadAllObjects } from "@/testing/git-fixtures"
+import { createObjectStore, type ObjectStore } from "@/store/object-store"
+import { allObjectOids, bigFile, loadAllObjects } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema, startPostgres } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-function bigFile(changedLine: string): string {
-	const lines = Array.from({ length: 400 }, (_, i) => `line ${i}`)
-	lines[200] = changedLine
-	return `${lines.join("\n")}\n`
-}
 
 describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () => {
 	let container: StartedPostgreSqlContainer

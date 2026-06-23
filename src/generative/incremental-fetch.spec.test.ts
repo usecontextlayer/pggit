@@ -10,7 +10,7 @@
  * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
  * A failure is a real negotiation bug.
  */
-import { mkdtempSync, readdirSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
@@ -21,30 +21,17 @@ import {
 	repoCommands,
 } from "@/generative/commands"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
+import {
+	allObjectOids,
+	packFiles,
+	packObjectOids,
+	seedRepoIntoStore,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-const PACK_DIR = ".git/objects/pack"
-
-function packFiles(dir: string): string[] {
-	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
-}
-
-/** The OIDs inside one pack, per `git verify-pack -v` — the bytes git received. */
-async function packObjectOids(dir: string, packFile: string): Promise<string[]> {
-	const idx = join(dir, PACK_DIR, packFile.replace(/\.pack$/, ".idx"))
-	const out = await spawnGit(["verify-pack", "-v", idx], { cwd: dir })
-	const oids: string[] = []
-	for (const line of out.stdout.split("\n")) {
-		const m = line.match(/^([0-9a-f]{40}) (commit|tree|blob|tag) /)
-		if (m?.[1]) oids.push(m[1])
-	}
-	return oids.sort()
-}
 
 describe("§8.4 generative — incremental fetch (M1) differential", () => {
 	it("transfers exactly the post-clone delta (have-closure subtracted)", async () => {

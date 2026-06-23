@@ -1,11 +1,9 @@
-import { decodePktStream, encodePkt, encodePktLine } from "@/pkt-line"
+import { AGENT, assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
-import { AGENT, assertSupportedObjectFormat } from "@/protocol/v2"
+import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"
+import { encodeSideband, SIDEBAND_DATA } from "@/protocol/sideband"
 
 const ZERO_OID = "0".repeat(40)
-const SIDEBAND_DATA = 0x01
-// band byte + report data must fit the pkt-line writer cap (65515).
-const MAX_BAND_DATA = 65514
 
 /** A ref name longer than this (bytes) is rejected at the boundary: `git_ref`'s PK is
  * a btree on (repo_id, name) whose index entry overflows past ~2704 bytes, which
@@ -115,14 +113,10 @@ export function encodeReportStatus(
 	lines.push(encodePkt({ type: "flush" }))
 	const report = Buffer.concat(lines)
 	if (!useSideband) return report
-
-	const parts: Buffer[] = []
-	for (let i = 0; i < report.length; i += MAX_BAND_DATA) {
-		const chunk = report.subarray(i, i + MAX_BAND_DATA)
-		parts.push(encodePktLine(Buffer.concat([Buffer.from([SIDEBAND_DATA]), chunk])))
-	}
-	parts.push(encodePkt({ type: "flush" }))
-	return Buffer.concat(parts)
+	return Buffer.concat([
+		encodeSideband(SIDEBAND_DATA, report),
+		encodePkt({ type: "flush" }),
+	])
 }
 
 /** Everything receive-pack needs from a single repo's storage. */

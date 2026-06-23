@@ -14,27 +14,12 @@ import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
 import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
+import { allObjectOids, objectsByType, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-/** Non-blob object OIDs (commits + trees + tags) of a repo, sorted. */
-async function nonBlobOids(dir: string): Promise<string[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-		{ cwd: dir },
-	)
-	return list.stdout
-		.trim()
-		.split("\n")
-		.map((line) => line.split(" "))
-		.filter(([oid, type]) => oid && type && type !== "blob")
-		.map(([oid]) => oid as string)
-		.sort()
-}
 
 describe("§8.4 generative — blobless partial clone (M1) differential", () => {
 	it("transfers exactly the non-blob closure, then lazily faults HEAD's blobs", async () => {
@@ -69,7 +54,12 @@ describe("§8.4 generative — blobless partial clone (M1) differential", () => 
 						await spawnGit(["fsck"], { cwd: dest }) // promisor-aware
 
 						// The blobless pack carried exactly the commits + trees + tags.
-						expect(await allObjectOids(dest)).toEqual(await nonBlobOids(src))
+						expect(await allObjectOids(dest)).toEqual(
+							(await objectsByType(src))
+								.filter((o) => o.type !== "blob")
+								.map((o) => o.oid)
+								.sort(),
+						)
 
 						// Checking out HEAD's branch must lazily fault its blobs back from
 						// us — `checkout` throws if any needed blob can't be served.

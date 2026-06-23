@@ -4,7 +4,7 @@ import { Command } from "commander"
 import type { Kysely } from "kysely"
 import postgres from "postgres"
 import { createMigrator, migrateToLatest } from "./src/database/migrate"
-import { initKysely } from "./src/postgres"
+import { initKysely } from "./src/database/postgres"
 
 // Schema/codegen ops CLI, mirroring web/manage.ts. One difference: `codegen`
 // here is testcontainer-driven (boots a throwaway Postgres, migrates it, points

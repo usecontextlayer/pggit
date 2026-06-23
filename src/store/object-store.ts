@@ -5,8 +5,8 @@ import { type Database, initKysely } from "@/database"
 import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
 import { count, withPhase } from "@/instrument"
-import { computeOid, type GitObjectType } from "@/object"
-import { deriveEdges, EDGE_KIND, treeBlobOids, validateObject } from "@/object-edges"
+import { deriveEdges, EDGE_KIND, validateObject } from "@/object/edges"
+import { computeOid, type GitObjectType } from "@/object/object"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import {
@@ -16,7 +16,8 @@ import {
 	writePack,
 } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
-import { createRepoResolver } from "@/repo-store"
+import { ancestryReachesCommon, reachableClosure } from "@/store/reachability"
+import { createRepoResolver } from "@/store/repo-resolver"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */
 const PACK_BATCH = 1000
@@ -105,7 +106,7 @@ export function createObjectStore(pg: Sql) {
 			if (id === null || wants.length === 0) return writePack([])
 
 			const served = await withPhase("closure", async () => {
-				const want = await reachableClosure(id, wants, omitBlobs)
+				const want = await reachableClosure(db, id, wants, omitBlobs)
 				// A want whose closure is incomplete cannot be served (git rejects it
 				// too) — fail loud rather than ship a short pack. The have side may be
 				// incomplete (we just don't subtract what we lack), so only wants matter.
@@ -114,7 +115,7 @@ export function createObjectStore(pg: Sql) {
 				}
 				const have =
 					haves.length > 0
-						? await reachableClosure(id, haves, omitBlobs)
+						? await reachableClosure(db, id, haves, omitBlobs)
 						: { missing: new Set<string>(), present: new Set<string>() }
 				const set = new Set<string>()
 				for (const o of want.present) if (!have.present.has(o)) set.add(o)
@@ -255,7 +256,7 @@ export function createObjectStore(pg: Sql) {
 		async isConnected(repoId: string, oid: string): Promise<boolean> {
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
-			const { missing } = await reachableClosure(id, [oid], false)
+			const { missing } = await reachableClosure(db, id, [oid], false)
 			return missing.size === 0
 		},
 
@@ -286,7 +287,7 @@ export function createObjectStore(pg: Sql) {
 			if (id === null) return false
 			const commonBufs = common.map((h) => Buffer.from(h, "hex"))
 			for (const want of wants) {
-				if (!(await ancestryReachesCommon(id, want, commonBufs))) return false
+				if (!(await ancestryReachesCommon(db, id, want, commonBufs))) return false
 			}
 			return true
 		},
@@ -379,109 +380,6 @@ export function createObjectStore(pg: Sql) {
 			parts.push(row.chunk)
 		}
 		return Buffer.concat(parts)
-	}
-
-	/**
-	 * The objects reachable from `roots` over the stored DAG — the ONE reachability
-	 * engine shared by connectivity, clone, and incremental fetch (so they can never
-	 * disagree). A recursive CTE walks `git_edge` (all stored kinds 1,2,3,5) for the
-	 * commit/tree/tag closure; the LEFT JOIN marks which are present. Blobs are not
-	 * edges (§4.3), so unless `omitBlobs` they are enumerated from each present tree's
-	 * content (mode-aware) and their presence checked. Returns the reachable set
-	 * partitioned into present / missing. `::bigint`/`::bytea` casts and the
-	 * `VALUES (…::bytea)` seed pin types in the raw CTE (the porsager driver can't
-	 * bind a raw `bytea[]`, OQ-13); array lookups use Kysely's `in`-expansion.
-	 */
-	async function reachableClosure(
-		id: ReposId,
-		roots: string[],
-		omitBlobs: boolean,
-	): Promise<{ present: Set<string>; missing: Set<string> }> {
-		const present = new Set<string>()
-		const missing = new Set<string>()
-		if (roots.length === 0) return { missing, present }
-
-		const seed = sql.join(roots.map((r) => sql`(${Buffer.from(r, "hex")}::bytea)`))
-		const closure = await sql<{ oid: Buffer; type: number | null }>`
-			with recursive closure(oid) as (
-				select oid from (values ${seed}) as roots(oid)
-				union
-				select e.child from git_edge e
-					join closure c on e.parent = c.oid
-					where e.repo_id = ${id}::bigint
-			)
-			select c.oid, o.type
-			from closure c
-			left join git_object o on o.repo_id = ${id}::bigint and o.oid = c.oid
-		`.execute(db)
-
-		const treeOids: Buffer[] = []
-		for (const r of closure.rows) {
-			const hex = r.oid.toString("hex")
-			if (r.type === null) {
-				missing.add(hex)
-			} else {
-				present.add(hex)
-				if (r.type === PACK_OBJ_TYPE.TREE) treeOids.push(r.oid)
-			}
-		}
-		if (omitBlobs || treeOids.length === 0) return { missing, present }
-
-		const blobCandidates = new Set<string>()
-		for (const batch of batches(treeOids, PACK_BATCH)) {
-			const trees = await db
-				.selectFrom("git_object")
-				.select("content")
-				.where("repo_id", "=", id)
-				.where("oid", "in", batch)
-				.execute()
-			for (const t of trees) {
-				for (const blob of treeBlobOids(t.content)) blobCandidates.add(blob)
-			}
-		}
-		if (blobCandidates.size === 0) return { missing, present }
-
-		const presentBlobs = new Set<string>()
-		for (const batch of batches([...blobCandidates], PACK_BATCH)) {
-			const rows = await db
-				.selectFrom("git_object")
-				.select("oid")
-				.where("repo_id", "=", id)
-				.where(
-					"oid",
-					"in",
-					batch.map((h) => Buffer.from(h, "hex")),
-				)
-				.execute()
-			for (const r of rows) presentBlobs.add(r.oid.toString("hex"))
-		}
-		for (const b of blobCandidates) (presentBlobs.has(b) ? present : missing).add(b)
-		return { missing, present }
-	}
-
-	/** Does `want`'s commit/tag ancestry (edge kinds 2,5) reach any oid in `common`?
-	 * The ancestry-only CTE that underpins `readyToGiveUp`. */
-	async function ancestryReachesCommon(
-		id: ReposId,
-		want: string,
-		commonBufs: Buffer[],
-	): Promise<boolean> {
-		if (commonBufs.length === 0) return false
-		const commons = sql.join(commonBufs.map((b) => sql`(${b}::bytea)`))
-		const result = await sql<{ reached: boolean }>`
-			with recursive anc(oid) as (
-				select ${Buffer.from(want, "hex")}::bytea
-				union
-				select e.child from git_edge e
-					join anc a on e.parent = a.oid
-					where e.repo_id = ${id}::bigint
-						and e.kind in (${EDGE_KIND.COMMIT_PARENT}, ${EDGE_KIND.TAG_TARGET})
-			)
-			select exists (
-				select 1 from anc join (values ${commons}) as c(oid) on c.oid = anc.oid
-			) as reached
-		`.execute(db)
-		return result.rows[0]?.reached ?? false
 	}
 
 	/**

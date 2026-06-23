@@ -13,7 +13,7 @@
  * signal on today.)
  */
 import { describe, expect, it } from "vitest"
-import { encodePkt, encodePktLine } from "@/pkt-line"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 
 const WANT = "a".repeat(40)

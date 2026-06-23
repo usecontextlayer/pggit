@@ -35,34 +35,14 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { encodePkt, encodePktLine } from "@/pkt-line"
-import { createRefStore } from "@/refs-store"
 import { createSnapshotStore } from "@/repo-view/snapshot-store"
 import { type GitServer, serveOnPort } from "@/server"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { packObjectCount } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
-
-/** A v2 fetch whose only ref-selection arg is `want-ref <ref>` (ref-in-want). */
-function wantRefFetchBody(ref: string): Buffer {
-	return Buffer.concat([
-		encodePktLine(Buffer.from("command=fetch\n")),
-		encodePktLine(Buffer.from("object-format=sha1\n")),
-		encodePkt({ type: "delim" }),
-		encodePktLine(Buffer.from(`want-ref ${ref}\n`)),
-		encodePktLine(Buffer.from("done\n")),
-		encodePkt({ type: "flush" }),
-	])
-}
-
-/** Count packed objects from a smart-HTTP fetch response body, or null if the
- * body is not a recognizable `packfile`/PACK response. The PACK header is
- * `PACK` + 4-byte version + 4-byte big-endian object count. */
-function packObjectCount(body: Buffer): number | null {
-	const i = body.indexOf(Buffer.from("PACK", "ascii"))
-	if (i < 0 || i + 12 > body.length) return null
-	return body.readUInt32BE(i + 8)
-}
+import { fetchRequest } from "@/testing/wire-fetch"
 
 describe("mal04 — ref-in-want (want-ref, unadvertised) must fail loudly, not clone empty", () => {
 	let db: IsolatedDb
@@ -105,7 +85,11 @@ describe("mal04 — ref-in-want (want-ref, unadvertised) must fail loudly, not c
 		expect(tip, "seeded repo must advertise a branch tip").toBeTruthy()
 
 		const res = await app.request("/mal04/git-upload-pack", {
-			body: wantRefFetchBody("refs/heads/main"),
+			body: fetchRequest({
+				done: true,
+				objectFormat: "sha1",
+				wantRefs: ["refs/heads/main"],
+			}),
 			headers: { "Git-Protocol": "version=2" },
 			method: "POST",
 		})

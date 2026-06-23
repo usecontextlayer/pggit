@@ -27,7 +27,7 @@
  * EXPECTED-RED until pggit's reachability direction is fixed. Drives a real git
  * client over the wire (push) + a raw v2 fetch POST matching the finding.
  *
- * NOTE: src/m1-multiround.spec.test.ts currently enshrines the BUGGY behavior
+ * NOTE: src/e2e/fetch-multiround.spec.test.ts currently enshrines the BUGGY behavior
  * (asserts `ACK f1` + no pack for this same sibling-have case). That spec is the
  * specification of the wrong contract; this regression test observes the real
  * divergence against canonical git.
@@ -37,11 +37,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { decodePktStream } from "@/pkt-line"
-import { createRefStore } from "@/refs-store"
+import { decodePktStream } from "@/protocol/pkt-line"
 import { createSnapshotStore } from "@/repo-view/snapshot-store"
 import { type GitServer, serveOnPort } from "@/server"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
@@ -108,7 +108,7 @@ describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (g
 	})
 
 	// DEFERRED (rc8, decision 2026-06-22): the real fix reworks readyToGiveUp to git's
-	// ok_to_give_up direction AND rewrites the m1-multiround spec that encodes the
+	// ok_to_give_up direction AND rewrites the fetch-multiround spec that encodes the
 	// current behavior. Low impact — an extra negotiation round-trip, never data loss
 	// (both fetches complete, fsck-clean, object sets equal source). The repro is kept
 	// but skipped until addressed deliberately with the git oracle.

@@ -13,7 +13,7 @@
  *
  * The KNOWN LIMITATION (documented, not fixed — per the decision): the derived
  * `repo_file` view stores `path` as Postgres `text`, decoded via
- * `Buffer.toString("utf8")` (src/object.ts treeEntries), so non-UTF-8 name bytes
+ * `Buffer.toString("utf8")` (src/object/object.ts treeEntries), so non-UTF-8 name bytes
  * (0xff 0xfe) become U+FFFD. This affects ONLY the queryable text projection, never
  * the canonical objects/clone. A byte-exact view (path as `bytea`) was considered and
  * deliberately not adopted, to keep the view SQL-queryable as text; non-UTF-8 names
@@ -28,10 +28,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
 import { createSnapshotStore } from "@/repo-view/snapshot-store"
 import { type GitServer, serveOnPort } from "@/server"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 

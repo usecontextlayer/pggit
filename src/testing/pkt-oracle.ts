@@ -12,7 +12,7 @@
  * §8.1 goldens, so their own tests (`pkt-oracle.test.ts`) are a normal `*.test.ts`
  * and stay GREEN on the gate — never a `*.spec.test.ts`.
  */
-import { decodePktStream } from "@/pkt-line"
+import { decodePktStream } from "@/protocol/pkt-line"
 
 /** test_oid values, verbatim from `/tmp/git-src/t/oid-info/hash-info` (sha1 rows). */
 export const ZERO_OID = "0".repeat(40)
@@ -166,4 +166,15 @@ export function renderRefAdvertV0(buf: Buffer): RefAdvertV0 {
 		refs.push(ref)
 	}
 	return { endsWithFlush: packets.at(-1)?.type === "flush", refs }
+}
+
+/**
+ * Object count from a smart-HTTP fetch response (the PACK header is `PACK` + a
+ * 4-byte version + a 4-byte big-endian object count), or null if no PACK is present.
+ * `PACK` rides band-1 literally, so a raw search locates it.
+ */
+export function packObjectCount(body: Buffer): number | null {
+	const i = body.indexOf(Buffer.from("PACK", "ascii"))
+	if (i < 0 || i + 12 > body.length) return null
+	return body.readUInt32BE(i + 8)
 }

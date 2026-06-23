@@ -14,26 +14,15 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { createObjectStore } from "@/object-store"
-import { decodePktStream, encodePkt, encodePktLine, type Pkt } from "@/pkt-line"
+import { decodePktStream, type Pkt } from "@/protocol/pkt-line"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
-import { createRefStore } from "@/refs-store"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
-
-/** Drive a fetch round directly against the upload-pack handler. */
-function fetchBody(wants: string[], haves: string[], done: boolean): Buffer {
-	return Buffer.concat([
-		encodePktLine(Buffer.from("command=fetch\n")),
-		encodePkt({ type: "delim" }),
-		...wants.map((w) => encodePktLine(Buffer.from(`want ${w}\n`))),
-		...haves.map((h) => encodePktLine(Buffer.from(`have ${h}\n`))),
-		...(done ? [encodePktLine(Buffer.from("done\n"))] : []),
-		encodePkt({ type: "flush" }),
-	])
-}
+import { fetchRequest } from "@/testing/wire-fetch"
 
 /** The data packets before the delim — the acknowledgments section text. */
 function ackSection(out: Buffer): string {
@@ -100,14 +89,20 @@ describe("M1 multi-round negotiation", () => {
 	})
 
 	it("a non-cutting have → acknowledgments + ACK + flush, and NO packfile", async () => {
-		const out = await handleUploadPack(fetchBody([c3], [f1], false), backend)
+		const out = await handleUploadPack(
+			fetchRequest({ done: false, haves: [f1], wants: [c3] }),
+			backend,
+		)
 		expect(ackSection(out)).toBe(`acknowledgments\nACK ${f1}\n`)
 		expect(out.toString("utf8")).not.toContain("packfile")
 		expect(sidebandDemux(out).band1.length).toBe(0)
 	})
 
 	it("adding a cutting have → acknowledgments + ready, then DELIM + pack in one response", async () => {
-		const out = await handleUploadPack(fetchBody([c3], [f1, c2], false), backend)
+		const out = await handleUploadPack(
+			fetchRequest({ done: false, haves: [f1, c2], wants: [c3] }),
+			backend,
+		)
 		expect(ackSection(out)).toBe(`acknowledgments\nACK ${f1}\nACK ${c2}\nready\n`)
 		const { packets } = decodePktStream(out)
 		expect(packets.some((p) => p.type === "delim")).toBe(true)
@@ -115,7 +110,10 @@ describe("M1 multi-round negotiation", () => {
 	})
 
 	it("the clone shape (done, no haves) returns the packfile directly", async () => {
-		const out = await handleUploadPack(fetchBody([c3], [], true), backend)
+		const out = await handleUploadPack(
+			fetchRequest({ done: true, haves: [], wants: [c3] }),
+			backend,
+		)
 		expect(sidebandDemux(out).band1.subarray(0, 4).toString("latin1")).toBe("PACK")
 	})
 
@@ -124,7 +122,10 @@ describe("M1 multi-round negotiation", () => {
 		// `ERR upload-pack: not our ref <oid>` (an HTTP-200 protocol error the client
 		// reads), not a transport-level rejection/500 — and never ships a short/partial
 		// pack. (Earlier this rejected; that diverged from the oracle — see smoke/mal01.)
-		const out = await handleUploadPack(fetchBody(["a".repeat(40)], [], true), backend)
+		const out = await handleUploadPack(
+			fetchRequest({ done: true, haves: [], wants: ["a".repeat(40)] }),
+			backend,
+		)
 		const text = out.toString("utf8")
 		expect(text).toMatch(/ERR .*not our ref/)
 		expect(text).toContain("a".repeat(40))

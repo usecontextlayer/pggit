@@ -12,7 +12,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { decodePktStream, encodePkt, encodePktLine, WRITER_MAX_PAYLOAD } from "@/pkt-line"
+import {
+	decodePktStream,
+	encodePkt,
+	encodePktLine,
+	WRITER_MAX_PAYLOAD,
+} from "@/protocol/pkt-line"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** Raw latin1 bytes (binary-safe) for asserting against literal hex frames. */

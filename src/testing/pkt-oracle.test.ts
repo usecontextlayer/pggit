@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { computeOid } from "@/object"
-import { encodePkt, encodePktLine } from "@/pkt-line"
+import { computeOid } from "@/object/object"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import {
 	EMPTY_BLOB,
 	EMPTY_TREE,

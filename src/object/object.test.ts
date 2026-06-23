@@ -2,25 +2,18 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { GitFormatError } from "@/git-format-error"
-import { commitTreeOid, computeOid, type GitObjectType, treeEntries } from "@/object"
+import {
+	commitTreeOid,
+	computeOid,
+	type GitObjectType,
+	treeEntries,
+} from "@/object/object"
+import { expectGitFormatError } from "@/testing/format-error"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** A well-formed tree entry: `<mode> <name>\0<20-byte oid>`. */
 function treeEntry(mode: string, name: string, oidByte: number): Buffer {
 	return Buffer.concat([Buffer.from(`${mode} ${name}\0`), Buffer.alloc(20, oidByte)])
-}
-
-/** The stable `GitFormatError.code` thrown by `fn` — asserted instead of message
- * prose, so a reworded throw never breaks the test. */
-const codeOf = (fn: () => unknown): string => {
-	try {
-		fn()
-	} catch (e) {
-		if (e instanceof GitFormatError) return e.code
-		throw e
-	}
-	throw new Error("expected a GitFormatError, none thrown")
 }
 
 describe("computeOid", () => {
@@ -83,7 +76,9 @@ describe("treeEntries", () => {
 	// object connected, silently accepting bad data. Asserted by the stable code,
 	// not the message text.
 	it("throws on an entry with no NUL terminator", () => {
-		expect(codeOf(() => treeEntries(Buffer.from("100644 a.txt")))).toBe("malformed-tree")
+		expect(expectGitFormatError(() => treeEntries(Buffer.from("100644 a.txt")))).toBe(
+			"malformed-tree",
+		)
 	})
 
 	it("throws on a truncated trailing OID (fewer than 20 bytes)", () => {
@@ -91,12 +86,12 @@ describe("treeEntries", () => {
 			Buffer.from("100644 a.txt\0"),
 			Buffer.alloc(5, 0xab),
 		])
-		expect(codeOf(() => treeEntries(truncated))).toBe("malformed-tree")
+		expect(expectGitFormatError(() => treeEntries(truncated))).toBe("malformed-tree")
 	})
 
 	it("throws on trailing garbage after a complete entry", () => {
 		const tree = Buffer.concat([treeEntry("100644", "a.txt", 0xab), Buffer.from("xx")])
-		expect(codeOf(() => treeEntries(tree))).toBe("malformed-tree")
+		expect(expectGitFormatError(() => treeEntries(tree))).toBe("malformed-tree")
 	})
 })
 
@@ -104,8 +99,8 @@ describe("commitTreeOid fail loud", () => {
 	// Reachable on the repo-view projection path (build-file-list walks a pushed
 	// commit's tree via commitTreeOid), so the guard is real, not dead defense.
 	it("throws on a commit with no tree header", () => {
-		expect(codeOf(() => commitTreeOid(Buffer.from("parent abc\n\nmsg\n")))).toBe(
-			"missing-tree-header",
-		)
+		expect(
+			expectGitFormatError(() => commitTreeOid(Buffer.from("parent abc\n\nmsg\n"))),
+		).toBe("missing-tree-header")
 	})
 })

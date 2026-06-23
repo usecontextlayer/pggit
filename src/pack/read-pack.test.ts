@@ -2,7 +2,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { computeOid } from "@/object"
+import { computeOid } from "@/object/object"
 import { readPack } from "@/pack/read-pack"
 import { writePack } from "@/pack/write-pack"
 import { spawnGit } from "@/testing/spawn-git"

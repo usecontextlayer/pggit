@@ -21,18 +21,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
+import { encodePktLine } from "@/protocol/pkt-line"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const ZERO = "0".repeat(40)
-
-function pkt(line: string): Buffer {
-	const payload = Buffer.from(line, "utf8")
-	const len = payload.length + 4
-	return Buffer.concat([Buffer.from(len.toString(16).padStart(4, "0")), payload])
-}
 
 /** Atomic receive-pack body: update r1 and r2 (caps incl. `atomic` on line 1). */
 function atomicBody(
@@ -41,8 +36,10 @@ function atomicBody(
 	pack: Buffer,
 ): Buffer {
 	return Buffer.concat([
-		pkt(`${r1.old} ${r1.new} refs/heads/r1\0report-status atomic\n`),
-		pkt(`${r2.old} ${r2.new} refs/heads/r2\n`),
+		encodePktLine(
+			Buffer.from(`${r1.old} ${r1.new} refs/heads/r1\0report-status atomic\n`, "utf8"),
+		),
+		encodePktLine(Buffer.from(`${r2.old} ${r2.new} refs/heads/r2\n`, "utf8")),
 		Buffer.from("0000"),
 		pack,
 	])
@@ -123,7 +120,9 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 				app,
 				repo,
 				Buffer.concat([
-					pkt(`${ZERO} ${base} refs/heads/r1\0report-status\n`),
+					encodePktLine(
+						Buffer.from(`${ZERO} ${base} refs/heads/r1\0report-status\n`, "utf8"),
+					),
 					Buffer.from("0000"),
 					(
 						await spawnGit(["pack-objects", "--stdout", "--revs"], {
@@ -137,7 +136,9 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 				app,
 				repo,
 				Buffer.concat([
-					pkt(`${ZERO} ${base} refs/heads/r2\0report-status\n`),
+					encodePktLine(
+						Buffer.from(`${ZERO} ${base} refs/heads/r2\0report-status\n`, "utf8"),
+					),
 					Buffer.from("0000"),
 					(
 						await spawnGit(["pack-objects", "--stdout", "--revs"], {
@@ -155,8 +156,10 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 				packA,
 			)
 			const bodyB = Buffer.concat([
-				pkt(`${base} ${tips.b2} refs/heads/r2\0report-status atomic\n`),
-				pkt(`${base} ${tips.b1} refs/heads/r1\n`),
+				encodePktLine(
+					Buffer.from(`${base} ${tips.b2} refs/heads/r2\0report-status atomic\n`, "utf8"),
+				),
+				encodePktLine(Buffer.from(`${base} ${tips.b1} refs/heads/r1\n`, "utf8")),
 				Buffer.from("0000"),
 				packB,
 			])

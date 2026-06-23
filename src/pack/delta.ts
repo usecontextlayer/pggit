@@ -1,4 +1,4 @@
-import { GitFormatError } from "@/git-format-error"
+import { GitFormatError } from "@/object/format-error"
 
 /**
  * Apply a git delta to its base, producing the target object. The delta begins

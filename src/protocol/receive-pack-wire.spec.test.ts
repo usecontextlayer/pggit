@@ -11,12 +11,12 @@
  * "the handler agrees with itself." AGENT is the one imported input.
  */
 import { describe, expect, it } from "vitest"
+import { AGENT } from "@/protocol/capabilities"
 import {
 	type CommandResult,
 	encodeReceivePackAdvertisement,
 	encodeReportStatus,
 } from "@/protocol/receive-pack"
-import { AGENT } from "@/protocol/v2"
 import {
 	framedLine,
 	framedPktLines,

@@ -1,7 +1,7 @@
 import { label, withPhase } from "@/instrument"
+import { assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError, WantNotFoundError } from "@/protocol/errors"
 import {
-	assertSupportedObjectFormat,
 	encodeAcknowledgments,
 	encodeErr,
 	encodeLsRefsResponse,

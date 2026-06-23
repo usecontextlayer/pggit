@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
-import { computeOid, type GitObjectType } from "@/object"
+import { computeOid, type GitObjectType } from "@/object/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
 import { spawnGit } from "@/testing/spawn-git"
 

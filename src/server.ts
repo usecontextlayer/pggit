@@ -3,9 +3,9 @@ import type { Hono } from "hono"
 import postgres from "postgres"
 import { env } from "@/env"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { createRefStore } from "@/refs-store"
 import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 
 export type GitServer = {
 	port: number

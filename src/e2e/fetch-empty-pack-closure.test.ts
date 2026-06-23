@@ -40,36 +40,14 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createObjectStore } from "@/object-store"
-import { encodePkt, encodePktLine } from "@/pkt-line"
-import { createRefStore } from "@/refs-store"
 import { createSnapshotStore } from "@/repo-view/snapshot-store"
 import { type GitServer, serveOnPort } from "@/server"
+import { createObjectStore } from "@/store/object-store"
+import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { packObjectCount } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
-
-/** A v2 fetch with `done`: `want <oid>`, `have <oid>`, no filter. */
-function fetchBody(want: string, have: string): Buffer {
-	return Buffer.concat([
-		encodePktLine(Buffer.from("command=fetch\n")),
-		encodePktLine(Buffer.from("object-format=sha1\n")),
-		encodePkt({ type: "delim" }),
-		encodePktLine(Buffer.from(`want ${want}\n`)),
-		encodePktLine(Buffer.from(`have ${have}\n`)),
-		encodePktLine(Buffer.from("done\n")),
-		encodePkt({ type: "flush" }),
-	])
-}
-
-/** Count packed objects from a smart-HTTP fetch response, or null if no PACK is
- * present. The pack header is `PACK` + 4-byte version + 4-byte big-endian object
- * count; `PACK` appears literally inside the sideband band-1 payload, so a raw
- * search locates it without de-muxing. */
-function packObjectCount(body: Buffer): number | null {
-	const i = body.indexOf(Buffer.from("PACK", "ascii"))
-	if (i < 0 || i + 12 > body.length) return null
-	return body.readUInt32BE(i + 8)
-}
+import { fetchRequest } from "@/testing/wire-fetch"
 
 describe("neg02 — buildPack must not re-add a want already in the have-closure (minimal pack)", () => {
 	let db: IsolatedDb
@@ -112,7 +90,7 @@ describe("neg02 — buildPack must not re-add a want already in the have-closure
 
 	it("want fully contained in the have-closure serves a ZERO-object pack (oracle), not 1", async () => {
 		const res = await app.request("/neg02/git-upload-pack", {
-			body: fetchBody(c3, c6),
+			body: fetchRequest({ done: true, haves: [c6], objectFormat: "sha1", wants: [c3] }),
 			headers: { "Git-Protocol": "version=2" },
 			method: "POST",
 		})

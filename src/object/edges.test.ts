@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { GitFormatError } from "@/git-format-error"
-import { deriveEdges, EDGE_KIND, treeBlobOids } from "@/object-edges"
+import { deriveEdges, EDGE_KIND, treeBlobOids } from "@/object/edges"
+import { GitFormatError } from "@/object/format-error"
 
 /** A tree blob: `<mode> <name>\0<20-byte oid>` repeated. */
 function tree(entries: { mode: string; name: string; oid: Buffer }[]): Buffer {
