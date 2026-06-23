@@ -1,8 +1,9 @@
 import { label, withPhase } from "@/instrument"
-import { GitProtocolError } from "@/protocol/errors"
+import { GitProtocolError, WantNotFoundError } from "@/protocol/errors"
 import {
 	assertSupportedObjectFormat,
 	encodeAcknowledgments,
+	encodeErr,
 	encodeLsRefsResponse,
 	encodePackfileResponse,
 	encodeReadyWithPack,
@@ -98,6 +99,8 @@ function filterOmitsBlobs(filter: string | undefined): boolean {
 
 async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer> {
 	label("fetch")
+	// parseFetch validates wire shape (malformed/unsupported args → GitProtocolError
+	// → 400) BEFORE the serve attempt — kept outside the try so it stays a 400.
 	const { wants, haves, done, filter, includeTag } = parseFetch(req)
 	// A zero-want fetch is NOT an error: git's upload-pack treats it as a no-op
 	// (upload-pack.c) and returns an empty pack — buildPack produces one, so we let
@@ -105,24 +108,33 @@ async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer
 	const omitBlobs = filterOmitsBlobs(filter)
 	const common = await backend.commonHaves(haves)
 
-	if (!done) {
-		// Negotiation round (spec §4 shape b): until the haves cut every want we
-		// ACK/NAK and flush, no pack — the client sends more haves. Once ready, git
-		// requires the pack in this same response, after the `ready` line.
-		if (!(await backend.readyToGiveUp(wants, common))) {
-			return encodeAcknowledgments(common, false)
+	try {
+		if (!done) {
+			// Negotiation round (spec §4 shape b): until the haves cut every want we
+			// ACK/NAK and flush, no pack — the client sends more haves. Once ready, git
+			// requires the pack in this same response, after the `ready` line.
+			if (!(await backend.readyToGiveUp(wants, common))) {
+				return encodeAcknowledgments(common, false)
+			}
+			return encodeReadyWithPack(
+				common,
+				await backend.buildPack(wants, common, omitBlobs, includeTag),
+			)
 		}
-		return encodeReadyWithPack(
-			common,
+
+		// `done` (spec §4 shapes a/c): pack the delta directly. A clone has no haves, so
+		// the subtrahend is empty and we pack the whole want-closure.
+		return encodePackfileResponse(
 			await backend.buildPack(wants, common, omitBlobs, includeTag),
 		)
+	} catch (err) {
+		// A `want` the repo does not have is a client condition, not a server fault:
+		// answer it in-band like canonical upload-pack (`ERR … not our ref`) so the
+		// client reads a clean protocol error, not an HTTP 500. A genuine serve failure
+		// (any other error) still propagates → 500 (§10, no partial pack is emitted).
+		if (err instanceof WantNotFoundError) return encodeErr(err.message)
+		throw err
 	}
-
-	// `done` (spec §4 shapes a/c): pack the delta directly. A clone has no haves, so
-	// the subtrahend is empty and we pack the whole want-closure.
-	return encodePackfileResponse(
-		await backend.buildPack(wants, common, omitBlobs, includeTag),
-	)
 }
 
 /** Dispatch a v2 upload-pack POST body to ls-refs or fetch. */

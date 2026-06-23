@@ -50,7 +50,18 @@ async function readRequestBody(c: Context): Promise<Buffer> {
 	const raw = Buffer.from(await c.req.arrayBuffer())
 	const encoding = c.req.header("content-encoding")?.toLowerCase()
 	if (encoding === undefined || encoding === "identity") return raw
-	if (encoding === "gzip" || encoding === "x-gzip") return gunzipSync(raw)
+	if (encoding === "gzip" || encoding === "x-gzip") {
+		// A body that declares gzip but fails to inflate is a CLIENT wire fault, not a
+		// server error — surface it on the same clean 400 path as the unsupported
+		// encodings below, never let the ZlibError escape to a 500.
+		try {
+			return gunzipSync(raw)
+		} catch (err) {
+			throw new GitProtocolError(
+				`request body declared Content-Encoding ${JSON.stringify(encoding)} but failed to gunzip: ${err instanceof Error ? err.message : String(err)}`,
+			)
+		}
+	}
 	throw new GitProtocolError(
 		`unsupported request Content-Encoding: ${JSON.stringify(encoding)}`,
 	)

@@ -63,7 +63,7 @@
 			"correctness": {
 				"noUnknownProperty": "off"
 			},
-			"recommended": true,
+			"preset": "recommended",
 			"style": {
 				"useConst": "error",
 				"useImportType": "error"

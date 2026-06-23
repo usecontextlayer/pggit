@@ -65,18 +65,22 @@ function parseLen(buf: Buffer, offset: number): number {
  * With `stopAtFlush`, decoding returns at the first flush (which is NOT included
  * in `packets`), leaving the bytes after it in `rest`. The receive-pack request
  * splits here: a pkt-line command list, a flush, then the raw (un-framed) pack.
+ *
+ * `flushed` reports whether a flush actually terminated the stream in
+ * `stopAtFlush` mode — the parser uses it to reject an unterminated command list
+ * on a COMPLETE request body (where "more bytes coming" is not an option).
  */
 export function decodePktStream(
 	buf: Buffer,
 	opts: { stopAtFlush?: boolean } = {},
-): { packets: Pkt[]; rest: Buffer } {
+): { packets: Pkt[]; rest: Buffer; flushed: boolean } {
 	const packets: Pkt[] = []
 	let offset = 0
 	while (offset + 4 <= buf.length) {
 		const len = parseLen(buf, offset)
 		if (len === 0) {
 			offset += 4
-			if (opts.stopAtFlush) return { packets, rest: buf.subarray(offset) }
+			if (opts.stopAtFlush) return { flushed: true, packets, rest: buf.subarray(offset) }
 			packets.push({ type: "flush" })
 			continue
 		}
@@ -105,5 +109,5 @@ export function decodePktStream(
 		packets.push({ payload, type: "data" })
 		offset += len
 	}
-	return { packets, rest: buf.subarray(offset) }
+	return { flushed: false, packets, rest: buf.subarray(offset) }
 }

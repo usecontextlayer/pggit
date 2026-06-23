@@ -119,9 +119,15 @@ describe("M1 multi-round negotiation", () => {
 		expect(sidebandDemux(out).band1.subarray(0, 4).toString("latin1")).toBe("PACK")
 	})
 
-	it("a want for an object the repo lacks rejects loud (no short pack)", async () => {
-		await expect(
-			handleUploadPack(fetchBody(["a".repeat(40)], [], true), backend),
-		).rejects.toThrow(/missing/)
+	it("a want for an object the repo lacks is answered in-band with ERR, never a short pack (like real git)", async () => {
+		// Oracle: real git upload-pack answers a `want` it does not have IN-BAND with
+		// `ERR upload-pack: not our ref <oid>` (an HTTP-200 protocol error the client
+		// reads), not a transport-level rejection/500 — and never ships a short/partial
+		// pack. (Earlier this rejected; that diverged from the oracle — see smoke/mal01.)
+		const out = await handleUploadPack(fetchBody(["a".repeat(40)], [], true), backend)
+		const text = out.toString("utf8")
+		expect(text).toMatch(/ERR .*not our ref/)
+		expect(text).toContain("a".repeat(40))
+		expect(text).not.toContain("packfile")
 	})
 })

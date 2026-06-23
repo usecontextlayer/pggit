@@ -12,3 +12,18 @@ export class GitProtocolError extends Error {
 		this.name = "GitProtocolError"
 	}
 }
+
+/**
+ * A fetch `want` names an object this repo does not have — a CLIENT condition (a
+ * stale/force-pushed tip, a lost promisor blob), not an internal failure. Real git
+ * upload-pack answers it IN-BAND with `ERR upload-pack: not our ref <oid>` (an HTTP
+ * 200 protocol error the client reads), so it must NOT escape as a 500. Carries the
+ * absent OIDs; `handleFetch` maps it to the ERR pkt-line. Distinct from a generic
+ * `Error` out of the serve path (a real backend fault), which still propagates → 500.
+ */
+export class WantNotFoundError extends Error {
+	constructor(readonly oids: string[]) {
+		super(`upload-pack: not our ref ${oids.join(" ")}`)
+		this.name = "WantNotFoundError"
+	}
+}

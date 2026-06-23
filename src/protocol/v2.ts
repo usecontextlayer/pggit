@@ -51,7 +51,16 @@ export type V2Request = {
 
 /** Decode a `command=… <caps> 0001 <args> 0000` v2 request body. */
 export function parseV2Request(body: Buffer): V2Request {
-	const { packets } = decodePktStream(body)
+	const { packets, rest } = decodePktStream(body)
+	// The body is a COMPLETE request: any leftover bytes are an incomplete or
+	// length-overrunning packet (decodePktStream leaves a partial packet in `rest`).
+	// On a complete body that is a framing fault, not a streaming boundary — reject
+	// it loudly rather than silently dropping the truncated args.
+	if (rest.length > 0) {
+		throw new GitProtocolError(
+			`pkt-line: ${rest.length} trailing bytes after the request — incomplete or length-overrunning packet`,
+		)
+	}
 	let command = ""
 	const capabilities: string[] = []
 	const args: string[] = []
@@ -81,6 +90,14 @@ export type FetchRequest = {
 	includeTag: boolean
 }
 
+/** Fetch features pggit deliberately does NOT advertise (encodeAdvertisement): a
+ * client that drives one anyway must FAIL LOUDLY, never be silently dropped to an
+ * empty result (the charter). `ref-in-want` (`want-ref`) and the `shallow`/`deepen`
+ * family are the unimplemented ones. */
+const UNSUPPORTED_FETCH_ARG = /^(want-ref|deepen|shallow)\b/
+
+const OID = /^[0-9a-f]{40}$/
+
 export function parseFetch(req: V2Request): FetchRequest {
 	const wants: string[] = []
 	const haves: string[] = []
@@ -88,8 +105,26 @@ export function parseFetch(req: V2Request): FetchRequest {
 	let filter: string | undefined
 	let includeTag = false
 	for (const arg of req.args) {
-		if (arg.startsWith("want ")) wants.push(arg.slice(5))
-		else if (arg.startsWith("have ")) haves.push(arg.slice(5))
+		// Reject an unadvertised feature request loudly before parsing wants — else a
+		// `want-ref` line falls through every branch below and silently leaves wants=[]
+		// (a no-op empty pack the client misreads as a successful empty clone).
+		if (UNSUPPORTED_FETCH_ARG.test(arg)) {
+			throw new GitProtocolError(
+				`fetch: unsupported feature ${JSON.stringify(arg.split(" ")[0])} — pggit does not advertise it`,
+			)
+		}
+		if (arg.startsWith("want ")) {
+			const oid = arg.slice(5)
+			// A want OID is coerced to `bytea` downstream via Buffer.from(oid, "hex"),
+			// which SILENTLY yields a short/empty buffer for a non-hex value and then
+			// fails deep in buildPack. Validate the wire shape at the boundary instead.
+			if (!OID.test(oid)) {
+				throw new GitProtocolError(
+					`fetch: malformed want object id ${JSON.stringify(oid)}`,
+				)
+			}
+			wants.push(oid)
+		} else if (arg.startsWith("have ")) haves.push(arg.slice(5))
 		else if (arg.startsWith("filter ")) filter = arg.slice("filter ".length)
 		else if (arg === "include-tag") includeTag = true
 		else if (arg === "done") done = true
@@ -149,6 +184,16 @@ export function encodeReadyWithPack(common: string[], pack: Buffer): Buffer {
 		encodePkt({ type: "delim" }),
 		encodePackfileResponse(pack),
 	])
+}
+
+/**
+ * A v2 error response: a single `ERR <message>` pkt-line. git's packet reader
+ * recognizes the `ERR ` prefix and the client dies with `remote error: <message>`
+ * — the in-band channel for a request that cannot be served (e.g. a `want` the repo
+ * does not have): an HTTP-200 protocol error the client can read, NOT a transport 500.
+ */
+export function encodeErr(message: string): Buffer {
+	return encodePktLine(Buffer.from(`ERR ${message}\n`))
 }
 
 /**

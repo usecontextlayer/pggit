@@ -15,10 +15,22 @@ import {
 	packObject,
 	writePack,
 } from "@/pack/write-pack"
+import { WantNotFoundError } from "@/protocol/errors"
 import { createRepoResolver } from "@/repo-store"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */
 const PACK_BATCH = 1000
+
+/**
+ * A stored object at/over this size is read in size-bounded chunks, never in one
+ * round-trip. The porsager driver decodes a `bytea` RESULT from its text form
+ * (`\x` + hex, DOUBLE the byte length), so a value over ~256MiB would build a JS
+ * string past V8's max length and throw on the SERVE path — the read-side mirror of
+ * the ingest string-cap that binary COPY fixed (a07/blb01). Kept well under the cap
+ * so the doubled hex of a single chunk stays safely below it.
+ */
+const BIG_OBJECT_BYTES = 200_000_000
+const READ_CHUNK_BYTES = 100_000_000
 
 /** Split `items` into consecutive batches of at most `size`. */
 function batches<T>(items: T[], size: number): T[][] {
@@ -98,9 +110,7 @@ export function createObjectStore(pg: Sql) {
 				// too) — fail loud rather than ship a short pack. The have side may be
 				// incomplete (we just don't subtract what we lack), so only wants matter.
 				if (want.missing.size > 0) {
-					throw new Error(
-						`upload-pack: wanted objects missing from store: ${[...want.missing].join(", ")}`,
-					)
+					throw new WantNotFoundError([...want.missing])
 				}
 				const have =
 					haves.length > 0
@@ -108,7 +118,12 @@ export function createObjectStore(pg: Sql) {
 						: { missing: new Set<string>(), present: new Set<string>() }
 				const set = new Set<string>()
 				for (const o of want.present) if (!have.present.has(o)) set.add(o)
-				for (const w of wants) if (want.present.has(w)) set.add(w)
+				// Under a blobless/partial filter the client may explicitly want an object
+				// reachable from a `have` whose closure it does NOT fully possess (a promisor
+				// root the omitBlobs subtraction drops), so re-add those wants. On an unfiltered
+				// fetch a `have` implies its whole closure — a want already in it is genuinely
+				// owned, so re-adding would re-send what the client has (a non-minimal pack).
+				if (omitBlobs) for (const w of wants) if (want.present.has(w)) set.add(w)
 				if (includeTag) await augmentWithTags(id, set)
 				return [...set]
 			})
@@ -124,7 +139,16 @@ export function createObjectStore(pg: Sql) {
 				for (const batch of batches(served, PACK_BATCH)) {
 					const rows = await db
 						.selectFrom("git_object")
-						.select(["type", "content"])
+						.select(["oid", "type"])
+						// Keep a >256MiB blob's content server-side (CASE → NULL on the wire) so the
+						// porsager driver never builds its over-cap `\x`+hex string; oversized rows
+						// (content NULL here) are read in size-bounded chunks below.
+						.select(sql<number>`octet_length(content)`.as("size"))
+						.select(
+							sql<Buffer | null>`case when octet_length(content) < ${BIG_OBJECT_BYTES} then content end`.as(
+								"content",
+							),
+						)
 						.where("repo_id", "=", id)
 						.where(
 							"oid",
@@ -132,7 +156,10 @@ export function createObjectStore(pg: Sql) {
 							batch.map((h) => Buffer.from(h, "hex")),
 						)
 						.execute()
-					for (const r of rows) push(packObject(typeFromCode(r.type), r.content))
+					for (const r of rows) {
+						const content = r.content ?? (await readContentChunked(id, r.oid, r.size))
+						push(packObject(typeFromCode(r.type), content))
+					}
 				}
 				const pack = Buffer.concat([...parts, hash.digest()])
 				count("objectsServed", served.length)
@@ -169,14 +196,24 @@ export function createObjectStore(pg: Sql) {
 
 			const row = await db
 				.selectFrom("git_object")
-				.select(["type", "content"])
+				.select(["type"])
+				.select(sql<number>`octet_length(content)`.as("size"))
+				.select(
+					sql<Buffer | null>`case when octet_length(content) < ${BIG_OBJECT_BYTES} then content end`.as(
+						"content",
+					),
+				)
 				.where("repo_id", "=", id)
 				.where("oid", "=", Buffer.from(oid, "hex"))
 				.executeTakeFirst()
 			if (!row) return null
 
-			count("objectBytesRead", row.content.length)
-			return { content: row.content, type: typeFromCode(row.type) }
+			// A >256MiB object comes back with content NULL (the CASE guard); read it chunked
+			// so its bytes never transit the porsager driver as one over-cap hex string.
+			const content =
+				row.content ?? (await readContentChunked(id, Buffer.from(oid, "hex"), row.size))
+			count("objectBytesRead", content.length)
+			return { content, type: typeFromCode(row.type) }
 		},
 
 		async hasObject(repoId: string, oid: string): Promise<boolean> {
@@ -317,6 +354,31 @@ export function createObjectStore(pg: Sql) {
 			await copyInsert(tx, "git_edge", ["repo_id", "parent", "child", "kind"], edgeRows)
 		})
 		return entries.map((e) => e.hex)
+	}
+
+	/**
+	 * Read a single object's `content` in size-bounded chunks via `substring`, so a
+	 * blob larger than V8's max string length never reaches the porsager driver as one
+	 * over-cap `\x`+hex string — the serve-side mirror of the binary COPY ingest. Used
+	 * only for objects at/over BIG_OBJECT_BYTES (smaller content comes back inline).
+	 */
+	async function readContentChunked(
+		id: ReposId,
+		oid: Buffer,
+		size: number,
+	): Promise<Buffer> {
+		const parts: Buffer[] = []
+		for (let off = 0; off < size; off += READ_CHUNK_BYTES) {
+			const len = Math.min(READ_CHUNK_BYTES, size - off)
+			const row = await db
+				.selectFrom("git_object")
+				.select(sql<Buffer>`substring(content from ${off + 1} for ${len})`.as("chunk"))
+				.where("repo_id", "=", id)
+				.where("oid", "=", oid)
+				.executeTakeFirstOrThrow()
+			parts.push(row.chunk)
+		}
+		return Buffer.concat(parts)
 	}
 
 	/**
