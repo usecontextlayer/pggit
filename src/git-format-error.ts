@@ -28,6 +28,9 @@ export type GitFormatErrorCode =
 	| "malformed-tree"
 	| "malformed-oid"
 	| "missing-tree-header"
+	| "multiple-tree-headers"
+	| "missing-tag-object"
+	| "multiple-tag-objects"
 
 export class GitFormatError extends Error {
 	readonly code: GitFormatErrorCode

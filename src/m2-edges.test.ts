@@ -31,8 +31,8 @@ describe("git_edge derivation at ingest", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		const refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		const refs = createRefStore(db.sql)
 
 		// A repo with a subtree (dir/), blobs, two commits (a parent edge), and an
 		// annotated tag (a tag→target edge). dir/ is unchanged across commits, so its

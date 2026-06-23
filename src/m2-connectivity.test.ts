@@ -24,8 +24,8 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 		app = createGitApp({ objects, refs })
 	}, 180_000)
 

@@ -79,8 +79,8 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		const refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		const refs = createRefStore(db.sql)
 
 		src = mkdtempSync(join(tmpdir(), "pggit-gzip-src-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })

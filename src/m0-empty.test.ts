@@ -29,8 +29,8 @@ describe("M0 — empty (unborn) repo", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		const refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		const refs = createRefStore(db.sql)
 		// An unborn repo: HEAD points at a branch that has no commit yet. No objects,
 		// no direct refs — exactly what `git init` + a server default branch yields.
 		await refs.setSymref("empty", "HEAD", "refs/heads/main")

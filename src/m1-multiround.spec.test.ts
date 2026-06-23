@@ -62,8 +62,8 @@ describe("M1 multi-round negotiation", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		const refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		const refs = createRefStore(db.sql)
 
 		// main: c1 ← c2 ← c3.  feature (off c1): f1 — a sibling, NOT an ancestor of c3.
 		dir = mkdtempSync(join(tmpdir(), "pggit-mr-"))

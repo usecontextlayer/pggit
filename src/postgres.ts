@@ -5,8 +5,9 @@ import { recordQuery } from "@/instrument"
 
 // Mirrors web/postgres.ts: Kysely over the porsager `postgres` driver via
 // PostgresJSDialect. Unlike web, pggit does NOT keep a module-level singleton —
-// the caller owns the porsager instance and injects the Kysely it builds (so the
-// app stays a mountable sub-app and per-schema test isolation works).
+// the caller owns the porsager client and injects it; each store builds its own
+// Kysely from it (so the app stays a mountable sub-app and per-schema test
+// isolation works), and keeps the raw client for the COPY ingest path.
 const EVENT_SIGNS = { error: "🔴", query: "🟢" } as const
 
 /** Wrap a porsager client in a typed Kysely. Dev builds log query/error events. */

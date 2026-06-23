@@ -1,5 +1,6 @@
 import { type Kysely, sql } from "kysely"
-import type { Database } from "@/database"
+import type { Sql } from "postgres"
+import { type Database, initKysely } from "@/database"
 import type { GitRefName } from "@/database/models/public/GitRef"
 import type { ReposId } from "@/database/models/public/Repos"
 import { EDGE_KIND } from "@/object-edges"
@@ -25,19 +26,22 @@ const toOid = (hex: string): Buffer => Buffer.from(hex, "hex")
  */
 type RefOp =
 	| { kind: "create"; newOid: Buffer }
-	| { kind: "delete"; oldOid: Buffer }
+	// `oldOid: null` ⇒ the client asserted no expected value (zero old-oid): an
+	// unconditional delete — drop the ref if present, a no-op success otherwise.
+	| { kind: "delete"; oldOid: Buffer | null }
 	| { kind: "update"; oldOid: Buffer; newOid: Buffer }
 
 function classifyRefUpdate(cmd: RefUpdate): RefOp {
 	const create = isZero(cmd.oldOid)
 	const del = isZero(cmd.newOid)
-	if (create && del) {
-		// old=new=zero is not a valid command (a create whose target is the zero
-		// OID). Fail loud rather than coerce the sentinel into a real bytea.
-		throw new Error(`refs-store: malformed ref command (zero old and new) for ${cmd.ref}`)
-	}
+	// A zero new-oid is a delete regardless of the old-oid. git sends `<zero>
+	// <zero> ref` to delete a ref it knows no value for — including one that does
+	// not exist, which canonical receive-pack reports as a no-op success — so a
+	// zero old-oid here means "delete unconditionally" (oldOid null), never a
+	// malformed command. The all-zeros sentinel is classified away here and never
+	// coerced into a real all-zero bytea.
+	if (del) return { kind: "delete", oldOid: create ? null : toOid(cmd.oldOid) }
 	if (create) return { kind: "create", newOid: toOid(cmd.newOid) }
-	if (del) return { kind: "delete", oldOid: toOid(cmd.oldOid) }
 	return { kind: "update", newOid: toOid(cmd.newOid), oldOid: toOid(cmd.oldOid) }
 }
 
@@ -83,6 +87,28 @@ async function peelRef(
 class AtomicAbort extends Error {}
 
 /**
+ * A repo is born with `HEAD → refs/heads/main`, mirroring `git init --bare`
+ * (init.defaultBranch). Established lazily on the first ref write — a repo's birth
+ * is its first push — and never overwritten (do-nothing on conflict). So once the
+ * default branch exists `ls-refs` advertises HEAD and a clone checks it out;
+ * before then HEAD dangles unadvertised, exactly like a bare repo whose HEAD
+ * points at an unborn `main`.
+ */
+const DEFAULT_HEAD_TARGET = "refs/heads/main"
+
+async function ensureHeadDefault(exec: Kysely<Database>, repoId: ReposId): Promise<void> {
+	await exec
+		.insertInto("git_ref")
+		.values({
+			name: "HEAD" as GitRefName,
+			repo_id: repoId,
+			symref_target: DEFAULT_HEAD_TARGET,
+		})
+		.onConflict((oc) => oc.columns(["repo_id", "name"]).doNothing())
+		.execute()
+}
+
+/**
  * Apply one ref change by compare-and-swap against the client's advertised old
  * oid, on the given executor (the db, or a transaction for an atomic batch).
  * Returns whether exactly one row changed. Non-ff is accepted by default — CAS
@@ -107,14 +133,16 @@ async function casRefUpdate(
 			return rows.length === 1
 		}
 		case "delete": {
-			const rows = await exec
+			// CAS the delete on the asserted old-oid; an unconditional delete (zero
+			// old-oid ⇒ null) drops the ref by name and succeeds even when it was
+			// already absent — git treats deleting a non-existent ref as a no-op.
+			let q = exec
 				.deleteFrom("git_ref")
 				.where("repo_id", "=", repoId)
 				.where("name", "=", name)
-				.where("oid", "=", op.oldOid)
-				.returningAll()
-				.execute()
-			return rows.length === 1
+			if (op.oldOid !== null) q = q.where("oid", "=", op.oldOid)
+			const rows = await q.returningAll().execute()
+			return op.oldOid === null || rows.length === 1
 		}
 		case "update": {
 			const peeled = await peelRef(exec, repoId, op.newOid)
@@ -140,7 +168,8 @@ async function casRefUpdate(
  * its bigint surrogate (memoized) here, ref names cast to their branded column
  * type, and oids coerce hex↔raw `bytea`.
  */
-export function createRefStore(db: Kysely<Database>) {
+export function createRefStore(pg: Sql) {
+	const db = initKysely<Database>(pg)
 	const repos = createRepoResolver(db)
 
 	return {
@@ -156,6 +185,7 @@ export function createRefStore(db: Kysely<Database>) {
 			atomic: boolean,
 		): Promise<boolean[]> {
 			const id = await repos.ensureRepoId(repoId)
+			await ensureHeadDefault(db, id)
 			if (!atomic) {
 				const results: boolean[] = []
 				for (const cmd of commands) {
@@ -163,16 +193,21 @@ export function createRefStore(db: Kysely<Database>) {
 				}
 				return results
 			}
+			// Atomic batch: take the per-ref row locks in a deterministic by-name order
+			// so two concurrent batches touching the same refs can never form a lock
+			// cycle (Postgres 40P01 deadlock). An atomic result is uniform — every CAS
+			// succeeds or the first failure aborts the whole batch — so the by-name CAS
+			// order never affects the per-command flags, which stay in input order.
+			const ordered = [...commands].sort((a, b) =>
+				a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0,
+			)
 			try {
-				return await db.transaction().execute(async (trx) => {
-					const results: boolean[] = []
-					for (const cmd of commands) {
-						const ok = await casRefUpdate(trx, id, cmd)
-						results.push(ok)
-						if (!ok) throw new AtomicAbort()
+				await db.transaction().execute(async (trx) => {
+					for (const cmd of ordered) {
+						if (!(await casRefUpdate(trx, id, cmd))) throw new AtomicAbort()
 					}
-					return results
 				})
+				return commands.map(() => true)
 			} catch (error) {
 				if (error instanceof AtomicAbort) return commands.map(() => false)
 				throw error

@@ -45,8 +45,8 @@ describe("include-tag augmentation", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		const refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		const refs = createRefStore(db.sql)
 
 		dir = mkdtempSync(join(tmpdir(), "pggit-inctag-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })

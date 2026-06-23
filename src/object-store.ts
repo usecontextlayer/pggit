@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto"
-import { type Kysely, sql } from "kysely"
-import type { Database } from "@/database"
+import { sql } from "kysely"
+import type { Sql } from "postgres"
+import { type Database, initKysely } from "@/database"
+import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
 import { count, withPhase } from "@/instrument"
 import { computeOid, type GitObjectType } from "@/object"
-import { deriveEdges, EDGE_KIND, treeBlobOids } from "@/object-edges"
+import { deriveEdges, EDGE_KIND, treeBlobOids, validateObject } from "@/object-edges"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import {
@@ -67,7 +69,8 @@ function typeFromCode(code: number): GitObjectType {
  * name; OIDs are coerced hex↔raw here, and the repo name is resolved to its
  * bigint surrogate (memoized) here.
  */
-export function createObjectStore(db: Kysely<Database>) {
+export function createObjectStore(pg: Sql) {
+	const db = initKysely<Database>(pg)
 	const repos = createRepoResolver(db)
 
 	const store = {
@@ -263,6 +266,7 @@ export function createObjectStore(db: Kysely<Database>) {
 		objects: PackInputObject[],
 	): Promise<string[]> {
 		const entries = objects.map((obj) => {
+			validateObject(obj.type, obj.content)
 			const hex = computeOid(obj.type, obj.content)
 			const oid = Buffer.from(hex, "hex")
 			return {
@@ -284,21 +288,33 @@ export function createObjectStore(db: Kysely<Database>) {
 		})
 		if (entries.length === 0) return []
 
-		const objectRows = entries.map((e) => e.row)
-		const edgeRows = entries.flatMap((e) => e.edges)
-		await db.transaction().execute(async (trx) => {
-			await trx
-				.insertInto("git_object")
-				.values(objectRows)
-				.onConflict((oc) => oc.doNothing())
-				.execute()
-			if (edgeRows.length > 0) {
-				await trx
-					.insertInto("git_edge")
-					.values(edgeRows)
-					.onConflict((oc) => oc.doNothing())
-					.execute()
-			}
+		const objectRows: CopyValue[][] = entries.map((e) => [
+			{ t: "int8", v: e.row.repo_id },
+			{ t: "bytea", v: e.row.oid },
+			{ t: "int2", v: e.row.type },
+			{ t: "int4", v: e.row.size },
+			{ t: "bytea", v: e.row.content },
+		])
+		const edgeRows: CopyValue[][] = entries.flatMap((e) =>
+			e.edges.map((edge): CopyValue[] => [
+				{ t: "int8", v: edge.repo_id },
+				{ t: "bytea", v: edge.parent },
+				{ t: "bytea", v: edge.child },
+				{ t: "int2", v: edge.kind },
+			]),
+		)
+		// One transaction (the object⟺edges invariant, §10.1) via COPY into staging:
+		// no bind-parameter ceiling and content streams as raw bytes (see copyInsert),
+		// so neither object count nor blob size has a hard wall. Empty edgeRows (an
+		// all-blob push) is a no-op, never an empty insert.
+		await pg.begin(async (tx) => {
+			await copyInsert(
+				tx,
+				"git_object",
+				["repo_id", "oid", "type", "size", "content"],
+				objectRows,
+			)
+			await copyInsert(tx, "git_edge", ["repo_id", "parent", "child", "kind"], edgeRows)
 		})
 		return entries.map((e) => e.hex)
 	}

@@ -40,9 +40,9 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
-		snapshots = createSnapshotStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
+		snapshots = createSnapshotStore(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
 	}, 180_000)
 

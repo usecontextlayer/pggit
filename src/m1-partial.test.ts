@@ -35,8 +35,8 @@ describe("M1 — blobless partial clone (real git)", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		const refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		const refs = createRefStore(db.sql)
 
 		src = mkdtempSync(join(tmpdir(), "pggit-m1-src-"))
 		await spawnGit(["init", "-q"], { cwd: src })

@@ -84,11 +84,16 @@ async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffe
 	})
 }
 
-/** Translate the wire filter spec to a walk option; reject what we don't honor. */
+/**
+ * Translate the wire filter spec to a walk option. We optimize the common
+ * `blob:none` (blobless partial clone) by omitting blobs; any other filter
+ * (`tree:0`, `blob:limit=…`, …) serves the FULL closure. The protocol lets a
+ * server send more than a filter requests — the client accepts the superset and
+ * has nothing to lazily fetch — so over-serving completes the clone that a hard
+ * rejection would abort, without implementing every filter spec.
+ */
 function filterOmitsBlobs(filter: string | undefined): boolean {
-	if (filter === undefined) return false
-	if (filter === "blob:none") return true
-	throw new GitProtocolError(`upload-pack: unsupported filter ${JSON.stringify(filter)}`)
+	return filter === "blob:none"
 }
 
 async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer> {

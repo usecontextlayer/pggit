@@ -1,5 +1,7 @@
-import { type Kysely, sql } from "kysely"
-import type { Database } from "@/database"
+import { sql } from "kysely"
+import type { Sql } from "postgres"
+import { type Database, initKysely } from "@/database"
+import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import { createRepoResolver } from "@/repo-store"
 import type { FileList } from "@/repo-view/build-file-list"
 
@@ -16,7 +18,8 @@ export type SnapshotStore = ReturnType<typeof createSnapshotStore>
  * rebuildable at will. The wire repo name resolves to its bigint surrogate
  * (memoized) here, like the other stores.
  */
-export function createSnapshotStore(db: Kysely<Database>) {
+export function createSnapshotStore(pg: Sql) {
+	const db = initKysely<Database>(pg)
 	const repos = createRepoResolver(db)
 
 	/** repo_file ⋈ git_object: the file's content for the joined blob_oid. */
@@ -108,26 +111,24 @@ export function createSnapshotStore(db: Kysely<Database>) {
 			fileList: FileList,
 		): Promise<void> {
 			const id = await repos.ensureRepoId(repoId)
-			await db.transaction().execute(async (tx) => {
-				await tx
-					.deleteFrom("repo_file")
-					.where("repo_id", "=", id)
-					.where("ref_name", "=", refName)
-					.execute()
-				if (fileList.files.length > 0) {
-					await tx
-						.insertInto("repo_file")
-						.values(
-							fileList.files.map((f) => ({
-								blob_oid: Buffer.from(f.blobOid, "hex"),
-								mode: f.mode,
-								path: f.path,
-								ref_name: refName,
-								repo_id: id,
-							})),
-						)
-						.execute()
-				}
+			const rows: CopyValue[][] = fileList.files.map((f) => [
+				{ t: "int8", v: id },
+				{ t: "text", v: refName },
+				{ t: "text", v: f.path },
+				{ t: "text", v: f.mode },
+				{ t: "bytea", v: Buffer.from(f.blobOid, "hex") },
+			])
+			// Replace the branch's snapshot in one transaction. COPY into staging has no
+			// bind-parameter ceiling, so a tip with any file count lands in a single
+			// statement (an un-chunked multi-row INSERT died at ~13k files, §a06).
+			await pg.begin(async (tx) => {
+				await tx`delete from repo_file where repo_id = ${id} and ref_name = ${refName}`
+				await copyInsert(
+					tx,
+					"repo_file",
+					["repo_id", "ref_name", "path", "mode", "blob_oid"],
+					rows,
+				)
 			})
 		},
 	}

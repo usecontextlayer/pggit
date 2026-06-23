@@ -5,6 +5,8 @@
  * `0002`. See gitprotocol-common + design spec §5.
  */
 
+import { GitProtocolError } from "@/protocol/errors"
+
 export type Pkt =
 	| { type: "data"; payload: Buffer }
 	| { type: "flush" }
@@ -49,7 +51,9 @@ export function encodePkt(pkt: Pkt): Buffer {
 function parseLen(buf: Buffer, offset: number): number {
 	const hex = buf.toString("latin1", offset, offset + 4)
 	if (!/^[0-9a-f]{4}$/i.test(hex)) {
-		throw new Error(`pkt-line: invalid length prefix ${JSON.stringify(hex)}`)
+		// Malformed framing in a client request body — a wire-boundary fault (400),
+		// not a server error.
+		throw new GitProtocolError(`pkt-line: invalid length prefix ${JSON.stringify(hex)}`)
 	}
 	return Number.parseInt(hex, 16)
 }
@@ -87,11 +91,11 @@ export function decodePktStream(
 			continue
 		}
 		if (len === 3) {
-			throw new Error("pkt-line: reserved length 0003")
+			throw new GitProtocolError("pkt-line: reserved length 0003")
 		}
 		const payloadLen = len - 4
 		if (payloadLen > READER_MAX_PAYLOAD) {
-			throw new Error(
+			throw new GitProtocolError(
 				`pkt-line: declared payload ${payloadLen} exceeds reader bound ${READER_MAX_PAYLOAD}`,
 			)
 		}

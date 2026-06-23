@@ -22,8 +22,8 @@ describe("M2 — ref command modes: delete + non-fast-forward (real git)", () =>
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
 		url = `http://127.0.0.1:${server.port}`
 	}, 180_000)

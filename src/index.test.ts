@@ -1,6 +1,5 @@
 import postgres from "postgres"
 import { describe, expect, it } from "vitest"
-import { type Database, initKysely } from "@/database"
 import { createGitApp } from "@/index"
 import { createObjectStore } from "@/object-store"
 import { encodePkt, encodePktLine } from "@/pkt-line"
@@ -8,10 +7,10 @@ import { createRefStore } from "@/refs-store"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 
 // A client that is never queried by /health, so no real Postgres is needed.
-const db = initKysely<Database>(postgres("postgres://unused:1/none"))
+const pg = postgres("postgres://unused:1/none")
 const app = createGitApp({
-	objects: createObjectStore(db),
-	refs: createRefStore(db),
+	objects: createObjectStore(pg),
+	refs: createRefStore(pg),
 })
 
 const A = "a".repeat(40)
@@ -36,7 +35,12 @@ describe("createGitApp", () => {
 	// The first byte-exchange of every clone/fetch: a strict client contract. git
 	// refuses the connection if the Content-Type or the `# service` framing is wrong.
 	it("serves the upload-pack info/refs advert with the smart-HTTP preamble + Content-Type", async () => {
-		const res = await app.request("/repo1/info/refs?service=git-upload-pack")
+		// A v2 fetch client negotiates the protocol with this header; the server
+		// serves the v2 advert only when it is present (a v0 client is refused — see
+		// the boundary-error suite below).
+		const res = await app.request("/repo1/info/refs?service=git-upload-pack", {
+			headers: { "git-protocol": "version=2" },
+		})
 		expect(res.status).toBe(200)
 		expect(res.headers.get("Content-Type")).toBe(
 			"application/x-git-upload-pack-advertisement",
@@ -71,6 +75,14 @@ describe("createGitApp — server-boundary error responses", () => {
 		const res = await post("/repo1/git-upload-pack", body)
 		expect(res.status).toBe(400)
 		expect(await res.text()).toMatch(/unsupported command/)
+	})
+
+	// Fetch is protocol-v2 only (the charter). A client that did not negotiate v2
+	// (no `Git-Protocol: version=2`) cannot parse the v2 advert and would clone an
+	// empty repo, so the advert is refused with a clean 4xx rather than served.
+	it("400s an upload-pack info/refs request that did not negotiate protocol v2", async () => {
+		const res = await app.request("/repo1/info/refs?service=git-upload-pack")
+		expect(res.status).toBe(400)
 	})
 
 	it("400s a request body in an unsupported Content-Encoding", async () => {

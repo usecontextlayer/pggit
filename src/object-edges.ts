@@ -45,6 +45,55 @@ function assertOid(oid: string, context: string): string {
 	return oid
 }
 
+/** Count the leading `key value` header lines (up to the blank line that ends a
+ * commit/tag's header block). */
+function countHeader(content: Buffer, key: string): number {
+	const prefix = `${key} `
+	let n = 0
+	for (const line of content.toString("latin1").split("\n")) {
+		if (line === "") break // headers end at the blank line
+		if (line.startsWith(prefix)) n++
+	}
+	return n
+}
+
+/**
+ * fsck-grade structural validation at the ingest boundary (§5.1, invariant §10.2):
+ * reject the malformed objects that OID-wellformedness and tree parsing do not
+ * catch. A commit must not carry more than one `tree` header (git fsck:
+ * multipleTrees — `commitTreeOid` would otherwise silently take the first and drop
+ * the rest, recording an edge to a tree the object does not actually root). An
+ * annotated tag must carry exactly one `object` header (git fsck: missingObject /
+ * an extra object line): zero yields no `kind=5` edge and silently breaks peeling
+ * and connectivity; more than one yields multiple divergent `kind=5` edges and a
+ * nondeterministic `peeled_oid`. The other structural guarantees are already
+ * enforced downstream: `assertOid` on every referenced OID (below), a present root
+ * `tree` (`commitTreeOid`, which also rejects a zero-tree commit), and a well-formed
+ * tree body (`treeEntries` throws). Called by the store once per object before
+ * derivation, in the ingest transaction, so a malformed push aborts before any row
+ * lands.
+ */
+export function validateObject(type: GitObjectType, content: Buffer): void {
+	if (type === "commit" && countHeader(content, "tree") > 1) {
+		throw new GitFormatError(
+			"multiple-tree-headers",
+			"commit carries more than one tree header",
+		)
+	}
+	if (type === "tag") {
+		const objects = countHeader(content, "object")
+		if (objects < 1) {
+			throw new GitFormatError("missing-tag-object", "annotated tag has no object header")
+		}
+		if (objects > 1) {
+			throw new GitFormatError(
+				"multiple-tag-objects",
+				"annotated tag carries more than one object header",
+			)
+		}
+	}
+}
+
 /**
  * The edges an object contributes to `git_edge`, with the object's own OID as the
  * parent — the §4.3 standing rule, mode-aware:

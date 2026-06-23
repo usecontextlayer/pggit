@@ -56,6 +56,23 @@ async function readRequestBody(c: Context): Promise<Buffer> {
 	)
 }
 
+/**
+ * Fetch is served over git protocol v2 ONLY (the charter). git requests v2 with a
+ * `Git-Protocol: version=2` header (a `:`-joined key list; git ≥ 2.26 sends it by
+ * default). A v0/v1 client sends no such header and cannot parse the v2
+ * advertisement — it would read the `version 2` line + flush as an empty repo and
+ * silently clone nothing. So reject the unnegotiated case loudly at the boundary
+ * (400) instead of handing back an advertisement it will misread.
+ */
+function assertProtocolV2(header: string | undefined): void {
+	const requested = (header ?? "").split(":").map((s) => s.trim())
+	if (!requested.includes("version=2")) {
+		throw new GitProtocolError(
+			"pggit serves fetch over git protocol v2 only; set protocol.version=2 (git ≥ 2.26 negotiates it by default)",
+		)
+	}
+}
+
 function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	return {
 		buildPack: (wants, haves, omitBlobs, includeTag) =>
@@ -123,6 +140,7 @@ export function createGitApp(
 	app.get("/:repo/info/refs", async (c) => {
 		const service = c.req.query("service")
 		if (service === "git-upload-pack") {
+			assertProtocolV2(c.req.header("git-protocol"))
 			return c.body(ADVERTISEMENT_BODY, 200, {
 				"Cache-Control": "no-cache",
 				"Content-Type": "application/x-git-upload-pack-advertisement",

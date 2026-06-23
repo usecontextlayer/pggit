@@ -41,8 +41,8 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 
 		src = mkdtempSync(join(tmpdir(), "pggit-m1neg-src-"))
 		await spawnGit(["init", "-q"], { cwd: src })

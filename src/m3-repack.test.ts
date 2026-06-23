@@ -31,8 +31,8 @@ describe("M3 — at-rest repack invariant", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 
 		// A real repo: two commits + an annotated tag (a tag object to consolidate too).
 		src = mkdtempSync(join(tmpdir(), "pggit-repack-src-"))

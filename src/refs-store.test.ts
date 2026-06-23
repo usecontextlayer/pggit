@@ -21,7 +21,7 @@ afterAll(async () => {
 /** A fresh isolated ref store on its own schema. */
 async function freshStore(): Promise<{ refs: RefStore; db: IsolatedDb }> {
 	const db = await createIsolatedSchema(container.getConnectionUri())
-	return { db, refs: createRefStore(db.db) }
+	return { db, refs: createRefStore(db.sql) }
 }
 
 /** The oid stored for `name`, or undefined — the observable per-ref state. */

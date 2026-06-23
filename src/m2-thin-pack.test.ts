@@ -23,7 +23,7 @@ describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () =
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
+		objects = createObjectStore(db.sql)
 	}, 180_000)
 
 	afterAll(async () => {

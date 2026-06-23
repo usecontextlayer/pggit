@@ -54,8 +54,8 @@ describe("M2 — concurrent push race + malformed-pack rejection", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 
 		// A base repo with one commit on main, seeded so both clients clone the same tip.
 		base = mkdtempSync(join(tmpdir(), "pggit-race-base-"))

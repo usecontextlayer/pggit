@@ -22,8 +22,8 @@ describe("M2 — push to an empty repo (real git)", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 		// No seed: repo1 is empty — the dominant first-push state.
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
 	}, 180_000)

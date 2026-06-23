@@ -57,7 +57,7 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
 		server = await serveOnPort(
-			createGitApp({ objects: createObjectStore(db.db), refs: createRefStore(db.db) }),
+			createGitApp({ objects: createObjectStore(db.sql), refs: createRefStore(db.sql) }),
 			0,
 		)
 		url = `http://127.0.0.1:${server.port}`
@@ -86,7 +86,7 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 			])
 			await spawnGit(["fsck", "--full"], { cwd: back })
 			expect(await reachableOids(back)).toEqual(await reachableOids(src))
-			const stored = (await createRefStore(db.db).listRefs(repoId)).sort((a, b) =>
+			const stored = (await createRefStore(db.sql).listRefs(repoId)).sort((a, b) =>
 				a.name.localeCompare(b.name),
 			)
 			expect(stored).toEqual(await refsOf(src))

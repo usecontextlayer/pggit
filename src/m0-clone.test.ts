@@ -28,8 +28,8 @@ describe("M0 — full clone over smart-HTTP v2 (real git)", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		const refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		const refs = createRefStore(db.sql)
 
 		// Build a real source repo: nested dirs, two commits, an annotated tag.
 		src = mkdtempSync(join(tmpdir(), "pggit-m0-src-"))

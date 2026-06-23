@@ -39,8 +39,8 @@ describe("§8.4 generative — full clone (M0) differential", () => {
 					let server: GitServer | undefined
 					let dest: string | undefined
 					try {
-						const objects = createObjectStore(isolated.db)
-						const refs = createRefStore(isolated.db)
+						const objects = createObjectStore(isolated.sql)
+						const refs = createRefStore(isolated.sql)
 						await seedRepoIntoStore("repo", src, { objects, refs })
 						server = await serveOnPort(createGitApp({ objects, refs }), 0)
 

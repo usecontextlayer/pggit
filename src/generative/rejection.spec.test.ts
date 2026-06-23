@@ -53,8 +53,8 @@ describe("§8.4 generative — connectivity rejection over random graphs", () =>
 
 					const isolated = await createIsolatedSchema(baseUrl)
 					try {
-						const objects = createObjectStore(isolated.db)
-						const refs = createRefStore(isolated.db)
+						const objects = createObjectStore(isolated.sql)
+						const refs = createRefStore(isolated.sql)
 						const backend: ReceiveBackend = {
 							applyRefUpdates: (cmds, atomic) => refs.applyRefUpdates("r", cmds, atomic),
 							ingest: async (pack) => {
@@ -103,8 +103,8 @@ describe("§8.4 generative — empty-tree round-trip", () => {
 			).stdout.trim()
 			expect(tree).toBe(EMPTY_TREE)
 
-			const objects = createObjectStore(isolated.db)
-			const refs = createRefStore(isolated.db)
+			const objects = createObjectStore(isolated.sql)
+			const refs = createRefStore(isolated.sql)
 			server = await serveOnPort(createGitApp({ objects, refs }), 0)
 			const url = `http://127.0.0.1:${server.port}/repo`
 			await spawnGit(["push", url, "refs/heads/*:refs/heads/*"], { cwd: src })

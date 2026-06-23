@@ -19,7 +19,7 @@ describe("object store", () => {
 	it("round-trips objects through Postgres (put pack, get by oid)", async () => {
 		const db = await createIsolatedSchema(container.getConnectionUri())
 		try {
-			const store = createObjectStore(db.db)
+			const store = createObjectStore(db.sql)
 
 			const objects: PackInputObject[] = [
 				{ content: Buffer.from("hello\n"), type: "blob" },
@@ -62,7 +62,7 @@ describe("object store", () => {
 	it("putPack is idempotent — re-storing the same objects neither errors nor changes the set", async () => {
 		const db = await createIsolatedSchema(container.getConnectionUri())
 		try {
-			const store = createObjectStore(db.db)
+			const store = createObjectStore(db.sql)
 			const objects: PackInputObject[] = [
 				{ content: Buffer.from("dup-a\n"), type: "blob" },
 				{ content: Buffer.from("dup-b\n"), type: "blob" },
@@ -81,7 +81,7 @@ describe("object store", () => {
 	it("ingesting two overlapping packs yields the union, each object present", async () => {
 		const db = await createIsolatedSchema(container.getConnectionUri())
 		try {
-			const store = createObjectStore(db.db)
+			const store = createObjectStore(db.sql)
 			const a = { content: Buffer.from("only-a\n"), type: "blob" as const }
 			const shared = { content: Buffer.from("shared\n"), type: "blob" as const }
 			const c = { content: Buffer.from("only-c\n"), type: "blob" as const }

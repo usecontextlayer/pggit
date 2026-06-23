@@ -29,8 +29,8 @@ describe("peeled_oid at ref-write", () => {
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		const objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		const objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 
 		dir = mkdtempSync(join(tmpdir(), "pggit-peel-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })

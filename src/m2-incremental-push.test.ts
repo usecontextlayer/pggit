@@ -28,8 +28,8 @@ describe("M2 — incremental push: CAS update of an existing ref (real git)", ()
 	beforeAll(async () => {
 		container = await startPostgres()
 		db = await createIsolatedSchema(container.getConnectionUri())
-		objects = createObjectStore(db.db)
-		refs = createRefStore(db.db)
+		objects = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
 	}, 180_000)
 

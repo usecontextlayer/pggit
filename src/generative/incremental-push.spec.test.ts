@@ -46,8 +46,8 @@ describe("§8.4 generative — incremental push (M2) differential", () => {
 						let server: GitServer | undefined
 						let back: string | undefined
 						try {
-							const objects = createObjectStore(isolated.db)
-							const refs = createRefStore(isolated.db)
+							const objects = createObjectStore(isolated.sql)
+							const refs = createRefStore(isolated.sql)
 							// Empty server: the first push creates the refs — do NOT seed.
 							server = await serveOnPort(createGitApp({ objects, refs }), 0)
 							const url = `http://127.0.0.1:${server.port}/repo`
