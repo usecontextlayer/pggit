@@ -233,11 +233,19 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 		// the independent oracle for "complete edge set, nothing wrongly deleted".
 		const expectedEdges = await withTempDir("pggit-gc5-oracle-", async (dir) => {
 			await spawnGit(["init", "-q"], { cwd: dir })
+			// Fetch into a real local ref, not just FETCH_HEAD: the edge/closure oracle
+			// walks `rev-list --all`, which only sees `refs/` entries — a bare FETCH_HEAD
+			// is invisible to it, leaving the expected set wrongly empty. A non-default
+			// ref name avoids colliding with the fresh repo's unborn current branch.
 			await spawnGit(
-				["-c", "protocol.version=2", "fetch", repoUrl(fx, repo), "refs/heads/main"],
-				{
-					cwd: dir,
-				},
+				[
+					"-c",
+					"protocol.version=2",
+					"fetch",
+					repoUrl(fx, repo),
+					"refs/heads/main:refs/heads/oracle",
+				],
+				{ cwd: dir },
 			)
 			expect(
 				(await spawnGit(["rev-parse", "FETCH_HEAD"], { cwd: dir })).stdout.trim(),

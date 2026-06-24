@@ -7,10 +7,14 @@
  * counts, advisory locks, CTE/SQL shape) — those stay free to change. Grace is
  * made deterministic with `graceSeconds` + `ageObjects`, never a wall-clock sleep.
  *
- * RED now: `createGc` is a throwing stub, so every `gc()` call rejects with
- * "pggit gc: not implemented (TDD stub)". GREEN once GC honours the §4 contract.
+ * GC-9 is the one exception to "observable-only": it passes the GC's documented
+ * internal test seam (`_hooks.afterLiveSet`, gc.ts) — the ONLY internal coupling
+ * allowed here — to interpose a real push between the live-set snapshot and the
+ * sweep, turning §5's in-flight race into a deterministic, non-flaky test. Every
+ * ASSERTION is still observable-only (git oracle + Postgres rows + gc() return).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GcResult } from "@/store/gc"
 import {
 	ageObjects,
 	cloneAndFsck,
@@ -19,10 +23,27 @@ import {
 	edgeRows,
 	type GcFixture,
 	objectOids,
+	type PushResult,
 	pushFile,
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
+
+/**
+ * GC-9's documented internal test seam (gc.ts `InternalGcOptions._hooks`): not
+ * part of the public `GcOptions` contract, so the test states the exact shape it
+ * relies on. `afterLiveSet` is awaited after the live set is materialized and
+ * before the object sweep — the one point §5 in-flight safety hinges on. This is
+ * the SOLE internal coupling in this file; every assertion stays observable-only.
+ */
+type GcWithSeam = (
+	repo: string,
+	opts: {
+		graceSeconds: number
+		batchLimit?: number
+		_hooks: { afterLiveSet: () => Promise<void> }
+	},
+) => Promise<GcResult>
 
 describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 	let fx: GcFixture
@@ -78,52 +99,84 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 		expect(cloneB.fileContent).toBe("totally-different-B\n")
 	})
 
-	// GC-9 — LIVENESS SMOKE TEST: a GC fired around a push does not corrupt the
-	// live tip. We bracket a `pushFile` with a `gc(grace=0)` before AND after it,
-	// then assert the pushed-and-referenced tip clones complete + fsck-clean and
-	// every object of that tip survives in Postgres. We assert via the git oracle
-	// + rows, NOT via the §5 REPEATABLE-READ / advisory-lock internals.
+	// GC-9 — IN-FLIGHT PUSH SAFETY (the real §5 race, deterministic). The property:
+	// an object a push sends AND references DURING a GC's window — after GC has
+	// snapshotted the live set, before/while it sweeps — must NOT be reclaimed,
+	// even though it is absent from that already-fixed live set. §5's defence here
+	// is the `created_at` time-grace (the write-path advisory lock is deferred to
+	// §5.4 and not yet wired), so a push's fresh objects, younger than `grace`, are
+	// retained across a sweep that snapshotted before they existed.
 	//
-	// This is DELIBERATELY only a smoke test, not an in-flight-safety proof. The
-	// Promise.all interleave cannot establish §5's guarantee: `pushFile` spawns a
-	// real `git` subprocess whose startup dwarfs the in-process GC SQL, and the
-	// post-push GC reads refs AFTER the push has committed, over fresh (un-aged)
-	// objects at grace=0 — so the live tip is never actually in-flight relative to
-	// either sweep. An implementation with ZERO §5 isolation passes this test;
-	// that is why GC-9 only claims liveness-around-a-push here.
+	// The smoke test this replaces could not prove that: a `Promise.all` interleave
+	// is non-deterministic (the `git` subprocess startup dwarfs the in-process GC
+	// SQL, so the push always committed before either sweep) — the live tip was
+	// never actually in-flight relative to a sweep. We make the race deterministic
+	// with the documented `_hooks.afterLiveSet` seam: it fires a REAL force-commit
+	// push of a FRESH commit (new objects + ref move) at exactly the moment §5
+	// cares about — after the live set is materialized, before the sweep runs.
 	//
-	// TODO(impl): the genuine in-flight safety property (§5 REPEATABLE-READ live
-	// set + advisory-locked ref read) requires a GC pause-seam between the
-	// live-set read and the sweep; write that deterministic race test during GC
-	// implementation.
-	it("GC-9: a GC fired around a push does not corrupt the live tip (liveness smoke test)", async () => {
+	// Construction (all three states present in ONE sweep):
+	//   c1  pre-existing orphan  — unreachable BEFORE the GC (orphaned by c2's
+	//                              force-push) AND aged past grace ⇒ MUST be reclaimed.
+	//   c2  the live tip at snapshot — reachable, captured in the live set.
+	//   c3  the in-flight push    — sent inside the window, young (just created),
+	//                              unreachable-at-snapshot ⇒ MUST survive (grace).
+	// Grace sits between the two ages (orphans aged 1h ≫ grace ≫ c3's ~0s age), so
+	// the SAME sweep reclaims the old orphan and protects the young in-flight tip.
+	//
+	// Why this catches a no-isolation impl: an implementation that reclaims anything
+	// unreachable-at-snapshot regardless of age would delete c3's objects (c3 is not
+	// in the live set), and the clone of the pushed tip would fail `fsck` / fetch
+	// ("not our ref"). Only the grace (or, later, the advisory lock) keeps c3 alive
+	// — so this test fails any impl that drops the §5 in-flight defence, while the
+	// reclaimed c1 proves the sweep genuinely ran (not a vacuous no-op).
+	it("GC-9: an in-flight push's objects survive a concurrent GC sweep while pre-existing orphans are reclaimed", async () => {
 		const repo = "gc9"
 
-		// Seed an initial commit so the repo exists, then orphan it via force so
-		// there is genuine garbage for the bracketing GC to chase.
-		await pushFile(fx, repo, { content: "gc9-seed\n" })
+		// c1: seed. c2: force-commit that orphans c1 BEFORE any GC runs — so c1 is
+		// unreachable at the live-set snapshot, the precondition for it to be swept.
+		const c1 = await pushFile(fx, repo, { content: "gc9-c1\n" })
+		const c2 = await pushFile(fx, repo, { content: "gc9-c2\n", force: true })
+
+		// Age every stored object back 1h. c1's orphans now sit past the grace
+		// (eligible); c2 is reachable-at-snapshot so the live set protects it
+		// regardless of age. c3 is pushed AFTER this, so it stays young.
 		await ageObjects(fx.db, repo, "1 hour")
 
-		// Bracket a fresh force-commit push with a GC before AND after it. The
-		// push's new tip + its objects must survive both sweeps intact. (This is a
-		// liveness smoke test — see the block comment above; it does NOT prove the
-		// §5 in-flight isolation property.)
-		const firstGc = fx.gc.gc(repo, { graceSeconds: 0 })
-		const push = pushFile(fx, repo, { content: "gc9-inflight\n", force: true })
-		const [, pushed] = await Promise.all([firstGc, push])
-		await fx.gc.gc(repo, { graceSeconds: 0 })
+		// Run GC with a grace that straddles the two ages: 30min < 1h orphan age,
+		// but ≫ c3's ~0s age. The seam fires the in-flight force-commit push of c3
+		// after the live set is fixed (which captured c2, not c3) and before the
+		// sweep — the exact §5 window.
+		let c3: PushResult | undefined
+		const reclaimed = await (fx.gc.gc as GcWithSeam)(repo, {
+			_hooks: {
+				afterLiveSet: async () => {
+					c3 = await pushFile(fx, repo, { content: "gc9-c3-inflight\n", force: true })
+				},
+			},
+			graceSeconds: 1800,
+		})
+		if (!c3) throw new Error("afterLiveSet seam did not fire")
 
-		// The pushed ref clones complete + fsck-clean, at exactly the pushed tip.
-		const clone = await cloneAndFsck(fx, repo)
-		expect(clone.head).toBe(pushed.head)
-		expect(clone.fileContent).toBe("gc9-inflight\n")
-
-		// Every object the pushed tip reaches still exists in Postgres (no object
-		// of the live tip was reclaimed by the concurrent/bracketing GC).
+		// The sweep genuinely ran: c1's aged orphans were reclaimed (not a no-op).
+		expect(reclaimed.deletedObjects).toBeGreaterThan(0)
 		const survivors = await objectOids(fx.db, repo)
-		for (const oid of pushed.reachable) {
+		for (const oid of c1.reachable) {
+			if (c2.reachable.includes(oid) || c3.reachable.includes(oid)) continue
+			expect(survivors).not.toContain(oid)
+		}
+
+		// The in-flight tip survives intact: every object c3 reaches is still in
+		// Postgres, even though it was absent from the snapshotted live set.
+		for (const oid of c3.reachable) {
 			expect(survivors).toContain(oid)
 		}
+
+		// And the pushed ref clones complete + fsck-clean, at exactly the c3 tip —
+		// the end-to-end git oracle that a no-isolation impl (which swept c3) fails.
+		const clone = await cloneAndFsck(fx, repo)
+		expect(clone.head).toBe(c3.head)
+		expect(clone.fileContent).toBe("gc9-c3-inflight\n")
 	})
 
 	// GC-10 — Batch invariance. GC with batchLimit:1 reaches the SAME final
