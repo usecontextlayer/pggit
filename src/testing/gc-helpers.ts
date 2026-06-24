@@ -273,3 +273,23 @@ export async function ageObjects(
 		where repo_id = (select id from repos where name = ${repo})
 	`
 }
+
+/** The two GC-scheduling timestamps on the `repos` row — the durable activity
+ * signal the background drain polls (docs/2026-06-24-gc-scheduler-design.md §2).
+ * Both are `null` when the repo row is absent (never pushed) or the column unset.
+ * Observable surface for SCH-1/SCH-2 (a push stamps `last_pushed_at`) and
+ * SCH-3/SCH-4 (a drain advances `last_gc_at`). */
+export type RepoGcState = { lastPushedAt: Date | null; lastGcAt: Date | null }
+
+export async function repoGcState(
+	db: Pick<IsolatedDb, "sql">,
+	repo: string,
+): Promise<RepoGcState> {
+	const [row] = await db.sql<{ last_pushed_at: Date | null; last_gc_at: Date | null }[]>`
+		select last_pushed_at, last_gc_at from repos where name = ${repo}
+	`
+	return {
+		lastGcAt: row?.last_gc_at ?? null,
+		lastPushedAt: row?.last_pushed_at ?? null,
+	}
+}

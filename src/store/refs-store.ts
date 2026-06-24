@@ -109,16 +109,38 @@ async function ensureHeadDefault(exec: Kysely<Database>, repoId: ReposId): Promi
 }
 
 /**
+ * Stamp the repo's GC-activity watermark (`repos.last_pushed_at`) — a ref change
+ * makes the prior tip a reclaim candidate, so the self-scheduling drain must judge
+ * the repo eligible (gc-scheduler.ts §2). Called only when a ref ROW actually
+ * changed (not on a no-op success like deleting an absent ref), so non-mutating
+ * traffic never re-triggers GC. A tiny single-row HOT update on the churn-tuned
+ * `repos` (0004); `clock_timestamp()` is the server-side wall clock.
+ */
+async function stampPushed(exec: Kysely<Database>, repoId: ReposId): Promise<void> {
+	await exec
+		.updateTable("repos")
+		.set({ last_pushed_at: sql`clock_timestamp()` })
+		.where("id", "=", repoId)
+		.execute()
+}
+
+/** The outcome of one CAS: `ok` is the report-status success the client sees;
+ * `mutated` is whether a ref row actually changed. They differ only for an
+ * unconditional delete of an absent ref — a no-op SUCCESS that mutated nothing,
+ * which must NOT stamp activity. */
+type CasResult = { ok: boolean; mutated: boolean }
+
+/**
  * Apply one ref change by compare-and-swap against the client's advertised old
  * oid, on the given executor (the db, or a transaction for an atomic batch).
- * Returns whether exactly one row changed. Non-ff is accepted by default — CAS
- * guards concurrency, not ancestry (spec §3.6).
+ * Returns the report-status `ok` and whether a row actually changed (`mutated`).
+ * Non-ff is accepted by default — CAS guards concurrency, not ancestry (spec §3.6).
  */
 async function casRefUpdate(
 	exec: Kysely<Database>,
 	repoId: ReposId,
 	cmd: RefUpdate,
-): Promise<boolean> {
+): Promise<CasResult> {
 	const name = cmd.ref as GitRefName
 	const op = classifyRefUpdate(cmd)
 	switch (op.kind) {
@@ -130,19 +152,22 @@ async function casRefUpdate(
 				.onConflict((oc) => oc.doNothing())
 				.returningAll()
 				.execute()
-			return rows.length === 1
+			const mutated = rows.length === 1
+			return { mutated, ok: mutated }
 		}
 		case "delete": {
 			// CAS the delete on the asserted old-oid; an unconditional delete (zero
 			// old-oid ⇒ null) drops the ref by name and succeeds even when it was
-			// already absent — git treats deleting a non-existent ref as a no-op.
+			// already absent — git treats deleting a non-existent ref as a no-op. That
+			// no-op is `ok` but NOT a mutation (no row removed), so it does not stamp.
 			let q = exec
 				.deleteFrom("git_ref")
 				.where("repo_id", "=", repoId)
 				.where("name", "=", name)
 			if (op.oldOid !== null) q = q.where("oid", "=", op.oldOid)
 			const rows = await q.returningAll().execute()
-			return op.oldOid === null || rows.length === 1
+			const mutated = rows.length === 1
+			return { mutated, ok: op.oldOid === null || mutated }
 		}
 		case "update": {
 			const peeled = await peelRef(exec, repoId, op.newOid)
@@ -154,7 +179,8 @@ async function casRefUpdate(
 				.where("oid", "=", op.oldOid)
 				.returningAll()
 				.execute()
-			return rows.length === 1
+			const mutated = rows.length === 1
+			return { mutated, ok: mutated }
 		}
 	}
 }
@@ -188,9 +214,15 @@ export function createRefStore(pg: Sql) {
 			await ensureHeadDefault(db, id)
 			if (!atomic) {
 				const results: boolean[] = []
+				let mutated = false
 				for (const cmd of commands) {
-					results.push(await casRefUpdate(db, id, cmd))
+					const r = await casRefUpdate(db, id, cmd)
+					results.push(r.ok)
+					if (r.mutated) mutated = true
 				}
+				// One activity stamp per push, only when a ref actually changed — a batch
+				// of pure no-ops leaves the watermark untouched (so GC is not re-triggered).
+				if (mutated) await stampPushed(db, id)
 				return results
 			}
 			// Atomic batch: take the per-ref row locks in a deterministic by-name order
@@ -201,17 +233,29 @@ export function createRefStore(pg: Sql) {
 			const ordered = [...commands].sort((a, b) =>
 				a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0,
 			)
+			let anyMutated = false
 			try {
 				await db.transaction().execute(async (trx) => {
 					for (const cmd of ordered) {
-						if (!(await casRefUpdate(trx, id, cmd))) throw new AtomicAbort()
+						const r = await casRefUpdate(trx, id, cmd)
+						if (!r.ok) throw new AtomicAbort()
+						if (r.mutated) anyMutated = true
 					}
 				})
-				return commands.map(() => true)
 			} catch (error) {
 				if (error instanceof AtomicAbort) return commands.map(() => false)
 				throw error
 			}
+			// Stamp AFTER the batch commits — NOT inside the txn. `clock_timestamp()` must
+			// be read at/after the ref-move's COMMIT so the activity watermark is never
+			// stamped earlier than the orphan it announces; an in-txn stamp evaluates
+			// before commit, letting a concurrent GC pass write `last_gc_at` past it and
+			// lose that garbage forever (the GC primitive's snapshot still protects
+			// liveness, so this is leak-not-corruption — but a leak the durable signal is
+			// meant to prevent). Mirrors the non-atomic path, which already stamps after
+			// its CAS commits.
+			if (anyMutated) await stampPushed(db, id)
+			return commands.map(() => true)
 		},
 
 		async getSymref(repoId: string, name: string): Promise<string | null> {

@@ -353,6 +353,13 @@ export function createObjectStore(pg: Sql) {
 				objectRows,
 			)
 			await copyInsert(tx, "git_edge", ["repo_id", "parent", "child", "kind"], edgeRows)
+			// Stamp the repo's GC-activity watermark in the SAME transaction as the
+			// ingest: these objects are reclaim candidates (a force-commit orphans the
+			// prior snapshot the instant the ref moves), so the self-scheduling drain must
+			// judge this repo eligible (gc-scheduler.ts §2). A tiny single-row HOT update
+			// on the churn-tuned `repos` (0004) — reached only on a non-empty ingest (the
+			// empty case returned above).
+			await tx`update repos set last_pushed_at = clock_timestamp() where id = ${id}::bigint`
 		})
 		return entries.map((e) => e.hex)
 	}

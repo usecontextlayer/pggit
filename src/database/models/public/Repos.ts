@@ -11,6 +11,10 @@ export default interface ReposTable {
 	id: ColumnType<ReposId, never, never>
 
 	name: ColumnType<string, string, string>
+
+	last_pushed_at: ColumnType<Date | null, Date | string | null, Date | string | null>
+
+	last_gc_at: ColumnType<Date | null, Date | string | null, Date | string | null>
 }
 
 export type Repos = Selectable<ReposTable>

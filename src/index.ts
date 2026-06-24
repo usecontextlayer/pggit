@@ -194,3 +194,16 @@ export function createGitApp(
 
 	return app
 }
+
+export type {
+	DrainEntry,
+	DrainSummary,
+	GcScheduler,
+	GcSchedulerOptions,
+} from "@/gc-scheduler"
+// Public GC surface: the per-repo reachability GC primitive (a host may drive it
+// directly on its own schedule) and the self-scheduling background drain that
+// decides when to run it (docs/2026-06-24-gc-scheduler-design.md §4).
+export { createGcScheduler } from "@/gc-scheduler"
+export type { Gc, GcOptions, GcResult } from "@/store/gc"
+export { createGc } from "@/store/gc"

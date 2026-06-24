@@ -152,7 +152,7 @@ Build the tests with subagents/workflows, verifying every §6 item **red-for-the
 
 ## 8. Explicitly out of scope (named, not silently dropped)
 
-- **Per-repo advisory lock + multi-instance claim** (`FOR UPDATE SKIP LOCKED` / `pg_advisory_xact_lock(repos.id)`) — deferred until pggit runs >1 instance; v1 is single-instance with an in-process per-repo guard. The data model already extends to it (claim on the eligible `repos` row).
+- **Per-repo advisory lock + multi-instance claim** (`FOR UPDATE SKIP LOCKED` / `pg_advisory_xact_lock(repos.id)`) — deferred until pggit runs >1 instance; v1 is single-instance with the in-process overlap guard (`inFlight`). The data model already extends to it (claim on the eligible `repos` row). **⚠ Hard prerequisite for multi-instance:** the GC primitive's per-repo `gc_live_<id>` staging table is named by repo id and is **shared across instances** — two instances GC'ing the same repo would have one `truncate`/`drop` the other's live set mid-sweep, and the surviving anti-join would then delete the whole *reachable* set (live data loss). So before a second instance runs, the advisory lock MUST wrap the **entire** pass (create→load→sweep→drop) **and** the staging table be instance-scoped (`gc_live_<id>_<token>`). Safe today only because v1 is single-instance.
 - **`manage.ts` / CLI subcommand** — the GC design's §6/§9 floated a CLI; **superseded.** The self-scheduling server is the "server knows when" mechanism, and `createGc` is exported for a host that wants manual/cron control. (The speculative `gc-cli.ts` was already removed as YAGNI.)
 - **Durable state beyond the two columns** (a queue table, per-push counters, `gc_dirty` boolean) — unnecessary; `last_pushed_at > last_gc_at` is the whole signal.
 - **`xmin`/epoch grace** — still the §15 hardening lever of the redesign; v1 ships the short time-grace.
@@ -160,8 +160,18 @@ Build the tests with subagents/workflows, verifying every §6 item **red-for-the
 
 ---
 
-## 9. Open items (resolve during tests/impl, not blocking the design)
+## 9. Resolved during implementation + remaining open items
 
-- **Default `PGGIT_GC_INTERVAL_MS` / `GRACE_SECONDS`** — `30000` / `60` are starting points; tune once measured. The parameters are the contract, the defaults are tunable.
-- **Exact `last_pushed_at` bump site(s)** — §3 names `insertObjects` + `applyRefUpdates`; the precise placement is pinned by SCH-1/SCH-2 tests (a delete and a connectivity-rejected ingest must each move it).
-- **`gc.ts` skip-VACUUM-on-empty refinement (§4)** — include or defer; reviewed independently of the scheduler.
+**Resolved (review-driven, 2026-06-24):**
+
+- **Activity-stamp safety.** The stamp must carry a value `≥` the mutation's COMMIT time, else a concurrent drain can write `last_gc_at` past it and lose the garbage (an atomic-path leak found in review — leak, not corruption: the primitive's snapshot still protects liveness). Both paths now stamp `last_pushed_at` AFTER the ref mutation commits (the atomic path moved its stamp *outside* the txn), and `last_gc_at = t0` is captured **per-repo** immediately before that repo's GC snapshot. Closes the leak by construction; the precise intra-pass interleave stays covered by the primitive's GC-9.
+- **Bloat under `maintain:false`.** The drain never VACUUM/REINDEXes, so migration `0005` retunes the `git_object`/`git_edge` leaf partitions' autovacuum for the DELETE churn (delete-aware scale factor + absolute floor + `cost_delay 0`, incl. the content TOAST), making the autovacuum hand-off engineered rather than asserted.
+- **Connection isolation.** The drain runs on a **dedicated** porsager pool (`startServer`), so its closure-walk reservations never contend with clone/fetch/push on the request pool.
+- **Failure isolation.** One repo's `gc()` throwing is caught and that repo skipped (retried next pass) — a poison repo never aborts the whole pass.
+- **Clean shutdown.** `stop()` awaits the in-flight pass before `close()` tears the pools down.
+- **Bump sites** pinned by SCH-1/SCH-2 + the §3 ingest test (an ingested-but-unreferenced push must stamp). **Skip-VACUUM-on-empty** landed in `gc.ts` (gated on `maintain !== false && reclaimed > 0`).
+
+**Remaining open:**
+
+- **Default `PGGIT_GC_INTERVAL_MS` / `GRACE_SECONDS`** (`30000` / `60`) and the **`0005` autovacuum values** (`scale_factor 0.02` / `threshold 1000` / `cost_delay 0`) are conservative starting points — revisit against measured force-commit churn + index-bloat.
+- **`xmin`/epoch grace** — still the redesign's §15 hardening lever and the principled replacement for the wall-clock `t0` watermark; v1 ships the short time-grace + after-commit stamp.
