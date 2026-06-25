@@ -9,21 +9,19 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { computeOid } from "@/object/object"
 import { readPack } from "@/pack/read-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 
 describe("include-tag augmentation", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let dir = ""
 	let backend: RepoBackend
@@ -32,8 +30,7 @@ describe("include-tag augmentation", () => {
 	let av2 = "" // annotated tag → c2 (NOT in the served set)
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 
@@ -64,7 +61,6 @@ describe("include-tag augmentation", () => {
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 		if (dir) rmSync(dir, { force: true, recursive: true })
 	})
 

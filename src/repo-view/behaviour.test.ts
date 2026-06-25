@@ -8,8 +8,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { rebuildAllSnapshots } from "@/repo-view/rebuild"
 import { createSnapshotStore, type SnapshotStore } from "@/repo-view/snapshot-store"
@@ -17,7 +16,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { parseLsTree } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 // The EXTERNAL contract of the queryable file view, end to end: real `git push`
@@ -30,7 +29,6 @@ import { spawnGit } from "@/testing/spawn-git"
 type FileRow = { path: string; mode: string; content: Buffer }
 
 describe("repo-view — queryable file view (behaviour, real git)", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let server: GitServer
 	let objects: ObjectStore
@@ -38,8 +36,7 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 	let snapshots: SnapshotStore
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 		snapshots = createSnapshotStore(db.sql)
@@ -49,7 +46,6 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 	afterAll(async () => {
 		await server?.close()
 		await db?.drop()
-		await container?.stop()
 	})
 
 	/** The documented external read surface: the canonical "files at a ref" query —

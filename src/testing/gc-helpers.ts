@@ -1,14 +1,14 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
+import { inject } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { allObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 /**
@@ -21,10 +21,9 @@ import { spawnGit } from "@/testing/spawn-git"
  * `created_at` (see `ageObjects`), never by sleeping on the wall clock.
  */
 
-/** The full per-suite fixture: one real Postgres container + an isolated schema,
- * the object/ref stores, a served git app, and the GC under test. */
+/** The full per-suite fixture: an isolated schema on the shared `globalSetup` Postgres
+ * container, the object/ref stores, a served git app, and the GC under test. */
 export type GcFixture = {
-	container: StartedPostgreSqlContainer
 	db: IsolatedDb
 	server: GitServer
 	objects: ObjectStore
@@ -33,54 +32,35 @@ export type GcFixture = {
 }
 
 /**
- * Stand up the whole fixture (call in `beforeAll`, timeout 180_000): start
- * Postgres, carve an isolated schema, build the stores + GC over its porsager
- * client, and serve the git app on an ephemeral port. Repos are auto-created on
- * first push, so no repo setup is needed here.
- */
-export async function setupGcFixture(): Promise<GcFixture> {
-	const container = await startPostgres()
-	return gcFixtureOnContainer(container)
-}
-
-/**
- * Build the schema-level fixture — an isolated schema (its OWN `git_object`/`git_edge`
- * partitions), the stores, GC, and a served git app — on an ALREADY-STARTED container.
- * Split out from `startPostgres` so a property test can give EACH candidate a fresh
- * schema while sharing one container: a property that seeds + GCs many large repos
- * into ONE schema lets every candidate's rows pile into the next candidate's GC, and
- * the accumulated partition skews the planner's `repo_id`/`created_at` statistics
- * until the sweep's anti-join flips from a hash-anti-join to a per-row nested loop
- * (orders of magnitude slower). A fresh schema per candidate keeps each GC's stats
+ * Stand up the fixture (call in `beforeAll`, or per-candidate in a property): carve a
+ * FRESH isolated schema (its OWN `git_object`/`git_edge` partitions) out of the shared
+ * `globalSetup` Postgres container (`pgBaseUrl`), build the stores + GC over its
+ * porsager client, and serve the git app on an ephemeral port. Repos are auto-created
+ * on first push, so no repo setup is needed here. The shared container is owned — and
+ * stopped — by `globalSetup`, so there is no per-fixture container to tear down.
+ *
+ * One schema PER call is load-bearing for the stress suite: a property that seeds + GCs
+ * many large repos into ONE schema lets every candidate's rows pile into the next
+ * candidate's GC, and the accumulated partition skews the planner's `repo_id`/`created_at`
+ * statistics until the sweep's anti-join flips from a hash-anti-join to a per-row nested
+ * loop (orders of magnitude slower). A fresh schema per candidate keeps each GC's stats
  * representative. See the gc-stress suite.
  */
-export async function gcFixtureOnContainer(
-	container: StartedPostgreSqlContainer,
-): Promise<GcFixture> {
-	const db = await createIsolatedSchema(container.getConnectionUri())
+export async function setupGcFixture(): Promise<GcFixture> {
+	const db = await createIsolatedSchema(inject("pgBaseUrl"))
 	const objects = createObjectStore(db.sql)
 	const refs = createRefStore(db.sql)
 	const gc = createGc(db.sql)
 	const server = await serveOnPort(createGitApp({ objects, refs }), 0)
-	return { container, db, gc, objects, refs, server }
+	return { db, gc, objects, refs, server }
 }
 
-/** Tear the fixture down (call in `afterAll`): close the server, drop the schema
- * (ends its pooled clients), stop the container. Tolerant of a partial setup. */
+/** Tear the fixture down (call in `afterAll`, or per-candidate): close the server and
+ * drop the schema (which ends its pooled clients). The shared container is left running
+ * — `globalSetup` stops it once, after the whole run. Tolerant of a partial setup. */
 export async function teardownGcFixture(fx: Partial<GcFixture>): Promise<void> {
 	await fx.server?.close()
 	await fx.db?.drop()
-	await fx.container?.stop()
-}
-
-/** Tear down a per-candidate schema fixture built by `gcFixtureOnContainer`, leaving
- * the shared container running — close the server and drop the schema (which ends its
- * pooled clients), so the caller stops the container once, after all candidates. */
-export async function teardownGcSchema(
-	fx: Pick<GcFixture, "server" | "db">,
-): Promise<void> {
-	await fx.server.close()
-	await fx.db.drop()
 }
 
 /** The smart-HTTP URL of `repo` on the fixture's server (repo auto-created on

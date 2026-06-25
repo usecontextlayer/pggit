@@ -1,27 +1,24 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { allObjectOids, bigFile } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
-import { createIsolatedSchema, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 describe("M2 — incremental push: CAS update of an existing ref (real git)", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let server: GitServer
 	let objects: ObjectStore
 	let refs: RefStore
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
@@ -30,7 +27,6 @@ describe("M2 — incremental push: CAS update of an existing ref (real git)", ()
 	afterAll(async () => {
 		await server?.close()
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("accepts a second push that updates the ref (old→new) via CAS", async () => {

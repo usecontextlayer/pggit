@@ -10,14 +10,13 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { refsOf } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 async function commitFile(
@@ -48,14 +47,12 @@ async function reachableOids(dir: string): Promise<string[]> {
 }
 
 describe("merge graph shapes — octopus + criss-cross differential", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let server: GitServer
 	let url = ""
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		server = await serveOnPort(
 			createGitApp({ objects: createObjectStore(db.sql), refs: createRefStore(db.sql) }),
 			0,
@@ -66,7 +63,6 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 	afterAll(async () => {
 		await server?.close()
 		await db?.drop()
-		await container?.stop()
 	})
 
 	/** Push every branch, clone back --no-checkout, fsck, and assert exact parity. */

@@ -1,9 +1,8 @@
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import type { Kysely } from "kysely"
 import postgres, { type Sql } from "postgres"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { type Database, initKysely } from "@/database"
-import { migrateToLatest } from "@/database/migrate"
+import { applyMigrations } from "@/database/migrate"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort, startServer } from "@/server"
 import { createObjectStore } from "@/store/object-store"
@@ -15,7 +14,6 @@ import {
 	pushFile,
 	repoGcState,
 } from "@/testing/gc-helpers"
-import { startPostgres } from "@/testing/pg"
 
 /**
  * GC scheduler — server wiring & config (`docs/2026-06-24-gc-scheduler-design.md`
@@ -34,11 +32,12 @@ import { startPostgres } from "@/testing/pg"
  * wall-clock grace wait. SCH-10's self-GC is the ONE place a real timer is
  * exercised, so it POLLS (bounded) for the observable reclamation effect.
  *
- * Dedicated DB on the PUBLIC schema: `startServer` builds its own porsager
- * client from `databaseUrl` and sets no per-connection `search_path`, so the
- * isolated-schema `setupGcFixture` (which hides the schema behind `search_path`)
- * cannot back it. We stand up our own container + `public`-schema migrations and
- * keep a raw `postgres(uri)` client (passed as `{ sql }`) for the row helpers.
+ * The PUBLIC schema on the shared `globalSetup` container: `startServer` builds its
+ * own porsager client from `databaseUrl` and sets no per-connection `search_path`, so
+ * the isolated-schema `setupGcFixture` (which hides the schema behind `search_path`)
+ * cannot back it. We migrate `public` ourselves and keep a raw `postgres(uri)` client
+ * (passed as `{ sql }`) for the row helpers. No other test touches `public`, so this
+ * stays isolated from the schema-per-file tests sharing the container.
  *
  * RED now because: the store does NOT yet stamp `repos.last_pushed_at` (stays
  * NULL after a push → SCH-9's stamp assertion fails) and `startServer` ignores
@@ -46,22 +45,26 @@ import { startPostgres } from "@/testing/pg"
  * orphans never reclaimed). GREEN once §6 is implemented.
  */
 describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
-	let container: StartedPostgreSqlContainer
 	let db: Kysely<Database>
 	let pg: Sql
+	let baseUrl: string
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		const uri = container.getConnectionUri()
-		pg = postgres(uri)
+		// `applyMigrations` (each up() once, no tracking table), NOT `migrateToLatest`:
+		// on the shared globalSetup container, Kysely's Migrator introspects EVERY schema
+		// to check its bookkeeping table and throws `3F000` the moment a sibling test
+		// `DROP SCHEMA … CASCADE`s a `t_<uuid>` schema mid-introspection. `public` here is
+		// a throwaway-per-run schema (only this file touches it), so it needs each
+		// migration exactly once with no incremental tracking — the race-free path.
+		baseUrl = inject("pgBaseUrl")
+		pg = postgres(baseUrl)
 		db = initKysely<Database>(pg)
-		await migrateToLatest(db)
+		await applyMigrations(db)
 	}, 180_000)
 
 	afterAll(async () => {
 		await db?.destroy()
 		await pg?.end()
-		await container?.stop()
 	})
 
 	/** The DB shape the row helpers want (`{ sql }`), backed by our raw public-schema
@@ -131,7 +134,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		// repos and pollute the later no-reclamation assertions. Closing it here also
 		// implicitly pins that close() halts the drain.
 		const enabled = await startServer({
-			databaseUrl: container.getConnectionUri(),
+			databaseUrl: baseUrl,
 			gc: { enabled: true, graceSeconds: 0, intervalMs: 50 },
 			port: 0,
 		})
@@ -197,7 +200,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	// the stamp.)
 	it("SCH-9: a disabled startServer never reclaims, yet still stamps last_pushed_at and serves clean", async () => {
 		const disabled = await startServer({
-			databaseUrl: container.getConnectionUri(),
+			databaseUrl: baseUrl,
 			gc: { enabled: false, graceSeconds: 0, intervalMs: 50 },
 			port: 0,
 		})

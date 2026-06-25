@@ -60,9 +60,8 @@ import { spawn } from "node:child_process"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import fc from "fast-check"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { describe, expect, it } from "vitest"
 import type { GitObjectType } from "@/object/object"
 import type { PackInputObject } from "@/pack/write-pack"
 import {
@@ -70,13 +69,12 @@ import {
 	countEdges,
 	countObjects,
 	type GcFixture,
-	gcFixtureOnContainer,
 	gitReachableOids,
 	objectOids,
 	repoUrl,
-	teardownGcSchema,
+	setupGcFixture,
+	teardownGcFixture,
 } from "@/testing/gc-helpers"
-import { startPostgres } from "@/testing/pg"
 import { PINNED_DATE, PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
 // fast-import's committer line wants `<unix-seconds> <tz>`, NOT git's `@<seconds>`
@@ -382,8 +380,8 @@ function logScale(label: string, t: ScaleTally): void {
 
 /**
  * The deep/wide parameter arbitrary. Each candidate is LARGE — the bounds were
- * chosen empirically so a candidate builds+seeds in ~0.5-7s (one container-up cost
- * amortized across the few runs):
+ * chosen empirically so a candidate builds+seeds in ~0.5-7s (each candidate carves its
+ * own fresh schema on the shared container):
  *   - chainDepth 40-120   (DEEP — tens-of-commits chain; empirically a 90/120
  *                          history loads in ~0.6s and seeds ~6.5k objects)
  *   - files 60-160        (WIDE — tens-to-low-hundreds of files per snapshot)
@@ -406,32 +404,24 @@ const deepWideParams = fc.record({
 const NUM_RUNS = 3
 
 describe("§4 PBT stress — deep + wide GC differential at scale", () => {
-	// ONE container for the whole suite, but a FRESH schema PER fast-check candidate
-	// (`withCandidate` below). The stress repos are huge, so seeding many of them into
-	// one shared schema would pile every candidate's rows into the next candidate's GC;
-	// the accumulated partition then skews the planner's statistics until the sweep's
-	// anti-join flips to a per-row nested loop and a single GC blows past the test
-	// budget. A fresh schema per candidate keeps each GC's stats representative (and
-	// makes the property candidates genuinely independent). Repo names can therefore be
-	// fixed — they never collide across candidates (each lives in its own schema).
-	let container: StartedPostgreSqlContainer
-
-	beforeAll(async () => {
-		container = await startPostgres()
-	}, 180_000)
-
-	afterAll(async () => {
-		await container.stop()
-	})
+	// A FRESH schema PER fast-check candidate (`withCandidate` below) on the shared
+	// `globalSetup` Postgres container. The stress repos are huge, so seeding many of
+	// them into one shared schema would pile every candidate's rows into the next
+	// candidate's GC; the accumulated partition then skews the planner's statistics
+	// until the sweep's anti-join flips to a per-row nested loop and a single GC blows
+	// past the test budget. A fresh schema per candidate keeps each GC's stats
+	// representative (and makes the property candidates genuinely independent). Repo
+	// names can therefore be fixed — they never collide across candidates (each lives
+	// in its own schema).
 
 	/** Run one fast-check candidate against its OWN fresh schema fixture, torn down
 	 * (server + schema) afterwards while the shared container keeps running. */
 	const withCandidate = async (body: (fx: GcFixture) => Promise<void>): Promise<void> => {
-		const fx = await gcFixtureOnContainer(container)
+		const fx = await setupGcFixture()
 		try {
 			await body(fx)
 		} finally {
-			await teardownGcSchema(fx)
+			await teardownGcFixture(fx)
 		}
 	}
 

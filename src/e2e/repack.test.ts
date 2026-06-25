@@ -10,18 +10,16 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 describe("M3 — at-rest repack invariant", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let server: GitServer
 	let objects: ObjectStore
@@ -29,8 +27,7 @@ describe("M3 — at-rest repack invariant", () => {
 	let src = ""
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 
@@ -52,7 +49,6 @@ describe("M3 — at-rest repack invariant", () => {
 	afterAll(async () => {
 		await server?.close()
 		await db?.drop()
-		await container?.stop()
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 

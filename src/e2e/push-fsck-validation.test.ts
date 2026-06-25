@@ -9,15 +9,14 @@
  * the fix the push would otherwise SUCCEED — isolating the malformedness as the
  * sole reason for rejection.
  */
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { computeOid } from "@/object/object"
 import { writePack } from "@/pack/write-pack"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 
 const ZERO = "0".repeat(40)
@@ -38,15 +37,13 @@ function pushBody(
 }
 
 describe("M2 — ingest rejects fsck-malformed objects", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let objects: ObjectStore
 	let refs: RefStore
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 		app = createGitApp({ objects, refs })
@@ -54,7 +51,6 @@ describe("M2 — ingest rejects fsck-malformed objects", () => {
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("refuses a commit with two tree headers and leaves the ref unset", async () => {

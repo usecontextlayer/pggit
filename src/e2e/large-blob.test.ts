@@ -15,15 +15,14 @@
  * Each original `describe` is preserved verbatim as its own block so the two
  * bug rationales and their assertions stay independent.
  */
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { computeOid } from "@/object/object"
 import { writePack } from "@/pack/write-pack"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
 
@@ -52,7 +51,6 @@ const ZERO = "0".repeat(40)
  * through a JS string (e.g. binary bytea bind / COPY).
  */
 describe("a07 — large-blob push over V8 string cap", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let objects: ObjectStore
@@ -72,8 +70,7 @@ describe("a07 — large-blob push over V8 string cap", () => {
 	}
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 		app = createGitApp({ objects, refs })
@@ -81,7 +78,6 @@ describe("a07 — large-blob push over V8 string cap", () => {
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("ingests a ~257MB blob and creates the ref (real git accepts it)", async () => {
@@ -142,7 +138,6 @@ describe("a07 — large-blob push over V8 string cap", () => {
  * symmetric to the ingest COPY.
  */
 describe("blb01 — large blob is write-only (serve over V8 string cap)", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let objects: ObjectStore
@@ -164,8 +159,7 @@ describe("blb01 — large blob is write-only (serve over V8 string cap)", () => 
 	}
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 		app = createGitApp({ objects, refs })
@@ -190,7 +184,6 @@ describe("blb01 — large blob is write-only (serve over V8 string cap)", () => 
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("serves a fetch of a >256MiB stored blob (HTTP 200 packfile), never a 500", async () => {

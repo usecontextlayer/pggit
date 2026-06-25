@@ -7,25 +7,21 @@
  * present — independent of how the store batches the write (no assertion on chunk
  * size, only on the end state).
  */
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 
 describe("M2 — large push exceeding the bind-parameter ceiling", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let objects: ObjectStore
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 	}, 180_000)
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("stores every object in a push of 15,000 (> 65535/5 columns) objects", async () => {

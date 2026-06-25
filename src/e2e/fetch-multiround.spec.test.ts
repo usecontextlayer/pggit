@@ -12,14 +12,13 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { decodePktStream, type Pkt } from "@/protocol/pkt-line"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
@@ -40,7 +39,6 @@ function ackSection(out: Buffer): string {
 }
 
 describe("M1 multi-round negotiation", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let dir: string
 	let backend: RepoBackend
@@ -49,8 +47,7 @@ describe("M1 multi-round negotiation", () => {
 	let f1 = ""
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 
@@ -84,7 +81,6 @@ describe("M1 multi-round negotiation", () => {
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 		if (dir) rmSync(dir, { force: true, recursive: true })
 	})
 

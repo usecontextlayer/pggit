@@ -1,29 +1,26 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import type { Hono } from "hono"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
-import { createIsolatedSchema, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const ZERO = "0".repeat(40)
 
 describe("M2 — connectivity check rejects an incomplete push (spec §10)", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let app: Hono
 	let objects: ObjectStore
 	let refs: RefStore
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 		app = createGitApp({ objects, refs })
@@ -31,7 +28,6 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("ng's a push whose pack omits a referenced blob, leaving the ref unset", async () => {

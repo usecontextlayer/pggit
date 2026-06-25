@@ -1,23 +1,12 @@
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { describe, expect, inject, it } from "vitest"
 import { computeOid } from "@/object/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
 import { createObjectStore } from "@/store/object-store"
-import { createIsolatedSchema, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema } from "@/testing/pg"
 
 describe("object store", () => {
-	let container: StartedPostgreSqlContainer
-
-	beforeAll(async () => {
-		container = await startPostgres()
-	}, 180_000)
-
-	afterAll(async () => {
-		await container?.stop()
-	})
-
 	it("round-trips objects through Postgres (put pack, get by oid)", async () => {
-		const db = await createIsolatedSchema(container.getConnectionUri())
+		const db = await createIsolatedSchema(inject("pgBaseUrl"))
 		try {
 			const store = createObjectStore(db.sql)
 
@@ -60,7 +49,7 @@ describe("object store", () => {
 	// insert ever regressed from onConflict-doNothing to an error, every second push
 	// would 500 — so pin the idempotency at the unit level.
 	it("putPack is idempotent — re-storing the same objects neither errors nor changes the set", async () => {
-		const db = await createIsolatedSchema(container.getConnectionUri())
+		const db = await createIsolatedSchema(inject("pgBaseUrl"))
 		try {
 			const store = createObjectStore(db.sql)
 			const objects: PackInputObject[] = [
@@ -79,7 +68,7 @@ describe("object store", () => {
 	})
 
 	it("ingesting two overlapping packs yields the union, each object present", async () => {
-		const db = await createIsolatedSchema(container.getConnectionUri())
+		const db = await createIsolatedSchema(inject("pgBaseUrl"))
 		try {
 			const store = createObjectStore(db.sql)
 			const a = { content: Buffer.from("only-a\n"), type: "blob" as const }

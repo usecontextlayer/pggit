@@ -1,8 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
@@ -14,11 +13,10 @@ import {
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
-import { createIsolatedSchema, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 describe("M1 — incremental fetch negotiation (real git)", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
@@ -26,8 +24,7 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 	let refs: ReturnType<typeof createRefStore>
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 
@@ -48,7 +45,6 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 	afterAll(async () => {
 		await server?.close()
 		await db?.drop()
-		await container?.stop()
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 

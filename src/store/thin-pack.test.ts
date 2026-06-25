@@ -1,28 +1,24 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { allObjectOids, bigFile, loadAllObjects } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
-import { createIsolatedSchema, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let objects: ObjectStore
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 	}, 180_000)
 
 	afterAll(async () => {
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("resolves a thin pack against stored bases — and fails without them", async () => {

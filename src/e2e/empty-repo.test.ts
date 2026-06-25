@@ -9,26 +9,23 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { allObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 
 describe("M0 — empty (unborn) repo", () => {
-	let container: StartedPostgreSqlContainer
 	let db: IsolatedDb
 	let server: GitServer
 	let app: ReturnType<typeof createGitApp>
 
 	beforeAll(async () => {
-		container = await startPostgres()
-		db = await createIsolatedSchema(container.getConnectionUri())
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		// An unborn repo: HEAD points at a branch that has no commit yet. No objects,
@@ -41,7 +38,6 @@ describe("M0 — empty (unborn) repo", () => {
 	afterAll(async () => {
 		await server?.close()
 		await db?.drop()
-		await container?.stop()
 	})
 
 	it("clones an empty repo successfully, with no objects and the server's default branch", async () => {

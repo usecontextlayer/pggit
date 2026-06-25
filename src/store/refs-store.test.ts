@@ -1,26 +1,15 @@
-import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { describe, expect, inject, it } from "vitest"
 import { createRefStore, type RefStore } from "@/store/refs-store"
-import { createIsolatedSchema, type IsolatedDb, startPostgres } from "@/testing/pg"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 
 const A = "a".repeat(40)
 const B = "b".repeat(40)
 const C = "c".repeat(40)
 const ZERO = "0".repeat(40)
 
-let container: StartedPostgreSqlContainer
-
-beforeAll(async () => {
-	container = await startPostgres()
-}, 180_000)
-
-afterAll(async () => {
-	await container?.stop()
-})
-
-/** A fresh isolated ref store on its own schema. */
+/** A fresh isolated ref store on its own schema carved from the shared globalSetup container. */
 async function freshStore(): Promise<{ refs: RefStore; db: IsolatedDb }> {
-	const db = await createIsolatedSchema(container.getConnectionUri())
+	const db = await createIsolatedSchema(inject("pgBaseUrl"))
 	return { db, refs: createRefStore(db.sql) }
 }
 
