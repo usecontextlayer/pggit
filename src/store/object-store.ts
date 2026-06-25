@@ -353,14 +353,19 @@ export function createObjectStore(pg: Sql) {
 				objectRows,
 			)
 			await copyInsert(tx, "git_edge", ["repo_id", "parent", "child", "kind"], edgeRows)
-			// Stamp the repo's GC-activity watermark in the SAME transaction as the
-			// ingest: these objects are reclaim candidates (a force-commit orphans the
-			// prior snapshot the instant the ref moves), so the self-scheduling drain must
-			// judge this repo eligible (gc-scheduler.ts §2). A tiny single-row HOT update
-			// on the churn-tuned `repos` (0004) — reached only on a non-empty ingest (the
-			// empty case returned above).
-			await tx`update repos set last_pushed_at = clock_timestamp() where id = ${id}::bigint`
 		})
+		// Stamp the repo's GC-activity watermark AFTER the ingest commits — never inside
+		// the txn, where `clock_timestamp()` would be read BEFORE the commit. These objects
+		// are reclaim candidates (a force-commit orphans the prior snapshot the instant the
+		// ref moves), so the self-scheduling drain must judge this repo eligible
+		// (gc-scheduler.ts §2). Stamping post-commit guarantees `last_pushed_at` is never
+		// earlier than the commit of the orphan it announces, so a drain reading
+		// `t0 = clock_timestamp()` after these objects' commit can't settle
+		// `last_gc_at >= last_pushed_at` and lose that garbage — the same no-lost-garbage
+		// rule refs-store's post-commit `stampPushed` follows. A tiny single-row HOT update
+		// on the churn-tuned `repos` (0004) — reached only on a non-empty ingest (the empty
+		// case returned above).
+		await pg`update repos set last_pushed_at = clock_timestamp() where id = ${id}::bigint`
 		return entries.map((e) => e.hex)
 	}
 
