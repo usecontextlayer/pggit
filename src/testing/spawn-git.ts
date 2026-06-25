@@ -88,6 +88,15 @@ export async function spawnGit(
 			cwd: opts.cwd,
 			env: buildGitEnv(),
 		})
+		// git may close its stdin before we finish writing/ending it (it already has what
+		// it needs — e.g. a rejected push), surfacing a benign EPIPE/EOF on our write. The
+		// real outcome is the exit code via 'close' below, so that case is ignored; without
+		// any handler the stream error would crash the worker and (under the test pool) be
+		// pinned on an unrelated later test. Any OTHER stdin error is a genuine fault — fail
+		// loud by rejecting.
+		child.stdin.on("error", (err: NodeJS.ErrnoException) => {
+			if (err.code !== "EPIPE" && err.code !== "ERR_STREAM_DESTROYED") reject(err)
+		})
 		if (opts.input !== undefined) child.stdin.write(opts.input)
 		child.stdin.end()
 
