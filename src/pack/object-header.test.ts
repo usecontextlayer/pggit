@@ -46,6 +46,8 @@ describe("pack object header", () => {
 					expect(dec.bytesRead).toBe(enc.length)
 				},
 			),
+			// Pinned seed (424_242) for a deterministic gate, matching the sibling specs.
+			{ seed: 424_242 },
 		)
 	})
 })

@@ -90,7 +90,8 @@ describe("writePack", () => {
 					expect(await oidsGitResolves(pack)).toEqual([...byOid.keys()].sort())
 				},
 			),
-			{ numRuns: 12 },
+			// Pinned seed (424_242) for a deterministic gate, matching the sibling specs.
+			{ numRuns: 12, seed: 424_242 },
 		)
 	})
 })

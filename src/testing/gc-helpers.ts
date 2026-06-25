@@ -40,6 +40,23 @@ export type GcFixture = {
  */
 export async function setupGcFixture(): Promise<GcFixture> {
 	const container = await startPostgres()
+	return gcFixtureOnContainer(container)
+}
+
+/**
+ * Build the schema-level fixture — an isolated schema (its OWN `git_object`/`git_edge`
+ * partitions), the stores, GC, and a served git app — on an ALREADY-STARTED container.
+ * Split out from `startPostgres` so a property test can give EACH candidate a fresh
+ * schema while sharing one container: a property that seeds + GCs many large repos
+ * into ONE schema lets every candidate's rows pile into the next candidate's GC, and
+ * the accumulated partition skews the planner's `repo_id`/`created_at` statistics
+ * until the sweep's anti-join flips from a hash-anti-join to a per-row nested loop
+ * (orders of magnitude slower). A fresh schema per candidate keeps each GC's stats
+ * representative. See the gc-stress suite.
+ */
+export async function gcFixtureOnContainer(
+	container: StartedPostgreSqlContainer,
+): Promise<GcFixture> {
 	const db = await createIsolatedSchema(container.getConnectionUri())
 	const objects = createObjectStore(db.sql)
 	const refs = createRefStore(db.sql)
@@ -54,6 +71,16 @@ export async function teardownGcFixture(fx: Partial<GcFixture>): Promise<void> {
 	await fx.server?.close()
 	await fx.db?.drop()
 	await fx.container?.stop()
+}
+
+/** Tear down a per-candidate schema fixture built by `gcFixtureOnContainer`, leaving
+ * the shared container running — close the server and drop the schema (which ends its
+ * pooled clients), so the caller stops the container once, after all candidates. */
+export async function teardownGcSchema(
+	fx: Pick<GcFixture, "server" | "db">,
+): Promise<void> {
+	await fx.server.close()
+	await fx.db.drop()
 }
 
 /** The smart-HTTP URL of `repo` on the fixture's server (repo auto-created on

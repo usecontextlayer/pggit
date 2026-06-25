@@ -95,6 +95,8 @@ describe("pkt-line generative round-trip (fast-check)", () => {
 				expect(rest.length).toBe(0)
 				expect(packets).toEqual(pkts)
 			}),
+			// Pinned seed (424_242) for a deterministic gate, matching the sibling specs.
+			{ seed: 424_242 },
 		)
 	})
 

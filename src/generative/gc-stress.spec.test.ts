@@ -60,6 +60,7 @@ import { spawn } from "node:child_process"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitObjectType } from "@/object/object"
@@ -69,12 +70,13 @@ import {
 	countEdges,
 	countObjects,
 	type GcFixture,
+	gcFixtureOnContainer,
 	gitReachableOids,
 	objectOids,
 	repoUrl,
-	setupGcFixture,
-	teardownGcFixture,
+	teardownGcSchema,
 } from "@/testing/gc-helpers"
+import { startPostgres } from "@/testing/pg"
 import { PINNED_DATE, PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
 // fast-import's committer line wants `<unix-seconds> <tz>`, NOT git's `@<seconds>`
@@ -404,53 +406,70 @@ const deepWideParams = fc.record({
 const NUM_RUNS = 3
 
 describe("§4 PBT stress — deep + wide GC differential at scale", () => {
-	let fx: GcFixture
-	let counter = 0
-	// Unique repo name per fast-check invocation (incl. shrink re-runs) so candidates
-	// never collide inside the one shared schema; helpers key purely off the name.
-	const nextRepo = (tag: string): string => `${tag}-${counter++}`
+	// ONE container for the whole suite, but a FRESH schema PER fast-check candidate
+	// (`withCandidate` below). The stress repos are huge, so seeding many of them into
+	// one shared schema would pile every candidate's rows into the next candidate's GC;
+	// the accumulated partition then skews the planner's statistics until the sweep's
+	// anti-join flips to a per-row nested loop and a single GC blows past the test
+	// budget. A fresh schema per candidate keeps each GC's stats representative (and
+	// makes the property candidates genuinely independent). Repo names can therefore be
+	// fixed — they never collide across candidates (each lives in its own schema).
+	let container: StartedPostgreSqlContainer
 
 	beforeAll(async () => {
-		fx = await setupGcFixture()
+		container = await startPostgres()
 	}, 180_000)
 
 	afterAll(async () => {
-		await teardownGcFixture(fx)
+		await container.stop()
 	})
+
+	/** Run one fast-check candidate against its OWN fresh schema fixture, torn down
+	 * (server + schema) afterwards while the shared container keeps running. */
+	const withCandidate = async (body: (fx: GcFixture) => Promise<void>): Promise<void> => {
+		const fx = await gcFixtureOnContainer(container)
+		try {
+			await body(fx)
+		} finally {
+			await teardownGcSchema(fx)
+		}
+	}
 
 	it("STRESS-1 — survivors == git reachable closure over many tips, deep chain + wide nested trees + large orphan set", async () => {
 		const tally = newTally()
 		await fc.assert(
 			fc.asyncProperty(deepWideParams, async (params) => {
-				const repo = nextRepo("stress1")
-				const { liveDir, orphanObjects } = await seedDeepWideRepo(fx, repo, params)
-				try {
-					const seeded = await countObjects(fx.db, repo)
-					recordScale(
-						tally,
-						{
-							chainDepth: params.chainDepth,
-							files: params.files,
-							nesting: params.nesting,
-							refs: Math.min(params.refCount, BRANCHES.length),
-						},
-						orphanObjects,
-						seeded,
-					)
-					// Age every row past the grace=0 cutoff so the orphan set is unambiguously
-					// reclaimable (deterministic; no wall-clock wait).
-					await ageObjects(fx.db, repo, "1 hour")
+				await withCandidate(async (fx) => {
+					const repo = "stress1"
+					const { liveDir, orphanObjects } = await seedDeepWideRepo(fx, repo, params)
+					try {
+						const seeded = await countObjects(fx.db, repo)
+						recordScale(
+							tally,
+							{
+								chainDepth: params.chainDepth,
+								files: params.files,
+								nesting: params.nesting,
+								refs: Math.min(params.refCount, BRANCHES.length),
+							},
+							orphanObjects,
+							seeded,
+						)
+						// Age every row past the grace=0 cutoff so the orphan set is unambiguously
+						// reclaimable (deterministic; no wall-clock wait).
+						await ageObjects(fx.db, repo, "1 hour")
 
-					await fx.gc.gc(repo, { graceSeconds: 0 })
+						await fx.gc.gc(repo, { graceSeconds: 0 })
 
-					// Survivors in Postgres == real-git reachable closure over the on-disk live
-					// source (all branch tips + peeled tags). Neither over- nor under-deletes.
-					expect(await objectOids(fx.db, repo)).toEqual(await gitReachableOids(liveDir))
-					// And a live ref still fetches fsck-clean end-to-end.
-					await fetchAndFsck(fx, repo)
-				} finally {
-					rmSync(liveDir, { force: true, recursive: true })
-				}
+						// Survivors in Postgres == real-git reachable closure over the on-disk live
+						// source (all branch tips + peeled tags). Neither over- nor under-deletes.
+						expect(await objectOids(fx.db, repo)).toEqual(await gitReachableOids(liveDir))
+						// And a live ref still fetches fsck-clean end-to-end.
+						await fetchAndFsck(fx, repo)
+					} finally {
+						rmSync(liveDir, { force: true, recursive: true })
+					}
+				})
 			}),
 			{ numRuns: NUM_RUNS, seed: 424_242 },
 		)
@@ -461,33 +480,35 @@ describe("§4 PBT stress — deep + wide GC differential at scale", () => {
 		const tally = newTally()
 		await fc.assert(
 			fc.asyncProperty(deepWideParams, async (params) => {
-				const repo = nextRepo("stress2")
-				const { liveDir, orphanObjects } = await seedDeepWideRepo(fx, repo, params)
-				try {
-					const seeded = await countObjects(fx.db, repo)
-					recordScale(
-						tally,
-						{
-							chainDepth: params.chainDepth,
-							files: params.files,
-							nesting: params.nesting,
-							refs: Math.min(params.refCount, BRANCHES.length),
-						},
-						orphanObjects,
-						seeded,
-					)
-					await ageObjects(fx.db, repo, "1 hour")
+				await withCandidate(async (fx) => {
+					const repo = "stress2"
+					const { liveDir, orphanObjects } = await seedDeepWideRepo(fx, repo, params)
+					try {
+						const seeded = await countObjects(fx.db, repo)
+						recordScale(
+							tally,
+							{
+								chainDepth: params.chainDepth,
+								files: params.files,
+								nesting: params.nesting,
+								refs: Math.min(params.refCount, BRANCHES.length),
+							},
+							orphanObjects,
+							seeded,
+						)
+						await ageObjects(fx.db, repo, "1 hour")
 
-					await fx.gc.gc(repo, { graceSeconds: 0 })
-					const afterFirst = await objectOids(fx.db, repo)
+						await fx.gc.gc(repo, { graceSeconds: 0 })
+						const afterFirst = await objectOids(fx.db, repo)
 
-					// Second pass is a no-op: deletes nothing, leaves rows + survivor set identical.
-					const second = await fx.gc.gc(repo, { graceSeconds: 0 })
-					expect(second).toEqual({ deletedEdges: 0, deletedObjects: 0 })
-					expect(await objectOids(fx.db, repo)).toEqual(afterFirst)
-				} finally {
-					rmSync(liveDir, { force: true, recursive: true })
-				}
+						// Second pass is a no-op: deletes nothing, leaves rows + survivor set identical.
+						const second = await fx.gc.gc(repo, { graceSeconds: 0 })
+						expect(second).toEqual({ deletedEdges: 0, deletedObjects: 0 })
+						expect(await objectOids(fx.db, repo)).toEqual(afterFirst)
+					} finally {
+						rmSync(liveDir, { force: true, recursive: true })
+					}
+				})
 			}),
 			{ numRuns: NUM_RUNS, seed: 424_242 },
 		)
@@ -498,49 +519,55 @@ describe("§4 PBT stress — deep + wide GC differential at scale", () => {
 		const tally = newTally()
 		await fc.assert(
 			fc.asyncProperty(deepWideParams, async (params) => {
-				// Two byte-identical large repos: pinned identity + clock → identical OIDs,
-				// so the survivor sets are directly comparable across batch sizes. (The
-				// small-batchLimit run crosses the multi-batch DELETE boundary many times.)
-				const repoSmall = nextRepo("stress3-small")
-				const repoHuge = nextRepo("stress3-huge")
-				const small = await seedDeepWideRepo(fx, repoSmall, params)
-				const huge = await seedDeepWideRepo(fx, repoHuge, params)
-				try {
-					const seeded = await countObjects(fx.db, repoSmall)
-					recordScale(
-						tally,
-						{
-							chainDepth: params.chainDepth,
-							files: params.files,
-							nesting: params.nesting,
-							refs: Math.min(params.refCount, BRANCHES.length),
-						},
-						small.orphanObjects,
-						seeded,
-					)
-					await ageObjects(fx.db, repoSmall, "1 hour")
-					await ageObjects(fx.db, repoHuge, "1 hour")
+				await withCandidate(async (fx) => {
+					// Two byte-identical large repos: pinned identity + clock → identical OIDs,
+					// so the survivor sets are directly comparable across batch sizes. The
+					// small-batchLimit run (256) still crosses the multi-batch DELETE boundary
+					// many times (~hundreds of batches at this scale); `1` is avoided because it
+					// is O(orphans × survivors) — every one-row batch rescans the live set to
+					// find the next victim — and is far smaller than anything production uses
+					// (the drain's default is 10_000).
+					const repoSmall = "stress3-small"
+					const repoHuge = "stress3-huge"
+					const small = await seedDeepWideRepo(fx, repoSmall, params)
+					const huge = await seedDeepWideRepo(fx, repoHuge, params)
+					try {
+						const seeded = await countObjects(fx.db, repoSmall)
+						recordScale(
+							tally,
+							{
+								chainDepth: params.chainDepth,
+								files: params.files,
+								nesting: params.nesting,
+								refs: Math.min(params.refCount, BRANCHES.length),
+							},
+							small.orphanObjects,
+							seeded,
+						)
+						await ageObjects(fx.db, repoSmall, "1 hour")
+						await ageObjects(fx.db, repoHuge, "1 hour")
 
-					await fx.gc.gc(repoSmall, { batchLimit: 1, graceSeconds: 0 })
-					await fx.gc.gc(repoHuge, { batchLimit: 1_000_000, graceSeconds: 0 })
+						await fx.gc.gc(repoSmall, { batchLimit: 256, graceSeconds: 0 })
+						await fx.gc.gc(repoHuge, { batchLimit: 1_000_000, graceSeconds: 0 })
 
-					// Same final observable state regardless of batch size: identical survivor
-					// OIDs (the two seeds are byte-identical) AND identical row/edge counts.
-					const survivorsSmall = await objectOids(fx.db, repoSmall)
-					expect(survivorsSmall).toEqual(await objectOids(fx.db, repoHuge))
-					expect(await countObjects(fx.db, repoSmall)).toEqual(
-						await countObjects(fx.db, repoHuge),
-					)
-					expect(await countEdges(fx.db, repoSmall)).toEqual(
-						await countEdges(fx.db, repoHuge),
-					)
-					// And the survivor set is exactly git's reachable closure (anchors invariance
-					// to the correct answer, not merely "both batches did the same wrong thing").
-					expect(survivorsSmall).toEqual(await gitReachableOids(small.liveDir))
-				} finally {
-					rmSync(small.liveDir, { force: true, recursive: true })
-					rmSync(huge.liveDir, { force: true, recursive: true })
-				}
+						// Same final observable state regardless of batch size: identical survivor
+						// OIDs (the two seeds are byte-identical) AND identical row/edge counts.
+						const survivorsSmall = await objectOids(fx.db, repoSmall)
+						expect(survivorsSmall).toEqual(await objectOids(fx.db, repoHuge))
+						expect(await countObjects(fx.db, repoSmall)).toEqual(
+							await countObjects(fx.db, repoHuge),
+						)
+						expect(await countEdges(fx.db, repoSmall)).toEqual(
+							await countEdges(fx.db, repoHuge),
+						)
+						// And the survivor set is exactly git's reachable closure (anchors invariance
+						// to the correct answer, not merely "both batches did the same wrong thing").
+						expect(survivorsSmall).toEqual(await gitReachableOids(small.liveDir))
+					} finally {
+						rmSync(small.liveDir, { force: true, recursive: true })
+						rmSync(huge.liveDir, { force: true, recursive: true })
+					}
+				})
 			}),
 			{ numRuns: NUM_RUNS, seed: 424_242 },
 		)
