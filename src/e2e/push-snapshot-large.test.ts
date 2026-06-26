@@ -4,14 +4,14 @@
  *
  * The object-store ingest path chunks its INSERTs (INSERT_BATCH=1000) so a large
  * push lands under the 65534-parameter wire cap. But the post-commit `repo_file`
- * snapshot rebuild (`snapshot-store.rebuildRefSnapshot`) does ONE un-chunked
+ * snapshot rebuild (`repo-file-projection.rebuildRefSnapshot`) does ONE un-chunked
  * multi-row INSERT of every file at the tip. `repo_file` has 5 bound columns, so a
  * single commit whose tree holds >= 13107 files binds >= 65535 parameters and the
  * driver throws MAX_PARAMETERS_EXCEEDED. The exception escapes the receive-pack
  * handler -> HTTP 500 -> the client's push dies ("the remote end hung up
  * unexpectedly", exit 1) EVEN THOUGH the objects + ref already committed.
  *
- * The live server wires `snapshots: createSnapshotStore(db)` (server.ts), so this
+ * The live server wires `snapshots: createRepoFileProjection(db)` (server.ts), so this
  * reproduces production. Canonical git accepts a 13107-file push without error;
  * pggit must too. Observed via the wire: the push exits 0 and the ref is created.
  */
@@ -20,7 +20,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -39,7 +39,7 @@ describe("a06 — repo_file snapshot insert exceeds the bind-parameter ceiling",
 		const objects = createObjectStore(isolated.sql)
 		const refs = createRefStore(isolated.sql)
 		// Wire the queryable-view layer EXACTLY as the live server does (server.ts).
-		const snapshots = createSnapshotStore(isolated.sql)
+		const snapshots = createRepoFileProjection(isolated.sql)
 		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
 		url = `http://127.0.0.1:${server.port}/repo`
 	}, 120_000)

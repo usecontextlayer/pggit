@@ -23,7 +23,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { encodePktLine } from "@/protocol/pkt-line"
-import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -125,7 +125,7 @@ describe("nam01 — over-long incompressible ref name must reject in-band, not 5
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		// Mirror the LIVE server boot (the queryable snapshot view is wired in prod).
-		const snapshots = createSnapshotStore(db.sql)
+		const snapshots = createRepoFileProjection(db.sql)
 		app = createGitApp({ objects, refs, snapshots })
 
 		src = mkdtempSync(join(tmpdir(), "nam01-src-"))
@@ -255,7 +255,7 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 		const refs = createRefStore(db.sql)
 		// Boot exactly like the live server (server.ts) — objects + refs + the
 		// queryable snapshot view — so the receive-pack path under test is identical.
-		const snapshots = createSnapshotStore(db.sql)
+		const snapshots = createRepoFileProjection(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
 		url = `http://127.0.0.1:${server.port}/nam02`
 

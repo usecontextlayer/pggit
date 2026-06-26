@@ -4,7 +4,7 @@ import postgres from "postgres"
 import { env } from "@/env"
 import { createGcScheduler, type GcSchedulerOptions } from "@/gc-scheduler"
 import { createGitApp } from "@/index"
-import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 
@@ -53,7 +53,7 @@ export async function startServer(
 	const app = createGitApp({
 		objects: createObjectStore(pg),
 		refs: createRefStore(pg),
-		snapshots: createSnapshotStore(pg),
+		snapshots: createRepoFileProjection(pg),
 	})
 
 	// Self-scheduling GC: the background drain that keeps storage bounded, off the

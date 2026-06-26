@@ -20,7 +20,7 @@
  * are pathological in practice. This test LOCKS both facts, so a future change to a
  * byte-exact view is a deliberate, test-updating decision rather than a silent drift.
  *
- * The live server wires `snapshots: createSnapshotStore(db)` (server.ts), so the view
+ * The live server wires `snapshots: createRepoFileProjection(db)` (server.ts), so the view
  * path under test is production's.
  */
 import { mkdtempSync, rmSync } from "node:fs"
@@ -28,7 +28,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -38,7 +38,7 @@ import { spawnGit } from "@/testing/spawn-git"
 describe("mod — non-UTF-8 filename: faithful objects, lossy text view (known limit)", () => {
 	let isolated: IsolatedDb
 	let server: GitServer
-	let snapshots: ReturnType<typeof createSnapshotStore>
+	let snapshots: ReturnType<typeof createRepoFileProjection>
 	let url: string
 	const dirs: string[] = []
 
@@ -54,7 +54,7 @@ describe("mod — non-UTF-8 filename: faithful objects, lossy text view (known l
 		isolated = await createIsolatedSchema(baseUrl)
 		const objects = createObjectStore(isolated.sql)
 		const refs = createRefStore(isolated.sql)
-		snapshots = createSnapshotStore(isolated.sql)
+		snapshots = createRepoFileProjection(isolated.sql)
 		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
 		url = `http://127.0.0.1:${server.port}/repo`
 	}, 120_000)
@@ -117,7 +117,12 @@ describe("mod — non-UTF-8 filename: faithful objects, lossy text view (known l
 		// KNOWN LIMITATION — the repo_file text view decodes the name lossily. The 0xff
 		// 0xfe pair becomes two U+FFFD at the Buffer.toString("utf8") boundary, so the
 		// stored path is NOT the true bytes. Documented + locked (see file header).
-		const files = await snapshots.listFiles("repo", "refs/heads/main")
+		const files = await isolated.sql<{ path: string }[]>`
+			select f.path from repo_file f
+			join repos r on r.id = f.repo_id
+			where r.name = 'repo' and f.ref_name = 'refs/heads/main'
+			order by f.path collate "C"
+		`
 		expect(files).toHaveLength(1)
 		const stored = files[0]
 		if (!stored) throw new Error("expected exactly one file in the view")

@@ -1,6 +1,6 @@
 import { buildFileList } from "@/repo-view/build-file-list"
 import { SNAPSHOT_REFS } from "@/repo-view/config"
-import type { SnapshotStore } from "@/repo-view/snapshot-store"
+import type { RepoFileProjection } from "@/repo-view/repo-file-projection"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 
@@ -8,7 +8,7 @@ const ZERO_OID = "0".repeat(40)
 
 export type SnapshotDeps = {
 	objects: ObjectStore
-	snapshots: SnapshotStore
+	snapshots: RepoFileProjection
 }
 
 /**

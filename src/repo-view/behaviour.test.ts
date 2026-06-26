@@ -11,7 +11,10 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { rebuildAllSnapshots } from "@/repo-view/rebuild"
-import { createSnapshotStore, type SnapshotStore } from "@/repo-view/snapshot-store"
+import {
+	createRepoFileProjection,
+	type RepoFileProjection,
+} from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
@@ -33,13 +36,13 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 	let server: GitServer
 	let objects: ObjectStore
 	let refs: RefStore
-	let snapshots: SnapshotStore
+	let snapshots: RepoFileProjection
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
-		snapshots = createSnapshotStore(db.sql)
+		snapshots = createRepoFileProjection(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
 	}, 180_000)
 
@@ -70,6 +73,22 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			where r.name = ${repoId} and f.ref_name = ${ref}
 		`
 		return rows[0]?.n ?? 0
+	}
+
+	/** Path + blob oid per file at a ref — the same direct-SQL read surface a consumer
+	 * uses (no read-API method), enough to observe content-addressed dedup across refs. */
+	async function indexRows(
+		repoId: string,
+		ref: string,
+	): Promise<{ path: string; blobOid: string }[]> {
+		const rows = await db.sql<{ path: string; blob_oid: Buffer }[]>`
+			select f.path, f.blob_oid
+			from repo_file f
+			join repos r on r.id = f.repo_id
+			where r.name = ${repoId} and f.ref_name = ${ref}
+			order by f.path collate "C"
+		`
+		return rows.map((r) => ({ blobOid: r.blob_oid.toString("hex"), path: r.path }))
 	}
 
 	/** Oracle: `git ls-tree -r` + `cat-file` as `{path, mode, content}`, sorted. */
@@ -263,8 +282,8 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			await commitAll(dir, "c2")
 			await push(dir, "dedup", "HEAD:refs/heads/dev")
 
-			const main = await snapshots.listFiles("dedup", "refs/heads/main")
-			const dev = await snapshots.listFiles("dedup", "refs/heads/dev")
+			const main = await indexRows("dedup", "refs/heads/main")
+			const dev = await indexRows("dedup", "refs/heads/dev")
 			expect(main.map((f) => f.path)).toEqual(["a.txt"])
 			expect(dev.map((f) => f.path)).toEqual(["b.txt"])
 			// Same content → same OID → both index rows point at one git_object blob.

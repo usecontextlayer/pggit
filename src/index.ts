@@ -12,7 +12,7 @@ import {
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { encodeAdvertisement } from "@/protocol/v2"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
-import type { SnapshotStore } from "@/repo-view/snapshot-store"
+import type { RepoFileProjection } from "@/repo-view/repo-file-projection"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 
@@ -21,7 +21,7 @@ export type GitAppDeps = {
 	refs: RefStore
 	/** Optional queryable-view layer. When provided, push maintains a `repo_file`
 	 * path→blob index per branch; when omitted, this is a plain git remote. */
-	snapshots?: SnapshotStore
+	snapshots?: RepoFileProjection
 }
 
 // Smart-HTTP info/refs body: the `# service` preamble + flush, then the v2

@@ -29,7 +29,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { encodePktLine } from "@/protocol/pkt-line"
-import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
@@ -80,7 +80,7 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 		const refs = createRefStore(db.sql)
 		// The LIVE server wires the queryable snapshot view — reproduce that boot so
 		// the snapshot rebuild (where the bug lives) is actually exercised.
-		const snapshots = createSnapshotStore(db.sql)
+		const snapshots = createRepoFileProjection(db.sql)
 		app = createGitApp({ objects, refs, snapshots })
 
 		src = mkdtempSync(join(tmpdir(), "a13-src-"))

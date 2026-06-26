@@ -40,7 +40,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -63,7 +63,7 @@ describe("neg02 — buildPack must not re-add a want already in the have-closure
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		// Wire the snapshot layer exactly as the live server does (server.ts).
-		const snapshots = createSnapshotStore(db.sql)
+		const snapshots = createRepoFileProjection(db.sql)
 		app = createGitApp({ objects, refs, snapshots })
 		server = await serveOnPort(app, 0)
 		url = `http://127.0.0.1:${server.port}/neg02`

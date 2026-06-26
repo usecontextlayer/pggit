@@ -22,7 +22,7 @@ import { createGitApp } from "@/index"
 import type { GitObjectType } from "@/object/object"
 import type { PackInputObject } from "@/pack/write-pack"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
-import { createSnapshotStore } from "@/repo-view/snapshot-store"
+import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -220,7 +220,7 @@ describe("pro02 — Content-Encoding: gzip with a non-gzip body yields a clean 4
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		const snapshots = createSnapshotStore(db.sql)
+		const snapshots = createRepoFileProjection(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
 	}, 180_000)
 
