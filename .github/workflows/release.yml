@@ -1,0 +1,60 @@
+name: release
+
+# Manual, semantic-release-driven publish of @usecontextlayer/pggit to npm.
+#
+# semantic-release reads the Conventional Commit history, derives the next
+# version, publishes to npm, and cuts the matching GitHub Release. This workflow
+# only runs on demand (workflow_dispatch) so a release is always a deliberate
+# act, not a side effect of pushing to main. The `dry_run` input defaults to
+# true: the first run previews the next version + notes and publishes NOTHING;
+# re-run with it unchecked to actually ship.
+#
+# PRECONDITION: the NPM_TOKEN repo secret must hold a granular npm token with
+# publish rights to the @usecontextlayer scope. GITHUB_TOKEN is provided by
+# Actions. npm provenance (publishConfig.provenance in package.json) needs
+# id-token: write, set below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — compute the next version + notes, publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release (semantic-release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # @semantic-release/github creates the Release + tag
+      issues: write # comments on released issues
+      pull-requests: write # comments on released PRs
+      id-token: write # npm provenance (OIDC attestation)
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # semantic-release walks the full history + tags to derive the version.
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4 # node 24, per mise.toml
+      - name: Enable pnpm
+        # corepack-managed pnpm pinned by package.json `packageManager`.
+        run: corepack enable pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify formatting
+        run: pnpm run format.verify
+      - name: Typecheck
+        run: pnpm run tsc
+      - name: Build
+        # tsdown -> dist/*.mjs + dist/*.d.mts; the published tarball is `files`.
+        run: pnpm run build
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npx semantic-release ${{ inputs.dry_run && '--dry-run' || '' }}

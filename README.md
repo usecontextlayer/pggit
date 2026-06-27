@@ -43,7 +43,11 @@ A git server normally needs a filesystem: bare repos on disk, backed up and repl
 
 ## Installation
 
-Not published to npm. Build from source (Node >= 20, pnpm, and a Postgres you can reach):
+```sh
+npm install @usecontextlayer/pggit
+```
+
+Or build from source to hack on it (Node >= 20, pnpm, and a Postgres you can reach):
 
 ```sh
 git clone https://github.com/usecontextlayer/pggit
@@ -119,7 +123,7 @@ Because objects are append-only, cleanup is deletion, not rewriting. A backgroun
 
 ## Scope
 
-pggit is pre-1.0 and deliberately narrow:
+pggit is deliberately narrow:
 
 - **No authentication.** It serves every request; put it behind your own auth/network boundary.
 - **SHA-1 only.** A SHA-256 client is rejected at the wire boundary.

@@ -16,6 +16,19 @@ workspace). It mirrors the `@usecontextlayer/` engineering conventions:
   at edges, libraries-first, net-negative line delta on bug fixes. The monorepo's
   Dagster/dlt/PyAirbyte/plugin/Slate-specific rules do NOT apply here.
 
+## Releases & versioning
+
+Published to npm as `@usecontextlayer/pggit` by **semantic-release**, driven by
+the Conventional Commit history. The `version` field in `package.json` is a
+placeholder (`0.0.0-development`) and is intentionally **not** kept current —
+the authoritative version lives in the git tags, the npm registry, and the
+GitHub Releases. Do NOT hand-bump it.
+
+Releases are manual: GitHub Actions → **release** workflow → Run. Leave
+`dry_run` checked for a preview (computes the next version + notes, publishes
+nothing); re-run with it unchecked to ship. See
+`docs/2026-06-26-npm-publishing-design.md`.
+
 ## This repo is harness/oracle-first
 
 Per the design spec at

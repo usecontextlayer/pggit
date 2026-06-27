@@ -1,4 +1,7 @@
 {
+	"bugs": {
+		"url": "https://github.com/usecontextlayer/pggit/issues"
+	},
 	"dependencies": {
 		"@hono/node-server": "^1.19.14",
 		"hono": "^4.12.23",
@@ -7,6 +10,7 @@
 		"postgres": "^3.4.9",
 		"zod": "^4.4.3"
 	},
+	"description": "A battle-tested git server that runs on Postgres.",
 	"devDependencies": {
 		"@biomejs/biome": "latest",
 		"@datadog/pprof": "^5.15.0",
@@ -18,6 +22,7 @@
 		"fast-check": "latest",
 		"kanel": "^4.0.2",
 		"kanel-kysely": "^4.0.0",
+		"semantic-release": "latest",
 		"testcontainers": "12.0.3",
 		"toxiproxy-node-client": "^4.1.0",
 		"tsdown": "latest",
@@ -41,6 +46,17 @@
 	"files": [
 		"dist"
 	],
+	"homepage": "https://github.com/usecontextlayer/pggit#readme",
+	"keywords": [
+		"git",
+		"git-server",
+		"smart-http",
+		"postgres",
+		"postgresql",
+		"hono",
+		"kysely"
+	],
+	"license": "MIT",
 	"main": "./dist/index.mjs",
 	"name": "@usecontextlayer/pggit",
 	"packageManager": "pnpm@10.34.1",
@@ -48,6 +64,14 @@
 		"onlyBuiltDependencies": [
 			"esbuild"
 		]
+	},
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/usecontextlayer/pggit.git"
 	},
 	"scripts": {
 		"build": "npx tsdown",
@@ -58,10 +82,11 @@
 		"format.fix": "npx @biomejs/biome check --fix --error-on-warnings .",
 		"format.verify": "npx @biomejs/biome check --error-on-warnings .",
 		"perf": "NODE_OPTIONS=--expose-gc npx tsx perf/run.ts",
+		"release": "npx semantic-release",
 		"test": "npx vitest run",
 		"tsc": "npx tsc -b tsconfig.json"
 	},
 	"type": "module",
 	"types": "./dist/index.d.mts",
-	"version": "0.1.0"
+	"version": "0.0.0-development"
 }
