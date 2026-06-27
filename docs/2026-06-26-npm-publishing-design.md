@@ -97,8 +97,13 @@ OIDC path) rather than re-adding `id-token` to this workflow.
 
 ## One-time manual step (repo owner)
 
-Mint a granular npm token with publish rights to `@usecontextlayer` and add it
-as the `NPM_TOKEN` repository secret. Nothing else is published from a laptop.
+Mint an npm token that can **create new packages in the `@usecontextlayer`
+scope** and add it as the `NPM_TOKEN` repository secret. This is the part that
+bit the first publish: a **granular** token must grant **Read and write** on the
+**scope** (`@usecontextlayer`), not "only select packages" — pggit didn't exist
+yet, so a package-scoped token had nothing to select and the publish `PUT` 404'd
+("could not be found or you do not have permission"). A classic **Automation**
+token (account-wide publish) also works. Nothing is published from a laptop.
 
 ## Release procedure
 
