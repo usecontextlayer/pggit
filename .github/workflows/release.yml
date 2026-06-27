@@ -11,8 +11,14 @@ name: release
 #
 # PRECONDITION: the NPM_TOKEN repo secret must hold a granular npm token with
 # publish rights to the @usecontextlayer scope. GITHUB_TOKEN is provided by
-# Actions. npm provenance (publishConfig.provenance in package.json) needs
-# id-token: write, set below.
+# Actions.
+#
+# Auth is pure NPM_TOKEN (matching the ContextLayer monorepo). We deliberately do
+# NOT enable npm provenance / id-token: write — on npm CLI 11.x, the presence of
+# id-token makes npm PREFER OIDC trusted publishing, which 404s on a scoped
+# package that has no trusted-publisher configured (npm/cli#8976) instead of
+# falling back to the token. If provenance is wanted later, configure a trusted
+# publisher on npmjs.com (the proper OIDC path) rather than re-adding id-token here.
 
 on:
   workflow_dispatch:
@@ -34,7 +40,6 @@ jobs:
       contents: write # @semantic-release/github creates the Release + tag
       issues: write # comments on released issues
       pull-requests: write # comments on released PRs
-      id-token: write # npm provenance (OIDC attestation)
     steps:
       - uses: actions/checkout@v6
         with:

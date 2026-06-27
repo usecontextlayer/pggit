@@ -75,16 +75,25 @@ Docker/Postgres and is heavy); add it as a separate PR-check workflow if/when
 wanted.
 
 Auth: `NPM_TOKEN` repo secret (granular token with publish rights to the
-`@usecontextlayer` scope) + the built-in `GITHUB_TOKEN`. npm **provenance** is
-enabled (`publishConfig.provenance: true` + `id-token: write`) so the package
-gets the supply-chain attestation badge alongside token auth.
+`@usecontextlayer` scope) + the built-in `GITHUB_TOKEN`. Pure token auth, like
+the monorepo.
+
+**No npm provenance.** Provenance was tried first (`publishConfig.provenance`
++ `id-token: write`) and broke the publish: on npm CLI 11.x the available
+id-token makes npm prefer OIDC trusted publishing, which 404s on this scoped
+package because no trusted publisher is configured, instead of falling back to
+`NPM_TOKEN` (npm/cli#8976). The symptom was `OIDC token exchange ... 404 ...
+package not found` followed by `npm error 404 ... PUT .../@usecontextlayer%2fpggit`.
+Removing `provenance` + `id-token: write` (pure token auth) fixes it. To get the
+provenance badge later, configure a trusted publisher on npmjs.com (the proper
+OIDC path) rather than re-adding `id-token` to this workflow.
 
 ## Manifest additions (`package.json`)
 
 `description`, `license: "MIT"` (the field; the LICENSE file already existed),
 `repository`, `homepage`, `bugs`, `keywords`, and
-`publishConfig: { access: "public", provenance: true }`. `files: ["dist"]` was
-already correct (npm always includes README + LICENSE + package.json on top).
+`publishConfig: { access: "public" }`. `files: ["dist"]` was already correct
+(npm always includes README + LICENSE + package.json on top).
 
 ## One-time manual step (repo owner)
 
