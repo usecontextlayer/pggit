@@ -3,10 +3,7 @@ import type { Hono } from "hono"
 import postgres from "postgres"
 import { env } from "@/env"
 import { createGcScheduler, type GcSchedulerOptions } from "@/gc-scheduler"
-import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
-import { createObjectStore } from "@/store/object-store"
-import { createRefStore } from "@/store/refs-store"
+import { createGitApp, createGitDeps } from "@/index"
 
 export type GitServer = {
 	port: number
@@ -50,11 +47,7 @@ export async function startServer(
 		throw new Error("pggit: PGGIT_DATABASE_URL is required to serve")
 	}
 	const pg = postgres(databaseUrl)
-	const app = createGitApp({
-		objects: createObjectStore(pg),
-		refs: createRefStore(pg),
-		snapshots: createRepoFileProjection(pg),
-	})
+	const app = createGitApp(createGitDeps(pg))
 
 	// Self-scheduling GC: the background drain that keeps storage bounded, off the
 	// request path (docs/2026-06-24-gc-scheduler-design.md §4). Enabled by default;

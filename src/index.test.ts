@@ -1,6 +1,7 @@
+import { Hono } from "hono"
 import postgres from "postgres"
 import { describe, expect, it } from "vitest"
-import { createGitApp } from "@/index"
+import { createGitApp, createGitDeps } from "@/index"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -50,6 +51,20 @@ describe("createGitApp", () => {
 		expect(unpacked.startsWith("# service=git-upload-pack\n0000\nversion 2\n")).toBe(true)
 		expect(unpacked).toContain("ls-refs=unborn\n")
 		expect(unpacked.endsWith("object-format=sha1\n0000\n")).toBe(true)
+	})
+
+	// The persistence three-repo grammar uses slash-delimited repoIds
+	// (<kind>/<owner>/<ws>[/<user>]). Routing must treat the repoId as the opaque
+	// slash-containing string the store already keys on — not a single segment.
+	it("routes a slash-containing repoId to the upload-pack advert", async () => {
+		const res = await app.request(
+			"/claude/slate/ws-1/user-1/info/refs?service=git-upload-pack",
+			{ headers: { "git-protocol": "version=2" } },
+		)
+		expect(res.status).toBe(200)
+		expect(res.headers.get("Content-Type")).toBe(
+			"application/x-git-upload-pack-advertisement",
+		)
 	})
 })
 
@@ -107,5 +122,34 @@ describe("createGitApp — server-boundary error responses", () => {
 		const res = await post("/repo1/git-upload-pack", body)
 		expect(res.status).toBe(500)
 		expect(await res.text()).toBe("internal server error")
+	})
+})
+
+// The embed-into-a-host factory: a mounted host (packages/platform) builds the
+// git-app deps from its own `pg` and mounts createGitApp(createGitDeps(pg)).
+describe("createGitDeps", () => {
+	it("composes the mountable deps (objects + refs + repo_file projection) from a pg", () => {
+		const deps = createGitDeps(pg)
+		expect(deps.objects).toBeDefined()
+		expect(deps.refs).toBeDefined()
+		expect(deps.snapshots).toBeDefined()
+	})
+})
+
+// The mount contract: a host MUST embed this app with `app.mount` (which strips
+// the mount prefix) — NOT `app.route` (which leaves it in c.req.path and corrupts
+// the parsed repoId). Pinned here because it's silent + easy to get wrong.
+describe("mounted under a host prefix", () => {
+	it("parses the repoId mount-relative when embedded with app.mount", async () => {
+		const host = new Hono()
+		host.mount("/git", app.fetch)
+		const res = await host.request(
+			"/git/claude/slate/ws/user/info/refs?service=git-upload-pack",
+			{ headers: { "git-protocol": "version=2" } },
+		)
+		expect(res.status).toBe(200)
+		expect(res.headers.get("Content-Type")).toBe(
+			"application/x-git-upload-pack-advertisement",
+		)
 	})
 })
