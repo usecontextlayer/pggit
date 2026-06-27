@@ -253,6 +253,12 @@ export function createGitDeps(pg: Sql): GitAppDeps {
 	}
 }
 
+// Schema migration for a host that owns the pggit Postgres lifecycle: bring a fresh
+// (or behind) database to the latest pggit schema before mounting `createGitApp`. The
+// migration set is bundled into `dist` (static imports, not a disk read), so this works
+// from the published package — a consumer e2e migrating a throwaway `ctx_pggit`, or a
+// production deploy provisioning the agent-state store.
+export { migrateToLatest } from "@/database/migrate"
 export type {
 	DrainEntry,
 	DrainSummary,
