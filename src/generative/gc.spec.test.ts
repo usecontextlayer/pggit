@@ -9,8 +9,8 @@
  *           the real-git reachable closure over exactly the seeded refs. The
  *           random subset is what creates the unreachable set: objects reachable
  *           only from a dropped ref must be reclaimed. Generalises GC-1/2/7.
- *   PBT-2 — Force-commit storage bound.  Over a random-length sequence of
- *           force-commits (each an independent root commit → the ref moves to a
+ *   PBT-2 — Rewind storage bound.  Over a random-length sequence of store
+ *           rewinds (each an independent root commit → the ref moves to a
  *           non-descendant, orphaning the prior snapshot), GC after every cycle
  *           pins `git_object` to the CURRENT reachable closure — it never grows
  *           with the sequence length K. Generalises GC-4.
@@ -23,7 +23,7 @@
  * return value. Nothing probes GC internals. Grace is made deterministic by
  * `ageObjects` + `graceSeconds: 0`, never a wall-clock sleep.
  *
- * SAMPLING (`NUM_RUNS` / `NUM_RUNS_FORCE`): the fast-check seed is pinned (424_242)
+ * SAMPLING (`NUM_RUNS` / `NUM_RUNS_REWIND`): the fast-check seed is pinned (424_242)
  * so every run is reproducible, but the run count is CI-aware — a small count
  * locally (each candidate is a full PG round-trip) and a broad count under `CI` so
  * the thin annotated-tag / nested-tree / dropped-ref corners actually get sampled.
@@ -244,7 +244,7 @@ function logCoverage(label: string, cov: ShapeCoverage): void {
 const IS_CI = process.env.CI !== undefined && process.env.CI !== ""
 const NUM_RUNS = IS_CI ? 200 : 12
 // PBT-2 drives a per-cycle push+GC loop (heavier per candidate), so it scales lower.
-const NUM_RUNS_FORCE = IS_CI ? 120 : 8
+const NUM_RUNS_REWIND = IS_CI ? 120 : 8
 
 describe("§4 PBT — property-based GC differential", () => {
 	let fx: GcFixture
@@ -303,10 +303,10 @@ describe("§4 PBT — property-based GC differential", () => {
 	})
 
 	it("PBT-2 — repeated GC pins git_object to the current reachable closure (no growth with K)", async () => {
-		// Force-commit coverage: how many cycles were force-commits that ORPHANED a
-		// prior snapshot (i > 0), and the longest amend chain (K) sampled. A 0-orphan
+		// Rewind coverage: how many cycles were rewinds that ORPHANED a prior
+		// snapshot (i > 0), and the longest amend chain (K) sampled. A 0-orphan
 		// run would mean the storage-bound corner was never exercised — made visible.
-		let forceCommitCycles = 0
+		let rewindCycles = 0
 		let maxChainK = 0
 		await fc.assert(
 			fc.asyncProperty(
@@ -319,13 +319,13 @@ describe("§4 PBT — property-based GC differential", () => {
 					let last: { head: string; reachable: string[] } | undefined
 					maxChainK = Math.max(maxChainK, contents.length)
 					for (let i = 0; i < contents.length; i++) {
-						// First push creates the ref; every later push is a force-commit from an
-						// INDEPENDENT root commit → non-descendant tip, orphaning the prior snapshot.
-						// `\n${i}` keeps each content (hence each blob/tree/commit oid) distinct.
-						if (i > 0) forceCommitCycles++
+						// First push creates the ref; every later push REWINDS main (store level)
+						// to an INDEPENDENT root commit → non-descendant tip, orphaning the prior
+						// snapshot. `\n${i}` keeps each content (hence each oid) distinct.
+						if (i > 0) rewindCycles++
 						last = await pushFile(fx, repo, {
 							content: `${contents[i]}\n${i}`,
-							force: i > 0,
+							rewind: i > 0,
 						})
 						// Age + reclaim every cycle: the storage bound must hold AFTER EACH push,
 						// not just at the end — that is what "no monotonic growth with K" means.
@@ -346,10 +346,10 @@ describe("§4 PBT — property-based GC differential", () => {
 					}
 				},
 			),
-			{ numRuns: NUM_RUNS_FORCE, seed: 424_242 },
+			{ numRuns: NUM_RUNS_REWIND, seed: 424_242 },
 		)
 		console.log(
-			`[gc-pbt shape coverage] PBT-2: force-commit-orphan-cycles=${forceCommitCycles} ` +
+			`[gc-pbt shape coverage] PBT-2: rewind-orphan-cycles=${rewindCycles} ` +
 				`max-amend-chain-K=${maxChainK}`,
 		)
 	})

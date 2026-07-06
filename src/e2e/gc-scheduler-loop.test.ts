@@ -81,10 +81,10 @@ describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", (
 		const first = await sched.drainOnce()
 		expect(summaryRepos(first)).toEqual([repoA, repoB, repoC])
 
-		// Re-push only A and C (force-commit advances their last_pushed_at past their
+		// Re-push only A and C (a rewind advances their last_pushed_at past their
 		// fresh last_gc_at). B is left untouched, so on the next pass B is NOT eligible.
-		await pushFile(fx, repoA, { content: "a2\n", force: true })
-		await pushFile(fx, repoC, { content: "c2\n", force: true })
+		await pushFile(fx, repoA, { content: "a2\n", rewind: true })
+		await pushFile(fx, repoC, { content: "c2\n", rewind: true })
 
 		// Snapshot B's stored objects right before the discriminating pass.
 		const bObjectsBefore = await objectOids(fx.db, repoB)

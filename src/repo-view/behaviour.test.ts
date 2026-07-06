@@ -10,7 +10,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { rebuildAllSnapshots } from "@/repo-view/rebuild"
+import { rebuildAllSnapshots, syncRefSnapshot } from "@/repo-view/rebuild"
 import {
 	createRepoFileProjection,
 	type RepoFileProjection,
@@ -208,7 +208,7 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 		}
 	})
 
-	it("deleting the branch empties its query", async () => {
+	it("deleting the branch empties its query (store delete + view sync; the wire denies deletes)", async () => {
 		const dir = newRepo("delbranch")
 		try {
 			await spawnGit(["init", "-q"], { cwd: dir })
@@ -217,7 +217,27 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			await push(dir, "delbranch", "HEAD:refs/heads/main")
 			expect((await queryFiles("delbranch", "refs/heads/main")).length).toBe(1)
 
-			await push(dir, "delbranch", ":refs/heads/main") // delete the branch
+			// The wire refuses ref deletion outright (deny-non-FF policy, 2026-07-05) —
+			// and a refused delete must leave the view intact.
+			await expect(push(dir, "delbranch", ":refs/heads/main")).rejects.toThrow(
+				/deletion denied/i,
+			)
+			expect((await queryFiles("delbranch", "refs/heads/main")).length).toBe(1)
+
+			// Deletion is now an INTERNAL operation (store + explicit view sync — the
+			// path an operator/retirement flow takes). The view empties.
+			const deleted = await refs.applyRefUpdates(
+				"delbranch",
+				[{ newOid: "0".repeat(40), oldOid: "0".repeat(40), ref: "refs/heads/main" }],
+				false,
+			)
+			expect(deleted).toEqual([true])
+			await syncRefSnapshot(
+				{ objects, snapshots },
+				"delbranch",
+				"refs/heads/main",
+				"0".repeat(40),
+			)
 			expect(await queryFiles("delbranch", "refs/heads/main")).toEqual([])
 		} finally {
 			rmSync(dir, { force: true, recursive: true })

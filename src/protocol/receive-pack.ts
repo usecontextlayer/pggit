@@ -12,8 +12,11 @@ const ZERO_OID = "0".repeat(40)
  * never as an HTTP 500 that has already orphaned the ingested pack. */
 const MAX_REF_NAME_BYTES = 2000
 
-// The push capabilities we advertise AND honor (spec §4): report-status over
-// side-band, ref deletion, atomic mode, sha1. We pick plain `report-status`
+// The push capabilities we advertise (spec §4): report-status over side-band,
+// ref deletion, atomic mode, sha1. `delete-refs` stays advertised even though
+// the deny-non-FF policy refuses every delete — advertising keeps the refusal
+// in-band (a per-ref `ng` with the policy reason) instead of a client-side
+// "remote does not support deleting refs". We pick plain `report-status`
 // (not `-v2`) — we do not emit its extra option lines.
 const RECEIVE_CAPS = [
 	"report-status",
@@ -126,6 +129,9 @@ export type ReceiveBackend = {
 	applyRefUpdates: (commands: RefCommand[], atomic: boolean) => Promise<boolean[]>
 	/** Is every object reachable from `oid` present? (connectivity, spec §10). */
 	isConnected: (oid: string) => Promise<boolean>
+	/** Is `ancestor` in `descendant`'s history (or equal)? The fast-forward
+	 * policy check — see the deny-non-FF rules on handleReceivePack. */
+	isAncestor: (ancestor: string, descendant: string) => Promise<boolean>
 	/** Refresh the queryable file projection for a just-applied ref. Present only
 	 * when the (optional) queryable-view layer is wired; a plain remote omits it. */
 	syncRefSnapshot?: (ref: string, newOid: string) => Promise<void>
@@ -135,8 +141,18 @@ export type ReceiveBackend = {
  * Handle a receive-pack POST: ingest the pack (if any), then apply the ref
  * commands under CAS — atomically when the client negotiated `atomic` — and
  * report status. A failed unpack fails every ref; an atomic failure ng's every
- * ref (none applied). Non-ff is accepted by default (CAS guards concurrency, not
- * ancestry — spec §3.6).
+ * ref (none applied).
+ *
+ * DENY-NON-FF POLICY (workspace-writes model, 2026-07-05): a ref may only
+ * ADVANCE. Updates must be fast-forward (old reachable from new — checked here
+ * as server policy; the CAS in the store keeps guarding concurrency, not
+ * ancestry), and deletions are denied outright (a delete is the ultimate
+ * non-FF; nothing legitimate deletes branches). Creates are unrestricted. This
+ * is the server-side backstop that makes a `push --force` from ANY client a
+ * loud `ng` instead of a silent history overwrite — and since refs only move
+ * forward, GC can never reclaim a commit that was rewound away. Note the pack
+ * is ingested BEFORE policy runs (protocol order), so a denied push leaves
+ * orphaned objects — ordinary GC food, not corruption.
  */
 export async function handleReceivePack(
 	body: Buffer,
@@ -186,15 +202,33 @@ export async function handleReceivePack(
 				: backend.isConnected(c.newOid),
 		),
 	)
+	// The deny-non-FF policy (see the handler docstring): an UPDATE (both oids
+	// non-zero) must be a fast-forward. Checked against the client's asserted
+	// old oid — if that assertion is stale the CAS rejects anyway, so a passing
+	// ancestry check + a passing CAS TOGETHER guarantee the applied update
+	// advanced the ref. Deletes never reach this check (denied below); creates
+	// and already-disqualified commands skip it.
+	const fastForward = await Promise.all(
+		commands.map((c, i) =>
+			nameTooLong[i] || !connected[i] || c.oldOid === ZERO_OID || c.newOid === ZERO_OID
+				? Promise.resolve(true)
+				: backend.isAncestor(c.oldOid, c.newOid),
+		),
+	)
 	// Per-command disqualification reason (null ⇒ applicable): a too-long name fails
-	// the storage boundary, a disconnected tip fails connectivity. A disqualified
-	// command never touches a ref.
-	const reasons = commands.map((_, i) =>
+	// the storage boundary, a disconnected tip fails connectivity, and the
+	// deny-non-FF policy fails deletions + non-fast-forward updates. A
+	// disqualified command never touches a ref.
+	const reasons = commands.map((c, i) =>
 		nameTooLong[i]
 			? "funny refname (too long to store)"
-			: connected[i]
-				? null
-				: "missing necessary objects",
+			: !connected[i]
+				? "missing necessary objects"
+				: c.newOid === ZERO_OID
+					? "deletion denied (refs only advance)"
+					: fastForward[i]
+						? null
+						: "non-fast-forward (refs only advance)",
 	)
 	if (atomic && reasons.some((r) => r !== null)) {
 		const failed = commands.map((c, i) => ({

@@ -6,7 +6,7 @@ import { applyMigrations } from "@/database/migrate"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort, startServer } from "@/server"
 import { createObjectStore } from "@/store/object-store"
-import { createRefStore } from "@/store/refs-store"
+import { createRefStore, type RefStore } from "@/store/refs-store"
 import {
 	ageObjects,
 	cloneAndFsck,
@@ -72,21 +72,25 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	 * `repos` in `public`. */
 	const sqlDb = (): { sql: Sql } => ({ sql: pg })
 
-	/** A `Pick<GcFixture, "server">` shape so the gc-helpers' URL builder, `pushFile`,
-	 * and `cloneAndFsck` target one of our dedicated servers (the helpers read only
-	 * `server.port`). */
-	const at = (s: GitServer): { server: GitServer } => ({ server: s })
+	/** A `Pick<GcFixture, "server" | "refs">` shape so the gc-helpers' URL builder,
+	 * `pushFile` (including its store-level rewind), and `cloneAndFsck` target one of
+	 * our dedicated servers. */
+	const at = (s: GitServer): { server: GitServer; refs: RefStore } => ({
+		// Built on demand over the shared client — createRefStore is a cheap wrapper.
+		refs: createRefStore(pg),
+		server: s,
+	})
 
-	/** The orphan OID set a force-commit leaves behind: reachable(before) minus
+	/** The orphan OID set a store-level rewind leaves behind: reachable(before) minus
 	 * reachable(after), both from real-git closures `pushFile` returns. Distinct
 	 * roots ⇒ disjoint closures, so this is the prior tip's whole closure — exactly
 	 * what GC must reclaim once aged. */
-	async function pushThenForceOrphan(
+	async function pushThenRewindOrphan(
 		s: GitServer,
 		repo: string,
 	): Promise<{ orphans: string[]; head: string }> {
 		const r1 = await pushFile(at(s), repo, { content: `${repo} v1\n` })
-		const r2 = await pushFile(at(s), repo, { content: `${repo} v2\n`, force: true })
+		const r2 = await pushFile(at(s), repo, { content: `${repo} v2\n`, rewind: true })
 		const live = new Set(r2.reachable)
 		const orphans = r1.reachable.filter((oid) => !live.has(oid))
 		return { head: r2.head, orphans }
@@ -120,7 +124,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	}
 
 	// SCH-10 — Standalone server self-GCs on its cadence; the mounted path is
-	// unchanged. With GC enabled and a tiny interval, force-commit orphans (aged
+	// unchanged. With GC enabled and a tiny interval, rewind orphans (aged
 	// past a grace=0 cutoff) are reclaimed end-to-end via the server's own timer,
 	// and a clone is fsck-clean at the latest tree. The SAME workload against a
 	// `createGitApp` served with NO scheduler reclaims nothing over the same window
@@ -140,7 +144,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		})
 		try {
 			const repo = "sch10-self-gc"
-			const { head, orphans } = await pushThenForceOrphan(enabled, repo)
+			const { head, orphans } = await pushThenRewindOrphan(enabled, repo)
 			expect(orphans.length).toBeGreaterThan(0)
 
 			// Age every row past the grace=0 cutoff so the drain is free to reclaim the
@@ -173,7 +177,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		const mountSrv = await serveOnPort(createGitApp({ objects, refs }), 0)
 		try {
 			const mountRepo = "sch10-mount-unchanged"
-			const mounted = await pushThenForceOrphan(mountSrv, mountRepo)
+			const mounted = await pushThenRewindOrphan(mountSrv, mountRepo)
 			expect(mounted.orphans.length).toBeGreaterThan(0)
 			await ageObjects(sqlDb(), mountRepo, "1 hour")
 
@@ -206,7 +210,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		})
 		try {
 			const repo = "sch9-disabled"
-			const { head, orphans } = await pushThenForceOrphan(disabled, repo)
+			const { head, orphans } = await pushThenRewindOrphan(disabled, repo)
 			expect(orphans.length).toBeGreaterThan(0)
 			await ageObjects(sqlDb(), repo, "1 hour")
 

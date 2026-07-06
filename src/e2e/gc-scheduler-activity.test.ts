@@ -42,13 +42,13 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		await teardownGcFixture(fx)
 	})
 
-	// SCH-1 — Any storage-mutating push stamps activity. A never-pushed repo's
+	// SCH-1 — Any storage mutation stamps activity. A never-pushed repo's
 	// `last_pushed_at` is NULL; the first push (create) makes it non-null; a
-	// fast-forward update and a non-ff force push each strictly advance it. Pins
-	// that EVERY push type that mutates storage moves the column forward — a wrong
-	// impl that stamps once and never again (or only on a force) fails the strict
-	// `>` between the captured snapshots.
-	it("SCH-1: create, fast-forward, and force pushes each stamp/advance last_pushed_at", async () => {
+	// fast-forward update and a store-level rewind each strictly advance it. Pins
+	// that EVERY mutation type moves the column forward — a wrong impl that
+	// stamps once and never again (or only on a rewind) fails the strict `>`
+	// between the captured snapshots.
+	it("SCH-1: a create push, a fast-forward push, and a store rewind each stamp/advance last_pushed_at", async () => {
 		const repo = "sch1-activity"
 
 		// Never pushed → no activity recorded yet (row absent or column unset; the
@@ -63,7 +63,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		// Fast-forward update: build a real descendant of the current tip by fetching
 		// it back, committing on top, and pushing the (fast-forward) child. A ff push
 		// ingests a new commit/tree/blob, so it must advance the stamp too — this is
-		// the push type a "force-only" stamp would miss.
+		// the mutation a "rewind-only" stamp would miss.
 		const ffDir = mkdtempSync(join(tmpdir(), "pggit-sch1-ff-"))
 		try {
 			const url = repoUrl(fx, repo)
@@ -82,21 +82,23 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		expect(afterFf).not.toBeNull()
 		expect((afterFf as Date).getTime()).toBeGreaterThan((afterCreate as Date).getTime())
 
-		// Non-ff force push (the §1 force-commit workload): an independent root orphans
-		// the prior tip and re-stamps the column, strictly later than the ff stamp.
-		await pushFile(fx, repo, { content: "third (force)\n", force: true })
-		const afterForce = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(afterForce).not.toBeNull()
-		expect((afterForce as Date).getTime()).toBeGreaterThan((afterFf as Date).getTime())
+		// A store-level rewind (the retired force-commit workload's internal twin):
+		// an independent root orphans the prior tip and re-stamps the column,
+		// strictly later than the ff stamp (applyRefUpdates stamps on mutation).
+		await pushFile(fx, repo, { content: "third (rewind)\n", rewind: true })
+		const afterRewind = (await repoGcState(fx.db, repo)).lastPushedAt
+		expect(afterRewind).not.toBeNull()
+		expect((afterRewind as Date).getTime()).toBeGreaterThan((afterFf as Date).getTime())
 	})
 
-	// SCH-2 — Delete is captured. Create a second branch `refs/heads/topic`, capture
-	// `last_pushed_at`, then DELETE that ref. The delete ingests NO new object, yet
-	// must still advance the stamp (the case a `git_object.created_at`-derived signal
-	// would miss — §3). Pins that the ref-update path itself stamps activity: an impl
-	// that only bumps on object ingest leaves the column unchanged across the delete
-	// and fails the strict `>`.
-	it("SCH-2: a ref-delete (ingesting no object) still advances last_pushed_at", async () => {
+	// SCH-2 — Delete is captured (and a DENIED wire delete is not). Create a second
+	// branch `refs/heads/topic`, capture `last_pushed_at`, prove the wire refusal
+	// leaves the stamp untouched, then delete the ref at the STORE level. The delete
+	// ingests NO new object, yet must still advance the stamp (the case a
+	// `git_object.created_at`-derived signal would miss — §3). Pins that the
+	// ref-update path itself stamps activity: an impl that only bumps on object
+	// ingest leaves the column unchanged across the delete and fails the strict `>`.
+	it("SCH-2: a store ref-delete (ingesting no object) still advances last_pushed_at; a denied wire delete does not", async () => {
 		const repo = "sch2-delete"
 		const url = repoUrl(fx, repo)
 
@@ -116,16 +118,32 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		const afterCreateTopic = (await repoGcState(fx.db, repo)).lastPushedAt
 		expect(afterCreateTopic).not.toBeNull()
 
-		// Delete `refs/heads/topic` — a ref update with no pack, no new object. Run
-		// from a throwaway repo (git needs a local repo to drive the transport even
-		// for a delete-only refspec, but sends nothing).
+		// A WIRE delete is denied outright now (deny-non-FF policy) and, being a
+		// pure refusal, must NOT advance the stamp.
 		const delDir = mkdtempSync(join(tmpdir(), "pggit-sch2-del-"))
 		try {
 			await spawnGit(["init", "-q"], { cwd: delDir })
-			await spawnGit(["push", url, ":refs/heads/topic"], { cwd: delDir })
+			await expect(
+				spawnGit(["push", url, ":refs/heads/topic"], { cwd: delDir }),
+			).rejects.toThrow(/deletion denied/i)
 		} finally {
 			rmSync(delDir, { force: true, recursive: true })
 		}
+		expect((await repoGcState(fx.db, repo)).lastPushedAt).toEqual(afterCreateTopic)
+
+		// The STORE-level delete (the internal path a retired ref takes) is a ref
+		// update with no pack, no new object — and must still stamp activity.
+		// Bracketed by existence checks: the store reports an absent-ref delete as
+		// a `true` no-op too, so `[true]` alone would not prove removal.
+		const names = async () => (await fx.refs.listRefs(repo)).map((r) => r.name)
+		expect(await names()).toContain("refs/heads/topic")
+		const deleted = await fx.refs.applyRefUpdates(
+			repo,
+			[{ newOid: "0".repeat(40), oldOid: "0".repeat(40), ref: "refs/heads/topic" }],
+			false,
+		)
+		expect(deleted).toEqual([true])
+		expect(await names()).not.toContain("refs/heads/topic")
 
 		// The delete still moved the stamp forward (it is a storage mutation: a ref
 		// disappeared, orphaning its commit). Strictly greater than the create.

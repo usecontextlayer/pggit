@@ -38,6 +38,9 @@ function recordingReceive() {
 		ingest: async () => {
 			calls.ingest++
 		},
+		// Permissive stub: this fake asserts the sha256 pre-ingest rejection, which
+		// fires before the FF policy ever runs.
+		isAncestor: async () => true,
 		isConnected: async () => {
 			calls.isConnected++
 			return true

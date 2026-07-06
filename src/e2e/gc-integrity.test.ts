@@ -7,6 +7,7 @@ import {
 	type GcFixture,
 	gitReachableOids,
 	objectOids,
+	pushDenied,
 	pushFile,
 	repoUrl,
 	setupGcFixture,
@@ -146,10 +147,11 @@ async function pushCommitAndTag(
 	await spawnGit(["add", "."], { cwd: src })
 	await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
 	await spawnGit(["tag", "-a", "v1", "-m", "release"], { cwd: src })
-	await spawnGit(
-		["push", "--force", url, "HEAD:refs/heads/main", "refs/tags/v1:refs/tags/v1"],
-		{ cwd: src },
-	)
+	// Plain push: under deny-non-FF this helper is only ever called against a
+	// FRESH repo (both refs are creates); the orphan producer is pushDenied.
+	await spawnGit(["push", url, "HEAD:refs/heads/main", "refs/tags/v1:refs/tags/v1"], {
+		cwd: src,
+	})
 }
 
 /**
@@ -157,13 +159,13 @@ async function pushCommitAndTag(
  * source repo as the real-git survivor oracle. Every deterministic example elsewhere
  * in this file uses flat single-root commits, so two live edge kinds are otherwise
  * never exercised by an example (only by the thin property tests): a real
- * commit→parent (kind 2) — force-commits orphan via *independent roots* with no
+ * commit→parent (kind 2) — denied pushes orphan via *independent roots* with no
  * parent — and a tree→subtree (kind 3) — `pushFile` writes a flat `file.txt` with no
  * nested directory. This builds both into the LIVE tip:
  *   - commit A roots `dir/a.txt` (root tree → subtree `dir/` → blob);
  *   - commit B (child of A) adds `dir/b.txt`, so B carries a `parent A` header
  *     (kind 2) and its root tree still nests `dir/` (kind 3).
- * `refs/heads/main` is force-pushed at B; `refs/heads/other` is pushed at the PARENT
+ * `refs/heads/main` is pushed at B; `refs/heads/other` is pushed at the PARENT
  * commit A, so A and its tree/blob stay reachable through a SECOND ref — exercising
  * multi-ref reachability — while everything in the prior orphan-producing push stays
  * unreachable. The source dir is kept (until the caller's `withTempDir` closes) so
@@ -186,10 +188,10 @@ async function pushNested(
 	await spawnGit(["add", "."], { cwd: src })
 	await spawnGit(["commit", "-q", "-m", "b"], { cwd: src })
 	const tip = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
-	await spawnGit(
-		["push", "--force", url, "HEAD:refs/heads/main", `${parent}:refs/heads/other`],
-		{ cwd: src },
-	)
+	// Plain push: fresh repo, both refs are creates (deny-non-FF era).
+	await spawnGit(["push", url, "HEAD:refs/heads/main", `${parent}:refs/heads/other`], {
+		cwd: src,
+	})
 	return { parent, tip }
 }
 
@@ -207,11 +209,11 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 	// GC-5 — No dangling edges / object⟺edges invariant.
 	it("GC-5: leaves no edge pointing at a deleted object after reclaiming orphans", async () => {
 		const repo = "gc5-no-dangling"
-		// Seed, then force-commit twice from independent repos so the first two pushes'
-		// commit/tree/blob objects (and their edges) are orphaned and eligible.
+		// Seed the live tip, then two DENIED pushes from independent repos: their
+		// ingested-but-refused commit/tree/blob objects (and edges) are orphans.
 		await pushFile(fx, repo, { content: "v1\n" })
-		await pushFile(fx, repo, { content: "v2\n", force: true })
-		await pushFile(fx, repo, { content: "v3\n", force: true })
+		await pushDenied(fx, repo, { content: "v2\n" })
+		await pushDenied(fx, repo, { content: "v3\n" })
 
 		// graceSeconds: 0 reclaims every unreachable object now, no aging needed.
 		const result = await fx.gc.gc(repo, { graceSeconds: 0 })
@@ -225,9 +227,9 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 
 	it("GC-5: every surviving object keeps its complete edge set (matches git's topology)", async () => {
 		const repo = "gc5-complete-edges"
-		await pushFile(fx, repo, { content: "v1\n" })
-		await pushFile(fx, repo, { content: "v2\n", force: true })
-		const final = await pushFile(fx, repo, { content: "v3\n", force: true })
+		const final = await pushFile(fx, repo, { content: "v1\n" })
+		await pushDenied(fx, repo, { content: "v2\n" })
+		await pushDenied(fx, repo, { content: "v3\n" })
 
 		// Reconstruct the surviving tip on disk to derive its real-git edge topology —
 		// the independent oracle for "complete edge set, nothing wrongly deleted".
@@ -267,7 +269,7 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 	it("GC-6: a second consecutive GC deletes nothing", async () => {
 		const repo = "gc6-idempotent-counts"
 		await pushFile(fx, repo, { content: "v1\n" })
-		await pushFile(fx, repo, { content: "v2\n", force: true })
+		await pushDenied(fx, repo, { content: "v2\n" })
 
 		const first = await fx.gc.gc(repo, { graceSeconds: 0 })
 		expect(first.deletedObjects).toBeGreaterThan(0)
@@ -278,9 +280,9 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 
 	it("GC-6: row sets and a clone are byte-identical after the second GC", async () => {
 		const repo = "gc6-idempotent-state"
-		await pushFile(fx, repo, { content: "v1\n" })
-		await pushFile(fx, repo, { content: "v2\n", force: true })
-		const final = await pushFile(fx, repo, { content: "v3\n", force: true })
+		const final = await pushFile(fx, repo, { content: "v1\n" })
+		await pushDenied(fx, repo, { content: "v2\n" })
+		await pushDenied(fx, repo, { content: "v3\n" })
 
 		await fx.gc.gc(repo, { graceSeconds: 0 })
 		const objAfter1 = await objectOids(fx.db, repo)
@@ -300,13 +302,14 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 	})
 
 	// GC-7 — Reachable set is exactly git's (graceSeconds: 0).
-	it("GC-7: survivors equal git's reachable closure after a force-commit", async () => {
+	it("GC-7: survivors equal git's reachable closure after denied pushes", async () => {
 		const repo = "gc7-exact-reachable"
-		await pushFile(fx, repo, { content: "v1\n" })
-		await pushFile(fx, repo, { content: "v2\n", force: true })
-		// The LAST push's source closure is the only reachable set; pushFile returns
+		// The LIVE push's source closure is the only reachable set; pushFile returns
 		// the real-git `rev-list --objects --all` oracle for that single-commit repo.
-		const final = await pushFile(fx, repo, { content: "v3\n", force: true })
+		// The two denied pushes only contribute orphans.
+		const final = await pushFile(fx, repo, { content: "v1\n" })
+		await pushDenied(fx, repo, { content: "v2\n" })
+		await pushDenied(fx, repo, { content: "v3\n" })
 
 		await fx.gc.gc(repo, { graceSeconds: 0 })
 
@@ -316,20 +319,21 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 
 	it("GC-7: survivors include the annotated-tag object and its peeled target", async () => {
 		const repo = "gc7-annotated-tag"
-		// First, an orphan-producing plain push on main (its objects must be reclaimed).
-		await pushFile(fx, repo, { content: "stale\n" })
-
-		// Then a commit + annotated tag, KEEPING the source as the survivor oracle. The
-		// tag ref points at the tag OBJECT (peeling to the commit), so the closure must
-		// include the tag object itself plus the peeled commit/tree/blob.
+		// The live scenario first: a commit + annotated tag into the FRESH repo,
+		// KEEPING the source as the survivor oracle. The tag ref points at the tag
+		// OBJECT (peeling to the commit), so the closure must include the tag
+		// object itself plus the peeled commit/tree/blob.
 		await withTempDir("pggit-gc7-tag-src-", async (src) => {
 			await pushCommitAndTag(fx, repo, src, "tagged\n")
 			const expected = await gitReachableOids(src) // includes the annotated-tag object
 
+			// Then a DENIED push contributes orphans (its objects must be reclaimed).
+			await pushDenied(fx, repo, { content: "stale\n" })
+
 			await fx.gc.gc(repo, { graceSeconds: 0 })
 
 			// Exactly git's reachable set — the annotated-tag object is kept (peeled
-			// targets exercised), the stale main objects are gone.
+			// targets exercised), the denied push's objects are gone.
 			expect(await objectOids(fx.db, repo)).toEqual(expected)
 		})
 
@@ -344,15 +348,15 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 	// and tree→subtree (kind 3) edges — the gap the flat single-root examples above
 	// leave to the property tests. The live tip is a two-commit chain with a nested
 	// `dir/`; a second ref keeps the parent commit reachable (multi-ref), while a
-	// prior plain push is orphaned so GC reclaims non-vacuously.
+	// denied push's objects are orphaned so GC reclaims non-vacuously.
 	it("GC-5/GC-7: keeps the full parent+subtree edge topology and exact closure of a nested two-commit history", async () => {
 		const repo = "gc57-nested-parent-subtree"
-		// Orphan-producing prior push: its flat commit/tree/blob become unreachable once
-		// `main` is force-moved to the nested history below, so GC has real work to do.
-		await pushFile(fx, repo, { content: "stale\n" })
-
 		await withTempDir("pggit-gc57-src-", async (src) => {
+			// The live nested history lands first (fresh repo — creates only)…
 			const { parent, tip } = await pushNested(fx, repo, src)
+			// …then a DENIED push contributes flat orphans, so GC reclaims
+			// non-vacuously.
+			await pushDenied(fx, repo, { content: "stale\n" })
 
 			// Independent real-git oracles over the kept source: the exact reachable
 			// closure (GC-7) and the exact reachable edge topology including kind-2
@@ -367,7 +371,7 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 			await fx.gc.gc(repo, { graceSeconds: 0 })
 
 			// GC-7: Postgres survivor set == git's reachable closure (parent A reachable
-			// via `refs/heads/other`, tip B via `refs/heads/main`); the stale push gone.
+			// via `refs/heads/other`, tip B via `refs/heads/main`); the denied push gone.
 			expect(await objectOids(fx.db, repo)).toEqual(expectedOids)
 			// GC-5: surviving git_edge rows == git's reachable topology exactly (the
 			// kind-2 parent edge and kind-3 subtree edge are kept, none wrongly swept)…

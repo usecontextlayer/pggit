@@ -129,4 +129,47 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 			rmSync(src, { force: true, recursive: true })
 		}
 	})
+
+	// The deny-non-FF policy composes with atomic (real git): ONE policy-denied
+	// command — a non-fast-forward, `+`-marked so the CLIENT sends it instead of
+	// refusing locally — poisons the whole batch. The perfectly valid create in
+	// the same push is ng'd too and NEITHER ref changes. Pins receive-pack's
+	// atomic disqualification branch: a regression that applied the valid half
+	// would break the all-or-nothing contract `--atomic` promises.
+	it("atomic: a policy-denied non-FF in the batch ng's every ref and applies none", async () => {
+		const src = mkdtempSync(join(tmpdir(), "pggit-atomic-policy-"))
+		try {
+			const repo = `http://127.0.0.1:${server.port}/repo-atomic-policy`
+			await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
+			writeFileSync(join(src, "a.txt"), "A\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "A"], { cwd: src })
+			const a = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+			writeFileSync(join(src, "a.txt"), "B\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "B"], { cwd: src })
+			const b = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+			await spawnGit(["push", repo, "HEAD:refs/heads/main"], { cwd: src })
+
+			// Rewrite history off A → C diverges from B (a non-fast-forward).
+			await spawnGit(["reset", "--hard", a], { cwd: src })
+			writeFileSync(join(src, "a.txt"), "C\n")
+			await spawnGit(["add", "."], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", "C"], { cwd: src })
+
+			await expect(
+				spawnGit(
+					["push", "--atomic", repo, "+HEAD:refs/heads/main", "HEAD:refs/heads/side"],
+					{ cwd: src },
+				),
+			).rejects.toThrow(/non-fast-forward|atomic/i)
+
+			// Nothing applied: `side` never created, `main` still exactly B.
+			expect(await refs.listRefs("repo-atomic-policy")).toEqual([
+				{ name: "refs/heads/main", oid: b },
+			])
+		} finally {
+			rmSync(src, { force: true, recursive: true })
+		}
+	})
 })

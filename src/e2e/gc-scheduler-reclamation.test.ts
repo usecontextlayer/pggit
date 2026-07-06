@@ -78,17 +78,17 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 	}
 
 	// SCH-6 — End-to-end reclamation + storage bound THROUGH the loop. A push then a
-	// force-commit orphans the prior tip; after ageing the orphans past the cutoff,
+	// rewind orphans the prior tip; after ageing the orphans past the cutoff,
 	// ONE `drainOnce()` (grace=0) must reduce the repo's surviving `git_object` to
 	// exactly the current tip's real-git reachable closure (no orphan survives, no
 	// live object lost), and the repo must clone fsck-clean at the latest content.
-	// Then over K force-commit + age + drain cycles the row count stays pinned at the
+	// Then over K rewind + age + drain cycles the row count stays pinned at the
 	// single-tip reachable size — it does NOT grow with K. This is GC-2/GC-4 reached
 	// through the scheduler: a stub `drainOnce` (throws) fails immediately; a drain
 	// that never judged the repo eligible (no `last_pushed_at` stamp) would leave the
 	// orphans in place and the survivor-equality / flat-count assertions would fail;
 	// an over-deleting drain would drop a live object and break the clone.
-	it("SCH-6 — drainOnce reduces git_object to the live closure and stays flat over K force-commit cycles", async () => {
+	it("SCH-6 — drainOnce reduces git_object to the live closure and stays flat over K rewind cycles", async () => {
 		const repo = "sch6-loop-reclaim"
 		const scheduler = createGcScheduler(fx.db.sql, {
 			concurrency: 4,
@@ -96,12 +96,12 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			intervalMs: 30_000,
 		})
 
-		// Establish the ref, then force-commit an independent root → the first tip's
+		// Establish the ref, then rewind to an independent root → the first tip's
 		// commit/tree/blob are orphaned (distinct content ⇒ disjoint closures).
 		const first = await pushFile(fx, repo, { content: "turn-1 transcript\n" })
 		const second = await pushFile(fx, repo, {
 			content: "turn-2 transcript\n",
-			force: true,
+			rewind: true,
 		})
 		expect(second.head).not.toBe(first.head)
 
@@ -146,7 +146,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		expect(clone.head).toBe(second.head)
 		expect(clone.fileContent).toBe("turn-2 transcript\n")
 
-		// Storage bound through the loop: K force-commit + age + drain cycles must NOT
+		// Storage bound through the loop: K rewind + age + drain cycles must NOT
 		// grow `git_object` with K. After each cycle the count returns to that cycle's
 		// single-tip closure size, so the count after cycle K equals the count now.
 		const boundAfterFirstDrain = await countObjects(fx.db, repo)
@@ -156,7 +156,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		const K = 5
 		const counts: number[] = [boundAfterFirstDrain]
 		for (let k = 1; k <= K; k++) {
-			const ck = await pushFile(fx, repo, { content: `turn-extra-${k}\n`, force: true })
+			const ck = await pushFile(fx, repo, { content: `turn-extra-${k}\n`, rewind: true })
 			await ageObjects(fx.db, repo, "1 hour")
 			await scheduler.drainOnce()
 			// Each cycle's survivors == that cycle's tip closure (no orphan accretion).
@@ -191,10 +191,10 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			intervalMs: 30_000,
 		})
 
-		// Round 1: seed, force-commit (orphans the seed), age, drain. This stamps
+		// Round 1: seed, rewind (orphans the seed), age, drain. This stamps
 		// `last_gc_at = t0` for the repo and reclaims round-1's orphans.
 		await pushFile(fx, repo, { content: "round1-a\n" })
-		const r1Tip = await pushFile(fx, repo, { content: "round1-b\n", force: true })
+		const r1Tip = await pushFile(fx, repo, { content: "round1-b\n", rewind: true })
 		await ageObjects(fx.db, repo, "1 hour")
 		const summary1 = await scheduler.drainOnce()
 		expect(summary1.filter((entry) => entry.repo === repo)).toHaveLength(1)
@@ -207,10 +207,10 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		expect(settled.lastGcAt).not.toBeNull()
 		expect(settled.lastPushedAt).not.toBeNull()
 
-		// A NEW force push AFTER that stamp orphans round-1's tip and re-stamps
+		// A NEW rewind AFTER that stamp orphans round-1's tip and re-stamps
 		// `last_pushed_at`. The durable signal must now strictly exceed the prior GC
 		// stamp — this is exactly what makes the repo re-qualify (the SCH-7 property).
-		const r2Tip = await pushFile(fx, repo, { content: "round2\n", force: true })
+		const r2Tip = await pushFile(fx, repo, { content: "round2\n", rewind: true })
 		expect(r2Tip.head).not.toBe(r1Tip.head)
 		const reStamped = await repoGcState(fx.db, repo)
 		const gcAt = settled.lastGcAt as Date

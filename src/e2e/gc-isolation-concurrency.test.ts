@@ -58,7 +58,7 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 
 	// GC-8 — Tenant isolation. GC on repo A never deletes any object/edge of repo
 	// B. We push two repos that share NO content (distinct file paths + bodies →
-	// disjoint blob/tree/commit oids), orphan A's old objects via a force-commit,
+	// disjoint blob/tree/commit oids), orphan A's old objects via a store rewind,
 	// then GC only A with grace=0. Repo B must be byte-for-byte untouched: its
 	// git_object / git_edge row counts and oid sets are unchanged, and a clone of
 	// B is still complete + fsck-clean.
@@ -66,11 +66,11 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 		const repoA = "gc8-a"
 		const repoB = "gc8-b"
 
-		// Repo A: an initial commit, then a force-commit that orphans the first.
+		// Repo A: an initial commit, then a rewind that orphans the first.
 		await pushFile(fx, repoA, { content: "A-v1\n" })
-		const aTip = await pushFile(fx, repoA, { content: "A-v2\n", force: true })
+		const aTip = await pushFile(fx, repoA, { content: "A-v2\n", rewind: true })
 
-		// Repo B: independent content, never force-committed (nothing orphaned).
+		// Repo B: independent content, never rewound (nothing orphaned).
 		const bTip = await pushFile(fx, repoB, { content: "totally-different-B\n" })
 
 		// Snapshot B's full observable state before A's GC.
@@ -111,13 +111,13 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 	// is non-deterministic (the `git` subprocess startup dwarfs the in-process GC
 	// SQL, so the push always committed before either sweep) — the live tip was
 	// never actually in-flight relative to a sweep. We make the race deterministic
-	// with the documented `_hooks.afterLiveSet` seam: it fires a REAL force-commit
-	// push of a FRESH commit (new objects + ref move) at exactly the moment §5
+	// with the documented `_hooks.afterLiveSet` seam: it fires a REAL rewind — a
+	// FRESH commit's objects pushed + the ref moved — at exactly the moment §5
 	// cares about — after the live set is materialized, before the sweep runs.
 	//
 	// Construction (all three states present in ONE sweep):
 	//   c1  pre-existing orphan  — unreachable BEFORE the GC (orphaned by c2's
-	//                              force-push) AND aged past grace ⇒ MUST be reclaimed.
+	//                              rewind) AND aged past grace ⇒ MUST be reclaimed.
 	//   c2  the live tip at snapshot — reachable, captured in the live set.
 	//   c3  the in-flight push    — sent inside the window, young (just created),
 	//                              unreachable-at-snapshot ⇒ MUST survive (grace).
@@ -133,10 +133,10 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 	it("GC-9: an in-flight push's objects survive a concurrent GC sweep while pre-existing orphans are reclaimed", async () => {
 		const repo = "gc9"
 
-		// c1: seed. c2: force-commit that orphans c1 BEFORE any GC runs — so c1 is
+		// c1: seed. c2: a rewind that orphans c1 BEFORE any GC runs — so c1 is
 		// unreachable at the live-set snapshot, the precondition for it to be swept.
 		const c1 = await pushFile(fx, repo, { content: "gc9-c1\n" })
-		const c2 = await pushFile(fx, repo, { content: "gc9-c2\n", force: true })
+		const c2 = await pushFile(fx, repo, { content: "gc9-c2\n", rewind: true })
 
 		// Age every stored object back 1h. c1's orphans now sit past the grace
 		// (eligible); c2 is reachable-at-snapshot so the live set protects it
@@ -144,14 +144,14 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 		await ageObjects(fx.db, repo, "1 hour")
 
 		// Run GC with a grace that straddles the two ages: 30min < 1h orphan age,
-		// but ≫ c3's ~0s age. The seam fires the in-flight force-commit push of c3
-		// after the live set is fixed (which captured c2, not c3) and before the
-		// sweep — the exact §5 window.
+		// but ≫ c3's ~0s age. The seam fires the in-flight rewind to c3 after the
+		// live set is fixed (which captured c2, not c3) and before the sweep — the
+		// exact §5 window.
 		let c3: PushResult | undefined
 		const reclaimed = await (fx.gc.gc as GcWithSeam)(repo, {
 			_hooks: {
 				afterLiveSet: async () => {
-					c3 = await pushFile(fx, repo, { content: "gc9-c3-inflight\n", force: true })
+					c3 = await pushFile(fx, repo, { content: "gc9-c3-inflight\n", rewind: true })
 				},
 			},
 			graceSeconds: 1800,
@@ -191,9 +191,9 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 
 		// Identical push sequences → identical object graphs (pinned identity/clock).
 		await pushFile(fx, repoSmall, { content: "gc10-v1\n" })
-		const smallTip = await pushFile(fx, repoSmall, { content: "gc10-v2\n", force: true })
+		const smallTip = await pushFile(fx, repoSmall, { content: "gc10-v2\n", rewind: true })
 		await pushFile(fx, repoLarge, { content: "gc10-v1\n" })
-		const largeTip = await pushFile(fx, repoLarge, { content: "gc10-v2\n", force: true })
+		const largeTip = await pushFile(fx, repoLarge, { content: "gc10-v2\n", rewind: true })
 
 		// Equivalent starting scenarios: same tip, same full stored object set.
 		expect(largeTip.head).toBe(smallTip.head)

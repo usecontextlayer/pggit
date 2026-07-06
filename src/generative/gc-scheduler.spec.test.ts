@@ -1,7 +1,7 @@
 /**
  * Property-based scheduler differential — `docs/2026-06-24-gc-scheduler-design.md`
  * §6, item PBT-S1 ("Multi-repo differential"). For a RANDOM sequence of operations
- * across several repos — each op a push, a force-commit, or a side-branch delete —
+ * across several repos — each op a push, a rewind, or a side-branch delete —
  * one `drainOnce({ graceSeconds: 0 })` with every object aged must, for EVERY repo:
  *
  *   (a) leave the surviving `git_object` rows (`objectOids`) exactly equal to that
@@ -55,21 +55,22 @@ import { spawnGit } from "@/testing/spawn-git"
 
 /** One operation against a single repo within a run. The generator emits a stream
  * of these; the test interprets them through a tiny per-repo model (below) so every
- * emitted op is a VALID, storage-mutating git operation:
+ * emitted op is a VALID storage mutation (wire pushes, plus the store-level moves
+ * the wire policy no longer allows):
  *   - `push`  — write `refs/heads/main`: the repo's first push (create) when main is
- *               absent, else a force-commit advancing main to an independent root
+ *               absent, else a rewind advancing main to an independent root
  *               (orphaning the prior tip).
- *   - `force` — same as a subsequent `push`: a force-commit on main (orphans the
- *               prior snapshot). Folded into `push` once main exists; kept as a
- *               distinct generated symbol so the sequence is push/force/delete.
+ *   - `rewind`— same as a subsequent `push`: a store-level rewind of main (orphans
+ *               the prior snapshot). Folded into `push` once main exists; kept as a
+ *               distinct generated symbol so the sequence is push/rewind/delete.
  *   - `branch`— write a side branch `refs/heads/side-<n>` (so a later `delete` has a
  *               target); each carries fresh content → its own commit/tree/blob.
- *   - `delete`— delete the most-recent surviving side branch (a ref-delete that
+ *   - `delete`— delete the most-recent surviving side branch (a store ref-delete that
  *               ingests no object — SCH-2's case — orphaning that branch's
  *               exclusive objects). A no-op when no side branch exists. */
 type RepoOp =
 	| { kind: "push" }
-	| { kind: "force" }
+	| { kind: "rewind" }
 	| { kind: "branch" }
 	| { kind: "delete" }
 
@@ -92,7 +93,7 @@ type RepoState = {
 const stepArb: fc.Arbitrary<Step> = fc.record({
 	op: fc.oneof(
 		{ arbitrary: fc.constant<RepoOp>({ kind: "push" }), weight: 3 },
-		{ arbitrary: fc.constant<RepoOp>({ kind: "force" }), weight: 3 },
+		{ arbitrary: fc.constant<RepoOp>({ kind: "rewind" }), weight: 3 },
 		{ arbitrary: fc.constant<RepoOp>({ kind: "branch" }), weight: 2 },
 		{ arbitrary: fc.constant<RepoOp>({ kind: "delete" }), weight: 2 },
 	),
@@ -106,8 +107,8 @@ const stepArb: fc.Arbitrary<Step> = fc.record({
  * source (then discard it) — the side-branch creator. `pushFile` only ever targets
  * `refs/heads/main`, so a side branch needs this raw push; it mirrors `pushFile`'s
  * "independent root, discard the source" shape so the branch's objects survive only
- * in Postgres (where a later delete orphans them). `--force` is harmless on a fresh
- * ref and keeps the push path identical to a force-commit's.
+ * in Postgres (where a later store-level delete orphans them). Plain push — the
+ * fresh ref is a CREATE, which the deny-non-FF wire policy allows.
  */
 async function pushBranch(
 	fx: Pick<GcFixture, "server">,
@@ -120,26 +121,31 @@ async function pushBranch(
 		writeFileSync(join(src, `${branch}.txt`), content)
 		await spawnGit(["add", "."], { cwd: src })
 		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
-		await spawnGit(["push", "--force", repoUrl(fx, repo), `HEAD:refs/heads/${branch}`], {
+		await spawnGit(["push", repoUrl(fx, repo), `HEAD:refs/heads/${branch}`], {
 			cwd: src,
 		})
 	})
 }
 
 /**
- * Delete a ref on the server by pushing an empty source over it (`git push <url>
- * :<ref>`), the raw-git ref-delete that ingests no object — exactly SCH-2's
- * delete-only-orphans case. Run from a throwaway dir so it needs no local history.
+ * Delete a ref at the STORE level (ingesting no object) — SCH-2's
+ * delete-only-orphans case, driven internally now that the wire denies deletes.
  */
 async function deleteRef(
-	fx: Pick<GcFixture, "server">,
+	fx: Pick<GcFixture, "refs">,
 	repo: string,
 	ref: string,
 ): Promise<void> {
-	await withTempDir("pggit-gcsch-del-", async (dir) => {
-		await spawnGit(["init", "-q"], { cwd: dir })
-		await spawnGit(["push", repoUrl(fx, repo), `:${ref}`], { cwd: dir })
-	})
+	// The wire now DENIES ref deletion (deny-non-FF policy), so the workload's
+	// delete-only-orphans case drives the STORE directly — the internal path a
+	// rewound/retired ref would take. An unconditional delete: zero new oid,
+	// zero old oid (no CAS assertion).
+	const done = await fx.refs.applyRefUpdates(
+		repo,
+		[{ newOid: "0".repeat(40), oldOid: "0".repeat(40), ref }],
+		false,
+	)
+	if (done.some((ok) => !ok)) throw new Error(`deleteRef: store delete failed for ${ref}`)
 }
 
 /**
@@ -185,13 +191,14 @@ async function applyStep(
 ): Promise<void> {
 	switch (op.kind) {
 		case "push":
-		case "force": {
-			// First push to a fresh repo creates main (no force); every later one is a
-			// force-commit advancing main to an independent root, orphaning the prior tip.
-			const force = state.mainExists
+		case "rewind": {
+			// First push to a fresh repo creates main (a plain wire push); every later
+			// one is a store-level rewind advancing main to an independent root,
+			// orphaning the prior tip (the retired force-commit workload's internal twin).
+			const rewind = state.mainExists
 			await pushFile(fx, repo, {
 				content: `main rev ${state.nextContent++}\n`,
-				force,
+				rewind,
 			})
 			state.mainExists = true
 			state.touched = true
@@ -285,7 +292,7 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 					// (a) Per-repo differential: after the single drain, each repo's surviving
 					// Postgres objects == its real-git reachable closure over its current refs.
 					// This pins BOTH liveness (no live object dropped) and reclamation (every
-					// orphan from a force-commit or a branch-delete gone) for EVERY repo at once
+					// orphan from a rewind or a branch-delete gone) for EVERY repo at once
 					// — the multi-repo generalisation of SCH-6, isolated per repo (SCH-8).
 					for (const repo of repos) {
 						const survivors = await objectOids(fx.db, repo)

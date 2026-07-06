@@ -130,6 +130,8 @@ function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 		ingest: async (pack) => {
 			await deps.objects.ingestPack(repoId, pack)
 		},
+		isAncestor: (ancestor, descendant) =>
+			deps.objects.isAncestor(repoId, ancestor, descendant),
 		isConnected: (oid) => deps.objects.isConnected(repoId, oid),
 	}
 	if (deps.snapshots) {

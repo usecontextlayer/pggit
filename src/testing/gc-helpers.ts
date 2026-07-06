@@ -83,17 +83,27 @@ export async function withTempDir<T>(
 	}
 }
 
-/** Options for one push: the file written and whether to `--force` the push.
- *
- * Force-commit (the §1 workload) is modelled by `force: true` from an INDEPENDENT
- * source repo: a fresh root commit whose tree/blob differ from the prior push, so
- * the ref moves to a non-descendant and the old objects are orphaned — no literal
- * `--amend` needed, and pggit accepts the non-ff via CAS (refs-store). The first
- * push of a repo needs no force; every subsequent force-commit does. */
-export type PushOpts = {
+/** The file one push writes — the options `pushFile` and `pushDenied` share. */
+export type PushContent = {
 	path?: string
 	content: string
-	force?: boolean
+}
+
+/** `pushFile`'s options: the file written, and whether to REWIND the ref to
+ * the new (non-descendant) commit at the STORE level afterwards.
+ *
+ * `rewind` replaces the pre-deny-non-FF `force` option: the wire now refuses
+ * non-fast-forward moves (receive-pack policy), but the STORE still executes
+ * any CAS-valid ref move — rewound states remain reachable internally
+ * (pre-policy history, operator surgery), and the GC suites' workload model
+ * ("the ref moved to a non-descendant; the old closure is orphaned") tests GC's
+ * store-level reachability math, not push policy. Mechanically: the new root
+ * is pushed to a throwaway ref (a CREATE — allowed), `main` is CAS-moved to it
+ * through the store, and the throwaway ref is store-deleted. The DENIED-push
+ * orphan flow (the production orphan source) is covered separately by
+ * `pushDenied` (gc-denied-push / gc-integrity). */
+export type PushOpts = PushContent & {
+	rewind?: boolean
 }
 
 /** What a push produced: the new HEAD oid and the full reachable object closure
@@ -102,15 +112,12 @@ export type PushResult = { head: string; reachable: string[] }
 
 /**
  * Push a single-file commit to `refs/heads/main` from a throwaway source repo,
- * then DISCARD the source dir. `force` sends it as a non-ff `push --force`.
- * Returns the new HEAD oid and the real-git reachable closure of that single-
- * commit repo (its commit, tree, and blob) — exactly the objects GC must keep
- * for this tip. Because the source dir is discarded each call, a later
- * force-commit's orphaned objects survive only in Postgres, where GC reclaims
- * them.
+ * then DISCARD the source dir. Returns the new HEAD oid and the real-git
+ * reachable closure of that single-commit repo (its commit, tree, and blob) —
+ * exactly the objects GC must keep for this tip.
  */
 export async function pushFile(
-	fx: Pick<GcFixture, "server">,
+	fx: Pick<GcFixture, "server" | "refs">,
 	repo: string,
 	opts: PushOpts,
 ): Promise<PushResult> {
@@ -121,10 +128,79 @@ export async function pushFile(
 		writeFileSync(join(src, path), opts.content)
 		await spawnGit(["add", "."], { cwd: src })
 		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
-		const pushArgs = opts.force
-			? ["push", "--force", url, "HEAD:refs/heads/main"]
-			: ["push", url, "HEAD:refs/heads/main"]
-		await spawnGit(pushArgs, { cwd: src })
+		const head = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+		if (opts.rewind) {
+			// Land the objects via a throwaway CREATE, then rewind `main` through
+			// the store (see PushOpts.rewind for why this bypasses the wire policy).
+			const tmpRef = `refs/heads/rewind-${head.slice(0, 12)}`
+			await spawnGit(["push", url, `HEAD:${tmpRef}`], { cwd: src })
+			const current = (await fx.refs.listRefs(repo)).find(
+				(r) => r.name === "refs/heads/main",
+			)
+			// A rewind's whole point is orphaning an EXISTING tip; falling back to a
+			// create here would silently under-exercise the GC workload.
+			if (!current) {
+				throw new Error(
+					`pushFile rewind: refs/heads/main missing in ${repo} — seed the ref before rewinding it`,
+				)
+			}
+			const moved = await fx.refs.applyRefUpdates(
+				repo,
+				[
+					{
+						newOid: head,
+						oldOid: current.oid,
+						ref: "refs/heads/main",
+					},
+					{ newOid: ZERO_OID_HEX, oldOid: head, ref: tmpRef },
+				],
+				false,
+			)
+			if (moved.some((ok) => !ok)) {
+				throw new Error(`pushFile rewind: store ref updates failed (${moved})`)
+			}
+		} else {
+			await spawnGit(["push", url, "HEAD:refs/heads/main"], { cwd: src })
+		}
+		const reachable = await gitReachableOids(src)
+		return { head, reachable }
+	})
+}
+
+/** The all-zeros sha1 oid: `create` as an old value, `delete` as a new value. */
+const ZERO_OID_HEX = "0".repeat(40)
+
+/**
+ * The deny-non-FF-era orphan generator (replaces the retired force-commit
+ * workload): attempt a `push --force` of an INDEPENDENT root commit and EXPECT
+ * the server to ng it (`non-fast-forward`). The wire protocol ingests the pack
+ * BEFORE the policy pass, so the denied push's objects land in Postgres as
+ * unreachable orphans while the ref stays untouched — exactly the garbage GC
+ * exists to reclaim. Returns the denied tip and its would-be closure (the
+ * orphan oracle). Throws if the push unexpectedly SUCCEEDS.
+ */
+export async function pushDenied(
+	fx: Pick<GcFixture, "server">,
+	repo: string,
+	opts: PushContent,
+): Promise<PushResult> {
+	return withTempDir("pggit-gc-denied-", async (src) => {
+		const url = repoUrl(fx, repo)
+		const path = opts.path ?? "file.txt"
+		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
+		writeFileSync(join(src, path), opts.content)
+		await spawnGit(["add", "."], { cwd: src })
+		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
+		let denied = false
+		try {
+			await spawnGit(["push", "--force", url, "HEAD:refs/heads/main"], { cwd: src })
+		} catch (e) {
+			if (!/non-fast-forward/i.test(e instanceof Error ? e.message : "")) throw e
+			denied = true
+		}
+		if (!denied) {
+			throw new Error("pushDenied: the force push unexpectedly succeeded")
+		}
 		const head = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 		const reachable = await gitReachableOids(src)
 		return { head, reachable }

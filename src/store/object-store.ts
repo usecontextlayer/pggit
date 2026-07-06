@@ -245,6 +245,27 @@ export function createObjectStore(pg: Sql) {
 		},
 
 		/**
+		 * Is `ancestor` in `descendant`'s history (or equal to it)? The
+		 * fast-forward policy check for receive-pack's deny-non-FF (a ref update
+		 * may only ADVANCE — see handleReceivePack): delegates to the same
+		 * ancestry CTE that powers negotiation (`ancestryReachesCommon`, edge
+		 * kinds 2,5 — the tag kind is harmless for branch tips), seeded at the
+		 * descendant and self-inclusive, so a no-op update (old == new) counts as
+		 * an ancestor.
+		 */
+		async isAncestor(
+			repoId: string,
+			ancestor: string,
+			descendant: string,
+		): Promise<boolean> {
+			const id = await repos.resolveRepoId(repoId)
+			if (id === null) return false
+			return await ancestryReachesCommon(db, id, descendant, [
+				Buffer.from(ancestor, "hex"),
+			])
+		},
+
+		/**
 		 * Connectivity check (spec §5.2): is every object reachable from `oid` present?
 		 * A push whose new tip fails this references an object the pack neither carried
 		 * nor delta-resolved, and must be rejected. Delegates to the one reachability

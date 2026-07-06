@@ -71,7 +71,7 @@ describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 	// SCH-8 — Tenant isolation through the loop. ONE fixture, several repos all made
 	// eligible (each pushed → `last_pushed_at` set, none yet GC'd), then a SINGLE
 	// `drainOnce({ graceSeconds: 0, concurrency: 4 })`. Repos:
-	//   - four force-commit repos (sch8-f0..f3): each pushed then force-committed, so
+	//   - four rewind repos (sch8-r0..r3): each pushed then store-rewound, so
 	//     each holds orphans (the prior tip's objects) that the drain must reclaim;
 	//   - one single-push repo (sch8-solo): pushed exactly once, NO orphans, but still
 	//     eligible (last_pushed_at set, last_gc_at null) — it must be GC'd (appear in
@@ -82,27 +82,27 @@ describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 	//
 	// Why a wrong impl fails: (a) a per-repo over-reach (A's GC deleting B's rows)
 	// shows up as B's survivors !== B's closure or B's clone breaking; (b) a per-repo
-	// under-reach (orphans left behind) shows up as a force-repo's survivors strictly
+	// under-reach (orphans left behind) shows up as a rewind-repo's survivors strictly
 	// containing its orphans (!== closure); (c) a drain that skips eligible repos
 	// (e.g. ignores the no-orphan solo repo, or only does a subset under concurrency)
 	// shows up as a missing summary entry or un-reclaimed orphans; (d) cross-repo
 	// bleed shows up in the explicit "no repo's survivors intersect another's" check.
 	it("SCH-8: one drain GCs every eligible repo correctly with no cross-repo bleed", async () => {
-		const forceRepos = ["sch8-f0", "sch8-f1", "sch8-f2", "sch8-f3"]
+		const rewindRepos = ["sch8-r0", "sch8-r1", "sch8-r2", "sch8-r3"]
 		const soloRepo = "sch8-solo"
-		const allRepos = [...forceRepos, soloRepo]
+		const allRepos = [...rewindRepos, soloRepo]
 
-		// Build the force-commit repos: an initial push, then a force-commit from an
+		// Build the rewind repos: an initial push, then a store rewind to an
 		// independent root → the prior tip's objects are orphaned in Postgres. Each
 		// repo's content is unique to keep all closures pairwise disjoint.
-		for (const repo of forceRepos) {
+		for (const repo of rewindRepos) {
 			await pushFile(fx, repo, { content: `${repo}-v1\n`, path: `${repo}.txt` })
 			const tip = await pushFile(fx, repo, {
 				content: `${repo}-v2\n`,
-				force: true,
 				path: `${repo}.txt`,
+				rewind: true,
 			})
-			// Sanity: the force-commit actually orphaned objects (so reclamation is not
+			// Sanity: the rewind actually orphaned objects (so reclamation is not
 			// vacuous) — there exist stored objects outside this tip's closure.
 			const tipClosure = new Set(tip.reachable)
 			const stored = await objectOids(fx.db, repo)
@@ -142,13 +142,13 @@ describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 			const expected = await reachableOfTip(repo)
 			const survivors = await objectOids(fx.db, repo)
 			survivorsByRepo.set(repo, survivors)
-			// Exact equality: orphans gone (force repos) AND nothing live lost.
+			// Exact equality: orphans gone (rewind repos) AND nothing live lost.
 			expect(survivors).toEqual(expected)
 		}
 
-		// Each force repo clones to its v2 tip + content, fsck-clean — unaffected by
+		// Each rewind repo clones to its v2 tip + content, fsck-clean — unaffected by
 		// the others' concurrent GC.
-		for (const repo of forceRepos) {
+		for (const repo of rewindRepos) {
 			const clone = await cloneAndFsck(fx, repo, "refs/heads/main", `${repo}.txt`)
 			expect(clone.fileContent).toBe(`${repo}-v2\n`)
 		}

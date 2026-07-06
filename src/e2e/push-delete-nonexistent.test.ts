@@ -4,12 +4,14 @@
  * Merged from a01-delete-nonexistent-ref.bug + a02-delete-nonexistent.bug.
  *
  * When the client doesn't know a current value for the ref it is deleting it
- * sends `<zero> <zero> <ref>` (old=zero, new=zero). Canonical git-receive-pack
- * treats this as a no-op delete: it warns "deleting a non-existent ref", emits
- * `unpack ok` then a non-error per-ref status (`ok ...`), and `git push` exits
- * 0. pggit instead 500s ("the remote end hung up unexpectedly"). These tests
- * drive the receive-pack wire directly with the exact `<zero> <zero> ref`
- * delete command and assert the canonical 200 report-status outcome.
+ * sends `<zero> <zero> <ref>` (old=zero, new=zero). The original bug: pggit
+ * threw on that command and the client saw HTTP 500 ("the remote end hung up
+ * unexpectedly"). The pin both tests exist for is the TRANSPORT contract:
+ * HTTP 200 with a clean per-ref report-status, never a thrown 500. WHAT the
+ * per-ref line says moved under deny-non-FF (2026-07-05): canonical git
+ * no-ops an absent-ref delete with a non-error status, but pggit refuses
+ * every wire delete as policy, so the line is now
+ * `ng ... deletion denied (refs only advance)`.
  *
  * The two describes preserve each original bug's distinct repro: a01 sends a
  * pack-less delete body (a delete carries no objects), a02 appends an empty
@@ -31,26 +33,19 @@ const ZERO = "0".repeat(40)
  *
  * A delete command is `<old> <zero> <ref>`; when the client doesn't have the ref
  * either, git sends `<zero> <zero> <ref>` (both old and new are the zero-oid).
- * Canonical receive-pack treats this as a no-op delete: it emits
- * `warning: deleting a non-existent ref` and reports success (`git push` exits 0,
- * the per-ref status is `[deleted]`).
+ * (Canonical receive-pack, for reference, no-ops this — `warning: deleting a
+ * non-existent ref`, success. pggit's deny-non-FF policy deliberately diverges
+ * and refuses every wire delete.)
  *
- * CONTROL (run on disk during exploration): pushing `:refs/heads/ghost` to a
- * fresh `git init --bare` prints
- *     remote: warning: deleting a non-existent ref
- *      - [deleted]         ghost
- * and exits 0.
- *
- * pggit instead returns HTTP 500 and the client sees
+ * The BUG this file pins: pggit used to THROW on the command and the client saw
  *     error: RPC failed; HTTP 500
  *     send-pack: unexpected disconnect while reading sideband packet
  *     fatal: the remote end hung up unexpectedly
  *
  * This test drives the receive-pack wire with the exact `<zero> <zero> ref`
  * delete command (no pack — a delete carries no objects) and asserts the
- * canonical outcome: HTTP 200 with a valid report-status (`unpack ok` and a
- * non-`ng` status for the ref). It is RED now (the handler 500s) and GREEN once
- * a no-op delete of a missing ref is handled gracefully.
+ * transport contract: HTTP 200 with a valid report-status carrying a per-ref
+ * line — `ng ... deletion denied` under the policy. It must NOT 500.
  */
 describe("a01 — receive-pack tolerates deleting a nonexistent ref", () => {
 	let isolated: IsolatedDb
@@ -84,34 +79,37 @@ describe("a01 — receive-pack tolerates deleting a nonexistent ref", () => {
 
 		expect(res.status).toBe(200)
 		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
-		// Canonical git unpacks (zero objects) and the no-op delete is NOT an error.
+		// The unpack (zero objects) is fine, and since deny-non-FF (2026-07-05) the
+		// delete — even a no-op delete of an absent ref — is refused as policy with
+		// a per-ref `ng`. The pin this test exists for is unchanged: a clean
+		// per-ref REPORT over HTTP 200, never a thrown 500.
 		expect(report).toContain("unpack ok")
-		expect(report).not.toContain("ng refs/heads/ghost")
+		expect(report).toContain("ng refs/heads/ghost deletion denied")
 	})
 })
 
 /**
- * force-nonff dimension — deleting a NONEXISTENT ref must be a clean per-ref
+ * a02 (empty-pack variant) — deleting a NONEXISTENT ref must be a clean per-ref
  * report, NOT an HTTP 500.
  *
  * When `git push <remote> :refs/heads/doesnotexist` targets a ref the server does
  * not advertise, git sends the command `0{40} 0{40} refs/heads/doesnotexist`
  * (old=zero because the client knows of no current value, new=zero for delete).
- * Canonical git-receive-pack accepts this as a no-op delete: `unpack ok` then a
- * per-ref `ok refs/heads/doesnotexist`, process exits 0 (it merely warns
- * "deleting a non-existent ref"). The LIVE pggit server instead returns HTTP 500
- * "internal server error" — the client sees "the remote end hung up unexpectedly".
+ * The LIVE pggit server used to return HTTP 500 "internal server error" — the
+ * client saw "the remote end hung up unexpectedly".
  *
- * Root cause (observed, not asserted): the zero-old/zero-delete command is
- * classified as "create whose target is the zero OID" and THROWS, propagating as
+ * Root cause (observed, not asserted): the zero-old/zero-delete command was
+ * classified as "create whose target is the zero OID" and THREW, propagating as
  * a 500 instead of being reported per-ref.
  *
  * This test drives the wire directly (the client never refuses a delete, so this
  * is reproducible end-to-end too, but the in-process request isolates the server
  * contract): a delete command for an absent ref must yield a 200 report-status
- * with `unpack ok` and a per-ref line (canonical git: `ok ...`). It must NOT 500.
+ * with `unpack ok` and a per-ref line — `ng ... deletion denied` since the
+ * deny-non-FF policy refuses every wire delete (canonical git, for reference,
+ * would no-op it with `ok`). It must NOT 500.
  */
-describe("a02 force-nonff — delete of a nonexistent ref is reported, not a 500", () => {
+describe("a02 — delete of a nonexistent ref is reported (ng, deny-non-FF), not a 500", () => {
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let objects: ObjectStore
@@ -143,13 +141,15 @@ describe("a02 force-nonff — delete of a nonexistent ref is reported, not a 500
 			method: "POST",
 		})
 
-		// Canonical git-receive-pack: this is a clean per-ref outcome, HTTP 200.
+		// The no-500 pin this test exists for is unchanged: a clean report, HTTP 200.
 		expect(res.status).toBe(200)
 		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
 		expect(report).toContain("unpack ok")
-		// Deleting an absent ref is a no-op success in canonical git (it warns but
-		// reports `ok`). The ref must not exist afterward, and nothing must crash.
-		expect(report).toContain("ok refs/heads/doesnotexist")
+		// Since deny-non-FF (2026-07-05) ALL deletions are refused as policy — the
+		// absent-ref delete now reports a per-ref `ng` with the policy reason
+		// (canonical git would no-op `ok`; the policy deliberately diverges). The
+		// contract this pins: a per-ref REPORT, never a thrown 500.
+		expect(report).toContain("ng refs/heads/doesnotexist deletion denied")
 		expect(
 			(await refs.listRefs("repo")).find((r) => r.name === "refs/heads/doesnotexist"),
 		).toBeUndefined()

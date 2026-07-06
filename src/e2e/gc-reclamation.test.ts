@@ -59,16 +59,16 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 		})
 	}
 
-	// GC-1 — Liveness preserved. After a force-commit orphans the old tip, GC with
+	// GC-1 — Liveness preserved. After a rewind orphans the old tip, GC with
 	// grace=0 still keeps every object reachable from the CURRENT ref tip (incl.
 	// peeled targets); a full clone after GC is byte-identical reachable content
 	// and `git fsck --full` passes.
 	it("GC-1: keeps the live closure and clones byte-identical + fsck-clean after GC", async () => {
 		const repo = "gc1-liveness"
 
-		// Initial push, then a force-commit that orphans the original tip's objects.
+		// Initial push, then a rewind that orphans the original tip's objects.
 		await pushFile(fx, repo, { content: "first revision\n" })
-		await pushFile(fx, repo, { content: "second revision\n", force: true })
+		await pushFile(fx, repo, { content: "second revision\n", rewind: true })
 
 		// Live survivor oracle: real-git reachable closure of the current tip.
 		const liveOids = await reachableOfTip(repo)
@@ -95,13 +95,13 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 	// GC-2 — Unreachable reclaimed. An object unreachable from all refs AND older
 	// than grace is absent from `git_object` after GC, and its `git_edge` rows are
 	// gone (no FK cascade — edges of deleted objects must be swept too).
-	it("GC-2: removes orphaned objects and their edges after a force-commit (grace=0, aged)", async () => {
+	it("GC-2: removes orphaned objects and their edges after a rewind (grace=0, aged)", async () => {
 		const repo = "gc2-reclaim"
 
-		// Push c1, capture its reachable closure, then force-commit c2 (independent
+		// Push c1, capture its reachable closure, then rewind to c2 (independent
 		// root → distinct commit/tree/blob) so c1's objects are orphaned.
 		const r1 = await pushFile(fx, repo, { content: "old transcript\n" })
-		const r2 = await pushFile(fx, repo, { content: "new transcript\n", force: true })
+		const r2 = await pushFile(fx, repo, { content: "new transcript\n", rewind: true })
 		expect(r2.head).not.toBe(r1.head)
 
 		// Orphaned = reachable-from-c1 minus reachable-from-c2 (distinct content ⇒
@@ -140,7 +140,7 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 		const repo = "gc3-grace"
 
 		const r1 = await pushFile(fx, repo, { content: "young v1\n" })
-		const r2 = await pushFile(fx, repo, { content: "young v2\n", force: true })
+		const r2 = await pushFile(fx, repo, { content: "young v2\n", rewind: true })
 
 		const liveSet = new Set(r2.reachable)
 		const orphaned = r1.reachable.filter((oid) => !liveSet.has(oid))
@@ -182,10 +182,10 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 	it("GC-3: grace is compared against created_at age (boundary straddle)", async () => {
 		const repo = "gc3-boundary"
 
-		// Push c1, force-commit c2 (independent root → disjoint closure) so c1's
+		// Push c1, rewind to c2 (independent root → disjoint closure) so c1's
 		// objects are orphaned. Orphaned = reachable(c1) \ reachable(c2).
 		const r1 = await pushFile(fx, repo, { content: "boundary v1\n" })
-		const r2 = await pushFile(fx, repo, { content: "boundary v2\n", force: true })
+		const r2 = await pushFile(fx, repo, { content: "boundary v2\n", rewind: true })
 		const liveSet = new Set(r2.reachable)
 		const orphaned = r1.reachable.filter((oid) => !liveSet.has(oid))
 		expect(orphaned.length).toBeGreaterThan(0)
