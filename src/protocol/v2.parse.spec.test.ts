@@ -93,6 +93,21 @@ describe("parseReceivePack — command-list decode", () => {
 			parseReceivePack(receiveBody([`${Z} ${A} refs/heads/main extra`])),
 		).toThrow(GitProtocolError)
 	})
+
+	// The command ids cross the trust boundary here: downstream they are fed to
+	// Buffer.from(oid, "hex"), which silently truncates garbage. Each malformed
+	// shape must throw in EITHER position; the zero sentinel (valid 40-hex) is
+	// already pinned by the passing cases above.
+	it("throws on a malformed object id in either position (non-hex, short, uppercase)", () => {
+		for (const bad of ["z".repeat(40), "a".repeat(39), "A".repeat(40)]) {
+			expect(() =>
+				parseReceivePack(receiveBody([`${bad} ${A} refs/heads/main`])),
+			).toThrow(/malformed object id/)
+			expect(() =>
+				parseReceivePack(receiveBody([`${A} ${bad} refs/heads/main`])),
+			).toThrow(/malformed object id/)
+		}
+	})
 })
 
 describe("handleUploadPack — command dispatch", () => {

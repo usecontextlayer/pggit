@@ -1,9 +1,8 @@
+import { isOid, type Oid, ZERO_OID } from "@/oid"
 import { AGENT, assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { encodeSideband, SIDEBAND_DATA } from "@/protocol/sideband"
-
-const ZERO_OID = "0".repeat(40)
 
 /** A ref name longer than this (bytes) is rejected at the boundary: `git_ref`'s PK is
  * a btree on (repo_id, name) whose index entry overflows past ~2704 bytes, which
@@ -27,7 +26,7 @@ const RECEIVE_CAPS = [
 	`agent=${AGENT}`,
 ]
 
-export type RefCommand = { oldOid: string; newOid: string; ref: string }
+export type RefCommand = { oldOid: Oid; newOid: Oid; ref: string }
 export type ReceiveRequest = { commands: RefCommand[]; caps: string[]; pack: Buffer }
 export type CommandResult = { ref: string; ok: boolean; reason?: string }
 
@@ -94,6 +93,15 @@ export function parseReceivePack(body: Buffer): ReceiveRequest {
 				`receive-pack: malformed command line ${JSON.stringify(line)}`,
 			)
 		}
+		// Both ids must be well-formed OIDs BEFORE anything trusts them: downstream
+		// Buffer.from(oid, "hex") conversions (store CAS, connectivity/ancestry
+		// walks) silently yield a short or empty buffer for garbage — the same
+		// boundary rule as parseFetch's want check. The zero sentinel is shape-valid.
+		if (!isOid(oldOid) || !isOid(newOid)) {
+			throw new GitProtocolError(
+				`receive-pack: malformed object id in command ${JSON.stringify(line)}`,
+			)
+		}
 		commands.push({ newOid, oldOid, ref })
 	}
 	return { caps, commands, pack: rest }
@@ -128,13 +136,13 @@ export type ReceiveBackend = {
 	/** Apply ref CAS updates; `atomic` ⇒ all-or-nothing. Per-command success flags. */
 	applyRefUpdates: (commands: RefCommand[], atomic: boolean) => Promise<boolean[]>
 	/** Is every object reachable from `oid` present? (connectivity, spec §10). */
-	isConnected: (oid: string) => Promise<boolean>
+	isConnected: (oid: Oid) => Promise<boolean>
 	/** Is `ancestor` in `descendant`'s history (or equal)? The fast-forward
 	 * policy check — see the deny-non-FF rules on handleReceivePack. */
-	isAncestor: (ancestor: string, descendant: string) => Promise<boolean>
+	isAncestor: (ancestor: Oid, descendant: Oid) => Promise<boolean>
 	/** Refresh the queryable file projection for a just-applied ref. Present only
 	 * when the (optional) queryable-view layer is wired; a plain remote omits it. */
-	syncRefSnapshot?: (ref: string, newOid: string) => Promise<void>
+	syncRefSnapshot?: (ref: string, newOid: Oid) => Promise<void>
 }
 
 /**

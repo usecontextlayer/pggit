@@ -1,3 +1,4 @@
+import { isOid } from "@/oid"
 import { AGENT } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"
@@ -77,8 +78,6 @@ export type FetchRequest = {
  * family are the unimplemented ones. */
 const UNSUPPORTED_FETCH_ARG = /^(want-ref|deepen|shallow)\b/
 
-const OID = /^[0-9a-f]{40}$/
-
 export function parseFetch(req: V2Request): FetchRequest {
 	const wants: string[] = []
 	const haves: string[] = []
@@ -99,7 +98,7 @@ export function parseFetch(req: V2Request): FetchRequest {
 			// A want OID is coerced to `bytea` downstream via Buffer.from(oid, "hex"),
 			// which SILENTLY yields a short/empty buffer for a non-hex value and then
 			// fails deep in buildPack. Validate the wire shape at the boundary instead.
-			if (!OID.test(oid)) {
+			if (!isOid(oid)) {
 				throw new GitProtocolError(
 					`fetch: malformed want object id ${JSON.stringify(oid)}`,
 				)

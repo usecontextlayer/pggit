@@ -7,6 +7,7 @@ import {
 	referencedOids,
 	treeEntries,
 } from "@/object/object"
+import { isOid } from "@/oid"
 
 /**
  * Edge kinds stored in `git_edge.kind`. tree→blob (would be `4`) is deliberately
@@ -25,8 +26,6 @@ export type DerivedEdge = { child: string; kind: number }
 /** A tree entry pointing at a commit in *another* repo — no blob, no edge here. */
 const GITLINK_MODE = "160000"
 
-const WELL_FORMED_OID = /^[0-9a-f]{40}$/
-
 /**
  * Validate an OID parsed from a commit/tag header. `commitParents`/`commitTreeOid`/
  * `referencedOids` take whatever follows the header key verbatim — a forged object
@@ -36,7 +35,7 @@ const WELL_FORMED_OID = /^[0-9a-f]{40}$/
  * database-level backstop for every edge.
  */
 function assertOid(oid: string, context: string): string {
-	if (!WELL_FORMED_OID.test(oid)) {
+	if (!isOid(oid)) {
 		throw new GitFormatError(
 			"malformed-oid",
 			`${context}: not a well-formed object id: ${JSON.stringify(oid)}`,
