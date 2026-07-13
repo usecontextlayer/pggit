@@ -2,6 +2,7 @@ import { gunzipSync } from "node:zlib"
 import { type Context, Hono } from "hono"
 import { cors } from "hono/cors"
 import type { Sql } from "postgres"
+import { type Database, initKysely } from "@/database"
 import { count, runRequest } from "@/instrument"
 import { GitProtocolError } from "@/protocol/errors"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
@@ -19,6 +20,8 @@ import {
 } from "@/repo-view/repo-file-projection"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
+import { createRepoAdmin, type RepoAdmin } from "@/store/repo-admin"
+import { createRepoResolver } from "@/store/repo-resolver"
 
 export type GitAppDeps = {
 	objects: ObjectStore
@@ -27,6 +30,11 @@ export type GitAppDeps = {
 	 * path→blob index per branch; when omitted, this is a plain git remote. */
 	snapshots?: RepoFileProjection
 }
+
+/** What `createGitDeps` composes: the git app's stores plus the administrative
+ * repo-lifecycle surface, all resolving names through ONE shared resolver — so a
+ * `deleteRepo` invalidation is seen by every store in the composition. */
+export type GitDeps = GitAppDeps & { admin: RepoAdmin }
 
 // Smart-HTTP info/refs body: the `# service` preamble + flush, then the v2
 // capability advertisement.
@@ -247,11 +255,16 @@ export function createGitApp(
  * included so a mounted host gets the queryable `repo_file` projection maintained
  * on push (the read surface).
  */
-export function createGitDeps(pg: Sql): GitAppDeps {
+export function createGitDeps(pg: Sql): GitDeps {
+	// ONE name→id resolver for the whole composition: every store resolves (and
+	// caches) through it, so `admin.deleteRepo`'s cache invalidation reaches them
+	// all — a store with its own private cache would keep serving the deleted id.
+	const repos = createRepoResolver(initKysely<Database>(pg))
 	return {
-		objects: createObjectStore(pg),
-		refs: createRefStore(pg),
-		snapshots: createRepoFileProjection(pg),
+		admin: createRepoAdmin(pg, repos),
+		objects: createObjectStore(pg, repos),
+		refs: createRefStore(pg, repos),
+		snapshots: createRepoFileProjection(pg, repos),
 	}
 }
 
@@ -273,3 +286,8 @@ export type {
 export { createGcScheduler } from "@/gc-scheduler"
 export type { Gc, GcOptions, GcResult } from "@/store/gc"
 export { createGc } from "@/store/gc"
+// Administrative repo lifecycle: exact-name delete + prefix listing, exported for
+// hosts composing their own deps; `createGitDeps` already wires it as `.admin`.
+export type { RepoAdmin } from "@/store/repo-admin"
+export { createRepoAdmin } from "@/store/repo-admin"
+export type { RepoResolver } from "@/store/repo-resolver"

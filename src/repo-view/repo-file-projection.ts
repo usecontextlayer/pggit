@@ -2,7 +2,7 @@ import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
 import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { FileList } from "@/repo-view/build-file-list"
-import { createRepoResolver } from "@/store/repo-resolver"
+import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 export type RepoFileProjection = ReturnType<typeof createRepoFileProjection>
 
@@ -17,9 +17,9 @@ export type RepoFileProjection = ReturnType<typeof createRepoFileProjection>
  * rebuildable at will. The wire repo name resolves to its bigint surrogate (memoized)
  * here, like the other stores.
  */
-export function createRepoFileProjection(pg: Sql) {
+export function createRepoFileProjection(pg: Sql, repoResolver?: RepoResolver) {
 	const db = initKysely<Database>(pg)
-	const repos = createRepoResolver(db)
+	const repos = repoResolver ?? createRepoResolver(db)
 
 	return {
 		/** Drop a repo's entire projection (all branches) — the clean slate for a full

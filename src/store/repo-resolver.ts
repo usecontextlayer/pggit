@@ -56,6 +56,12 @@ export function createRepoResolver(db: Kysely<Database>) {
 			cache.set(name, id)
 			return id
 		},
+		/** Forget a cached mapping. Repo deletion calls this: the id is dead, and a
+		 * later push under the same name must get-or-create a NEW row — a stale hit
+		 * would write children against the deleted id and FK-fail. */
+		invalidate(name: string): void {
+			cache.delete(name)
+		},
 		/** The repo's id, or `null` if it has never been written to. */
 		async resolveRepoId(name: string): Promise<ReposId | null> {
 			const cached = cache.get(name)

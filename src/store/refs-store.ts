@@ -5,7 +5,7 @@ import type { GitRefName } from "@/database/models/public/GitRef"
 import type { ReposId } from "@/database/models/public/Repos"
 import { EDGE_KIND } from "@/object/edges"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
-import { createRepoResolver } from "@/store/repo-resolver"
+import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 export type RefRow = { name: string; oid: string; peeled?: string }
 
@@ -194,9 +194,9 @@ async function casRefUpdate(
  * its bigint surrogate (memoized) here, ref names cast to their branded column
  * type, and oids coerce hex↔raw `bytea`.
  */
-export function createRefStore(pg: Sql) {
+export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 	const db = initKysely<Database>(pg)
-	const repos = createRepoResolver(db)
+	const repos = repoResolver ?? createRepoResolver(db)
 
 	return {
 		/**

@@ -6,6 +6,7 @@ import * as m0003 from "./migrations/0003_git_edge"
 import * as m0004 from "./migrations/0004_repo_gc_state"
 import * as m0005 from "./migrations/0005_gc_delete_autovacuum"
 import * as m0006 from "./migrations/0006_repo_file_path_pattern"
+import * as m0007 from "./migrations/0007_repo_delete_cascade"
 
 // The schema source of truth — a STATIC migration set built from explicit module imports,
 // not Kysely's `FileMigrationProvider` (which reads `.ts`/`.js` files off disk at runtime).
@@ -21,6 +22,7 @@ const MIGRATIONS: Record<string, Migration> = {
 	"0004_repo_gc_state": { down: m0004.down, up: m0004.up },
 	"0005_gc_delete_autovacuum": { down: m0005.down, up: m0005.up },
 	"0006_repo_file_path_pattern": { down: m0006.down, up: m0006.up },
+	"0007_repo_delete_cascade": { down: m0007.down, up: m0007.up },
 }
 
 function migrationProvider(): MigrationProvider {

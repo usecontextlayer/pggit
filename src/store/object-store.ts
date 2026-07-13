@@ -17,7 +17,7 @@ import {
 } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
 import { ancestryReachesCommon, reachableClosure } from "@/store/reachability"
-import { createRepoResolver } from "@/store/repo-resolver"
+import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */
 const PACK_BATCH = 1000
@@ -82,9 +82,9 @@ function typeFromCode(code: number): GitObjectType {
  * name; OIDs are coerced hex↔raw here, and the repo name is resolved to its
  * bigint surrogate (memoized) here.
  */
-export function createObjectStore(pg: Sql) {
+export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 	const db = initKysely<Database>(pg)
-	const repos = createRepoResolver(db)
+	const repos = repoResolver ?? createRepoResolver(db)
 
 	const store = {
 		/**
