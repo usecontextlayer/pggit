@@ -11,3 +11,5 @@ coverage/
 .vitest-attachments/
 
 perf/runs/
+
+.codegraph/
