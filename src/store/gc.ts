@@ -43,8 +43,13 @@ export type GcOptions = { graceSeconds: number; batchLimit?: number; maintain?: 
 type GcHooks = { afterLiveSet?: () => Promise<void> }
 type InternalGcOptions = GcOptions & { _hooks?: GcHooks }
 
-/** What one GC pass reclaimed: the deleted `git_object` / `git_edge` row counts. */
-export type GcResult = { deletedObjects: number; deletedEdges: number }
+/** What one GC pass reclaimed: the deleted `git_object` / `git_edge` /
+ * `git_pack_encoding` row counts. */
+export type GcResult = {
+	deletedObjects: number
+	deletedEdges: number
+	deletedEncodings: number
+}
 
 export type Gc = ReturnType<typeof createGc>
 
@@ -70,7 +75,7 @@ export function createGc(pg: Sql) {
 		async gc(repo: string, opts: InternalGcOptions): Promise<GcResult> {
 			// 1. Resolve the repo. A name never written has nothing to reclaim.
 			const id = await repos.resolveRepoId(repo)
-			if (id === null) return { deletedEdges: 0, deletedObjects: 0 }
+			if (id === null) return { deletedEdges: 0, deletedEncodings: 0, deletedObjects: 0 }
 
 			const batchLimit = opts.batchLimit ?? DEFAULT_BATCH_LIMIT
 
@@ -122,6 +127,14 @@ export function createGc(pg: Sql) {
 				// never dangle.
 				const deletedEdges = await sweepEdges(id, batchLimit)
 
+				// 5b. SWEEP the derived encoding tier (delta-pack design D7): a reclaimed
+				// object's encoding goes with it, and so does any DELTA encoding whose base
+				// this pass removed — a force push can orphan an ANCHOR while a delta
+				// against it stays reachable. The affected object then serves via the raw
+				// path until the next repack pass re-encodes it whole; after this sweep, no
+				// encoding row references a nonexistent object.
+				const deletedEncodings = await sweepEncodings(id, batchLimit)
+
 				// 6. MAINTENANCE (best-effort, not part of the counted deletion): reclaim the
 				// dead tuples + reindex the walk index. VACUUM cannot run in a txn block, so
 				// these are standalone statements run outside any transaction. Skipped when
@@ -133,7 +146,7 @@ export function createGc(pg: Sql) {
 					await maintain()
 				}
 
-				return { deletedEdges, deletedObjects }
+				return { deletedEdges, deletedEncodings, deletedObjects }
 			} finally {
 				await pg.unsafe(`drop table if exists ${live}`)
 			}
@@ -249,6 +262,42 @@ export function createGc(pg: Sql) {
 				delete from git_object o using victims v
 				where o.repo_id = $1::bigint and o.oid = v.oid returning 1 as n`,
 				[String(id), String(graceSeconds), String(batchLimit)],
+			)
+			if (deleted.length === 0) break
+			total += deleted.length
+		}
+		return total
+	}
+
+	/** Batched encoding sweep (delta-pack design D7): delete every `git_pack_encoding`
+	 * row whose object was reclaimed, plus every DELTA row whose base was — both are
+	 * derived state that must follow the inventory. Same batched victims-by-PK shape
+	 * as the other sweeps (never `ctid`, which is per-partition). */
+	async function sweepEncodings(id: ReposId, batchLimit: number): Promise<number> {
+		let total = 0
+		for (;;) {
+			const deleted = await pg.unsafe<{ n: number }[]>(
+				`with victims as (
+					select e.oid from git_pack_encoding e
+					where e.repo_id = $1::bigint
+						and (
+							not exists (
+								select 1 from git_object o
+								where o.repo_id = e.repo_id and o.oid = e.oid
+							)
+							or (
+								e.base_oid is not null
+								and not exists (
+									select 1 from git_object o
+									where o.repo_id = e.repo_id and o.oid = e.base_oid
+								)
+							)
+						)
+					limit $2::int
+				)
+				delete from git_pack_encoding e using victims v
+				where e.repo_id = $1::bigint and e.oid = v.oid returning 1 as n`,
+				[String(id), String(batchLimit)],
 			)
 			if (deleted.length === 0) break
 			total += deleted.length

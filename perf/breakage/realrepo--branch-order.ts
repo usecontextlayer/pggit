@@ -1,0 +1,227 @@
+/**
+ * The hazard the design names but nothing tests: "Base selection is contextual, not
+ * intrinsic (a later branch can introduce new same-path pairs), so 'packed once, never
+ * revisited' is an ENFORCED policy" (D4). Every existing check pushes one linear
+ * history or the whole mirror at once — neither ever hands repack a PARTIAL DAG,
+ * freezes anchors over it, and then extends the DAG with a branch whose first-parent
+ * lineage interleaves with trees already anchored.
+ *
+ * This does exactly that, on REAL repository history: push the mirror's refs ONE AT A
+ * TIME with a repack between every push, in two different orders, and check both
+ * results against a plain `file://` remote that received the identical per-ref
+ * sequence. Two orders because a frozen policy that is order-dependent in a way that
+ * matters would show up as one order diverging and the other not.
+ *
+ * It also checks the design's central read-side invariant the way a CLIENT sees it:
+ * `git verify-pack -v` on the served pack prints each delta entry's chain depth, so
+ * "depth <= 1, structurally" (D2/D9) is directly falsifiable from outside.
+ *
+ * A perf harness rather than a vitest e2e test because its corpus is a REAL local
+ * repository handed in at run time (`--repo=`), which no committed fixture can stand
+ * in for — the same reason `perf/delta-corpus.ts` lives here.
+ *
+ *   npx tsx perf/breakage/realrepo--branch-order.ts --repo=/path/to/checkout --slug=<name>
+ *
+ * Exit 0 = both orders served packs identical to git's, at depth <= 1.
+ * Exit 1 = reproduced, with the diverging ref/object or the offending depth named.
+ */
+import { mkdirSync, readdirSync } from "node:fs"
+import { join } from "node:path"
+import { createGitApp, createGitDeps } from "@/index"
+import { serveOnPort } from "@/server"
+import { createRepack } from "@/store/repack"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { spawnGit } from "@/testing/spawn-git"
+import {
+	createLedger,
+	createScratch,
+	DEFAULT_PG_URL,
+	flag,
+	oidSet,
+	prepareMirror,
+	tryGit,
+} from "./_realrepo-util"
+
+const SLUG = flag("slug", "repo")
+const MAX_DEPTH = Number(flag("max-depth", "1"))
+const PG_URL = flag("pg", DEFAULT_PG_URL)
+
+const scratch = createScratch(`border-${SLUG}`)
+const { fail, findings, report } = createLedger(SLUG)
+/** The private mirror clone of `--repo=`; set by `prepareMirror` in `main`. */
+let MIRROR = ""
+
+async function refList(dir: string): Promise<string> {
+	return (
+		await spawnGit(["for-each-ref", "--format=%(refname) %(objectname)"], { cwd: dir })
+	).stdout.trim()
+}
+
+/** Delta chain depths as the CLIENT measures them, from `git verify-pack -v`.
+ * Column 6 is the chain depth for a deltified entry; absent for a base entry. */
+async function depthHistogram(bareDir: string): Promise<Map<number, number>> {
+	const packDir = join(bareDir, "objects", "pack")
+	const hist = new Map<number, number>()
+	for (const f of readdirSync(packDir).filter((x) => x.endsWith(".idx"))) {
+		const out = await spawnGit(["verify-pack", "-v", join(packDir, f)], { cwd: bareDir })
+		for (const line of out.stdout.split("\n")) {
+			const p = line.trim().split(/\s+/)
+			if (p.length < 7 || !/^[0-9a-f]{40}$/.test(p[0] as string)) continue
+			const depth = Number(p[5])
+			if (!Number.isFinite(depth)) continue
+			hist.set(depth, (hist.get(depth) ?? 0) + 1)
+		}
+	}
+	return hist
+}
+
+async function runOrder(
+	db: IsolatedDb,
+	port: number,
+	label: string,
+	refs: string[],
+): Promise<{ dir: string; oids: Set<string> } | null> {
+	const repoId = `border/${SLUG}-${label}`
+	const url = `http://127.0.0.1:${port}/${repoId}`
+	const oracle = join(scratch.mk(`oracle-${label}`), "o.git")
+	mkdirSync(oracle, { recursive: true })
+	await spawnGit(["init", "-q", "--bare", oracle])
+
+	let totalW = 0
+	let totalD = 0
+	for (const ref of refs) {
+		const p = await tryGit(["push", url, `+${ref}:${ref}`], MIRROR)
+		const o = await tryGit(["push", `file://${oracle}`, `+${ref}:${ref}`], MIRROR)
+		if (p.ok !== o.ok) {
+			fail(
+				`${label}: push of ${ref} DIVERGES from git (pggit ${p.ok ? "accepted" : `rejected exit ${p.code}`}, git ${o.ok ? "accepted" : `rejected exit ${o.code}`})`,
+				(p.ok ? o : p).stderr.trim().slice(0, 500),
+			)
+		}
+		// repack after EVERY ref: anchors freeze over a partial DAG, then the next
+		// ref extends it. This is the D4 stress.
+		const r = await createRepack(db.sql).repack(repoId)
+		totalW += r.wholes
+		totalD += r.deltas
+	}
+	console.log(
+		`  ${label}: ${refs.length} refs pushed one at a time, repack totals ${totalW}w + ${totalD}d`,
+	)
+
+	const clone = join(scratch.mk(`clone-${label}`), "c.git")
+	const c = await tryGit([
+		"-c",
+		"protocol.version=2",
+		"clone",
+		"--mirror",
+		"-q",
+		url,
+		clone,
+	])
+	if (!c.ok) {
+		fail(
+			`${label}: mirror clone after per-ref pushes FAILED`,
+			c.stderr.trim().slice(0, 800),
+		)
+		return null
+	}
+	const oracleClone = join(scratch.mk(`oclone-${label}`), "o.git")
+	await spawnGit(["clone", "--mirror", "-q", `file://${oracle}`, oracleClone])
+
+	const fsck = await tryGit(["fsck", "--strict"], clone)
+	if (!fsck.ok)
+		fail(`${label}: git fsck --strict FAILED`, fsck.stderr.trim().slice(0, 800))
+
+	const [got, want] = [await oidSet(clone), await oidSet(oracleClone)]
+	const missing = [...want].filter((o) => !got.has(o))
+	const extra = [...got].filter((o) => !want.has(o))
+	if (missing.length > 0 || extra.length > 0) {
+		fail(
+			`${label}: object set diverges from git`,
+			`${missing.length} missing, ${extra.length} extra (first missing ${missing[0] ?? "-"})`,
+		)
+	}
+	const [gr, wr] = [await refList(clone), await refList(oracleClone)]
+	if (gr !== wr)
+		fail(
+			`${label}: ref listing diverges from git`,
+			`${gr.split("\n").length} vs ${wr.split("\n").length} refs`,
+		)
+
+	const hist = await depthHistogram(clone)
+	const depths = [...hist.entries()].sort((a, b) => a[0] - b[0])
+	const maxDepth =
+		depths.length > 0 ? (depths[depths.length - 1] as [number, number])[0] : 0
+	console.log(
+		`  ${label}: served delta depths ${depths.map(([d, n]) => `${d}:${n}`).join(" ") || "(none)"}`,
+	)
+	if (maxDepth > MAX_DEPTH) {
+		fail(
+			`${label}: served pack contains delta chains DEEPER than the design's structural bound`,
+			`max depth ${maxDepth} (bound ${MAX_DEPTH}); histogram ${depths.map(([d, n]) => `depth ${d}: ${n} entries`).join(", ")}`,
+		)
+	}
+	report.push(
+		`| ${label} | ${refs.length} refs, one push each + repack | ${missing.length === 0 && extra.length === 0 && gr === wr ? "IDENTICAL to git" : "DIVERGED"} |`,
+	)
+	report.push(
+		`| ${label} | served delta depth | max ${maxDepth} (${depths.map(([d, n]) => `${d}:${n}`).join(" ") || "no deltas"}) |`,
+	)
+	return { dir: clone, oids: got }
+}
+
+async function main(): Promise<void> {
+	MIRROR = await prepareMirror(scratch)
+	console.log(`# branch-order stress — ${SLUG}\n  mirror ${MIRROR}`)
+	const refs = (
+		await spawnGit(["for-each-ref", "--format=%(refname)"], { cwd: MIRROR })
+	).stdout
+		.trim()
+		.split("\n")
+		.filter(
+			(r) =>
+				r.startsWith("refs/heads/") ||
+				r.startsWith("refs/tags/") ||
+				r.startsWith("refs/remotes/"),
+		)
+	console.log(`  ${refs.length} refs`)
+
+	const db = await createIsolatedSchema(PG_URL)
+	const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+	try {
+		const forward = await runOrder(db, server.port, "forward", [...refs].sort())
+		const reverse = await runOrder(db, server.port, "reverse", [...refs].sort().reverse())
+		if (forward && reverse) {
+			const only1 = [...forward.oids].filter((o) => !reverse.oids.has(o))
+			const only2 = [...reverse.oids].filter((o) => !forward.oids.has(o))
+			if (only1.length > 0 || only2.length > 0) {
+				fail(
+					"the two push ORDERS produced different served object sets",
+					`forward-only ${only1.length}, reverse-only ${only2.length}`,
+				)
+			}
+			report.push(
+				`| both | forward vs reverse object sets | ${only1.length === 0 && only2.length === 0 ? "identical" : "DIVERGED"} |`,
+			)
+		}
+	} finally {
+		await server.close()
+		await db.drop()
+		scratch.cleanup()
+	}
+
+	console.log(`\n## ${SLUG} — branch-order stress\n`)
+	console.log("| order | what | verdict |")
+	console.log("|---|---|---|")
+	for (const r of report) console.log(r)
+	console.log(
+		`\n${findings.length === 0 ? "VERDICT: clean — both orders matched git, depth bound held." : `VERDICT: ${findings.length} FINDING(S)`}`,
+	)
+	for (const f of findings) console.log(`  - ${f}`)
+	if (findings.length > 0) process.exitCode = 1
+}
+
+main().catch((err) => {
+	console.error(err)
+	process.exitCode = 2
+})

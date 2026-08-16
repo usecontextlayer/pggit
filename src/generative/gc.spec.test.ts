@@ -379,7 +379,11 @@ describe("§4 PBT — property-based GC differential", () => {
 						const second = await fx.gc.gc(repo, { graceSeconds: 0 })
 
 						// Second pass is a no-op: deletes nothing, leaves the survivor set identical.
-						expect(second).toEqual({ deletedEdges: 0, deletedObjects: 0 })
+						expect(second).toEqual({
+							deletedEdges: 0,
+							deletedEncodings: 0,
+							deletedObjects: 0,
+						})
 						expect(await objectOids(fx.db, repo)).toEqual(afterFirst)
 
 						const keptRef = kept[0]

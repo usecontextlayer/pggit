@@ -1,0 +1,245 @@
+/**
+ * RACE: a real `git fetch` of an OLD tip (exact `want`, unadvertised) while
+ * `gc(graceSeconds: 0)` reclaims that tip's now-unreachable closure.
+ *
+ * The rewind (`setRef` backwards — the public way the platform moves refs)
+ * orphans a whole span of history. A client that still names the old tip drives
+ * `buildPack` to compute a closure that GC is concurrently deleting out from
+ * under it, batch by batch. The delta tier makes this sharper: GC's
+ * `sweepEncodings` (design D7) also removes any delta whose ANCHOR it reclaimed,
+ * so the encoding tier is mutating mid-serve too.
+ *
+ * The verdict is the FAILURE MODE, compared against the same scenario on a plain
+ * `file://` bare remote served by canonical git-upload-pack with a concurrent
+ * `git gc --prune=now`:
+ *
+ *   OK       — fetch succeeded and `git fsck --strict` is clean
+ *   PROTO    — clean in-band protocol refusal ("not our ref" / unadvertised)
+ *   HTTP500  — server-side internal error surfaced as an HTTP 500
+ *   CORRUPT  — fetch reported SUCCESS but the client is missing objects / fails
+ *              fsck  <-- the only outcome that is a real defect
+ *
+ * Both halves are kept: the real-git oracle IS the standard the pggit half is
+ * held to, so it is asserted here too (canonical git never hands a client a
+ * corrupt result for this race).
+ *
+ * Converted from `breakage/race--clone-vs-gc-rewind.ts` (`--iters=40 --runs=150
+ * --rewind=60`). Probabilistic: the iteration count and the swept gc-start delays
+ * are frozen exactly as the script ran them.
+ */
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import { createGitApp, createGitDeps } from "@/index"
+import type { GitObjectType } from "@/object/object"
+import { type GitServer, serveOnPort } from "@/server"
+import { createGc, type Gc } from "@/store/gc"
+import { createObjectStore, type ObjectStore } from "@/store/object-store"
+import { createRefStore, type RefStore } from "@/store/refs-store"
+import { createRepack, type Repack } from "@/store/repack"
+import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { spawnGit } from "@/testing/spawn-git"
+
+const ITERS = 40
+const RUNS = 150
+/** How far back the ref is rewound — the size of the orphaned span GC eats. */
+const REWIND = 60
+/** Oracle rounds against the plain `file://` bare remote. */
+const ORACLE_ROUNDS = 6
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+type Obj = { oid: string; type: GitObjectType; content: Buffer }
+
+/** Every reachable object of a real repo, in ONE `cat-file --batch`. */
+async function loadObjects(dir: string): Promise<Obj[]> {
+	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
+	const oids = [
+		...new Set(
+			list.stdout
+				.split("\n")
+				.map((l) => l.slice(0, 40))
+				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
+		),
+	]
+	const res = await spawnGit(["cat-file", "--batch"], {
+		cwd: dir,
+		input: `${oids.join("\n")}\n`,
+	})
+	const buf = res.stdoutBytes
+	const out: Obj[] = []
+	let pos = 0
+	while (pos < buf.length) {
+		const nl = buf.indexOf(0x0a, pos)
+		if (nl < 0) break
+		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
+		if (!oid || !type || !sizeStr) break
+		const size = Number(sizeStr)
+		const start = nl + 1
+		out.push({
+			content: buf.subarray(start, start + size),
+			oid,
+			type: type as GitObjectType,
+		})
+		pos = start + size + 1
+	}
+	return out
+}
+
+type Verdict = "OK" | "PROTO" | "HTTP500" | "CORRUPT" | "OTHER"
+
+/** Classify one raced fetch by what the CLIENT ended up with. */
+async function classify(
+	dest: string,
+	wantOid: string,
+	fetchErr: unknown,
+): Promise<{ verdict: Verdict; detail: string }> {
+	if (fetchErr !== undefined) {
+		const message = fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
+		if (/not our ref|unadvertised|not allow/i.test(message)) {
+			return { detail: message, verdict: "PROTO" }
+		}
+		if (/500|internal server error/i.test(message)) {
+			return { detail: message, verdict: "HTTP500" }
+		}
+		return { detail: message, verdict: "OTHER" }
+	}
+	// Fetch claimed success — hold it to that claim.
+	try {
+		await spawnGit(["update-ref", "refs/heads/probe", wantOid], { cwd: dest })
+		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+		return { detail: "", verdict: "OK" }
+	} catch (err) {
+		return {
+			detail: err instanceof Error ? err.message : String(err),
+			verdict: "CORRUPT",
+		}
+	}
+}
+
+describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
+	let db: IsolatedDb
+	let server: GitServer
+	let store: ObjectStore
+	let refs: RefStore
+	let repack: Repack
+	let gc: Gc
+	let src = ""
+	let objects: Obj[] = []
+	let tip = ""
+	let rewindTo = ""
+	const scratch: string[] = []
+
+	beforeAll(async () => {
+		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
+		scratch.push(src)
+		objects = await loadObjects(src)
+		const commits = (
+			await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: src })
+		).stdout
+			.trim()
+			.split("\n")
+		tip = commits[commits.length - 1] as string
+		rewindTo = commits[commits.length - 1 - REWIND] as string
+
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
+		store = createObjectStore(db.sql)
+		refs = createRefStore(db.sql)
+		repack = createRepack(db.sql)
+		gc = createGc(db.sql)
+		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+	}, 600_000)
+
+	afterAll(async () => {
+		await server?.close()
+		await db?.drop()
+		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+	})
+
+	// The ORACLE: canonical git, plain file:// bare remote, concurrent
+	// `git gc --prune=now`. This is the standard the pggit half is held to.
+	it("oracle: canonical git never leaves the client CORRUPT under the same race", async () => {
+		const observed: string[] = []
+		const corrupt: string[] = []
+		const bare = join(mkdtempSync(join(tmpdir(), "gcrew-bare-")), "r.git")
+		scratch.push(bare)
+		await spawnGit(["clone", "-q", "--bare", src, bare])
+		await spawnGit(["config", "uploadpack.allowAnySHA1InWant", "true"], { cwd: bare })
+		await spawnGit(["update-ref", "refs/heads/main", rewindTo], { cwd: bare })
+
+		for (let i = 0; i < ORACLE_ROUNDS; i++) {
+			const dest = join(mkdtempSync(join(tmpdir(), "gcrew-odest-")), "c")
+			scratch.push(dest)
+			await spawnGit(["init", "-q", "-b", "main", dest])
+			let err: unknown
+			await Promise.allSettled([
+				spawnGit(["fetch", "-q", `file://${bare}`, tip], { cwd: dest }).catch((e) => {
+					err = e
+				}),
+				sleep(i * 3).then(() =>
+					spawnGit(["gc", "--prune=now", "-q"], { cwd: bare }).catch(() => undefined),
+				),
+			])
+			const { verdict, detail } = await classify(dest, tip, err)
+			observed.push(`round ${i}: ${verdict}`)
+			if (verdict === "CORRUPT") {
+				corrupt.push(`round ${i}: ${detail.split("\n")[0] ?? ""}`)
+			}
+			rmSync(dest, { force: true, recursive: true })
+			// Restore the pruned objects for the next oracle round.
+			await spawnGit(["fetch", "-q", "--force", src, "+refs/heads/*:refs/heads/*"], {
+				cwd: bare,
+			})
+			await spawnGit(["update-ref", "refs/heads/main", rewindTo], { cwd: bare })
+		}
+
+		expect(corrupt, observed.join("\n")).toEqual([])
+	}, 600_000)
+
+	it("pggit: a fetch git reported as successful is never CORRUPT", async () => {
+		const breaks: string[] = []
+		const verdicts: string[] = []
+
+		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
+			const repo = `race/gc-rewind/${i}`
+			await store.putPack(repo, objects)
+			await refs.setRef(repo, "refs/heads/main", tip)
+			await refs.setSymref(repo, "HEAD", "refs/heads/main")
+			await repack.repack(repo) // the delta tier is live for this race
+
+			// Rewind through the PUBLIC ref surface, exactly how the platform does it.
+			await refs.setRef(repo, "refs/heads/main", rewindTo)
+
+			const dest = join(mkdtempSync(join(tmpdir(), "gcrew-dest-")), "c")
+			scratch.push(dest)
+			await spawnGit(["init", "-q", "-b", "main", dest])
+			const url = `http://127.0.0.1:${server.port}/${repo}`
+			const delay = [0, 1, 2, 4, 7, 11, 16, 22, 30, 45][i % 10] as number
+
+			let fetchErr: unknown
+			await Promise.allSettled([
+				spawnGit(["-c", "protocol.version=2", "fetch", "-q", url, tip], {
+					cwd: dest,
+				}).catch((e) => {
+					fetchErr = e
+				}),
+				// Small batchLimit ⇒ many short sweep transactions ⇒ the deletion is
+				// spread across the whole serve, not one atomic instant.
+				sleep(delay).then(() =>
+					gc.gc(repo, { batchLimit: 25, graceSeconds: 0, maintain: false }),
+				),
+			])
+
+			const { verdict, detail } = await classify(dest, tip, fetchErr)
+			verdicts.push(`iter ${i} gcAt=+${delay}ms ${verdict}`)
+			rmSync(dest, { force: true, recursive: true })
+			if (verdict === "CORRUPT") {
+				breaks.push(`iteration ${i} (gc started +${delay}ms): ${detail}`)
+			}
+		}
+
+		expect(breaks, verdicts.join("\n")).toEqual([])
+	}, 900_000)
+})

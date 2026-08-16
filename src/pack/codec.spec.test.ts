@@ -5,9 +5,11 @@
  *   1. writePack → readPack over arbitrary MIXED-TYPE object sets (the existing
  *      read-pack.test.ts round-trip is a fixed 5-object vector; write-pack's
  *      generative case is blob-only and goes through real git).
- *   2. applyDelta over random COPY/INSERT programs. The serve path emits NO deltas
- *      (spec §3.4 asymmetric kernel) so there is no `encodeDelta` to test against —
- *      so a test-local REFERENCE ENCODER is the producer (spec §7.2.6). It is safe:
+ *   2. applyDelta over random COPY/INSERT programs, produced by a test-local
+ *      REFERENCE ENCODER rather than the real `encodeDelta` (spec §7.2.6) — the
+ *      reference builds arbitrary instruction STREAMS (including shapes the real
+ *      encoder never emits), so the reader is exercised wider than the writer's
+ *      output; `encodeDelta` has its own spec (encode-delta.spec.test.ts). Safe:
  *      `applyDelta` is already pinned against GIT-produced deltas in
  *      read-pack.test.ts, so this adds breadth, not a self-referential oracle. The
  *      `target` is built independently by concatenation, so a wrong encoder fails.

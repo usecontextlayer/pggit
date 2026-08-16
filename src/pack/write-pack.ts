@@ -30,7 +30,11 @@ export function packHeader(objectCount: number): Buffer {
 }
 
 /** One packed object: its varint (type, uncompressed size) header + zlib-deflated
- * content. Undeltified — we never emit deltas (spec §3.4 asymmetric kernel). */
+ * content — always UNDELTIFIED. This is the serve path's raw FALLBACK (an object
+ * with no stored pack encoding) and the test-pack builder; deltified entries are
+ * emitted by `buildPack` from the derived `git_pack_encoding` tier, never
+ * computed here (docs/2026-08-15-delta-pack-design.md, which retired spec §3.4's
+ * write-zero-deltas kernel). */
 export function packObject(type: GitObjectType, content: Buffer): Buffer {
 	const deflated = deflateSync(content)
 	count("deflateInputBytes", content.length)

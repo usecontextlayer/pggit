@@ -493,7 +493,11 @@ describe("§4 PBT stress — deep + wide GC differential at scale", () => {
 
 						// Second pass is a no-op: deletes nothing, leaves rows + survivor set identical.
 						const second = await fx.gc.gc(repo, { graceSeconds: 0 })
-						expect(second).toEqual({ deletedEdges: 0, deletedObjects: 0 })
+						expect(second).toEqual({
+							deletedEdges: 0,
+							deletedEncodings: 0,
+							deletedObjects: 0,
+						})
 						expect(await objectOids(fx.db, repo)).toEqual(afterFirst)
 					} finally {
 						rmSync(liveDir, { force: true, recursive: true })

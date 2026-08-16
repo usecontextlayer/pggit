@@ -7,7 +7,7 @@ import type { ReposId } from "@/database/models/public/Repos"
 import { count, withPhase } from "@/instrument"
 import { deriveEdges, EDGE_KIND, validateObject } from "@/object/edges"
 import { computeOid, type GitObjectType } from "@/object/object"
-import { PACK_OBJ_TYPE } from "@/pack/object-header"
+import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import {
 	type PackInputObject,
@@ -137,30 +137,102 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 					parts.push(chunk)
 				}
 				push(packHeader(served.length))
+				// Which deltas may ship AS deltas: only those whose base is itself in this
+				// pack (delta-pack design D8). An external base would need the client's
+				// thin-pack request, which the v2 parser does not yet carry — so until it
+				// does, an out-of-set base means the object falls back to its whole form.
+				const servedSet = new Set(served)
+				let emitted = 0
 				for (const batch of batches(served, PACK_BATCH)) {
-					const rows = await db
-						.selectFrom("git_object")
-						.select(["oid", "type"])
-						// Keep a >256MiB blob's content server-side (CASE → NULL on the wire) so the
-						// porsager driver never builds its over-cap `\x`+hex string; oversized rows
-						// (content NULL here) are read in size-bounded chunks below.
-						.select(sql<number>`octet_length(content)`.as("size"))
-						.select(
-							sql<Buffer | null>`case when octet_length(content) < ${BIG_OBJECT_BYTES} then content end`.as(
-								"content",
-							),
-						)
-						.where("repo_id", "=", id)
-						.where(
-							"oid",
-							"in",
-							batch.map((h) => Buffer.from(h, "hex")),
-						)
-						.execute()
-					for (const r of rows) {
-						const content = r.content ?? (await readContentChunked(id, r.oid, r.size))
-						push(packObject(typeFromCode(r.type), content))
+					// The derived encoding beside the object's type (delta-pack design D1):
+					// a stored encoding is served as a verbatim byte copy — no deflate, no
+					// delta resolution; an object without one takes the raw path below.
+					type ServeRow = {
+						oid: string
+						type: number
+						base_oid: string | null
+						data_size: number | null
+						data: Buffer | null
 					}
+					const rows = await pg<ServeRow[]>`
+						select encode(o.oid, 'hex') as oid, o.type,
+							encode(e.base_oid, 'hex') as base_oid, e.data_size, e.data
+						from git_object o
+							left join git_pack_encoding e
+								on e.repo_id = o.repo_id and e.oid = o.oid
+						where o.repo_id = ${id}::bigint
+							and o.oid in ${pg(batch.map((h) => Buffer.from(h, "hex")))}`
+					const byOid = new Map(rows.map((r) => [r.oid, r]))
+
+					const usable = (r: ServeRow): boolean =>
+						r.data !== null &&
+						r.data_size !== null &&
+						(r.base_oid === null || servedSet.has(r.base_oid))
+
+					// Raw-path subset, read through the existing size-guarded query (CASE →
+					// NULL keeps a >256MiB blob off the driver's hex path; chunked below).
+					const fallback = batch.filter((h) => {
+						const r = byOid.get(h)
+						return r !== undefined && !usable(r)
+					})
+					const contentByOid = new Map<string, Buffer>()
+					if (fallback.length > 0) {
+						const raw = await db
+							.selectFrom("git_object")
+							.select(["oid"])
+							.select(sql<number>`octet_length(content)`.as("size"))
+							.select(
+								sql<Buffer | null>`case when octet_length(content) < ${BIG_OBJECT_BYTES} then content end`.as(
+									"content",
+								),
+							)
+							.where("repo_id", "=", id)
+							.where(
+								"oid",
+								"in",
+								fallback.map((h) => Buffer.from(h, "hex")),
+							)
+							.execute()
+						for (const r of raw) {
+							contentByOid.set(
+								r.oid.toString("hex"),
+								r.content ?? (await readContentChunked(id, r.oid, r.size)),
+							)
+						}
+					}
+
+					// Emit in served order (deterministic packs; the undeltified path used
+					// row order, which was only accidentally stable).
+					for (const h of batch) {
+						const r = byOid.get(h)
+						if (!r) {
+							// The closure said present moments ago — vanishing mid-serve is a
+							// hard fault (a mid-clone repo deletion), never a short pack.
+							throw new Error(`pggit: object ${h} vanished while packing`)
+						}
+						if (usable(r) && r.data !== null && r.data_size !== null) {
+							if (r.base_oid === null) {
+								push(encodeObjectHeader(r.type as PackObjType, r.data_size))
+							} else {
+								push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, r.data_size))
+								push(Buffer.from(r.base_oid, "hex"))
+								count("deltasServed")
+							}
+							push(r.data)
+						} else {
+							const content = contentByOid.get(h)
+							if (!content) throw new Error(`pggit: no content read for ${h}`)
+							push(packObject(typeFromCode(r.type), content))
+						}
+						emitted++
+					}
+				}
+				// The header count was fixed up front; a mismatch is a corrupt pack the
+				// client would reject cryptically — fail here, loudly, instead (D8).
+				if (emitted !== served.length) {
+					throw new Error(
+						`pggit: pack emitted ${emitted} objects, header promised ${served.length}`,
+					)
 				}
 				const pack = Buffer.concat([...parts, hash.digest()])
 				count("objectsServed", served.length)

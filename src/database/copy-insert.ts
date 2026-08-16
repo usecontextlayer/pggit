@@ -22,12 +22,14 @@ import type { TransactionSql } from "postgres"
  */
 
 /** One COPY field, tagged with the destination column's Postgres type so it
- * encodes to the correct binary wire form. */
+ * encodes to the correct binary wire form. A NULL `bytea` (a nullable column like
+ * `git_pack_encoding.base_oid`) rides the PGCOPY NULL form — a −1 field length
+ * with no bytes — never an empty buffer, which would be a zero-length VALUE. */
 export type CopyValue =
 	| { t: "int2"; v: number }
 	| { t: "int4"; v: number }
 	| { t: "int8"; v: number | bigint | string }
-	| { t: "bytea"; v: Buffer }
+	| { t: "bytea"; v: Buffer | null }
 	| { t: "text"; v: string }
 
 // PGCOPY binary signature + the two zero header words (flags, header extension).
@@ -42,7 +44,8 @@ const TRAILER = (() => {
 	return b
 })()
 
-function encodeValue(field: CopyValue): Buffer {
+/** A field's raw bytes, or null for the PGCOPY NULL form (a bytea `v: null`). */
+function encodeValue(field: CopyValue): Buffer | null {
 	switch (field.t) {
 		case "int2": {
 			const b = Buffer.alloc(2)
@@ -77,8 +80,13 @@ function encodeBinaryCopy(rows: CopyValue[][]): Buffer {
 		for (const field of row) {
 			const value = encodeValue(field)
 			const len = Buffer.alloc(4)
-			len.writeInt32BE(value.length)
-			parts.push(len, value)
+			if (value === null) {
+				len.writeInt32BE(-1) // PGCOPY NULL: length −1, no bytes follow
+				parts.push(len)
+			} else {
+				len.writeInt32BE(value.length)
+				parts.push(len, value)
+			}
 		}
 	}
 	parts.push(TRAILER)
