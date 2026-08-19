@@ -15,7 +15,7 @@ import { spawnGit } from "@/testing/spawn-git"
  * Shared scaffolding for the GC behavioural suite
  * (`docs/2026-06-24-force-commit-gc-design.md` §4). Everything here is
  * OBSERVABLE-ONLY: the real `git` oracle (clone/fetch/fsck/rev-list), Postgres
- * rows (`git_object`/`git_edge`), and the `gc()` return value. Nothing probes GC
+ * rows (`git_object` + the derived `git_commit`/`git_tag`), and the `gc()` return value. Nothing probes GC
  * internals (temp tables, batch counts, CTE/transaction shape) — those stay free
  * to change. Grace is made deterministic by controlling `graceSeconds` and
  * `created_at` (see `ageObjects`), never by sleeping on the wall clock.
@@ -33,7 +33,7 @@ export type GcFixture = {
 
 /**
  * Stand up the fixture (call in `beforeAll`, or per-candidate in a property): carve a
- * FRESH isolated schema (its OWN `git_object`/`git_edge` partitions) out of the shared
+ * FRESH isolated schema (its OWN table partitions) out of the shared
  * `globalSetup` Postgres container (`pgBaseUrl`), build the stores + GC over its
  * porsager client, and serve the git app on an ephemeral port. Repos are auto-created
  * on first push, so no repo setup is needed here. The shared container is owned — and
@@ -302,39 +302,82 @@ export async function countObjects(
 	return row?.n ?? 0
 }
 
-/** One stored edge as hex `{parent, child, kind}`. */
-export type EdgeRow = { parent: string; child: string; kind: number }
-
-/** Every `git_edge` row for `repo` as hex `{parent, child, kind}`, sorted — for
- * the dangling-edge / object⟺edges invariant (GC-5). */
-export async function edgeRows(
+/**
+ * The derived `git_commit`/`git_tag` rows for `repo` in ONE canonical sorted
+ * text form — `commit <oid> tree=<t> parents=<p1,p2> time=<epoch>` /
+ * `tag <oid> target=<t> type=<code>` — so suites can snapshot and diff the whole
+ * derived surface with plain array equality (the spine-era successor of the old
+ * `git_edge` row dump: the object⟺derived-rows invariant, GC-5).
+ */
+export async function derivedRows(
 	db: Pick<IsolatedDb, "sql">,
 	repo: string,
-): Promise<EdgeRow[]> {
-	const rows = await db.sql<EdgeRow[]>`
-		select encode(e.parent, 'hex') as parent,
-		       encode(e.child, 'hex') as child,
-		       e.kind as kind
-		from git_edge e
-		join repos r on r.id = e.repo_id
+): Promise<string[]> {
+	const commits = await db.sql<{ line: string }[]>`
+		select 'commit ' || encode(c.oid, 'hex')
+			|| ' tree=' || encode(c.tree_oid, 'hex')
+			|| ' parents=' || coalesce(
+				(select string_agg(encode(p.h, 'hex'), ',' order by p.ord)
+					from unnest(c.parents) with ordinality as p(h, ord)), '')
+			|| ' time=' || c.commit_time as line
+		from git_commit c
+		join repos r on r.id = c.repo_id
 		where r.name = ${repo}
-		order by parent, child, kind
 	`
-	return rows.map((row) => ({ child: row.child, kind: row.kind, parent: row.parent }))
+	const tags = await db.sql<{ line: string }[]>`
+		select 'tag ' || encode(t.oid, 'hex')
+			|| ' target=' || encode(t.target_oid, 'hex')
+			|| ' type=' || t.target_type as line
+		from git_tag t
+		join repos r on r.id = t.repo_id
+		where r.name = ${repo}
+	`
+	return [...commits, ...tags].map((r) => r.line).sort()
 }
 
-/** `git_edge` row count for `repo`. */
-export async function countEdges(
+/** Derived-row count (`git_commit` + `git_tag`) for `repo`. */
+export async function countDerivedRows(
 	db: Pick<IsolatedDb, "sql">,
 	repo: string,
 ): Promise<number> {
 	const [row] = await db.sql<{ n: number }[]>`
-		select count(*)::int as n
-		from git_edge e
-		join repos r on r.id = e.repo_id
-		where r.name = ${repo}
+		select (select count(*) from git_commit c join repos r on r.id = c.repo_id where r.name = ${repo})::int
+			+ (select count(*) from git_tag t join repos r on r.id = t.repo_id where r.name = ${repo})::int as n
 	`
 	return row?.n ?? 0
+}
+
+/** Commit/tag OBJECTS with no derived row, plus derived rows whose object is
+ * gone — both directions of the object⟺derived-rows invariant in one probe.
+ * MUST come back empty after any pass: the first direction is chunk 1's "every
+ * stored commit has its row", the second is the 0009 FK cascade doing GC's
+ * bookkeeping. (The stray direction is DDL-guaranteed; asserting it pins the
+ * cascade wiring against a future migration regression.) */
+export async function derivedRowViolations(
+	db: Pick<IsolatedDb, "sql">,
+	repo: string,
+): Promise<string[]> {
+	const rows = await db.sql<{ oid: string }[]>`
+		select 'row-missing:' || encode(o.oid, 'hex') as oid
+		from git_object o join repos r on r.id = o.repo_id
+		where r.name = ${repo} and (
+			(o.type = 1 and not exists (
+				select 1 from git_commit c where c.repo_id = o.repo_id and c.oid = o.oid))
+			or (o.type = 4 and not exists (
+				select 1 from git_tag t where t.repo_id = o.repo_id and t.oid = o.oid)))
+		union all
+		select 'object-missing:' || encode(c.oid, 'hex') as oid
+		from git_commit c join repos r on r.id = c.repo_id
+		where r.name = ${repo} and not exists (
+			select 1 from git_object o where o.repo_id = c.repo_id and o.oid = c.oid)
+		union all
+		select 'object-missing:' || encode(t.oid, 'hex') as oid
+		from git_tag t join repos r on r.id = t.repo_id
+		where r.name = ${repo} and not exists (
+			select 1 from git_object o where o.repo_id = t.repo_id and o.oid = t.oid)
+		order by oid
+	`
+	return rows.map((row) => row.oid)
 }
 
 /**

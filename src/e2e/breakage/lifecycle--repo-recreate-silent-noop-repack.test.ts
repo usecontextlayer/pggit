@@ -120,9 +120,9 @@ describe("lifecycle breakage — silent no-op repack after repo recreate", () =>
 	let server: GitServer
 	let root = ""
 	let longLivedRepack: RepackResult = { deltas: 0, wholes: 0 }
-	let longLivedGc: GcResult = { deletedEdges: 0, deletedObjects: 0 }
+	let longLivedGc: GcResult = { deletedObjects: 0, epoch: "unchanged" }
 	let freshRepack: RepackResult = { deltas: 0, wholes: 0 }
-	let freshGc: GcResult = { deletedEdges: 0, deletedObjects: 0 }
+	let freshGc: GcResult = { deletedObjects: 0, epoch: "unchanged" }
 	let packWhileStale = 0
 	let packAfterFresh = 0
 

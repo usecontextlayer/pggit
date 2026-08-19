@@ -188,9 +188,8 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 		for (const c of clones) {
 			expect(
 				c.error,
-				`${c.label} — gc reclaimed ${gcFirst.deletedObjects} objects / ` +
-					`${gcFirst.deletedEdges} edges; repair repack wrote ` +
-					`${repackRepair.wholes} wholes + ${repackRepair.deltas} deltas`,
+				`${c.label} — gc reclaimed ${gcFirst.deletedObjects} objects; ` +
+					`repair repack wrote ${repackRepair.wholes} wholes + ${repackRepair.deltas} deltas`,
 			).toBeNull()
 		}
 	})
@@ -213,8 +212,7 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 	it("clones fsck-clean after a SECOND gc pass over the repaired tier", () => {
 		expect(
 			afterSecondGcError,
-			`second gc reclaimed ${gcSecond.deletedObjects} objects / ` +
-				`${gcSecond.deletedEdges} edges`,
+			`second gc reclaimed ${gcSecond.deletedObjects} objects`,
 		).toBeNull()
 	})
 })

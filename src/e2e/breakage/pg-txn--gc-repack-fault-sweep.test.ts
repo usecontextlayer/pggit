@@ -7,9 +7,10 @@
  * ever WRONG (rather than merely behind), and whether one more gc+repack+clone
  * always returns it to correct.
  *
- * GC is: a REPEATABLE READ live-set snapshot on a pinned connection, then two
- * independently-committed batched sweeps — objects (whose DELETEs also take the
- * derived encoding rows with them via the 0008 FK cascades), then edges.
+ * GC is: a REPEATABLE READ live-set snapshot on a pinned connection, then ONE
+ * independently-committed batched sweep of objects — whose DELETEs also take
+ * every derived row (`git_pack_encoding` per 0008, `git_commit`/`git_tag` per
+ * 0009) via FK cascades.
  * Repack is: reads spread over many statements with NO shared snapshot, then
  * batched COPY inserts each in their own transaction. Neither pass is atomic, so
  * every batch boundary is a crash point.
@@ -18,9 +19,8 @@
  *   - a `statement_timeout` sweep (T = 50 … 6400ms) on the connection driving
  *     gc()/repack(): each T lands the abort in a different batch;
  *   - `pg_terminate_backend` against ONLY the pid read from this test's own gc
- *     connection, fired while that pid is inside `delete from git_object …` and
- *     inside `delete from git_edge …` — i.e. the window where objects are gone
- *     but their edges are not.
+ *     connection, fired while that pid is inside `delete from git_object …` —
+ *     mid-sweep, where a batch has committed and the rest has not.
  *
  * CHECKED after every fault, on the RAW torn state (before any repair):
  *   A. a fresh mirror clone succeeds, is fsck --strict clean, and carries the
@@ -77,9 +77,9 @@ async function tryGit(args: string[], cwd?: string): Promise<GitAttempt> {
 
 type Counts = {
 	objects: number
-	edges: number
+	derivedRows: number
 	encodings: number
-	danglingEdges: number
+	orphanRows: number
 	encNoObject: number
 	encNoBase: number
 	deltaOfDelta: number
@@ -89,9 +89,9 @@ async function counts(admin: Sql, repo: string): Promise<Counts> {
 	const [row] = await admin<
 		{
 			objects: number
-			edges: number
+			derived_rows: number
 			encodings: number
-			dangling_edges: number
+			orphan_rows: number
 			enc_no_object: number
 			enc_no_base: number
 			delta_of_delta: number
@@ -100,13 +100,19 @@ async function counts(admin: Sql, repo: string): Promise<Counts> {
 		with r as (select id from repos where name = ${repo})
 		select
 			(select count(*)::int from git_object where repo_id = (select id from r)) as objects,
-			(select count(*)::int from git_edge where repo_id = (select id from r)) as edges,
+			((select count(*) from git_commit where repo_id = (select id from r))
+				+ (select count(*) from git_tag where repo_id = (select id from r)))::int
+				as derived_rows,
 			(select count(*)::int from git_pack_encoding where repo_id = (select id from r))
 				as encodings,
-			(select count(*)::int from git_edge e
-				where e.repo_id = (select id from r) and not exists (
+			((select count(*) from git_commit c
+				where c.repo_id = (select id from r) and not exists (
 					select 1 from git_object o
-					where o.repo_id = e.repo_id and o.oid = e.parent)) as dangling_edges,
+					where o.repo_id = c.repo_id and o.oid = c.oid))
+				+ (select count(*) from git_tag t
+					where t.repo_id = (select id from r) and not exists (
+						select 1 from git_object o
+						where o.repo_id = t.repo_id and o.oid = t.oid)))::int as orphan_rows,
 			(select count(*)::int from git_pack_encoding g
 				where g.repo_id = (select id from r) and not exists (
 					select 1 from git_object o
@@ -120,13 +126,13 @@ async function counts(admin: Sql, repo: string): Promise<Counts> {
 				where g.repo_id = (select id from r)
 					and g.base_oid is not null and b.base_oid is not null) as delta_of_delta`
 	return {
-		danglingEdges: row?.dangling_edges ?? 0,
 		deltaOfDelta: row?.delta_of_delta ?? 0,
-		edges: row?.edges ?? 0,
+		derivedRows: row?.derived_rows ?? 0,
 		encNoBase: row?.enc_no_base ?? 0,
 		encNoObject: row?.enc_no_object ?? 0,
 		encodings: row?.encodings ?? 0,
 		objects: row?.objects ?? 0,
+		orphanRows: row?.orphan_rows ?? 0,
 	}
 }
 
@@ -211,13 +217,12 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 		const mid = commits[Math.floor(commits.length / 2)]
 		if (!tip || !mid) throw new Error("fixture too short to orphan")
 
-		// No encoding-sweep kill point: since the 0008 FK cascades, GC issues no
-		// statement touching git_pack_encoding to be killed inside — its rows die
-		// atomically within the object sweep's own DELETEs.
+		// No encoding/commit/tag kill points: since the 0008/0009 FK cascades, GC
+		// issues no statement touching those tables to be killed inside — their rows
+		// die atomically within the object sweep's own DELETEs.
 		const cases: FaultCase[] = [
 			...TIMEOUTS.map((t) => ({ label: `statement_timeout=${t}ms`, timeout: t })),
 			{ kill: "delete from git_object", label: "kill during the OBJECT sweep" },
-			{ kill: "delete from git_edge", label: "kill during the EDGE sweep" },
 		]
 
 		for (const [i, c] of cases.entries()) {
@@ -343,7 +348,7 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 	})
 
 	it("swept every fault point", () => {
-		expect(results.map((r) => r.label)).toHaveLength(TIMEOUTS.length + 2)
+		expect(results.map((r) => r.label)).toHaveLength(TIMEOUTS.length + 1)
 	})
 
 	it("never leaves a delta-of-a-delta encoding (design says depth ≤ 1)", () => {
@@ -365,7 +370,7 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 	it("gc converges — a third pass reclaims nothing", () => {
 		expect(
 			results
-				.filter((r) => r.gc3.deletedObjects + r.gc3.deletedEdges !== 0)
+				.filter((r) => r.gc3.deletedObjects !== 0)
 				.map((r) => `${r.label}: ${JSON.stringify(r.gc3)}`),
 		).toEqual([])
 	})
@@ -383,11 +388,11 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 			results
 				.filter(
 					(r) =>
-						r.after.danglingEdges > 0 || r.after.encNoObject > 0 || r.after.encNoBase > 0,
+						r.after.orphanRows > 0 || r.after.encNoObject > 0 || r.after.encNoBase > 0,
 				)
 				.map(
 					(r) =>
-						`${r.label}: dangling=${r.after.danglingEdges} encNoObject=${r.after.encNoObject} encNoBase=${r.after.encNoBase}`,
+						`${r.label}: orphanRows=${r.after.orphanRows} encNoObject=${r.after.encNoObject} encNoBase=${r.after.encNoBase}`,
 				),
 		).toEqual([])
 	})

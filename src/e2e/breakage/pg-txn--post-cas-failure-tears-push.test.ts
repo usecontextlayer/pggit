@@ -44,9 +44,13 @@
  * post-commit stamp and the abort lands exactly on the ref stamp.
  *
  * The source script exits non-zero when the tear reproduces; the assertions below
- * encode the CORRECT contract (a failed push moved no ref, the projection matches
- * the served tip, the watermark tracks the orphan, and a retry+gc+repack+clone
- * converges), so a reproduction is a red test.
+ * encode the CORRECT contract — refined 2026-08-19 when the fixes landed: a
+ * non-atomic multi-ref push MAY partially apply (canonical git: per-ref ok/ng,
+ * exit 1 when any ref fails), so the binding rule is that the per-ref REPORT is
+ * truthful, the projection matches the served tip, the watermark tracks the
+ * orphan, and a retry+gc+repack+clone converges. The fixes: a post-CAS stamp
+ * failure and a per-ref CAS failure are absorbed into ng/log lines instead of
+ * escaping as an HTTP 500 after refs already moved.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -109,6 +113,8 @@ function refMapOf(stdout: string): Map<string, string> {
 type PointResult = {
 	point: FaultPoint
 	pushOk: boolean
+	targeted: string[]
+	rejectedRefs: string[]
 	pushCode: number
 	pushTail: string
 	/** refs whose oid changed across the "failed" push. */
@@ -205,11 +211,16 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 				})
 				await new Promise((r) => setTimeout(r, 150))
 
-				const args =
+				const targeted =
 					point === "A-post-commit-stamp"
-						? ["push", url, `${c2}:refs/heads/main`]
-						: ["push", url, `${c2}:refs/heads/main`, `${c2}:refs/heads/zz`]
+						? ["refs/heads/main"]
+						: ["refs/heads/main", "refs/heads/zz"]
+				const args = ["push", url, ...targeted.map((t) => `${c2}:${t}`)]
 				const push = await tryGit(args, src)
+				// Per-ref verdicts straight from the client's report-status echo.
+				const rejectedRefs = [
+					...push.stderr.matchAll(/\[remote rejected\] \S+ -> (\S+)/g),
+				].map((m) => `refs/heads/${(m[1] as string).replace(/^refs\/heads\//, "")}`)
 				release()
 				await locker
 
@@ -236,6 +247,8 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 						pushCode: push.code,
 						pushOk: true,
 						pushTail: "",
+						rejectedRefs,
+						targeted,
 						unchanged,
 						watermarkLost: false,
 					})
@@ -278,6 +291,8 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 					pushCode: push.code,
 					pushOk: false,
 					pushTail: push.stderr.trim().split("\n").filter(Boolean).slice(-2).join(" | "),
+					rejectedRefs,
+					targeted,
 					unchanged,
 					watermarkLost,
 				})
@@ -298,17 +313,35 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 		expect(results.map((r) => r.point)).toEqual([...FAULT_POINTS])
 	})
 
-	it("a push that reports failure moved no ref", () => {
+	it("the per-ref report is truthful: rejected refs stayed put, accepted refs moved", () => {
+		// A non-atomic multi-ref push MAY partially apply — that is canonical git
+		// (per-ref ok/ng, exit 1 when any ref fails). The tear this file pins is the
+		// REPORT LYING: a ref that moved with no ok line, or an unmoved targeted ref
+		// with no ng line (the pre-fix behavior: a post-CAS throw became an HTTP 500
+		// with refs already moved and nothing reported at all).
 		expect(
 			results
-				.filter((r) => !r.pushOk && r.advanced.length > 0)
-				.map(
-					(r) =>
-						`${r.point}: git push exited ${r.pushCode} ("${r.pushTail}"), yet the server APPLIED: ${r.advanced.join(", ")}` +
-						(r.unchanged.length > 0
-							? ` — while these did NOT move: ${r.unchanged.join(", ")}`
-							: ""),
-				),
+				.filter((r) => !r.pushOk)
+				.flatMap((r) => {
+					const advancedNames = r.advanced
+						.map((a) => a.split(" ")[0] as string)
+						.filter((n) => n.startsWith("refs/heads/"))
+					const unmovedNames = r.unchanged.map((u) => u.split("@")[0] as string)
+					const lies: string[] = []
+					for (const n of advancedNames) {
+						if (r.rejectedRefs.includes(n)) {
+							lies.push(`${r.point}: ${n} was reported REJECTED but the server moved it`)
+						}
+					}
+					for (const n of r.targeted) {
+						if (unmovedNames.includes(n) && !r.rejectedRefs.includes(n)) {
+							lies.push(
+								`${r.point}: ${n} did not move but the push never reported it rejected ("${r.pushTail}")`,
+							)
+						}
+					}
+					return lies
+				}),
 		).toEqual([])
 	})
 

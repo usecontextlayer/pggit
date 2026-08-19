@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import {
 	ageObjects,
 	cloneAndFsck,
-	edgeRows,
+	derivedRows,
 	type GcFixture,
 	gitReachableOids,
 	objectOids,
@@ -119,11 +119,11 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 		const survivors = new Set(await objectOids(fx.db, repo))
 		for (const oid of orphaned) expect(survivors.has(oid)).toBe(false)
 
-		// No surviving edge references an orphaned object as parent or child.
+		// No derived row survives for an orphaned commit/tag (the 0009 cascades).
 		const orphanSet = new Set(orphaned)
-		for (const edge of await edgeRows(fx.db, repo)) {
-			expect(orphanSet.has(edge.parent)).toBe(false)
-			expect(orphanSet.has(edge.child)).toBe(false)
+		for (const row of await derivedRows(fx.db, repo)) {
+			const oid = row.split(" ")[1] as string
+			expect(orphanSet.has(oid)).toBe(false)
 		}
 
 		// The repo still clones clean to the live tip.

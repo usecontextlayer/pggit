@@ -8,8 +8,8 @@
  * its encoding row, and every delta row anchored on it, inside the very DELETE
  * that removes the object. There is no encoding sweep left to miss.
  *
- * This pins that invariant with the REAL gc() code killed at the worst remaining
- * point — mid-pass, after the object sweep, before the edge sweep — over the one
+ * This pins that invariant with the REAL gc() code killed at the last remaining
+ * crash point — after the object sweep, before the pass's cleanup — over the one
  * fixture shape (design N3/N4) where a reachable delta's anchor dies:
  *
  *   the tier is CONSISTENT even in the torn state (no orphaned-base rows, no
@@ -45,24 +45,30 @@ const RUNS = 50 // anchors land at lineage index 0 and 32; 33..50 is a PARTIAL s
 const KEEP_AT = 45 // a delta in that partial segment — the shape a new push extends
 const REWIND_TO = 20 // main rewinds far below the kept delta's anchor
 
-/** A porsager client whose `unsafe()` throws the moment GC reaches the EDGE
- * sweep — the process dying right after the object sweep, the worst point a pass
- * can die at now that the encoding tier follows the object DELETEs by cascade.
- * Everything before that point runs the real, unmodified GC code. Two traps this
- * proxy must dodge: the pass runs on one reserved connection, so `reserve()`
- * must be wrapped too (the sweeps go through ITS `unsafe`, not the pool's); and
- * the live-set walk ALSO reaches `unsafe` naming `git_edge` (the pinned Kysely
- * dialect executes the reachability CTE through it), so the trigger must be the
- * sweep's DELETE specifically, or the pass dies before it sweeps anything. */
-function killAtEdgeSweep(pg: Sql): Sql {
+/** A porsager client whose `unsafe()` throws the moment GC reaches its
+ * post-sweep cleanup — the process dying right after the object sweep completed,
+ * the last crash point a pass has now that every derived surface follows the
+ * object DELETEs by cascade (0008/0009) and no later sweep exists. The trigger
+ * is the SECOND `drop table if exists gc_live`: the first is the pass-start
+ * heal, the second is the success-path cleanup — so the whole sweep has run and
+ * the TEMP table is left leaked on the pooled connection (the next pass's heal
+ * covers it; killing here pins that too). Everything before that point runs the
+ * real, unmodified GC code. The pass runs on one reserved connection, so
+ * `reserve()` must be wrapped too (the sweep goes through ITS `unsafe`, not the
+ * pool's). */
+function killBeforeCleanup(pg: Sql): Sql {
+	let drops = 0
 	const wrapUnsafe = <T extends object>(target: T): T =>
 		new Proxy(target, {
 			get(t, prop, receiver) {
 				if (prop === "unsafe") {
 					const real = Reflect.get(t, prop, t) as Sql["unsafe"]
 					return (sql: string, ...rest: unknown[]) => {
-						if (sql.includes("delete from git_edge")) {
-							throw new Error("SIMULATED CRASH: process died before the edge sweep")
+						if (sql.includes("drop table if exists gc_live")) {
+							drops++
+							if (drops === 2) {
+								throw new Error("SIMULATED CRASH: process died before cleanup")
+							}
 						}
 						return (real as (s: string, ...r: unknown[]) => unknown).call(t, sql, ...rest)
 					}
@@ -110,7 +116,7 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 
 		// ── Fixture: the append-only shape, plus an orphan ref that keeps ONE late
 		// delta alive while the anchor it points at becomes garbage. Per the design
-		// doc's N4 this is the only shape that exercises the dangling-base sweep.
+		// doc's N4 this is the only shape where a reachable delta's anchor dies.
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		const commits = await commitsOldestFirst(src)
 		const keepFrom = commits[KEEP_AT]
@@ -148,17 +154,17 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 		// ── The force push: main rewinds far below the anchor, `keep` survives.
 		await refs.setRef(REPO, "refs/heads/main", rewindTo)
 
-		// ── The crash: real GC, killed the instant it reaches the edge sweep.
+		// ── The crash: real GC, killed the instant it reaches post-sweep cleanup.
 		let crashed = false
 		try {
-			await createGc(killAtEdgeSweep(db.sql)).gc(REPO, {
+			await createGc(killBeforeCleanup(db.sql)).gc(REPO, {
 				graceSeconds: 0,
 				maintain: false,
 			})
 		} catch {
 			crashed = true
 		}
-		if (!crashed) throw new Error("probe wrong: gc did not reach the edge sweep")
+		if (!crashed) throw new Error("probe wrong: gc did not reach its cleanup")
 
 		// ── The torn state, measured.
 		const [tornRow] = await db.sql<{ orphaned: number; ghosts: number }[]>`

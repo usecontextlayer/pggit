@@ -122,6 +122,25 @@ describe("TOAST storage propagation on the partitioned encoding tier (C4)", () =
 		).toEqual([])
 	})
 
+	it("declares STORAGE EXTERNAL on the unpartitioned reach-epoch blobs (0012)", async () => {
+		// The 0012 tables are UNPARTITIONED, so the catalog check reads attstorage
+		// straight off them — no leaf propagation question exists here.
+		const rows = await db.sql<AttrRow[]>`
+			select c.relname, a.attname, a.attstorage, a.attcompression
+			from pg_attribute a
+				join pg_class c on c.oid = a.attrelid
+				join pg_namespace n on n.oid = c.relnamespace
+			where n.nspname = current_schema()
+				and (c.relname = 'git_reach_epoch' and a.attname in ('tips', 'oids')
+					or c.relname = 'git_reach_bitmap' and a.attname = 'bits')
+			order by c.relname, a.attname`
+		expect(rows.map((r) => `${r.relname}.${r.attname}=${r.attstorage}`)).toEqual([
+			"git_reach_bitmap.bits=e",
+			"git_reach_epoch.oids=e",
+			"git_reach_epoch.tips=e",
+		])
+	})
+
 	it("A/B: inline STORAGE EXTERNAL on a partitioned parent reaches its leaves", async () => {
 		// Locally-created replicas of the DDL: one parent declares `storage external`
 		// inline, the other takes the default. Same payload into both.
@@ -171,6 +190,10 @@ describe("TOAST storage propagation on the partitioned encoding tier (C4)", () =
 			{ id: string }[]
 		>`insert into repos (name) values ('probe/storage') returning id::text as id`
 		const probeOid = Buffer.alloc(20, 0x7f)
+		// The 0008 FK cascades demand a real inventory row behind every encoding
+		// row, synthetic probes included — that DDL-level hygiene is the design.
+		await db.sql`insert into git_object (repo_id, oid, type, size, content)
+			values (${repo?.id as string}::bigint, ${probeOid}, 3, ${squishy.length}, ${squishy})`
 		await db.sql`insert into git_pack_encoding (repo_id, oid, base_oid, data_size, data)
 			values (${repo?.id as string}::bigint, ${probeOid}, null, ${squishy.length}, ${squishy})`
 		const [probe] = await db.sql<{ oct: string; col: string }[]>`

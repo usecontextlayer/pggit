@@ -4,7 +4,7 @@ import {
 	ageObjects,
 	cloneAndFsck,
 	countObjects,
-	edgeRows,
+	derivedRows,
 	type GcFixture,
 	gitReachableOids,
 	objectOids,
@@ -118,14 +118,13 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		// pass summary exactly once. The eligible SET is observable via the summary.
 		expect(summary.filter((entry) => entry.repo === repo)).toHaveLength(1)
 
-		// The DrainSummary's reclaim counts are REAL, not zeros: this pass deleted
-		// exactly the orphaned objects (no more, no fewer) plus at least one of their
-		// edges, surfaced per-repo. An impl that reclaims but reports {deletedObjects:0,
-		// deletedEdges:0} — or miscounts — is caught here (the rest of the suite only
-		// ever reads entry.repo, so this is the sole guard on the count surface).
+		// The DrainSummary's reclaim count is REAL, not zero: this pass deleted
+		// exactly the orphaned objects (no more, no fewer), surfaced per-repo. An
+		// impl that reclaims but reports {deletedObjects: 0} — or miscounts — is
+		// caught here (the rest of the suite only ever reads entry.repo, so this is
+		// the sole guard on the count surface).
 		const entry = summary.find((e) => e.repo === repo)
 		expect(entry?.deletedObjects).toBe(orphaned.length)
-		expect(entry?.deletedEdges ?? 0).toBeGreaterThan(0)
 
 		// Survivors == the current tip's reachable closure: nothing live lost AND no
 		// orphan survives. Equality fixes both directions at once.
@@ -133,12 +132,12 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		expect(after).toEqual([...liveOids].sort())
 		for (const oid of orphaned) expect(after).not.toContain(oid)
 
-		// Edge integrity through the loop (GC-5 reached via the scheduler): no surviving
-		// edge references an orphaned object as parent or child (orphan edges were swept).
+		// Derived-row integrity through the loop (GC-5 reached via the scheduler): no
+		// surviving git_commit/git_tag row belongs to an orphaned object.
 		const orphanSet = new Set(orphaned)
-		for (const edge of await edgeRows(fx.db, repo)) {
-			expect(orphanSet.has(edge.parent)).toBe(false)
-			expect(orphanSet.has(edge.child)).toBe(false)
+		for (const row of await derivedRows(fx.db, repo)) {
+			const oid = row.split(" ")[1] as string
+			expect(orphanSet.has(oid)).toBe(false)
 		}
 
 		// The repo clones fsck-clean at the latest content (real-git oracle).

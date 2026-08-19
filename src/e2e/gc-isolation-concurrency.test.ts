@@ -2,7 +2,7 @@
  * GC isolation & concurrency — `docs/2026-06-24-force-commit-gc-design.md` §4,
  * items GC-8, GC-9, GC-10. OBSERVABLE-ONLY: every assertion is on real-`git`
  * behaviour (clone/fetch/fsck), Postgres rows (`git_object`/`git_edge` via the
- * scaffold's `objectOids`/`countObjects`/`edgeRows`/`countEdges`), or the `gc()`
+ * scaffold's `objectOids`/`countObjects`/`derivedRows`/`countDerivedRows`), or the `gc()`
  * return value. Nothing here probes GC internals (temp tables, batch/transaction
  * counts, advisory locks, CTE/SQL shape) — those stay free to change. Grace is
  * made deterministic with `graceSeconds` + `ageObjects`, never a wall-clock sleep.
@@ -18,9 +18,9 @@ import type { GcResult } from "@/store/gc"
 import {
 	ageObjects,
 	cloneAndFsck,
-	countEdges,
+	countDerivedRows,
 	countObjects,
-	edgeRows,
+	derivedRows,
 	type GcFixture,
 	objectOids,
 	type PushResult,
@@ -75,9 +75,9 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 
 		// Snapshot B's full observable state before A's GC.
 		const bObjectsBefore = await objectOids(fx.db, repoB)
-		const bEdgeRowsBefore = await edgeRows(fx.db, repoB)
+		const bRowsBefore = await derivedRows(fx.db, repoB)
 		const bCountObjectsBefore = await countObjects(fx.db, repoB)
-		const bCountEdgesBefore = await countEdges(fx.db, repoB)
+		const bCountRowsBefore = await countDerivedRows(fx.db, repoB)
 		// Sanity: the two repos genuinely share no objects (disjoint storage).
 		expect(bObjectsBefore.some((oid) => aTip.reachable.includes(oid))).toBe(false)
 
@@ -87,11 +87,11 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 		// A actually reclaimed something (otherwise isolation is vacuous).
 		expect(reclaimed.deletedObjects).toBeGreaterThan(0)
 
-		// B is completely unchanged across A's GC — rows, edges, counts identical.
+		// B is completely unchanged across A's GC — objects, derived rows, counts.
 		expect(await objectOids(fx.db, repoB)).toEqual(bObjectsBefore)
-		expect(await edgeRows(fx.db, repoB)).toEqual(bEdgeRowsBefore)
+		expect(await derivedRows(fx.db, repoB)).toEqual(bRowsBefore)
 		expect(await countObjects(fx.db, repoB)).toBe(bCountObjectsBefore)
-		expect(await countEdges(fx.db, repoB)).toBe(bCountEdgesBefore)
+		expect(await countDerivedRows(fx.db, repoB)).toBe(bCountRowsBefore)
 
 		// And B still clones complete + fsck-clean, with its tip + content intact.
 		const cloneB = await cloneAndFsck(fx, repoB)

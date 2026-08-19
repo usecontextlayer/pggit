@@ -126,13 +126,23 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 			await commitFile(src, "base.txt", "base\n", "base")
 			await spawnGit(["checkout", "-q", "-b", "x"], { cwd: src })
 			await commitFile(src, "x.txt", "x\n", "cx")
+			const cx = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 			await spawnGit(["checkout", "-q", "-b", "y", "main"], { cwd: src })
 			await commitFile(src, "y.txt", "y\n", "cy")
-			// Mutual merges: x⇐y and y⇐x ⇒ two distinct merge bases (cx, cy).
+			// MUTUAL merges of the two ORIGINAL tips: x merges cy, y merges the OLD
+			// cx (by oid — merging the branch after x's merge would fast-forward
+			// and collapse the shape to one base). --no-ff pins the second merge.
 			await spawnGit(["checkout", "-q", "x"], { cwd: src })
 			await spawnGit(["merge", "--no-edit", "y"], { cwd: src })
 			await spawnGit(["checkout", "-q", "y"], { cwd: src })
-			await spawnGit(["merge", "--no-edit", "x"], { cwd: src })
+			await spawnGit(["merge", "--no-ff", "--no-edit", cx], { cwd: src })
+			// The fixture self-verifies: a criss-cross has TWO merge bases.
+			const bases = (
+				await spawnGit(["merge-base", "--all", "x", "y"], { cwd: src })
+			).stdout
+				.trim()
+				.split("\n")
+			expect(bases.length).toBe(2)
 
 			await pushAndVerify(src, "crisscross")
 		} finally {

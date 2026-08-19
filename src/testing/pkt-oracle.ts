@@ -14,6 +14,19 @@
  */
 import { decodePktStream } from "@/protocol/pkt-line"
 
+/** Decode a stream the caller claims is COMPLETE: undecoded trailing bytes are
+ * a truncated packet, and an oracle that ignored them would render a valid
+ * response followed by garbage identically to the valid response. */
+function decodeComplete(buf: Buffer): ReturnType<typeof decodePktStream> {
+	const decoded = decodePktStream(buf)
+	if (decoded.rest.length > 0) {
+		throw new Error(
+			`pkt-oracle: ${decoded.rest.length} undecoded trailing bytes — truncated packet in a stream asserted complete`,
+		)
+	}
+	return decoded
+}
+
 /** test_oid values, verbatim from `/tmp/git-src/t/oid-info/hash-info` (sha1 rows). */
 export const ZERO_OID = "0".repeat(40)
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -34,7 +47,7 @@ export const FLUSH_LINE = "0000\n"
  */
 export function pktLineUnpack(buf: Buffer): string {
 	let out = ""
-	for (const p of decodePktStream(buf).packets) {
+	for (const p of decodeComplete(buf).packets) {
 		switch (p.type) {
 			case "data":
 				out += `${p.payload.toString("utf8").replace(/\n$/, "")}\n`
@@ -64,7 +77,7 @@ export function pktLineUnpack(buf: Buffer): string {
  */
 export function framedPktLines(buf: Buffer): string {
 	let out = ""
-	for (const p of decodePktStream(buf).packets) {
+	for (const p of decodeComplete(buf).packets) {
 		switch (p.type) {
 			case "data": {
 				const len = p.payload.length + 4
@@ -108,7 +121,7 @@ export function sidebandDemux(buf: Buffer): {
 	const band1: Buffer[] = []
 	const band2: Buffer[] = []
 	const band3: Buffer[] = []
-	for (const p of decodePktStream(buf).packets) {
+	for (const p of decodeComplete(buf).packets) {
 		if (p.type === "flush") break
 		if (p.type !== "data" || p.payload.length === 0) continue
 		const rest = p.payload.subarray(1)
@@ -146,7 +159,7 @@ export type RefAdvertV0 = {
  * matching a `%s`-style render that would truncate the caps at the NUL.
  */
 export function renderRefAdvertV0(buf: Buffer): RefAdvertV0 {
-	const { packets } = decodePktStream(buf)
+	const { packets } = decodeComplete(buf)
 	const refs: RefAdvertV0["refs"] = []
 	for (const p of packets) {
 		if (p.type !== "data") continue

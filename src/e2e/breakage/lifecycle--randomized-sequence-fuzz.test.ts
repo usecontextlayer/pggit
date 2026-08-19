@@ -381,12 +381,12 @@ describe("lifecycle breakage — randomized sequence fuzz", () => {
 					case "gc0": {
 						const g = await gc.gc(REPO, { graceSeconds: 0 })
 						await spawnGit(["gc", "-q", "--prune=now"], { cwd: ref })
-						note = `gc0 obj=${g.deletedObjects} edges=${g.deletedEdges}`
+						note = `gc0 obj=${g.deletedObjects}`
 						break
 					}
 					case "gc-grace": {
 						const g = await gc.gc(REPO, { graceSeconds: 100000 })
-						note = `gc-grace obj=${g.deletedObjects} edges=${g.deletedEdges}`
+						note = `gc-grace obj=${g.deletedObjects}`
 						break
 					}
 					case "gc-grace-split": {
@@ -395,7 +395,7 @@ describe("lifecycle breakage — randomized sequence fuzz", () => {
 						await new Promise((res) => setTimeout(res, 1600))
 						const g = await gc.gc(REPO, { graceSeconds: 1 })
 						await spawnGit(["gc", "-q", "--prune=now"], { cwd: ref })
-						note = `gc-split obj=${g.deletedObjects} edges=${g.deletedEdges}`
+						note = `gc-split obj=${g.deletedObjects}`
 						break
 					}
 					case "repack": {

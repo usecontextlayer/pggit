@@ -2,15 +2,16 @@
  * BREAKAGE (pg-txn) — a cancel on every statement of the ingest transaction.
  * Converted from `breakage/pg-txn--ingest-fault-sweep.ts`; its rationale verbatim:
  *
- * HUNT: does the §10.1 object⟺edges invariant survive a fault landing on each
- * statement of `insertObjects`' transaction — and on the post-commit stamp that
- * sits OUTSIDE it — and does the store converge?
+ * HUNT: does the §10.1 object⟺derived-rows invariant survive a fault landing on
+ * each statement of `insertObjects`' transaction — and on the post-commit stamp
+ * that sits OUTSIDE it — and does the store converge?
  *
- * `insertObjects` is one `pg.begin` containing two `copyInsert` calls (each a
- * `create temp table … on commit drop`, a streaming `COPY … from stdin`, and an
- * `insert … select … on conflict do nothing`), followed AFTER the commit by
- * `update repos set last_pushed_at = clock_timestamp()`. Each of those is a
- * distinct crash point with a distinct consequence.
+ * `insertObjects` is one `pg.begin` containing the `copyInsert` of the object
+ * rows (a `create temp table … on commit drop`, a streaming `COPY … from
+ * stdin`, and an `insert … select … on conflict do nothing`) plus the derived
+ * `git_commit`/`git_tag` value-list INSERTs (spine chunk 1), followed AFTER the
+ * commit by `update repos set last_pushed_at = clock_timestamp()`. Each of
+ * those is a distinct crash point with a distinct consequence.
  *
  * FAULT INJECTED: `pg_cancel_backend` against ONLY the pid this test read from
  * its own app connection (`select pg_backend_pid()` on a max:1 pool), fired the
@@ -24,9 +25,9 @@
  * is covered there instead.
  *
  * CHECKED after every fault, then again after a clean retry push:
- *   1. no `git_object` row whose derived edges are missing from `git_edge`
- *      (re-derived in JS from stored content — the invariant under test)
- *   2. no `git_edge` row whose parent object is absent
+ *   1. no stored commit/tag object whose `git_commit`/`git_tag` row is missing
+ *      or value-mismatched (re-derived in JS from stored content)
+ *   2. no derived row whose object is absent
  *   3. the client saw a clean failure or a clean success, never a hang
  *   4. refs did not move on a failed push
  *   5. a retry push through a healthy connection succeeds, and a fresh mirror
@@ -39,7 +40,7 @@
  *
  * The source script exits 0 when the invariants hold and every case converges — a
  * NEGATIVE result, so this suite is expected GREEN. The negative IS the finding:
- * these ingest fault points do not tear the object⟺edges invariant.
+ * these ingest fault points do not tear the object⟺derived-rows invariant.
  */
 import { spawn } from "node:child_process"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -47,9 +48,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import { OBJECT_TYPE_CODE } from "@/database/object-type-codes"
 import { createGitApp, createGitDeps } from "@/index"
-import { deriveEdges } from "@/object/edges"
-import type { GitObjectType } from "@/object/object"
+import { deriveCommitRow, deriveTagRow } from "@/object/derive"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { type GitServer, serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
@@ -60,13 +61,6 @@ const RUNS = 700
 const BOUND_MS = 45_000
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-
-const TYPE_NAME: Record<number, GitObjectType> = {
-	[PACK_OBJ_TYPE.BLOB]: "blob",
-	[PACK_OBJ_TYPE.COMMIT]: "commit",
-	[PACK_OBJ_TYPE.TAG]: "tag",
-	[PACK_OBJ_TYPE.TREE]: "tree",
-}
 
 type BoundedGit = { settled: boolean; code: number | null; ms: number; out: string }
 
@@ -106,41 +100,66 @@ function gitBounded(
 	})
 }
 
-type Inv = { missing: string[]; dangling: string[]; objects: number; edges: number }
+type Inv = { missing: string[]; dangling: string[]; objects: number; rows: number }
 
-/** The §10.1 invariant, both directions, re-derived from stored content. */
+/** The §10.1 invariant, both directions, re-derived from stored content: every
+ * stored commit/tag object has its EXACT derived row (tree, ordered parents,
+ * committer time / target, type), and no row outlives its object. */
 async function invariant(admin: Sql, repo: string): Promise<Inv> {
-	const rows = await admin<{ oid: string; type: number; content: Buffer }[]>`
+	const objects = await admin<{ oid: string; type: number; content: Buffer }[]>`
 		select encode(o.oid, 'hex') as oid, o.type, o.content from git_object o
-		where o.repo_id = (select id from repos where name = ${repo})`
-	const edges = await admin<{ parent: string; child: string; kind: number }[]>`
-		select encode(parent, 'hex') as parent, encode(child, 'hex') as child, kind
-		from git_edge where repo_id = (select id from repos where name = ${repo})`
-	const stored = new Set(edges.map((e) => `${e.parent}:${e.child}:${e.kind}`))
-	const present = new Set(rows.map((r) => r.oid))
+		where o.repo_id = (select id from repos where name = ${repo})
+			and o.type in (${PACK_OBJ_TYPE.COMMIT}, ${PACK_OBJ_TYPE.TAG})`
+	const commitRows = await admin<
+		{ oid: string; tree: string; parents: string[]; commit_time: string }[]
+	>`
+		select encode(c.oid, 'hex') as oid, encode(c.tree_oid, 'hex') as tree,
+			(select coalesce(array_agg(encode(p.h, 'hex') order by p.ord), '{}')
+				from unnest(c.parents) with ordinality as p(h, ord)) as parents,
+			c.commit_time
+		from git_commit c where c.repo_id = (select id from repos where name = ${repo})`
+	const tagRows = await admin<{ oid: string; target: string; target_type: number }[]>`
+		select encode(t.oid, 'hex') as oid, encode(t.target_oid, 'hex') as target,
+			t.target_type
+		from git_tag t where t.repo_id = (select id from repos where name = ${repo})`
+	const commitByOid = new Map(commitRows.map((r) => [r.oid, r]))
+	const tagByOid = new Map(tagRows.map((r) => [r.oid, r]))
+	const present = new Set(objects.map((r) => r.oid))
 	const missing: string[] = []
-	for (const r of rows) {
-		const type = TYPE_NAME[r.type]
-		if (!type) throw new Error(`unknown git_object.type ${r.type} for ${r.oid}`)
-		for (const e of deriveEdges(type, r.content)) {
-			if (!stored.has(`${r.oid}:${e.child}:${e.kind}`)) {
-				missing.push(`${r.oid}(t${r.type}) -${e.kind}-> ${e.child}`)
-			}
+	for (const o of objects) {
+		if (o.type === PACK_OBJ_TYPE.COMMIT) {
+			const row = commitByOid.get(o.oid)
+			const want = deriveCommitRow(o.content)
+			const ok =
+				row !== undefined &&
+				row.tree === want.treeOid &&
+				row.parents.join(",") === want.parents.join(",") &&
+				row.commit_time === String(want.commitTime)
+			if (!ok) missing.push(`commit ${o.oid}: row ${row ? "MISMATCHED" : "MISSING"}`)
+		} else {
+			const row = tagByOid.get(o.oid)
+			const want = deriveTagRow(o.content)
+			const ok =
+				row !== undefined &&
+				row.target === want.targetOid &&
+				row.target_type === OBJECT_TYPE_CODE[want.targetType]
+			if (!ok) missing.push(`tag ${o.oid}: row ${row ? "MISMATCHED" : "MISSING"}`)
 		}
 	}
 	return {
-		dangling: [...new Set(edges.map((e) => e.parent))].filter((p) => !present.has(p)),
-		edges: edges.length,
+		dangling: [...commitByOid.keys(), ...tagByOid.keys()].filter(
+			(oid) => !present.has(oid),
+		),
 		missing,
-		objects: rows.length,
+		objects: objects.length,
+		rows: commitRows.length + tagRows.length,
 	}
 }
 
 /** Statement to cancel, matched against `pg_stat_activity.query` for our pid. */
 const POINTS: { label: string; needle: string }[] = [
 	{ label: "object INSERT (inside the txn)", needle: "insert into git_object" },
-	{ label: "edge COPY (inside the txn)", needle: 'copy "copy_stg_git_edge"' },
-	{ label: "edge INSERT (inside the txn)", needle: "insert into git_edge" },
+	{ label: "commit-row INSERT (inside the txn)", needle: "insert into git_commit" },
 	{
 		label: "post-commit last_pushed_at stamp (OUTSIDE the txn)",
 		needle: "update repos set last_pushed_at",
@@ -326,7 +345,7 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 		).toEqual([])
 	})
 
-	it("no object survives without its derived edges", () => {
+	it("no commit/tag object survives without its exact derived row", () => {
 		expect(
 			results
 				.filter((r) => r.inv.missing.length > 0)
@@ -334,7 +353,7 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 		).toEqual([])
 	})
 
-	it("no edge survives with an absent parent object", () => {
+	it("no derived row survives its object", () => {
 		expect(
 			results
 				.filter((r) => r.inv.dangling.length > 0)

@@ -20,7 +20,7 @@
  *
  * THIS IS EVERY WRITE PATH IN pggit. `pg.begin` is how `object-store.insertObjects`
  * (the object⟺edges invariant), `gc.loadLive`, `repack.flush`, and
- * `repo-file-projection.rebuildRefSnapshot` all commit. The controls below show
+ * `repo-file-projection.applyRefAdvance` all commit. The controls below show
  * the scope precisely:
  *
  *   kill during a plain query (no transaction) ················ survives

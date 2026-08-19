@@ -208,8 +208,12 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			} catch (e) {
 				// A content conflict is expected with random divergent branches: abort
 				// cleanly and skip. Anything else is real — rethrow after aborting.
+				// Every nonzero git exit is a GitCommandError, so the conflict must be
+				// PROVEN (unmerged index entries), not inferred from the error type —
+				// else broken config, corruption, and command regressions all skip.
+				const unmerged = await spawnGit(["ls-files", "-u"], { cwd: model.dir })
 				await spawnGit(["merge", "--abort"], { cwd: model.dir }).catch(() => {})
-				if (!(e instanceof GitCommandError)) throw e
+				if (!(e instanceof GitCommandError) || unmerged.stdout.trim() === "") throw e
 			}
 			return
 		}

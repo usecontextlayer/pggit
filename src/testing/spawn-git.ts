@@ -106,16 +106,24 @@ export async function spawnGit(
 		child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
 		child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
 		child.on("error", reject)
-		child.on("close", (rawCode) => {
-			const code = rawCode ?? 0
+		child.on("close", (rawCode, signal) => {
 			const outBytes = Buffer.concat(stdout)
 			const out = outBytes.toString("utf8")
 			const err = Buffer.concat(stderr).toString("utf8")
-			if (code !== 0) {
-				reject(new GitCommandError(args, code, out, err))
+			// A null exit code means the child died by SIGNAL — never success. A
+			// killed fsck/index-pack/clone that resolved as exit 0 would launder
+			// incomplete output into a green oracle.
+			if (rawCode === null) {
+				reject(
+					new GitCommandError(args, -1, out, `killed by ${signal ?? "signal"}: ${err}`),
+				)
 				return
 			}
-			resolve({ code, stderr: err, stdout: out, stdoutBytes: outBytes })
+			if (rawCode !== 0) {
+				reject(new GitCommandError(args, rawCode, out, err))
+				return
+			}
+			resolve({ code: rawCode, stderr: err, stdout: out, stdoutBytes: outBytes })
 		})
 	})
 }

@@ -55,7 +55,7 @@ describe("e2e — repo deletion (real git)", () => {
 	/** Rows remaining per child table for a repo surrogate id. */
 	async function childRowCounts(repoId: string): Promise<Record<string, number>> {
 		const counts: Record<string, number> = {}
-		for (const table of ["git_object", "git_edge", "git_ref", "repo_file"]) {
+		for (const table of ["git_object", "git_commit", "git_ref", "repo_file"]) {
 			const [row] = await db.sql.unsafe(
 				`select count(*)::int as n from ${table} where repo_id = $1`,
 				[repoId],
@@ -84,7 +84,7 @@ describe("e2e — repo deletion (real git)", () => {
 
 		// 1. The cascades took every dependent row with the repos row.
 		expect(await childRowCounts(contentId)).toEqual({
-			git_edge: 0,
+			git_commit: 0,
 			git_object: 0,
 			git_ref: 0,
 			repo_file: 0,

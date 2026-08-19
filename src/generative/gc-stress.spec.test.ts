@@ -27,7 +27,7 @@
  *              trees + a large orphan set. Generalises GC-1/2/7 at scale. A fetch of
  *              a live ref is then fsck-clean.
  *   STRESS-2 — Idempotence at scale.  A second `gc()` returns
- *              `{deletedObjects:0, deletedEdges:0}` and leaves the survivor set
+ *              `{deletedObjects: 0}` and leaves the survivor set
  *              unchanged. Generalises GC-6 at scale.
  *   STRESS-3 — Batch invariance at scale.  On two byte-identical large repos
  *              (pinned identity + clock → identical OIDs), `gc(batchLimit: small)`
@@ -36,7 +36,7 @@
  *              DELETE boundary many times. Generalises GC-10 at scale.
  *
  * OBSERVABLE-ONLY: assertions read only the real-`git` oracle (`rev-list` / fetch /
- * fsck), Postgres rows (`objectOids` / `countObjects` / `countEdges`), and the
+ * fsck), Postgres rows (`objectOids` / `countObjects` / `countDerivedRows`), and the
  * `gc()` return value. Nothing probes GC internals (temp tables, batch/CTE/txn
  * shape, advisory locks). Grace is made deterministic by `ageObjects` +
  * `graceSeconds: 0`, never a wall-clock sleep.
@@ -66,7 +66,7 @@ import type { GitObjectType } from "@/object/object"
 import type { PackInputObject } from "@/pack/write-pack"
 import {
 	ageObjects,
-	countEdges,
+	countDerivedRows,
 	countObjects,
 	type GcFixture,
 	gitReachableOids,
@@ -494,8 +494,8 @@ describe("§4 PBT stress — deep + wide GC differential at scale", () => {
 						// Second pass is a no-op: deletes nothing, leaves rows + survivor set identical.
 						const second = await fx.gc.gc(repo, { graceSeconds: 0 })
 						expect(second).toEqual({
-							deletedEdges: 0,
 							deletedObjects: 0,
+							epoch: "unchanged",
 						})
 						expect(await objectOids(fx.db, repo)).toEqual(afterFirst)
 					} finally {
@@ -544,14 +544,14 @@ describe("§4 PBT stress — deep + wide GC differential at scale", () => {
 						await fx.gc.gc(repoHuge, { batchLimit: 1_000_000, graceSeconds: 0 })
 
 						// Same final observable state regardless of batch size: identical survivor
-						// OIDs (the two seeds are byte-identical) AND identical row/edge counts.
+						// OIDs (the two seeds are byte-identical) AND identical row counts.
 						const survivorsSmall = await objectOids(fx.db, repoSmall)
 						expect(survivorsSmall).toEqual(await objectOids(fx.db, repoHuge))
 						expect(await countObjects(fx.db, repoSmall)).toEqual(
 							await countObjects(fx.db, repoHuge),
 						)
-						expect(await countEdges(fx.db, repoSmall)).toEqual(
-							await countEdges(fx.db, repoHuge),
+						expect(await countDerivedRows(fx.db, repoSmall)).toEqual(
+							await countDerivedRows(fx.db, repoHuge),
 						)
 						// And the survivor set is exactly git's reachable closure (anchors invariance
 						// to the correct answer, not merely "both batches did the same wrong thing").

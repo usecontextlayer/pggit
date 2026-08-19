@@ -330,11 +330,15 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			select c.relname, c.reloptions
 			from pg_class c join pg_namespace n on n.oid = c.relnamespace
 			where n.nspname = ${db.schema}
-				and c.relname in ('git_pack_encoding_p0', 'git_object_p0', 'git_edge_p0')`
+				and c.relname in ('git_pack_encoding_p0', 'git_object_p0', 'git_commit_p0')`
 		const byName = new Map(opts.map((o) => [o.relname, new Set(o.reloptions ?? [])]))
 		const enc = byName.get("git_pack_encoding_p0") ?? new Set<string>()
 		const obj = byName.get("git_object_p0") ?? new Set<string>()
 		const missing = [...obj].filter((k) => !enc.has(k))
+		// The 0009 tables cascade-churn on every GC pass too; their leaves carry the
+		// same delete-aware profile (the spine doc's "0005/0008 profile" rule).
+		const commit = byName.get("git_commit_p0") ?? new Set<string>()
+		const missingOnCommit = [...obj].filter((k) => !commit.has(k))
 
 		// The global default the missing key would have overridden — the reason the drift
 		// bites: unset means the reclaim is throttled at the instance's cost_delay.
@@ -347,6 +351,10 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			`reloptions on git_object_p0 but MISSING on git_pack_encoding_p0 (instance autovacuum_vacuum_cost_delay = ${gd?.setting}ms applies where unset); keys only on the encoding leaf: ${
 				[...enc].filter((k) => !obj.has(k)).join(", ") || "(none)"
 			}`,
+		).toEqual([])
+		expect(
+			missingOnCommit,
+			"reloptions on git_object_p0 but MISSING on git_commit_p0 (0009 must carry the delete-aware profile)",
 		).toEqual([])
 	})
 

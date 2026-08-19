@@ -43,8 +43,11 @@ import { spawnGit } from "@/testing/spawn-git"
 
 const RUNS = 400 // ~3.4k objects => several WRITE_BATCH flushes per pass
 /** Flush boundaries to die on. Each is < the pass's flush count at this scale, so
- * every one of them genuinely interrupts. */
-const KILL_AT = [1, 2, 3]
+ * every one of them genuinely interrupts — and each starts at 2, because dying on
+ * flush #1 commits NOTHING (an empty tier is trivially sound and exercises no
+ * partial-state invariant; the I1–I3 `partialRows > 0` guard exists precisely to
+ * keep these kill points meaningful). */
+const KILL_AT = [2, 3, 4]
 
 /** A client whose `begin()` throws on the Nth call — the pass dies with N-1
  * flushes committed, exactly what a killed process or a dropped connection

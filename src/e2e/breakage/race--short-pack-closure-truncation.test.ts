@@ -192,20 +192,25 @@ describe("race — a truncated want-closure serving a short pack", () => {
 			})()
 
 			let fetchErr: unknown
-			await Promise.allSettled([
-				spawnGit(["-c", "protocol.version=2", "fetch", "-q", url, tip], {
-					cwd: dest,
-				}).catch((e) => {
-					fetchErr = e
-				}),
-				sleep(delay).then(() =>
-					gc
-						.gc(repo, { batchLimit: 15, graceSeconds: 0, maintain: false })
-						.catch(() => undefined),
-				),
-			])
+			const fetchP = spawnGit(["-c", "protocol.version=2", "fetch", "-q", url, tip], {
+				cwd: dest,
+			}).catch((e) => {
+				fetchErr = e
+			})
+			const gcP = sleep(delay).then(() =>
+				gc
+					.gc(repo, { batchLimit: 15, graceSeconds: 0, maintain: false })
+					.catch(() => undefined),
+			)
+			// The resurrector races the FETCH's presence checks; it must stop when
+			// the fetch settles, NOT when gc does — a zero-grace sweep can never
+			// drain while the resurrector keeps re-inserting what it just deleted,
+			// so gating `stop` on gc livelocks the iteration (observed: a 36-minute
+			// wedge in the full-suite gate).
+			await fetchP
 			stop = true
 			await resurrect
+			await gcP
 
 			let verdict: Verdict
 			let detail = ""

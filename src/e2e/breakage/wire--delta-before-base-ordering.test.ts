@@ -216,8 +216,10 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 	})
 
 	it("does not emit a MAJORITY of deltas ahead of their base in the pack", () => {
-		// The source probe's guard: a pack with no deltas cannot have the pathology.
-		if (pggitOrder.deltas === 0) return
+		// The fixture is BUILT to produce a deltified pack (repacked lineage) — a
+		// zero-delta serve means the fixture stopped exercising the pathology,
+		// which must fail loudly, never pass vacuously.
+		expect(pggitOrder.deltas).toBeGreaterThan(0)
 		expect(
 			pggitOrder.ahead,
 			`pggit served ${pggitOrder.deltas} deltas in ${pggitOrder.bytes}B of pack; ` +

@@ -1041,7 +1041,7 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 			const gcRes = await gc.gc(name, { graceSeconds: 0 })
 			const res3 = await repack.repack(name)
 			console.log(
-				`shape ${name} — gc: ${gcRes.deletedObjects} objs / ${gcRes.deletedEdges} edges; repack3: ${res3.wholes}+${res3.deltas}`,
+				`shape ${name} — gc: ${gcRes.deletedObjects} objs; repack3: ${res3.wholes}+${res3.deltas}`,
 			)
 			const gcd = join(mk(`${name}-gcd`), "c.git")
 			await spawnGit(["clone", "-q", "--bare", url, gcd])
