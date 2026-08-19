@@ -121,7 +121,16 @@ export async function readPack(
 			count("bytesInflated", data.length)
 			offset += compressedLength
 			// The header size of a delta entry declares the DELTA PROGRAM's
-			// inflated length — a mismatch is corruption index-pack rejects.
+			// inflated length — a mismatch is corruption index-pack rejects, and
+			// git's DELTA_SIZE_MIN (4 bytes) rejects shorter programs outright.
+			// The minimum lives HERE, at the wire boundary: our own encoder may
+			// legally produce a 2-byte program for an empty target internally.
+			if (data.length < 4) {
+				throw new GitFormatError(
+					"delta-too-short",
+					`pack: delta program at ${start} is ${data.length} bytes; git's minimum is 4`,
+				)
+			}
 			if (data.length !== size) {
 				throw new GitFormatError(
 					"size-mismatch",
@@ -135,6 +144,12 @@ export async function readPack(
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
 			count("bytesInflated", data.length)
 			offset += compressedLength
+			if (data.length < 4) {
+				throw new GitFormatError(
+					"delta-too-short",
+					`pack: delta program at ${start} is ${data.length} bytes; git's minimum is 4`,
+				)
+			}
 			if (data.length !== size) {
 				throw new GitFormatError(
 					"size-mismatch",

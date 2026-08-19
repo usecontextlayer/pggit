@@ -298,14 +298,14 @@ export function createGc(pg: Sql) {
 				(t) => stopAt.has(t) || positionOf(epoch.oids, t) === -1,
 			)
 			if (deltaEligible) {
-				const walk = await originClosure(pinned, id, tips, stopAt)
-				if (walk.missing.size > 0) return withheld(walk)
+				const walk = await originClosure(pinned, id, tips, stopAt, "retain")
+				if (walk.missing.size > 0 || walk.violations.size > 0) return withheld(walk)
 				const advanced = buildAdvanced(tips, epoch, walk)
 				if (advanced !== null) return advanced
 			}
 		}
-		const walk = await originClosure(pinned, id, tips, new Set())
-		if (walk.missing.size > 0) return withheld(walk)
+		const walk = await originClosure(pinned, id, tips, new Set(), "retain")
+		if (walk.missing.size > 0 || walk.violations.size > 0) return withheld(walk)
 		const oids = concatSortedOids(walk.masks.keys())
 		const bitmaps = new Map<string, Uint8Array>()
 		for (const [t, positions] of maskPositions(tips, walk, oids)) {
@@ -323,12 +323,14 @@ export function createGc(pg: Sql) {
 		}
 	}
 
-	/** A walk that reported MISSING objects (a ref whose closure is incomplete —
-	 * external corruption or a mid-delete race) must never publish an epoch: a
+	/** A walk that reported MISSING objects or typed-edge VIOLATIONS (a ref
+	 * whose closure is incomplete or malformed) must never publish an epoch: a
 	 * bitmap serve answers with `missing: ∅` by construction, so a partial
-	 * epoch would convert a detectable incomplete closure into a silently short
-	 * pack. The stored epoch is dropped too — its guards cannot vouch for a
-	 * repo in this state. The pass still sweeps with the walked live set. */
+	 * epoch would convert a detectable defect into a silently short pack. The
+	 * stored epoch is dropped too — its guards cannot vouch for a repo in this
+	 * state. The pass still sweeps with the walked live set, which under
+	 * "retain" keeps every EXISTING object any edge names — a malformed edge
+	 * must never make a validly-referenced object sweepable. */
 	function withheld(walk: OriginWalk): { live: readonly string[]; plan: EpochPlan } {
 		return { live: [...walk.masks.keys()], plan: { outcome: "cleared" } }
 	}

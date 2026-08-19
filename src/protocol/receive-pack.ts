@@ -156,6 +156,10 @@ export function encodeReportStatus(
  */
 export function refNameProblem(ref: string): string | null {
 	if (!ref.startsWith("refs/")) return "funny refname (must be under refs/)"
+	// Canonical receive-pack validates the part AFTER "refs/" WITHOUT
+	// ALLOW_ONELEVEL: a bare one-level name ("refs/heads" itself) is funny — and
+	// accepting it would D/F-poison the whole refs/heads/* namespace.
+	if (ref.split("/").length < 3) return "funny refname (one-level name)"
 	if (ref.endsWith("/") || ref.endsWith(".")) return "funny refname"
 	if (ref.includes("..") || ref.includes("@{")) return "funny refname"
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: the control-byte ban IS the rule
@@ -218,29 +222,13 @@ export async function handleReceivePack(
 	// rc3 boundary check: a ref name too long to store, or malformed under git's
 	// check-ref-format rules, is rejected BEFORE ingest — so an all-unstorable
 	// push never ingests a pack (no orphaned objects), and the raw btree error
-	// never escapes as a 500. Directory/file conflicts (git: `refs/heads/a` vs
-	// `refs/heads/a/b`) are checked against the existing refs AND the batch's
-	// own applicable names — the loose-ref-filesystem rule git clients assume.
+	// never escapes as a 500. (Directory/file conflicts are judged LATER, after
+	// every other check — see the sequential-lock-order block below.)
 	const nameProblem = commands.map((c) =>
 		Buffer.byteLength(c.ref, "utf8") > MAX_REF_NAME_BYTES
 			? "funny refname (too long to store)"
 			: refNameProblem(c.ref),
 	)
-	const existingNames = await backend.listRefNames()
-	// Sequential, like git's ref-lock order: a later command clashes against the
-	// existing names PLUS the batch's earlier accepted names — `main` then
-	// `main/sub` applies the first and rejects the second, never both.
-	const acceptedNames: string[] = []
-	for (const [i, c] of commands.entries()) {
-		if (nameProblem[i] !== null) continue
-		const clashes = (other: string): boolean =>
-			other !== c.ref && (other.startsWith(`${c.ref}/`) || c.ref.startsWith(`${other}/`))
-		if (existingNames.some(clashes) || acceptedNames.some(clashes)) {
-			nameProblem[i] = "funny refname (directory/file conflict)"
-		} else {
-			acceptedNames.push(c.ref)
-		}
-	}
 	const anyApplicable =
 		nameProblem.length === 0 || nameProblem.some((problem) => problem === null)
 
@@ -305,6 +293,26 @@ export async function handleReceivePack(
 				: backend.objectType(c.newOid).then((t) => t === "commit"),
 		),
 	)
+	// Directory/file conflicts, judged LAST and in git's sequential lock order:
+	// only a command that passed every other check occupies its name — a
+	// rejected command must not reserve the namespace against a valid later one
+	// (git applies the valid one). The existing side includes SYMREF names:
+	// `refs/remotes/origin/HEAD` blocks `refs/remotes/origin/HEAD/x` exactly
+	// like a value ref would.
+	const existingNames = await backend.listRefNames()
+	const acceptedNames: string[] = []
+	for (const [i, c] of commands.entries()) {
+		const otherwiseEligible =
+			nameProblem[i] === null && connected[i] && validTip[i] && c.newOid !== ZERO_OID
+		if (!otherwiseEligible) continue
+		const clashes = (other: string): boolean =>
+			other !== c.ref && (other.startsWith(`${c.ref}/`) || c.ref.startsWith(`${other}/`))
+		if (existingNames.some(clashes) || acceptedNames.some(clashes)) {
+			nameProblem[i] = "funny refname (directory/file conflict)"
+		} else {
+			acceptedNames.push(c.ref)
+		}
+	}
 	// Per-command disqualification reason (null ⇒ applicable): a too-long name fails
 	// the storage boundary, a disconnected tip fails connectivity, and the
 	// deny-non-FF policy fails deletions + non-fast-forward updates. A

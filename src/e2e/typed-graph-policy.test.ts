@@ -20,6 +20,7 @@ import { createGitApp, createGitDeps, type GitDeps } from "@/index"
 import { computeOid } from "@/object/object"
 import { WantNotFoundError } from "@/protocol/errors"
 import { type GitServer, serveOnPort } from "@/server"
+import { createGc } from "@/store/gc"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -92,6 +93,49 @@ describe("typed-graph policy", () => {
 			{ content: commit, type: "commit" },
 		])
 		expect(await deps.objects.isConnected(REPO, commitOid)).toBe(false)
+	})
+
+	it("a parent whose derived row is MISSING crashes loud — corruption, never a sweepable miss", async () => {
+		// The adversarial review's critical: judged as a typed-edge "missing", a
+		// reachable parent with a broken chunk-1 invariant would be EXCLUDED from
+		// GC's live set and swept — corruption converted into data loss. It must
+		// crash the walk instead, in connectivity AND in the GC pass.
+		const repo = "policy/corrupt"
+		const parent = Buffer.from(
+			`tree ${treeOid}\ncommitter t <t@t> 1700000000 +0000\n\np\n`,
+		)
+		const parentOid = computeOid("commit", parent)
+		const child = Buffer.from(
+			`tree ${treeOid}\nparent ${parentOid}\ncommitter t <t@t> 1700000001 +0000\n\nc\n`,
+		)
+		const childOid = computeOid("commit", child)
+		// Seed the shared tree+blob closure first, then the two commits.
+		const blob = Buffer.from("hello\n")
+		const tree = Buffer.concat([
+			Buffer.from("100644 f.txt\0"),
+			Buffer.from(blobOid, "hex"),
+		])
+		await deps.objects.putPack(repo, [
+			{ content: blob, type: "blob" },
+			{ content: tree, type: "tree" },
+			{ content: parent, type: "commit" },
+			{ content: child, type: "commit" },
+		])
+		await deps.refs.setRef(repo, "refs/heads/main", childOid)
+		// Surgical corruption: the parent's derived row vanishes.
+		await db.sql`delete from git_commit where oid = ${Buffer.from(parentOid, "hex")}`
+
+		await expect(deps.objects.isConnected(repo, childOid)).rejects.toThrow(
+			/no derived row/,
+		)
+		await expect(createGc(db.sql).gc(repo, { graceSeconds: 0 })).rejects.toThrow(
+			/no derived row/,
+		)
+		// And nothing was swept by the failed pass.
+		const [row] = await db.sql<{ n: string }[]>`
+			select count(*)::text as n from git_object
+			where oid = ${Buffer.from(parentOid, "hex")}`
+		expect(row?.n).toBe("1")
 	})
 
 	it("a blob-mode tree entry naming a TREE fails connectivity for its commit", async () => {

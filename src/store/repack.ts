@@ -280,8 +280,12 @@ export function createRepack(pg: Sql) {
 							const delta = encodeDelta(await content(anchor), raw)
 							const deflated = deflateSync(delta)
 							const whole = deflateSync(raw)
-							// git's own rule: keep a delta only when it beats the whole form.
-							if (deflated.length < whole.length) {
+							// git's own rule: keep a delta only when it beats the whole form —
+							// and never one under 4 bytes (DELTA_SIZE_MIN): a stored delta is
+							// served VERBATIM as a REF_DELTA, and git's patch-delta rejects
+							// sub-minimum programs, so an empty-target delta would be
+							// client-fatal on the wire.
+							if (delta.length >= 4 && deflated.length < whole.length) {
 								await emit(treeOid, anchor, delta.length, deflated)
 							} else {
 								await emit(treeOid, null, raw.length, whole)

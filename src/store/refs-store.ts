@@ -304,6 +304,22 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 			return row?.symref_target ?? null
 		},
 
+		/** EVERY ref name in the repo — value refs AND symrefs. The receive
+		 * policy's directory/file check needs the full namespace: a symbolic
+		 * `refs/remotes/origin/HEAD` blocks `refs/remotes/origin/HEAD/x` exactly
+		 * like a value ref would (`listRefs` deliberately hides symrefs — that
+		 * is the ADVERT's contract, not the namespace's). */
+		async listRefNames(repoId: string): Promise<string[]> {
+			const id = await repos.resolveRepoId(repoId)
+			if (id === null) return []
+			const rows = await db
+				.selectFrom("git_ref")
+				.select("name")
+				.where("repo_id", "=", id)
+				.execute()
+			return rows.map((r) => r.name)
+		},
+
 		/** Direct refs (name → oid + peeled tag target), sorted by name. Excludes
 		 * symbolic refs. */
 		async listRefs(repoId: string): Promise<RefRow[]> {

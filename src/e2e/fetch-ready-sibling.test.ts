@@ -11,10 +11,13 @@
  * file:// bare repo with this exact history, same request bytes):
  *     acknowledgments\nACK <f1>\nready\n   + DELIM + packfile (6 objects)
  *
- * REGRESSION HISTORY: pggit's original check walked the WRONG direction (want
- * DESCENDS from a common — `ancestry`), never readied sibling haves, and cost
- * an extra negotiation round per fetch. Fixed 2026-08-19 by `sharesAncestry`
- * (merge-base-exists); this test was the parked expected-RED repro until then.
+ * REGRESSION HISTORY: pggit's original check asked whether the want descends
+ * from a BARE common, so a sibling have never readied and every such fetch
+ * cost an extra round; this file was the parked expected-RED repro. Fixed
+ * 2026-08-19 with git's exact `ok_to_give_up`: each ACKed have marks itself
+ * AND ITS DIRECT PARENTS `THEY_HAVE`, and the want's ancestry must reach that
+ * set — the parent step is precisely what readies the sibling (c1 here) while
+ * a deeper fork keeps negotiating, matching canonical git in both directions.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

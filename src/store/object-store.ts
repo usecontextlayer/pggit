@@ -15,12 +15,7 @@ import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/obje
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, packHeader, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
-import {
-	ancestry,
-	originClosure,
-	routeServeSet,
-	sharesAncestry,
-} from "@/store/reachability"
+import { ancestry, originClosure, routeServeSet } from "@/store/reachability"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */
@@ -270,6 +265,10 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 							const deltaDeflated = delta === null ? null : deflateSync(delta)
 							if (
 								delta !== null &&
+								// git's patch-delta rejects programs under 4 bytes
+								// (DELTA_SIZE_MIN) — an empty-target delta would be
+								// client-fatal, so it ships whole instead.
+								delta.length >= 4 &&
 								deltaDeflated !== null &&
 								warmBase !== undefined &&
 								deltaDeflated.length < wholeDeflated.length
@@ -437,7 +436,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			// boundary's whole history — one round-trip per commit per command,
 			// measured at ~4000 × 3000 sequential queries on a many-branch push of
 			// a deep repo (the fetch-haves probe's 900 s wall).
-			const walk = await originClosure(db, id, [oid], new Set(boundary))
+			const walk = await originClosure(db, id, [oid], new Set(boundary), "reject")
 			return walk.missing.size === 0
 		},
 
@@ -468,15 +467,18 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		},
 
 		/**
-		 * git's `ok_to_give_up`: ready once every want SHARES AN ANCESTOR with the
-		 * common set. An ACKed have marks its whole ancestry common (upload-pack's
-		 * mark_common descends parents), so a SIBLING have — shared base, not on
-		 * the want's own chain — readies exactly like canonical git; the frontier
-		 * then serves want-closure minus have-closure, which is minimal either
-		 * way. The earlier directional check (`ancestry`: want DESCENDS from a
-		 * common) never readied sibling haves and forced an extra negotiation
-		 * round per fetch (neg01). Generation-number pruning is a deferred §6.4
-		 * lever.
+		 * git's `ok_to_give_up`, EXACTLY (upload-pack.c `got_oid` +
+		 * `ok_to_give_up`): each ACKed have marks ITSELF AND ITS DIRECT PARENTS
+		 * `THEY_HAVE`, and readiness asks whether every COMMIT want's own
+		 * ancestry reaches that marked set — a directional walk into
+		 * {haves ∪ parents(haves)}, NOT a merge-base test. The one-step parent
+		 * widening is what readies a SIBLING have (its parent is the shared
+		 * base on the want's chain — neg01) without over-readying a have whose
+		 * fork point lies deeper (git keeps negotiating there, and so do we).
+		 * Non-commit wants are SKIPPED, as git skips them — a blob want must
+		 * not hold negotiation open forever. The earlier directional check
+		 * against the bare common set never readied siblings and cost an extra
+		 * round per fetch.
 		 */
 		async readyToGiveUp(
 			repoId: string,
@@ -486,9 +488,19 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			if (common.length === 0) return false
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
-			const commonBufs = common.map((h) => Buffer.from(h, "hex"))
+			const marked = new Set(common)
+			for (const batch of batches(common, PACK_BATCH)) {
+				const rows = await pg<{ h: string }[]>`
+					select encode(p.h, 'hex') as h
+					from git_commit c, unnest(c.parents) as p(h)
+					where c.repo_id = ${id}::bigint
+						and c.oid in ${pg(batch.map((x) => Buffer.from(x, "hex")))}`
+				for (const r of rows) marked.add(r.h)
+			}
+			const markedBufs = [...marked].map((h) => Buffer.from(h, "hex"))
 			for (const want of wants) {
-				if (!(await sharesAncestry(db, id, want, commonBufs))) return false
+				if ((await store.objectType(repoId, want)) !== "commit") continue
+				if (!(await ancestry(db, id, want, markedBufs))) return false
 			}
 			return true
 		},

@@ -23,6 +23,7 @@ export type GitFormatErrorCode =
 	// delta application
 	| "delta-base-size-mismatch"
 	| "delta-copy-out-of-range"
+	| "delta-too-short"
 	| "delta-insert-truncated"
 	| "delta-reserved-opcode"
 	| "delta-target-size-mismatch"

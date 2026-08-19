@@ -147,7 +147,7 @@ function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 			const tips = (await deps.refs.listRefs(repoId)).map((r) => r.oid)
 			return deps.objects.isConnected(repoId, oid, tips)
 		},
-		listRefNames: async () => (await deps.refs.listRefs(repoId)).map((r) => r.name),
+		listRefNames: () => deps.refs.listRefNames(repoId),
 		objectType: (oid) => deps.objects.objectType(repoId, oid),
 	}
 	if (deps.snapshots) {

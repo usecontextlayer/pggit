@@ -209,6 +209,10 @@ describe("§8.4 codec round-trips (pure)", () => {
 				async (baseBytes, ops, baseType) => {
 					const base = Buffer.from(baseBytes)
 					const { delta, target } = buildDelta(base, ops)
+					// A program under git's DELTA_SIZE_MIN (4 bytes) is not a legal
+					// pack member — canonical index-pack rejects it and so does
+					// readPack; the producers guarantee they never emit one.
+					fc.pre(delta.length >= 4)
 					const baseOid = computeOid(baseType, base)
 
 					// (1) base IN pack → readPack resolves it with no external resolver.

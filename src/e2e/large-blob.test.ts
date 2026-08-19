@@ -56,14 +56,17 @@ describe("a07 — large-blob push over V8 string cap", () => {
 	let objects: ObjectStore
 	let refs: RefStore
 
-	/** A receive-pack POST body that pushes `objects` and creates `refs/heads/<branch>`. */
+	/** A receive-pack POST body that pushes `objects` and creates `refs/tags/<name>` —
+	 * tags legally hold ANY object type (canonical git accepts a blob-tipped tag,
+	 * probed live), so the V8 string-cap subject stays isolated from the
+	 * branch-tips-must-be-commits policy without faking a commit wrapper. */
 	function pushBody(
 		newOid: string,
 		branch: string,
 		objects: { type: "blob" | "commit" | "tag" | "tree"; content: Buffer }[],
 	): Buffer {
 		return Buffer.concat([
-			encodePktLine(Buffer.from(`${ZERO} ${newOid} refs/heads/${branch}\0report-status`)),
+			encodePktLine(Buffer.from(`${ZERO} ${newOid} refs/tags/${branch}\0report-status`)),
 			encodePkt({ type: "flush" }),
 			writePack(objects),
 		])
@@ -103,10 +106,10 @@ describe("a07 — large-blob push over V8 string cap", () => {
 		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
 		// Canonical git: the pack unpacks and the ref is created.
 		expect(report).toContain("unpack ok")
-		expect(report).toContain(`ok refs/heads/${branch}`)
+		expect(report).toContain(`ok refs/tags/${branch}`)
 
 		const stored = (await refs.listRefs("r")).find(
-			(r) => r.name === `refs/heads/${branch}`,
+			(r) => r.name === `refs/tags/${branch}`,
 		)
 		expect(stored?.oid).toBe(blobOid)
 		expect(await objects.hasObject("r", blobOid)).toBe(true)
@@ -145,14 +148,12 @@ describe("blb01 — large blob is write-only (serve over V8 string cap)", () => 
 	const branch = "huge"
 	let blobOid: string
 
-	/** A receive-pack POST body that pushes a single blob and points refs/heads/<branch>
-	 * at it (no snapshot layer wired, so a blob-tipped branch is accepted — this isolates
+	/** A receive-pack POST body that pushes a single blob and points refs/tags/<name>
+	 * at it (a TAG holds any object type in canonical git — this isolates
 	 * the SERVE-side string-cap bug from the non-commit-tip snapshot bug). */
 	function pushBlobBody(blobOid: string, branch: string, content: Buffer): Buffer {
 		return Buffer.concat([
-			encodePktLine(
-				Buffer.from(`${ZERO} ${blobOid} refs/heads/${branch}\0report-status`),
-			),
+			encodePktLine(Buffer.from(`${ZERO} ${blobOid} refs/tags/${branch}\0report-status`)),
 			encodePkt({ type: "flush" }),
 			writePack([{ content, type: "blob" }]),
 		])

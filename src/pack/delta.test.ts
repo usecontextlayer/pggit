@@ -27,6 +27,13 @@ describe("applyDelta", () => {
 		expect(applyDelta(base, delta).equals(base)).toBe(true)
 	})
 
+	it("round-trips a sub-minimum internal program (the wire boundary owns git's DELTA_SIZE_MIN)", () => {
+		// `01 00`: source size 1, target size 0 — our encoder legally produces
+		// this for an empty target and applyDelta must reconstruct it; FOREIGN
+		// packs with sub-minimum programs are rejected in read-pack instead.
+		expect(applyDelta(Buffer.from("x"), Buffer.from([0x01, 0x00])).length).toBe(0)
+	})
+
 	it("throws when a COPY reaches past the base (never synthesizes zeros)", () => {
 		// Buffer.copy would CLAMP the read while outPos advances by the declared
 		// size — a malformed delta canonical index-pack rejects must throw, not
@@ -71,7 +78,8 @@ describe("applyDelta", () => {
 
 	it("throws when the base size disagrees with the delta header", () => {
 		const base = Buffer.from("abc") // 3 bytes
-		const delta = Buffer.from([0x05, 0x01]) // header says source size 5
+		// header says source size 5 (padded to git's 4-byte minimum program)
+		const delta = Buffer.from([0x05, 0x01, 0x00, 0x00])
 		expect(expectGitFormatError(() => applyDelta(base, delta))).toBe(
 			"delta-base-size-mismatch",
 		)
@@ -79,8 +87,9 @@ describe("applyDelta", () => {
 
 	it("throws on the reserved opcode 0x00", () => {
 		const base = Buffer.from("abc") // 3 bytes
-		// header: sourceSize=3, targetSize=5, then the reserved instruction byte 0x00.
-		const delta = Buffer.from([0x03, 0x05, 0x00])
+		// header: sourceSize=3, targetSize=5, then the reserved instruction byte
+		// 0x00 (padded past git's 4-byte minimum so the reserved check is reached).
+		const delta = Buffer.from([0x03, 0x05, 0x00, 0x41])
 		expect(expectGitFormatError(() => applyDelta(base, delta))).toBe(
 			"delta-reserved-opcode",
 		)

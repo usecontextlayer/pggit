@@ -111,20 +111,47 @@ async function loadObjectMeta(
  * treat a subtree as a leaf and silently skip its descendants. */
 type EdgeExpectation = "commit" | "tree" | "blob"
 
-function expectationViolated(want: EdgeExpectation | undefined, type: number): boolean {
-	if (want === undefined) return false
-	if (want === "commit") return true // a real commit resolves via git_commit rows, never here
-	return type !== (want === "tree" ? PACK_OBJ_TYPE.TREE : PACK_OBJ_TYPE.BLOB)
+/** Judge a git_object-probed oid against its edges' expectations (the SET of
+ * expectations its referencing edges made — satisfying ANY is enough, so a
+ * valid directory edge keeps an object alive even when a second, mistyped
+ * edge also names it). Returns:
+ * - "corruption": a COMMIT/TAG type here normally means the derived row is
+ *   MISSING — chunk 1's invariant broken, crash loud, NEVER a sweepable
+ *   "missing" (a healthy commit resolves via its row before this probe).
+ * - "violation": the one exception — when ONLY tree/blob edges named the oid,
+ *   the OBJECT may be healthy and the EDGE malformed; likewise a TREE/BLOB
+ *   type matching none of its expectations ("commit" is never satisfiable
+ *   here).
+ * - "ok" otherwise. */
+function judgeProbedType(
+	expects: ReadonlySet<EdgeExpectation> | undefined,
+	type: number,
+): "ok" | "violation" | "corruption" {
+	if (type === PACK_OBJ_TYPE.COMMIT || type === PACK_OBJ_TYPE.TAG) {
+		return expects !== undefined && expects.size > 0 && !expects.has("commit")
+			? "violation"
+			: "corruption"
+	}
+	if (expects === undefined || expects.size === 0) return "ok"
+	const actual = type === PACK_OBJ_TYPE.TREE ? "tree" : "blob"
+	return expects.has(actual) ? "ok" : "violation"
 }
 
-/** The chunk-1 invariant, judged AFTER expectations: a commit/tag object with
- * no derived row reached through an untyped edge is corruption, never data. */
-function assertDerivedRow(oid: string, type: number): void {
-	if (type === PACK_OBJ_TYPE.COMMIT || type === PACK_OBJ_TYPE.TAG) {
-		throw new Error(
-			`pggit reachability: stored ${objectTypeFromCode(type)} ${oid} has no derived row — the chunk-1 invariant is broken (backfill missed, or a write path skipped derivation)`,
-		)
-	}
+/** A boundary (stop-set) oid's deferred check: the walk never probes a stop
+ * oid, so its edge expectations are verified in one batched type probe at the
+ * end. At a boundary a "commit" expectation IS satisfiable by a commit. */
+function boundarySatisfies(expects: ReadonlySet<EdgeExpectation>, type: number): boolean {
+	if (type === PACK_OBJ_TYPE.COMMIT) return expects.has("commit")
+	if (type === PACK_OBJ_TYPE.TREE) return expects.has("tree")
+	if (type === PACK_OBJ_TYPE.BLOB) return expects.has("blob")
+	return false // a TAG satisfies no edge expectation (edges never declare tags)
+}
+
+/** The chunk-1 corruption crash — loud, never a sweepable "missing". */
+function throwMissingDerivedRow(oid: string, type: number): never {
+	throw new Error(
+		`pggit reachability: stored ${objectTypeFromCode(type)} ${oid} has no derived row — the chunk-1 invariant is broken (backfill missed, or a write path skipped derivation)`,
+	)
 }
 
 /** The router's `git_object` probe: stored type by oid, no invariant judgment
@@ -195,18 +222,27 @@ export async function fullClosure(
 	const present = new Set<string>()
 	const missing = new Set<string>()
 	const visited = new Set<string>(roots)
-	const expected = new Map<string, EdgeExpectation>()
+	const expected = new Map<string, Set<EdgeExpectation>>()
 	let frontier: Frontier = { commits: [], objects: [], unknown: [...new Set(roots)] }
 
+	const expect = (oid: string, kind: EdgeExpectation): void => {
+		const set = expected.get(oid)
+		if (set) set.add(kind)
+		else expected.set(oid, new Set([kind]))
+	}
 	const enqueue = (
 		next: Frontier,
 		bucket: keyof Frontier,
 		oid: string,
-		expect?: EdgeExpectation,
+		kind?: EdgeExpectation,
 	): void => {
+		// Expectations accumulate even for already-visited oids: a second edge
+		// naming the same object can only add ways to SATISFY (any-match), and an
+		// oid probed before a later mistyped edge arrives is simply judged by the
+		// edges seen so far — stricter never unsound (see judgeProbedType).
+		if (kind !== undefined) expect(oid, kind)
 		if (visited.has(oid)) return
 		visited.add(oid)
-		if (expect !== undefined) expected.set(oid, expect)
 		next[bucket].push(oid)
 	}
 
@@ -243,13 +279,15 @@ export async function fullClosure(
 		for (const [oid, m] of metas) {
 			// A typed-edge violation (commit.tree → blob, 40000 entry → blob, a
 			// parent that is no commit) is a MALFORMED GRAPH, judged like an
-			// absent object: connectivity rejects the push, a serve refuses the
-			// want — never an under-walk that silently skips descendants.
-			if (expectationViolated(expected.get(oid), m.type)) {
+			// absent object on this SERVE path: the want is refused — never an
+			// under-walk that silently skips descendants. A commit/tag with no
+			// derived row stays a LOUD crash (corruption, chunk 1).
+			const verdict = judgeProbedType(expected.get(oid), m.type)
+			if (verdict === "corruption") throwMissingDerivedRow(oid, m.type)
+			if (verdict === "violation") {
 				missing.add(oid)
 				continue
 			}
-			assertDerivedRow(oid, m.type)
 			present.add(oid)
 			if (m.type === PACK_OBJ_TYPE.TREE) {
 				if (m.content === null) {
@@ -283,6 +321,11 @@ export type OriginWalk = {
 	masks: Map<string, bigint>
 	hits: Map<string, bigint>
 	missing: Set<string>
+	/** Oids named by a MISTYPED edge (typed-edge policy). Under "reject" they
+	 * are also in `missing`; under "retain" they stay in `masks` — an existing
+	 * object validly reachable must never become sweepable because a second,
+	 * malformed edge also names it — but their presence withholds the epoch. */
+	violations: Set<string>
 }
 
 /**
@@ -300,11 +343,31 @@ export async function originClosure(
 	id: ReposId,
 	origins: string[],
 	stopAt: ReadonlySet<string>,
+	// How a typed-edge violation is judged. "reject" (connectivity): like an
+	// absent object — the push must fail. "retain" (GC): the object stays in
+	// the live masks and expands by its ACTUAL type — an existing object must
+	// never be swept over a malformed EDGE — while the violation still
+	// withholds the epoch (gc.ts).
+	onViolation: "reject" | "retain",
 ): Promise<OriginWalk> {
 	const masks = new Map<string, bigint>()
 	const hits = new Map<string, bigint>()
 	const missing = new Set<string>()
-	const expected = new Map<string, EdgeExpectation>()
+	const violations = new Set<string>()
+	const expected = new Map<string, Set<EdgeExpectation>>()
+	// Expectations on STOP oids: the walk never probes them, so they are
+	// verified in one batched type probe after the walk (path-independence —
+	// a mistyped edge must not escape scrutiny by pointing at a boundary tip).
+	const stopExpected = new Map<string, Set<EdgeExpectation>>()
+	const expect = (
+		map: Map<string, Set<EdgeExpectation>>,
+		oid: string,
+		kind: EdgeExpectation,
+	): void => {
+		const set = map.get(oid)
+		if (set) set.add(kind)
+		else map.set(oid, new Set([kind]))
+	}
 
 	type MaskLevel = {
 		commits: Map<string, bigint>
@@ -323,16 +386,17 @@ export async function originClosure(
 		bucket: keyof MaskLevel,
 		oid: string,
 		bits: bigint,
-		expect?: EdgeExpectation,
+		kind?: EdgeExpectation,
 	): void => {
 		if (stopAt.has(oid)) {
+			if (kind !== undefined) expect(stopExpected, oid, kind)
 			hits.set(oid, (hits.get(oid) ?? 0n) | bits)
 			return
 		}
+		if (kind !== undefined) expect(expected, oid, kind)
 		const have = masks.get(oid) ?? 0n
 		const news = bits & ~have
 		if (news === 0n) return
-		if (expect !== undefined && have === 0n) expected.set(oid, expect)
 		masks.set(oid, have | news)
 		const pending = next[bucket].get(oid) ?? 0n
 		next[bucket].set(oid, pending | news)
@@ -382,15 +446,22 @@ export async function originClosure(
 		)
 		const metas = await loadObjectMeta(db, id, objectProbe.keys())
 		for (const [oid, m] of metas) {
-			// Typed-edge violations are judged like absent objects (see
-			// fullClosure): the graph is malformed, so connectivity must fail
-			// and no epoch may claim the oid.
-			if (expectationViolated(expected.get(oid), m.type)) {
-				missing.add(oid)
-				masks.delete(oid)
-				continue
+			// Typed-edge violations: the graph is malformed. "reject" fails
+			// connectivity like an absent object; "retain" keeps the object live
+			// (a valid edge elsewhere must keep it un-sweepable) and expands it
+			// by its ACTUAL type — either way the violation is recorded and the
+			// epoch withheld. A commit/tag with no derived row stays a LOUD
+			// crash (corruption, chunk 1), never a sweepable "missing".
+			const verdict = judgeProbedType(expected.get(oid), m.type)
+			if (verdict === "corruption") throwMissingDerivedRow(oid, m.type)
+			if (verdict === "violation") {
+				violations.add(oid)
+				if (onViolation === "reject") {
+					missing.add(oid)
+					masks.delete(oid)
+					continue
+				}
 			}
-			assertDerivedRow(oid, m.type)
 			if (m.type === PACK_OBJ_TYPE.TREE) {
 				if (m.content === null) {
 					throw new Error(`pggit reachability: tree ${oid} returned no content`)
@@ -418,7 +489,25 @@ export async function originClosure(
 
 		level = next
 	}
-	return { hits, masks, missing }
+
+	// Deferred boundary checks: a stop oid's edge expectations, verified in one
+	// batched type probe (the walk never expanded these). An absent stop oid is
+	// genuinely missing for the wanting side.
+	if (stopExpected.size > 0) {
+		const types = await loadObjectTypes(db, id, stopExpected.keys())
+		for (const [oid, expects] of stopExpected) {
+			const type = types.get(oid)
+			if (type === undefined) {
+				missing.add(oid)
+				continue
+			}
+			if (!boundarySatisfies(expects, type)) {
+				violations.add(oid)
+				if (onViolation === "reject") missing.add(oid)
+			}
+		}
+	}
+	return { hits, masks, missing, violations }
 }
 
 /** Does `want`'s commit/tag ancestry (`git_commit.parents` + `git_tag` targets)
@@ -448,54 +537,6 @@ export async function ancestry(
 		)
 		select exists (
 			select 1 from anc join (values ${commons}) as c(oid) on c.oid = anc.oid
-		) as reached
-	`.execute(db)
-	return result.rows[0]?.reached ?? false
-}
-
-/** Does `want` share ANY ancestor with the `common` set — i.e. does a merge
- * base exist? This is git's `ok_to_give_up` relation: an ACKed have marks its
- * WHOLE ancestry common (upload-pack's mark_common descends parents), and a
- * want is satisfiable once its own ancestry reaches that common region — so a
- * SIBLING have (shared ancestor, not on the want's chain) readies exactly like
- * canonical git. `ancestry` above is the STRICTER directional relation (want
- * descends from a common) and stays the fast-forward check; the two are
- * different concepts and both earn their names. */
-export async function sharesAncestry(
-	db: Kysely<Database>,
-	id: ReposId,
-	want: string,
-	commonBufs: Buffer[],
-): Promise<boolean> {
-	if (commonBufs.length === 0) return false
-	const commons = sql.join(commonBufs.map((b) => sql`(${b}::bytea)`))
-	const result = await sql<{ reached: boolean }>`
-		with recursive want_anc(oid) as (
-			select ${Buffer.from(want, "hex")}::bytea
-			union
-			select step.oid from want_anc a
-				cross join lateral (
-					select unnest(c.parents) as oid from git_commit c
-						where c.repo_id = ${id}::bigint and c.oid = a.oid
-					union all
-					select t.target_oid from git_tag t
-						where t.repo_id = ${id}::bigint and t.oid = a.oid
-				) as step
-		),
-		have_anc(oid) as (
-			select v.oid from (values ${commons}) as v(oid)
-			union
-			select step.oid from have_anc a
-				cross join lateral (
-					select unnest(c.parents) as oid from git_commit c
-						where c.repo_id = ${id}::bigint and c.oid = a.oid
-					union all
-					select t.target_oid from git_tag t
-						where t.repo_id = ${id}::bigint and t.oid = a.oid
-				) as step
-		)
-		select exists (
-			select 1 from want_anc w join have_anc h on h.oid = w.oid
 		) as reached
 	`.execute(db)
 	return result.rows[0]?.reached ?? false
