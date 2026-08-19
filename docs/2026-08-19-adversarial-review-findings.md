@@ -80,6 +80,25 @@
 | Coverage gap: duplicate/mixed bitmap wants | **RECORDED** — epochServe dedups by construction; raw-wire combos noted. |
 | Coverage gap: router haveful/mixed-type matrix | **RECORDED** — the S4 oracle covers the primary pairs; the full matrix is follow-up. |
 
+## Round 3 — adversarial review OF the round-2 fixes (2026-08-19)
+
+The round-2 diff (the four post-review commits) was itself reviewed by a third codex chunk (raw report: Appendix C). It caught real defects in the fixes — the strongest argument for reviewing reviews. Dispositions:
+
+| finding | disposition |
+|---|---|
+| CRITICAL: typed-edge "commit" expectation converts a missing-derived-row parent into a sweepable object (corruption → data loss) | **FIXED** — `judgeProbedType` distinguishes corruption from violation: a COMMIT/TAG type in the object probe crashes LOUD (chunk-1 invariant) unless ONLY tree/blob edges named the oid (then the EDGE is malformed, the object possibly healthy). GC can never sweep on it — the pass dies first. Repro: the corrupt-parent case in `typed-graph-policy.test.ts` asserts both `isConnected` and `gc()` throw and nothing is swept. |
+| Typed-edge validation is path-dependent (stop-set short-circuit; first-enqueue-wins; GC could sweep a validly-referenced object) | **FIXED** — (a) stop-set oids collect their edge expectations and get one batched deferred type probe after the walk; (b) expectations are SETS satisfied by ANY member, accumulated even for visited oids; (c) `originClosure` gained a violation MODE: "reject" (connectivity — fail like absent) vs "retain" (GC — the object stays in the live masks and expands by ACTUAL type, so a malformed edge can never make a validly-referenced object sweepable), with `violations` reported separately and the epoch withheld on any. Cross-level expectation ordering can still over-REJECT a malformed graph on the serve path — stricter, never unsound; noted in code. |
+| Both optimized serve routes bypass the type policy (frontier blob probe; stale epochs on pre-strictness graphs) | **RECORDED** — the frontier's boundary logic already fails safe on tree-typed reads; a mistyped leaf served to a client fails the CLIENT's index-pack/fsck cleanly. A stale epoch over a corrupt graph persists until any walk runs (which withholds it); corrupt repos are outside the drain-invariance contract. |
+| receive-pack accepts one-level names under refs/ (`refs/heads` itself) | **FIXED** — `refNameProblem` requires a second level below `refs/`, matching canonical `check_refname_format` without ALLOW_ONELEVEL. |
+| D/F rule neither atomic nor complete (concurrent pushes; symrefs invisible) | **PARTIALLY FIXED** — `listRefNames` is now a dedicated refs-store query INCLUDING symrefs. The concurrent-push race folds into the standing deferred per-repo advisory lock (redesign §5.4) — same family as GC-vs-push, recorded there. |
+| A rejected command still reserves its namespace against valid ones | **FIXED** — D/F is judged LAST, in git's sequential lock order, over commands that passed every other check; a rejected command no longer occupies its name. |
+| `sharesAncestry` is not git's ok_to_give_up (over-readies deep forks; non-commit wants block readiness) | **FIXED** — `sharesAncestry` is DELETED. `readyToGiveUp` now implements upload-pack's exact semantics: each ACKed have marks itself AND ITS DIRECT PARENTS `THEY_HAVE`, every COMMIT want's ancestry must reach that set (directional `ancestry`, no second closure), and non-commit wants are skipped as git skips them. This also erased the dual-recursive-CTE cost and the planner-flip exposure the review flagged (one directional CTE remains, the shape already priced). The sibling-ready behavior is preserved (the parent step covers it) and its test header corrected. |
+| Strict delta decoder accepts sub-minimum programs | **FIXED (relocated after the gate caught the first cut)** — the 4-byte minimum belongs at the WIRE boundaries, not inside `applyDelta`: our own encoder legally produces 2-byte programs for empty targets (the encode→apply round-trip properties proved it). Enforced in read-pack (foreign packs) — and the gate exposed the deeper half: BOTH serve paths could ship a client-fatal sub-minimum delta, so the warm-delta emit AND repack's stored tier now fall back to whole forms under 4 bytes. The codec property constrains itself to legal packs. |
+| `sharesAncestry` repeats the deep common walk per want | **FIXED by deletion** (see ok_to_give_up above — the common side is now one parents lookup, batched). |
+| Grace settling re-runs the full GC pipeline 2–3× per push at defaults | **RECORDED** — the re-passes skip the WALK (unchanged tips) but still COPY the live set and sweep; 2–3 bounded repeats per push-then-quiet cycle is the price of never orphaning young garbage. If it bites at scale, the priced improvement is a persisted `next_gc_at` instead of re-eligibility. |
+| (plausible) negotiation CTE plan/spill exposure | **MOOT** — the dual-closure CTE is gone; the remaining directional CTE over `git_commit` is the shape the spine doc priced (PK probes, no anti-join). |
+| (plausible) typed-expectation maps add O(reachable) memory to walks | **RECORDED** — deterministic overhead, unmeasured at production concurrency; the negative sweep runs green with it. |
+
 ## Appendix A — raw code-chunk report
 
 ## Confirmed
@@ -638,4 +657,92 @@ Fix — Remove the error listener when listening succeeds, remove the listening 
 **Missing cases:** Exact tree want with haves; tag→tree and tag→blob; tag haves; ignored tree/blob haves; mixed commit/tree/blob/tag wants; duplicate and multi-want unions.
 
 **Minimal strengthening:** Table-drive the router over those combinations and derive every expected set from canonical Git rather than hand-authored closures.
+
+
+## Appendix C — raw round-3 report (review of the round-2 fixes)
+
+## Confirmed
+
+1. **CONFIRMED — Critical — typed-edge handling can turn a missing derived row into destructive GC.**
+
+   Evidence — [src/store/reachability.ts:116](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:116) says `if (want === "commit") return true`; callers handle that before [src/store/reachability.ts:252](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:252), `assertDerivedRow(...)`. `originClosure` then executes [src/store/reachability.ts:390](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:390), `masks.delete(oid)`, while GC’s error path still uses [src/store/gc.ts:333](/Users/alizain/ContextLayer/pggit/src/store/gc.ts:333), `live: [...walk.masks.keys()]`.
+
+   Scenario — Commit `C` names parent `P`; `P`’s raw commit object exists but its `git_commit` row is missing. `P` falls through to object metadata, is classified as a typed-edge “missing” object before the loud invariant assertion, and is removed from the live mask. After grace, GC can delete reachable `P` and all history below it instead of aborting on corruption.
+
+2. **CONFIRMED — High — typed-edge validation is path-dependent, admitting malformed pushes and potentially deleting valid objects.**
+
+   Evidence — `originClosure` checks [src/store/reachability.ts:328](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:328), `if (stopAt.has(oid))`, and returns before recording or checking the expectation. Receive connectivity supplies all pre-push tips as that stop-set at [src/index.ts:146](/Users/alizain/ContextLayer/pggit/src/index.ts:146). Independently, `fullClosure` returns on [src/store/reachability.ts:207](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:207), `if (visited.has(oid)) return`, before `expected.set`; `originClosure` similarly records an expectation only when [src/store/reachability.ts:335](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:335), `have === 0n`.
+
+   Scenarios —
+
+   - Existing `refs/tags/treetag` points at tree `T`; a new branch commit contains blob-mode entry `100644 f → T`. Connectivity stops at `T`, reports no missing object, and ACKs the branch. A later cold walk detects the mismatch and refuses that accepted tip.
+   - A tree contains `40000 a → T` followed by `100644 b → T`, with `T` actually a tree. The valid first edge records `"tree"` and the invalid blob edge is ignored. Reversing the names records `"blob"` first; GC removes `T` from all masks and can sweep `T` and its descendants despite the valid directory edge.
+
+3. **CONFIRMED — High — both optimized serve routes bypass the new type policy.**
+
+   Evidence — Frontier’s blob probe selects any object without a type predicate at [src/store/reachability.ts:783](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:783), then [src/store/reachability.ts:790](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:790) adds every present OID to `served`. Separately, unchanged tips cause GC to trust the stored epoch verbatim at [src/store/gc.ts:262](/Users/alizain/ContextLayer/pggit/src/store/gc.ts:262), while an exact epoch-tip want returns [src/store/reachability.ts:855](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:855), `missing: new Set()`.
+
+   Scenario — A malformed graph admitted through the preceding bugs, or represented by a pre-7e97b38 epoch, remains serve-authoritative. A haveful fetch treats a tree/commit named by a blob edge as a valid leaf. A no-have exact-tip fetch uses the bitmap without validation. With unchanged tips, subsequent GC never re-walks or invalidates that epoch.
+
+4. **CONFIRMED — High — receive-pack accepts one-level names below `refs/` that canonical Git rejects.**
+
+   Evidence — [src/protocol/receive-pack.ts:158](/Users/alizain/ContextLayer/pggit/src/protocol/receive-pack.ts:158) only requires `ref.startsWith("refs/")`; no second suffix component is required. Branch typing applies only to [src/protocol/receive-pack.ts:303](/Users/alizain/ContextLayer/pggit/src/protocol/receive-pack.ts:303), `refs/heads/`. Canonical receive-pack instead validates `name + 5` without `REFNAME_ALLOW_ONELEVEL` for creates/updates. [Git’s implementation shows that distinction directly.](https://github.com/git/git/blob/master/builtin/receive-pack.c#L1401-L1419)
+
+   Scenario — A hostile client creates `refs/heads` pointing at a blob. Pggit accepts both the name and non-commit tip; the persisted ref then D/F-conflicts with every ordinary `refs/heads/*` branch. Canonical Git rejects the original update as `funny refname`.
+
+5. **CONFIRMED — High — the D/F rule is neither atomic nor complete.**
+
+   Evidence — The namespace snapshot is read at [src/protocol/receive-pack.ts:229](/Users/alizain/ContextLayer/pggit/src/protocol/receive-pack.ts:229), but mutation occurs later at [src/protocol/receive-pack.ts:335](/Users/alizain/ContextLayer/pggit/src/protocol/receive-pack.ts:335). Storage enforces only [src/database/migrations/0001_init.ts:85](/Users/alizain/ContextLayer/pggit/src/database/migrations/0001_init.ts:85), `primary key (repo_id, name)`. Moreover, `listRefNames` uses `listRefs` at [src/index.ts:150](/Users/alizain/ContextLayer/pggit/src/index.ts:150), which explicitly filters out symrefs with [src/store/refs-store.ts:316](/Users/alizain/ContextLayer/pggit/src/store/refs-store.ts:316), `.where("oid", "is not", null)`.
+
+   Scenarios —
+
+   - Concurrent pushes creating `refs/heads/a` and `refs/heads/a/b` both observe an empty namespace and both exact-key inserts succeed.
+   - An existing symbolic `refs/remotes/origin/HEAD` is invisible, allowing a push to persist `refs/remotes/origin/HEAD/x`.
+
+6. **CONFIRMED — Medium — a command that later fails still reserves its namespace against valid commands.**
+
+   Evidence — [src/protocol/receive-pack.ts:233](/Users/alizain/ContextLayer/pggit/src/protocol/receive-pack.ts:233) builds `acceptedNames` using only syntactic validity, and [src/protocol/receive-pack.ts:241](/Users/alizain/ContextLayer/pggit/src/protocol/receive-pack.ts:241) records the name before connectivity, tip-type, fast-forward, or CAS checks.
+
+   Scenario — In a non-atomic push, command 1 creates a blob at `refs/heads/a`; command 2 creates a valid commit at `refs/heads/a/b`. Command 1 later fails as `invalid new value provided`, but it has already caused command 2 to fail D/F validation. Git 2.55’s receive-pack applies command 2 because the rejected first command never occupies the namespace.
+
+7. **CONFIRMED — Medium — `sharesAncestry` is not Git’s `ok_to_give_up` relation.**
+
+   Evidence — [src/store/reachability.ts:473](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:473) and [src/store/reachability.ts:485](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:485) recursively build both complete closures, then accept any intersection at [src/store/reachability.ts:497](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:497). Git marks an acknowledged commit and only its immediate parents `THEY_HAVE`, then checks whether every commit want reaches that marked set; it also skips non-commit wants for this test. [Git upload-pack](https://github.com/git/git/blob/master/upload-pack.c#L486-L531), [reachability implementation](https://github.com/git/git/blob/master/commit-reach.c#L817-L912).
+
+   Scenarios —
+
+   - For `B←W` and `B←H1←H2`, with `want=W` and only `have=H2`, pggit intersects at distant base `B` and emits `ready`; Git does not, because only `H2` and `H1` are marked.
+   - A blob/tree want with an unrelated common commit returns false in pggit, while Git ignores that non-commit want for readiness and emits `ready`.
+
+8. **CONFIRMED — Medium — the strict delta decoder still accepts programs canonical `index-pack` rejects.**
+
+   Evidence — [src/pack/delta.ts:173](/Users/alizain/ContextLayer/pggit/src/pack/delta.ts:173) reads the two sizes and immediately reaches [src/pack/delta.ts:184](/Users/alizain/ContextLayer/pggit/src/pack/delta.ts:184), `while (pos < delta.length)`, without a minimum-length check. The new pack-header equality check therefore accepts a two-byte program when its header also declares two bytes. Git rejects `delta_size < DELTA_SIZE_MIN`, where the minimum is four bytes. [Git patch-delta.c](https://github.com/git/git/blob/master/patch-delta.c#L13-L22).
+
+   Scenario — With one-byte base `"x"`, delta `01 00` declares source length one and zero-length output. Pggit returns an empty object; canonical `index-pack` rejects the delta.
+
+9. **CONFIRMED — Medium — `sharesAncestry` repeats the same deep common walk once per want, serially.**
+
+   Evidence — [src/store/object-store.ts:490](/Users/alizain/ContextLayer/pggit/src/store/object-store.ts:490) loops over wants and [src/store/object-store.ts:491](/Users/alizain/ContextLayer/pggit/src/store/object-store.ts:491) awaits each query. Every invocation reconstructs both `want_anc` and `have_anc` at [src/store/reachability.ts:473](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:473).
+
+   Scenario — One hundred wanted branch tips each fork near the root of a 100,000-commit common lineage. Every result is true, so the identical common closure is rebuilt roughly one hundred times before pack construction. Duplicate valid `want` lines cause the same amplification.
+
+10. **CONFIRMED — Medium — grace settling repeats the full GC pipeline two to three times per ordinary push under shipped defaults.**
+
+   Evidence — Unsettled repositories remain selected by [src/gc-scheduler.ts:74](/Users/alizain/ContextLayer/pggit/src/gc-scheduler.ts:74); settling requires [src/gc-scheduler.ts:108](/Users/alizain/ContextLayer/pggit/src/gc-scheduler.ts:108), `last_pushed_at + make_interval(...) <= t0`. Defaults are 60 seconds grace and 30 seconds cadence at [src/env.ts:21](/Users/alizain/ContextLayer/pggit/src/env.ts:21). Contrary to the claim of “cheap re-passes,” an unchanged epoch still expands all OIDs at [src/store/gc.ts:262](/Users/alizain/ContextLayer/pggit/src/store/gc.ts:262), COPYs them at [src/store/gc.ts:425](/Users/alizain/ContextLayer/pggit/src/store/gc.ts:425), analyzes both tables at [src/store/gc.ts:163](/Users/alizain/ContextLayer/pggit/src/store/gc.ts:163), and runs the sweep at [src/store/gc.ts:178](/Users/alizain/ContextLayer/pggit/src/store/gc.ts:178).
+
+   Scenario — A push just after a tick is fully GC’d at approximately 29 and 59 seconds without settling, then again around 89 seconds. Pushes arriving more frequently than grace keep a large repository permanently eligible, repeating the whole live-set pipeline every tick.
+
+## Plausible
+
+1. **PLAUSIBLE — Medium — the negotiation hot path reintroduces recursive-CTE plan and spill exposure.**
+
+   Evidence — [src/store/reachability.ts:152](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:152) says the old recursive CTE fragility is deleted and “structurally unexpressible,” but [src/store/reachability.ts:473](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:473) introduces two recursive `UNION` worktables plus a join. Repository history records the previous CTE plan flip taking over 1,800 seconds at [docs/2026-08-17-derived-state-spine-design.md:3](/Users/alizain/ContextLayer/pggit/docs/2026-08-17-derived-state-spine-design.md:3).
+
+   Scenario — Large, near-root intersections materialize deep worktables per want and per stateless round; limited `work_mem` can spill them, and a join-plan change can magnify the already-confirmed repeated work. Primary-key commit/tag probes make this safer than the deleted `git_edge` query, so the actual planner failure remains plausible rather than confirmed.
+
+2. **PLAUSIBLE — Low — typed expectations add another retained O(reachable objects) hash map to both hot walks.**
+
+   Evidence — `fullClosure` creates `expected` beside `visited` at [src/store/reachability.ts:197](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:197), while `originClosure` creates it beside `masks` at [src/store/reachability.ts:304](/Users/alizain/ContextLayer/pggit/src/store/reachability.ts:304). Entries are retained until the walk completes.
+
+   Scenario — Million-object cold clones or GC passes retain nearly one additional map entry per non-root object, adding tens of MiB plus hashing/collection work per concurrent walk. The allocation is deterministic; whether it causes material latency or OOM at production concurrency is not yet measured.
 
