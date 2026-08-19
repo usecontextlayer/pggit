@@ -63,7 +63,10 @@
 	"pnpm": {
 		"onlyBuiltDependencies": [
 			"esbuild"
-		]
+		],
+		"patchedDependencies": {
+			"postgres": "patches/postgres.patch"
+		}
 	},
 	"publishConfig": {
 		"access": "public"

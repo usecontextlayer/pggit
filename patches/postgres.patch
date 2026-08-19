@@ -1,0 +1,98 @@
+diff --git a/cjs/src/connection.js b/cjs/src/connection.js
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..4a82856f5c2fb1f1c38ce940ba7e5d374caf264e 100644
+--- a/cjs/src/connection.js
++++ b/cjs/src/connection.js
+@@ -252,6 +252,18 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function nextWrite(fn) {
++    // The connection can die (close() nulls the socket) with this write still
++    // queued behind a setImmediate — e.g. a transaction's ROLLBACK after the
++    // backend was terminated. The death path has already errored the query; a
++    // deferred write must fail LOUDLY, not throw an uncatchable TypeError that
++    // kills the host process — and never report success (a bare fn() would tell
++    // a copy stream its chunk flushed into a dead socket, hanging it forever).
++    if (socket === null) {
++      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++      chunk = nextWriteTimer = null
++      fn && fn(Errors.connection('CONNECTION_CLOSED', options, socket))
++      return false
++    }
+     const x = socket.write(chunk, fn)
+     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+     chunk = nextWriteTimer = null
+@@ -389,6 +401,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+ 
+   function errored(err) {
+     stream && (stream.destroy(err), stream = null)
++    // A copy stream that already end()ed parked its callback in `final`, waiting
++    // for CommandComplete/ReadyForQuery — which a dying connection never sends.
++    // The copy query's promise resolved (with the stream) long ago, so settling
++    // `final` here is the ONLY path that can surface a connection death to the
++    // copy's consumer instead of hanging it forever.
++    final && (final(err), final = null)
+     query && queryError(query, err)
+     initial && (queryError(initial, err), initial = null)
+   }
+@@ -813,6 +831,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (query) {
+       (query.cursorFn || query.describeFirst) && write(Sync)
+       errorResponse = Errors.postgres(parseError(x))
++      // An errored COPY never gets a CommandComplete, so an in-flight copy stream
++      // (or its already-stored final callback) would otherwise wait forever: the
++      // query promise was already resolved with the stream, so nothing else can
++      // surface this error to the stream's consumer.
++      stream && (stream.destroy(errorResponse), stream = null)
++      final && (final(errorResponse), final = null)
+     } else {
+       errored(Errors.postgres(parseError(x)))
+     }
+diff --git a/src/connection.js b/src/connection.js
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..c8951c01ff707c5cbc73768624befc52c60fbe85 100644
+--- a/src/connection.js
++++ b/src/connection.js
+@@ -252,6 +252,18 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function nextWrite(fn) {
++    // The connection can die (close() nulls the socket) with this write still
++    // queued behind a setImmediate — e.g. a transaction's ROLLBACK after the
++    // backend was terminated. The death path has already errored the query; a
++    // deferred write must fail LOUDLY, not throw an uncatchable TypeError that
++    // kills the host process — and never report success (a bare fn() would tell
++    // a copy stream its chunk flushed into a dead socket, hanging it forever).
++    if (socket === null) {
++      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++      chunk = nextWriteTimer = null
++      fn && fn(Errors.connection('CONNECTION_CLOSED', options, socket))
++      return false
++    }
+     const x = socket.write(chunk, fn)
+     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+     chunk = nextWriteTimer = null
+@@ -389,6 +401,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+ 
+   function errored(err) {
+     stream && (stream.destroy(err), stream = null)
++    // A copy stream that already end()ed parked its callback in `final`, waiting
++    // for CommandComplete/ReadyForQuery — which a dying connection never sends.
++    // The copy query's promise resolved (with the stream) long ago, so settling
++    // `final` here is the ONLY path that can surface a connection death to the
++    // copy's consumer instead of hanging it forever.
++    final && (final(err), final = null)
+     query && queryError(query, err)
+     initial && (queryError(initial, err), initial = null)
+   }
+@@ -813,6 +831,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (query) {
+       (query.cursorFn || query.describeFirst) && write(Sync)
+       errorResponse = Errors.postgres(parseError(x))
++      // An errored COPY never gets a CommandComplete, so an in-flight copy stream
++      // (or its already-stored final callback) would otherwise wait forever: the
++      // query promise was already resolved with the stream, so nothing else can
++      // surface this error to the stream's consumer.
++      stream && (stream.destroy(errorResponse), stream = null)
++      final && (final(errorResponse), final = null)
+     } else {
+       errored(Errors.postgres(parseError(x)))
+     }

@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  postgres:
+    hash: 3c6ad14249311b1009d0b5dc63a6223155b601ddf5a35abede25e8e10d200935
+    path: patches/postgres.patch
+
 importers:
 
   .:
@@ -19,10 +24,10 @@ importers:
         version: 0.29.2
       kysely-postgres-js:
         specifier: ^3.0.0
-        version: 3.0.0(kysely@0.29.2)(postgres@3.4.9)
+        version: 3.0.0(kysely@0.29.2)(postgres@3.4.9(patch_hash=3c6ad14249311b1009d0b5dc63a6223155b601ddf5a35abede25e8e10d200935))
       postgres:
         specifier: ^3.4.9
-        version: 3.4.9
+        version: 3.4.9(patch_hash=3c6ad14249311b1009d0b5dc63a6223155b601ddf5a35abede25e8e10d200935)
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -4717,11 +4722,11 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  kysely-postgres-js@3.0.0(kysely@0.29.2)(postgres@3.4.9):
+  kysely-postgres-js@3.0.0(kysely@0.29.2)(postgres@3.4.9(patch_hash=3c6ad14249311b1009d0b5dc63a6223155b601ddf5a35abede25e8e10d200935)):
     dependencies:
       kysely: 0.29.2
     optionalDependencies:
-      postgres: 3.4.9
+      postgres: 3.4.9(patch_hash=3c6ad14249311b1009d0b5dc63a6223155b601ddf5a35abede25e8e10d200935)
 
   kysely@0.29.2: {}
 
@@ -5143,7 +5148,7 @@ snapshots:
     dependencies:
       xtend: 4.0.2
 
-  postgres@3.4.9: {}
+  postgres@3.4.9(patch_hash=3c6ad14249311b1009d0b5dc63a6223155b601ddf5a35abede25e8e10d200935): {}
 
   pprof-format@2.2.2: {}
 
