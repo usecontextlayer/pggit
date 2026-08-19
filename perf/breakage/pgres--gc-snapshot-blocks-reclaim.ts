@@ -292,7 +292,7 @@ async function main(): Promise<void> {
 				["stage", "git_pack_encoding dead tuples", "git_object dead tuples"],
 				[
 					[
-						`after gc (deleted ${g.deletedEncodings} encodings / ${g.deletedObjects} objects)`,
+						`after gc (deleted ${g.deletedObjects} objects; encodings went with them by cascade)`,
 						"—",
 						"—",
 					],

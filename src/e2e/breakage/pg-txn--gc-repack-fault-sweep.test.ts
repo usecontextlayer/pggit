@@ -7,8 +7,9 @@
  * ever WRONG (rather than merely behind), and whether one more gc+repack+clone
  * always returns it to correct.
  *
- * GC is: a REPEATABLE READ live-set snapshot on a pinned connection, then three
- * independently-committed batched sweeps — objects, then edges, then encodings.
+ * GC is: a REPEATABLE READ live-set snapshot on a pinned connection, then two
+ * independently-committed batched sweeps — objects (whose DELETEs also take the
+ * derived encoding rows with them via the 0008 FK cascades), then edges.
  * Repack is: reads spread over many statements with NO shared snapshot, then
  * batched COPY inserts each in their own transaction. Neither pass is atomic, so
  * every batch boundary is a crash point.
@@ -210,11 +211,13 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 		const mid = commits[Math.floor(commits.length / 2)]
 		if (!tip || !mid) throw new Error("fixture too short to orphan")
 
+		// No encoding-sweep kill point: since the 0008 FK cascades, GC issues no
+		// statement touching git_pack_encoding to be killed inside — its rows die
+		// atomically within the object sweep's own DELETEs.
 		const cases: FaultCase[] = [
 			...TIMEOUTS.map((t) => ({ label: `statement_timeout=${t}ms`, timeout: t })),
 			{ kill: "delete from git_object", label: "kill during the OBJECT sweep" },
 			{ kill: "delete from git_edge", label: "kill during the EDGE sweep" },
-			{ kill: "delete from git_pack_encoding", label: "kill during the ENCODING sweep" },
 		]
 
 		for (const [i, c] of cases.entries()) {
@@ -340,7 +343,7 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 	})
 
 	it("swept every fault point", () => {
-		expect(results.map((r) => r.label)).toHaveLength(TIMEOUTS.length + 3)
+		expect(results.map((r) => r.label)).toHaveLength(TIMEOUTS.length + 2)
 	})
 
 	it("never leaves a delta-of-a-delta encoding (design says depth ≤ 1)", () => {
@@ -362,9 +365,7 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 	it("gc converges — a third pass reclaims nothing", () => {
 		expect(
 			results
-				.filter(
-					(r) => r.gc3.deletedObjects + r.gc3.deletedEdges + r.gc3.deletedEncodings !== 0,
-				)
+				.filter((r) => r.gc3.deletedObjects + r.gc3.deletedEdges !== 0)
 				.map((r) => `${r.label}: ${JSON.stringify(r.gc3)}`),
 		).toEqual([])
 	})

@@ -7,7 +7,11 @@
  * codebase are named by that id, or by a bare relation name, and are resolved
  * through `search_path` rather than being schema-qualified in the SQL:
  *
- *   gc.ts        `create unlogged table gc_live_${id}`   (id-named, unqualified)
+ *   gc.ts        `create temp table gc_live`             (TEMP since D12; resolves
+ *                via pg_temp ahead of the schema — session-private BY DESIGN, so
+ *                the cross-schema question this test asks is now answered
+ *                structurally for the live set; the probe still earns its keep
+ *                on the remaining unqualified names below)
  *   gc.ts        `vacuum (analyze) git_object`, `reindex index git_edge_walk`
  *   copy-insert  `create temp table copy_stg_${target}`  (target-named)
  *

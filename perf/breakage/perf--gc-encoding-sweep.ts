@@ -1,15 +1,16 @@
 /**
- * PROBE: what does the encoding sweep add to EVERY gc pass, including the passes
- * with nothing to reclaim?
+ * PROBE: what does the encoding tier's PRESENCE add to a zero-garbage gc pass?
  *
- * `gc()` gained `sweepEncodings` (design D7 / concern C2): a delete-with-anti-join
- * over `git_pack_encoding`, looped until it deletes nothing. On a zero-garbage
- * repo — the normal steady-state case for a self-scheduling drain — that loop
- * still runs, and its victim scan touches every encoding row.
+ * HISTORY (2026-08-16): this originally priced `sweepEncodings` (concern C2), a
+ * delete-with-anti-join whose victim scan touched every encoding row on every
+ * pass. D14 deleted that sweep — the 0008 FK cascades do the tier's bookkeeping
+ * inside the object DELETEs — so the measured difference should now be ~zero,
+ * and this probe survives as the REGRESSION GUARD for that: the bound firing
+ * again means per-pass tier work crept back into `gc()`.
  *
  * Isolated black-box: the SAME repo, the SAME reachable graph, gc'd before the
  * encoding tier exists and again after a full repack. The difference is the
- * sweep's standing cost.
+ * tier's standing cost on a pass.
  *
  *   npx tsx perf/breakage/perf--gc-encoding-sweep.ts [--sizes=250,500,1000,2000]
  */
@@ -113,7 +114,7 @@ async function main(): Promise<void> {
 
 	const worst = Math.max(...rows.map((r) => (r.post - r.pre) / r.pre))
 	console.log(
-		`\nFAIL CONDITION: the encoding sweep adds > ${(OVERHEAD_LIMIT * 100).toFixed(0)}% to a zero-garbage gc pass.`,
+		`\nFAIL CONDITION: the tier's presence adds > ${(OVERHEAD_LIMIT * 100).toFixed(0)}% to a zero-garbage gc pass (regression guard — the sweep itself is gone, D14).`,
 	)
 	console.log(`observed worst: ${(worst * 100).toFixed(0)}%`)
 	if (worst > OVERHEAD_LIMIT) process.exitCode = 1

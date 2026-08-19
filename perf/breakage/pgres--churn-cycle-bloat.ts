@@ -119,7 +119,6 @@ type Row = {
 	schemaTotal: number
 	gitDirBytes: number
 	gcObjects: number
-	gcEncodings: number
 	repackWholes: number
 	repackDeltas: number
 	xminLagS: number
@@ -238,7 +237,6 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 				encRows: census.rows,
 				encToast: e.toast,
 				encVac: e.vac,
-				gcEncodings: g.deletedEncodings,
 				gcObjects: g.deletedObjects,
 				gitDirBytes: dirBytes(join(dir, ".git")),
 				ms: Date.now() - t0,
@@ -348,7 +346,7 @@ function report(res: ModeResult): void {
 				"obj av/v",
 				"schema MB",
 				".git MB",
-				"gc obj/enc",
+				"gc objects",
 				"xmin lag s",
 				"ms",
 			],
@@ -367,7 +365,7 @@ function report(res: ModeResult): void {
 				`${r.objAutovac}/${r.objVac}`,
 				mb(r.schemaTotal),
 				mb(r.gitDirBytes),
-				`${r.gcObjects}/${r.gcEncodings}`,
+				r.gcObjects,
 				r.xminLagS,
 				r.ms,
 			]),
@@ -460,7 +458,7 @@ async function main(): Promise<void> {
 		),
 	)
 	console.log(
-		"\n`gc.ts maintain()` runs `vacuum (analyze) git_object` and `vacuum (analyze) git_edge`. It never names git_pack_encoding, and its gate (`deletedObjects + deletedEdges > 0`) does not count deletedEncodings — so a pass that reclaimed ONLY encodings runs no maintenance at all.",
+		"\n`gc.ts maintain()` runs `vacuum (analyze) git_object` and `vacuum (analyze) git_edge`. It never names git_pack_encoding: since 0008 the encoding rows die by FK cascade inside the object DELETEs, and their dead tuples are left to autovacuum (0008 sets aggressive per-partition reloptions for exactly this).",
 	)
 
 	console.log("\n## verdict\n")

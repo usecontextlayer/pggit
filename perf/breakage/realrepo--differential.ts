@@ -673,9 +673,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 
 			// (f) GC over the repacked state, then re-clone — the tier's hygiene (D7)
 			const g = await createGc(db.sql).gc(repoId, { graceSeconds: 0 })
-			console.log(
-				`  gc: ${g.deletedObjects} objects, ${g.deletedEdges} edges, ${g.deletedEncodings} encodings`,
-			)
+			console.log(`  gc: ${g.deletedObjects} objects, ${g.deletedEdges} edges`)
 			const afterGcDir = join(scratch.mk("aftergc"), "c.git")
 			const ag = await tryGit([
 				"-c",
@@ -696,7 +694,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 					refDir,
 				)
 				summary.push(
-					`| shapes | clone after gc | ${c.objects} objs ${c.equal ? "IDENTICAL" : "DIVERGED"} (gc reclaimed ${g.deletedObjects} objs / ${g.deletedEncodings} encodings) |`,
+					`| shapes | clone after gc | ${c.objects} objs ${c.equal ? "IDENTICAL" : "DIVERGED"} (gc reclaimed ${g.deletedObjects} objs) |`,
 				)
 			}
 			// repack again after gc, re-clone
@@ -823,16 +821,14 @@ async function phaseOrphan(db: IsolatedDb): Promise<void> {
 		)
 		const okBefore = await check("clone with orphans present (must not leak)")
 
-		// 2. GC reclaims them — and must take their encodings with them.
+		// 2. GC reclaims them — the FK cascades take their encodings inside the same DELETE.
 		const g = await createGc(db.sql).gc(repoId, { graceSeconds: 0 })
-		console.log(
-			`  gc: ${g.deletedObjects} objects, ${g.deletedEdges} edges, ${g.deletedEncodings} encodings reclaimed`,
-		)
+		console.log(`  gc: ${g.deletedObjects} objects, ${g.deletedEdges} edges reclaimed`)
 		if (g.deletedObjects === 0) {
 			fail(
 				"orphan",
 				"gc reclaimed NOTHING after a denied push ingested objects",
-				`deleted ${g.deletedObjects} objects / ${g.deletedEncodings} encodings`,
+				`deleted ${g.deletedObjects} objects`,
 			)
 		}
 		const okAfterGc = await check("clone after gc")
@@ -849,7 +845,7 @@ async function phaseOrphan(db: IsolatedDb): Promise<void> {
 			`| orphan | clone with orphans | ${okBefore ? "IDENTICAL to git" : "DIVERGED"} |`,
 		)
 		summary.push(
-			`| orphan | gc reclaimed | ${g.deletedObjects} objects / ${g.deletedEncodings} encodings |`,
+			`| orphan | gc reclaimed | ${g.deletedObjects} objects / ${g.deletedEdges} edges |`,
 		)
 		summary.push(
 			`| orphan | clone after gc | ${okAfterGc ? "IDENTICAL to git" : "DIVERGED"} |`,

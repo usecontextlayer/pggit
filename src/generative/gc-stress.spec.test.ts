@@ -495,7 +495,6 @@ describe("§4 PBT stress — deep + wide GC differential at scale", () => {
 						const second = await fx.gc.gc(repo, { graceSeconds: 0 })
 						expect(second).toEqual({
 							deletedEdges: 0,
-							deletedEncodings: 0,
 							deletedObjects: 0,
 						})
 						expect(await objectOids(fx.db, repo)).toEqual(afterFirst)

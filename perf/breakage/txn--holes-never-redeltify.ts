@@ -9,12 +9,13 @@
  *     ...
  *     for (const entry of treeEntries(raw)) ... encodeTreePair(entry.oid, prior)
  *
- * A tree that already has a row terminates the walk at that node. So when GC's
- * encoding sweep removes a SUBTREE's row (its anchor was reclaimed) but leaves the
- * ROOT tree's row alone — which is exactly what sweepEncodings does, since the two
+ * A tree that already has a row terminates the walk at that node. So when GC
+ * holes a SUBTREE's row (its anchor was reclaimed, and the 0008 base-oid cascade
+ * takes every delta anchored on it) while the ROOT tree's row survives — the two
  * lineages have different anchors — the next repack cannot reach that subtree
- * through the walk at all. It falls to the phase-2 sweep and ships WHOLE, forever
- * (design D4: rows are never rewritten).
+ * through the walk at all. Without D15's repair mode it falls to the phase-2
+ * sweep and ships WHOLE, forever (design D4: rows are never rewritten); with it,
+ * the walk descends through covered trees and re-deltas the hole.
  *
  * This deletes rows for the big growing tree's lineage the way the sweep would,
  * then measures what the next pass does with them.
@@ -111,7 +112,7 @@ async function main(): Promise<void> {
 			`${lineage.length} versions of ${RUNS_DIR} selected; ${holed.deltas} of them are currently deltas\n`,
 		)
 
-		// What sweepEncodings does to a hole: remove the rows, leave the objects.
+		// What the base-oid cascade does to a hole: remove the rows, leave the objects.
 		const gone = await db.sql`
 			delete from git_pack_encoding where oid in ${db.sql(bufs)} returning 1`
 		console.log(

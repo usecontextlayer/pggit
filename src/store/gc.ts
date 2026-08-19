@@ -1,10 +1,10 @@
 import type { Kysely } from "kysely"
 import type { ReservedSql, Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
-import { copyInsert } from "@/database/copy-insert"
+import { copyInto } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
 import { reachableClosure } from "@/store/reachability"
-import { createRepoResolver } from "@/store/repo-resolver"
+import { lookupRepoId } from "@/store/repo-resolver"
 
 /**
  * Per-repo reachability GC — the one piece of the Postgres-native redesign (§7)
@@ -14,18 +14,22 @@ import { createRepoResolver } from "@/store/repo-resolver"
  * redesign.md`.
  *
  * The mechanism (data-structures-first): materialize the LIVE set — the reachable
- * closure from every ref tip — into an UNLOGGED table, then sweep `git_object` in
- * batched short transactions with a server-side anti-join (`NOT EXISTS`) against
- * that table plus a `created_at` grace cutoff. Reachability itself is NOT re-derived
- * here: it is exactly `reachableClosure(omitBlobs=false)`, the one engine clone /
- * fetch / connectivity already share, so GC can never disagree with them about what
- * is reachable.
+ * closure from every ref tip — into a TEMP table on ONE reserved connection, then
+ * sweep `git_object` on that same connection in batched short transactions with a
+ * server-side anti-join (`NOT EXISTS`) against that table plus a `created_at`
+ * grace cutoff. Reachability itself is NOT re-derived here: it is exactly
+ * `reachableClosure(omitBlobs=false)`, the one engine clone / fetch / connectivity
+ * already share, so GC can never disagree with them about what is reachable.
  */
 
 /** Tunables for one GC pass. `graceSeconds` is REQUIRED — no silent default: an
  * object is reclaimed iff it is unreachable from every ref AND its `created_at`
  * is older than `graceSeconds` (0 ⇒ reclaim all unreachable; a huge value ⇒
- * retain). `batchLimit` caps the per-batch DELETE size (sweep tuning only — it
+ * retain). Grace is the ONLY in-flight defense (design D13, git's
+ * `gc.pruneExpire`): at 0, a pass racing a live push can reclaim the push's
+ * just-ingested objects and the client's ACKED push becomes unfetchable —
+ * exactly git's documented `--prune=now` hazard. 0 is an operator/test setting;
+ * production drains keep a real grace. `batchLimit` caps the per-batch DELETE size (sweep tuning only — it
  * never changes the final observable state). `maintain` (default true) runs the
  * post-sweep VACUUM/REINDEX; the self-scheduling drain passes `false` so a
  * frequent per-repo pass never triggers a full-table VACUUM on the hot cadence
@@ -43,12 +47,13 @@ export type GcOptions = { graceSeconds: number; batchLimit?: number; maintain?: 
 type GcHooks = { afterLiveSet?: () => Promise<void> }
 type InternalGcOptions = GcOptions & { _hooks?: GcHooks }
 
-/** What one GC pass reclaimed: the deleted `git_object` / `git_edge` /
- * `git_pack_encoding` row counts. */
+/** What one GC pass reclaimed: the deleted `git_object` / `git_edge` row counts.
+ * Derived `git_pack_encoding` rows are not counted: they follow the inventory by
+ * FK `ON DELETE CASCADE` (0008), dying inside the object sweep's own DELETEs
+ * rather than in a pass of their own. */
 export type GcResult = {
 	deletedObjects: number
 	deletedEdges: number
-	deletedEncodings: number
 }
 
 export type Gc = ReturnType<typeof createGc>
@@ -57,6 +62,11 @@ export type Gc = ReturnType<typeof createGc>
  * sweep a typical force-commit orphan set in one or two batches, small enough to
  * bound the dead-tuple burst and lock duration per transaction (§7). */
 const DEFAULT_BATCH_LIMIT = 10_000
+
+/** The per-pass live-set staging table. TEMP, so the fixed name is safe: it is
+ * created in the pass's own session (`pg_temp` resolves ahead of the schema's
+ * tables), invisible to every other connection, and dies with its own. */
+const LIVE_TABLE = "gc_live"
 
 /** OIDs loaded per COPY round-trip into the live table (the live set can be the whole
  * reachable tree, so it streams in bounded batches, never one giant payload). */
@@ -69,13 +79,14 @@ const LIVE_LOAD_BATCH = 10_000
  */
 export function createGc(pg: Sql) {
 	const db = initKysely<Database>(pg)
-	const repos = createRepoResolver(db)
 
 	return {
 		async gc(repo: string, opts: InternalGcOptions): Promise<GcResult> {
-			// 1. Resolve the repo. A name never written has nothing to reclaim.
-			const id = await repos.resolveRepoId(repo)
-			if (id === null) return { deletedEdges: 0, deletedEncodings: 0, deletedObjects: 0 }
+			// 1. Resolve the repo. A name never written has nothing to reclaim. Resolved
+			// fresh every pass — a long-lived Gc outlives repo delete/re-create cycles
+			// (lookupRepoId).
+			const id = await lookupRepoId(db, repo)
+			if (id === null) return { deletedEdges: 0, deletedObjects: 0 }
 
 			const batchLimit = opts.batchLimit ?? DEFAULT_BATCH_LIMIT
 
@@ -93,24 +104,23 @@ export function createGc(pg: Sql) {
 			// read for full §5 mutual exclusion — DO NOT add a key here that the write path
 			// does not also hold, or the lock would guard nothing.
 			//
-			// The live OIDs land in a per-repo UNLOGGED table (named by repo id, so two
-			// DIFFERENT repos' GC passes never collide) — server-side so the sweep's
-			// anti-join scales to a ~30k-orphan repo without pulling the orphan set through
-			// JS. SINGLE-INSTANCE ONLY: two pggit processes GC'ing the SAME repo would share
-			// this id-named table — B's `truncate`/`drop` could wipe A's live set mid-sweep,
-			// and A's anti-join would then match (and delete) the whole reachable set. So the
-			// deferred multi-instance advisory lock (redesign §5.4; scheduler design §8) MUST
-			// wrap the ENTIRE pass (create→load→sweep→drop) AND the staging table be
-			// instance-scoped, before a second instance is ever run.
-			const live = `gc_live_${id}`
-			await pg.unsafe(
-				`create unlogged table if not exists ${live} (oid bytea primary key)`,
-			)
+			// The live OIDs land in a TEMP table on this pass's one reserved connection —
+			// server-side, so the sweep's anti-join scales to a ~30k-orphan repo without
+			// pulling the orphan set through JS, and session-private, so two passes (same
+			// repo or not, this instance or another) can NEVER see or clobber each
+			// other's live set: `pg_temp` resolves ahead of the schema, and the table
+			// dies with its connection. A crashed pass's leftover is healed by the next
+			// pass's drop-if-exists on that pooled connection. The deferred advisory
+			// lock (redesign §5.4; scheduler design §8) is still wanted before a second
+			// INSTANCE ever runs — for the write-path interlock and to avoid duplicated
+			// sweep work — but staging-state correctness no longer depends on it.
+			const conn = await pg.reserve()
 			try {
-				await pg.unsafe(`truncate ${live}`)
+				await conn.unsafe(`drop table if exists ${LIVE_TABLE}`)
+				await conn.unsafe(`create temp table ${LIVE_TABLE} (oid bytea primary key)`)
 
-				const roots = await liveSet(id)
-				await loadLive(live, roots)
+				const roots = await liveSet(conn, id)
+				await loadLive(conn, roots)
 
 				// TEST SEAM (§5 in-flight safety): interpose a concurrent push here, between
 				// the live-set materialization and the object sweep.
@@ -119,21 +129,17 @@ export function createGc(pg: Sql) {
 				// 4. SWEEP objects: batched DELETE, each batch its own short transaction,
 				// anti-join `NOT EXISTS` against the live set, `created_at` past the grace
 				// cutoff. `clock_timestamp()` (not `now()`) so the cutoff advances per batch.
-				const deletedObjects = await sweepObjects(id, live, opts.graceSeconds, batchLimit)
+				// Each DELETE also takes the reclaimed objects' derived `git_pack_encoding`
+				// rows — and every delta anchored on them — via the 0008 FK cascades: the
+				// tier can never be torn from the inventory, mid-pass or mid-crash, and
+				// needs no sweep of its own (design D7, expressed as DDL).
+				const deletedObjects = await sweepObjects(conn, id, opts.graceSeconds, batchLimit)
 
 				// 5. SWEEP edges: drop every edge whose PARENT object no longer survives —
 				// run AFTER the object sweep, so a grace-retained object keeps its edges and a
 				// surviving (reachable) parent's edges (which point only at reachable children)
 				// never dangle.
-				const deletedEdges = await sweepEdges(id, batchLimit)
-
-				// 5b. SWEEP the derived encoding tier (delta-pack design D7): a reclaimed
-				// object's encoding goes with it, and so does any DELTA encoding whose base
-				// this pass removed — a force push can orphan an ANCHOR while a delta
-				// against it stays reachable. The affected object then serves via the raw
-				// path until the next repack pass re-encodes it whole; after this sweep, no
-				// encoding row references a nonexistent object.
-				const deletedEncodings = await sweepEncodings(id, batchLimit)
+				const deletedEdges = await sweepEdges(conn, id, batchLimit)
 
 				// 6. MAINTENANCE (best-effort, not part of the counted deletion): reclaim the
 				// dead tuples + reindex the walk index. VACUUM cannot run in a txn block, so
@@ -146,9 +152,13 @@ export function createGc(pg: Sql) {
 					await maintain()
 				}
 
-				return { deletedEdges, deletedEncodings, deletedObjects }
+				// Loud, and only on the success path: a FAILED pass skips this drop (its
+				// connection may be unusable, and a cleanup failure must never replace the
+				// pass's real error) — the next pass on this connection heals the leftover.
+				await conn.unsafe(`drop table if exists ${LIVE_TABLE}`)
+				return { deletedEdges, deletedObjects }
 			} finally {
-				await pg.unsafe(`drop table if exists ${live}`)
+				conn.release()
 			}
 		},
 	}
@@ -169,8 +179,7 @@ export function createGc(pg: Sql) {
 	 * connection. The transaction is read-only; it commits (releasing the snapshot)
 	 * before the sweep's own short write transactions begin.
 	 */
-	async function liveSet(id: ReposId): Promise<Set<string>> {
-		const conn = await pg.reserve()
+	async function liveSet(conn: ReservedSql, id: ReposId): Promise<Set<string>> {
 		try {
 			await conn`begin isolation level repeatable read`
 			const pinned = pinnedKysely(conn)
@@ -189,8 +198,17 @@ export function createGc(pg: Sql) {
 			const { present } = await reachableClosure(pinned, id, [...tips], false)
 			await conn`commit`
 			return present
-		} finally {
-			conn.release()
+		} catch (err) {
+			// The caller `release()`s this connection back to the POOL with its session
+			// state intact, so a walk that dies with the transaction open (a statement
+			// timeout, a cancel, lock contention — even a BEGIN that errored client-side
+			// after starting server-side) would hand every later borrower an open
+			// ABORTED transaction — `25P02` on all of them, forever, until a process
+			// restart. Roll back here. Best-effort: a dead backend has no transaction
+			// left to roll back, and the walk's own error must propagate, never this
+			// cleanup's.
+			await conn`rollback`.catch(() => {})
+			throw err
 		}
 	}
 
@@ -217,22 +235,21 @@ export function createGc(pg: Sql) {
 		return initKysely<Database>(handle as unknown as Sql)
 	}
 
-	/** Bulk-load the live OID set into the UNLOGGED `live` table via binary COPY (the
-	 * one bytea-safe bulk path, copy-insert.ts), batched so the payload stays bounded.
-	 * Each COPY runs in its own transaction so the staging temp table drops on commit. */
-	async function loadLive(live: string, oids: Set<string>): Promise<void> {
+	/** Bulk-load the live OID set into the session's TEMP table via binary COPY
+	 * (`copyInto`, the bytea-safe bulk primitive — no staging and no transaction:
+	 * the oids are already unique, and each COPY is one statement), batched so the
+	 * JS payload stays bounded. */
+	async function loadLive(conn: ReservedSql, oids: Set<string>): Promise<void> {
 		if (oids.size === 0) return
 		const all = [...oids]
 		for (let i = 0; i < all.length; i += LIVE_LOAD_BATCH) {
 			const chunk = all.slice(i, i + LIVE_LOAD_BATCH)
-			await pg.begin(async (tx) => {
-				await copyInsert(
-					tx,
-					live,
-					["oid"],
-					chunk.map((hex) => [{ t: "bytea", v: Buffer.from(hex, "hex") }]),
-				)
-			})
+			await copyInto(
+				conn,
+				LIVE_TABLE,
+				["oid"],
+				chunk.map((hex) => [{ t: "bytea", v: Buffer.from(hex, "hex") }]),
+			)
 		}
 	}
 
@@ -244,60 +261,24 @@ export function createGc(pg: Sql) {
 	 * Each batch is its own (implicit) transaction, so `clock_timestamp()` re-evaluates
 	 * per batch and the grace cutoff advances. Returns total rows deleted. */
 	async function sweepObjects(
+		conn: ReservedSql,
 		id: ReposId,
-		live: string,
 		graceSeconds: number,
 		batchLimit: number,
 	): Promise<number> {
 		let total = 0
 		for (;;) {
-			const deleted = await pg.unsafe<{ n: number }[]>(
+			const deleted = await conn.unsafe<{ n: number }[]>(
 				`with victims as (
 					select o.oid from git_object o
 					where o.repo_id = $1::bigint
-						and not exists (select 1 from ${live} l where l.oid = o.oid)
+						and not exists (select 1 from ${LIVE_TABLE} l where l.oid = o.oid)
 						and o.created_at < clock_timestamp() - make_interval(secs => $2::float8)
 					limit $3::int
 				)
 				delete from git_object o using victims v
 				where o.repo_id = $1::bigint and o.oid = v.oid returning 1 as n`,
 				[String(id), String(graceSeconds), String(batchLimit)],
-			)
-			if (deleted.length === 0) break
-			total += deleted.length
-		}
-		return total
-	}
-
-	/** Batched encoding sweep (delta-pack design D7): delete every `git_pack_encoding`
-	 * row whose object was reclaimed, plus every DELTA row whose base was — both are
-	 * derived state that must follow the inventory. Same batched victims-by-PK shape
-	 * as the other sweeps (never `ctid`, which is per-partition). */
-	async function sweepEncodings(id: ReposId, batchLimit: number): Promise<number> {
-		let total = 0
-		for (;;) {
-			const deleted = await pg.unsafe<{ n: number }[]>(
-				`with victims as (
-					select e.oid from git_pack_encoding e
-					where e.repo_id = $1::bigint
-						and (
-							not exists (
-								select 1 from git_object o
-								where o.repo_id = e.repo_id and o.oid = e.oid
-							)
-							or (
-								e.base_oid is not null
-								and not exists (
-									select 1 from git_object o
-									where o.repo_id = e.repo_id and o.oid = e.base_oid
-								)
-							)
-						)
-					limit $2::int
-				)
-				delete from git_pack_encoding e using victims v
-				where e.repo_id = $1::bigint and e.oid = v.oid returning 1 as n`,
-				[String(id), String(batchLimit)],
 			)
 			if (deleted.length === 0) break
 			total += deleted.length
@@ -312,10 +293,14 @@ export function createGc(pg: Sql) {
 	 * and present — its edges never dangle. Like the object sweep, each batch picks a
 	 * `LIMIT`-bounded victim set then deletes by PRIMARY KEY `(repo_id, parent, child)`
 	 * — never `ctid`, which is per-partition and would reach into other tenants. */
-	async function sweepEdges(id: ReposId, batchLimit: number): Promise<number> {
+	async function sweepEdges(
+		conn: ReservedSql,
+		id: ReposId,
+		batchLimit: number,
+	): Promise<number> {
 		let total = 0
 		for (;;) {
-			const deleted = await pg.unsafe<{ n: number }[]>(
+			const deleted = await conn.unsafe<{ n: number }[]>(
 				`with victims as (
 					select e.parent, e.child from git_edge e
 					where e.repo_id = $1::bigint

@@ -1,18 +1,19 @@
 /**
- * FINDING — after `admin.deleteRepo(name)` and a re-push under the SAME name,
- * a long-lived `createRepack(sql)` (and `createGc(sql)`) silently no-ops on that
- * repo forever, so the encoding tier is never built and the repo's garbage is
- * never reclaimed. No error, no log line: `repack()` returns `{wholes:0,deltas:0}`
- * — indistinguishable from "already covered".
+ * FINDING (fixed) — after `admin.deleteRepo(name)` and a re-push under the SAME
+ * name, a long-lived `createRepack(sql)` (and `createGc(sql)`) silently no-op'd
+ * on that repo forever, so the encoding tier was never built and the repo's
+ * garbage never reclaimed. No error, no log line: `repack()` returned
+ * `{wholes:0,deltas:0}` — indistinguishable from "already covered".
  *
- * Mechanism, entirely from the public surface: every one of these components
- * builds its OWN `createRepoResolver`, whose name->id cache is documented as safe
- * because "the mapping is immutable once a repo exists". Deletion breaks that
- * premise, which is why `RepoResolver.invalidate()` exists — but only the ONE
- * resolver inside a `createGitDeps` composition is invalidated by
- * `admin.deleteRepo`. `createRepack(pg)` / `createGc(pg)` are outside that
- * composition by construction (each takes a bare `Sql`), so they keep resolving
- * the dead id: their queries hit a repo_id with zero rows and report zero work.
+ * The mechanism, entirely from the public surface: each of those components
+ * built its OWN memoizing `createRepoResolver`, whose name->id cache was safe
+ * only while `RepoResolver.invalidate()` could reach it — and `admin.deleteRepo`
+ * invalidates only the ONE resolver inside its `createGitDeps` composition.
+ * `createRepack(pg)` / `createGc(pg)` take a bare `Sql` and sat outside it, so
+ * they kept resolving the dead id: queries hit a repo_id with zero rows and
+ * reported zero work. The fix: both resolve the name fresh per pass through the
+ * unmemoized `lookupRepoId` primitive, so a recreate is picked up on the very
+ * next pass.
  *
  * Why this lands with the delta work rather than being purely pre-existing: W1
  * puts `createRepack()` on the drain (`drainRepo`), built once per process and
@@ -119,9 +120,9 @@ describe("lifecycle breakage — silent no-op repack after repo recreate", () =>
 	let server: GitServer
 	let root = ""
 	let longLivedRepack: RepackResult = { deltas: 0, wholes: 0 }
-	let longLivedGc: GcResult = { deletedEdges: 0, deletedEncodings: 0, deletedObjects: 0 }
+	let longLivedGc: GcResult = { deletedEdges: 0, deletedObjects: 0 }
 	let freshRepack: RepackResult = { deltas: 0, wholes: 0 }
-	let freshGc: GcResult = { deletedEdges: 0, deletedEncodings: 0, deletedObjects: 0 }
+	let freshGc: GcResult = { deletedEdges: 0, deletedObjects: 0 }
 	let packWhileStale = 0
 	let packAfterFresh = 0
 

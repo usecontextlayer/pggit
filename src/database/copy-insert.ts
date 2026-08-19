@@ -1,4 +1,4 @@
-import type { TransactionSql } from "postgres"
+import type { ISql, TransactionSql } from "postgres"
 
 /**
  * Bulk binary insert via `COPY … FROM STDIN (FORMAT binary)` into a staging temp
@@ -94,10 +94,40 @@ function encodeBinaryCopy(rows: CopyValue[][]): Buffer {
 }
 
 /**
- * COPY `rows` into `target` (a temp staging table shaped from `target`'s columns,
- * then `INSERT … SELECT … ON CONFLICT DO NOTHING`). `tx` must be a
- * transaction-scoped porsager `Sql`. `target` and `columns` are internal constants
+ * Stream `rows` into `table` via `COPY … FROM STDIN (FORMAT binary)` — the raw
+ * bulk-write primitive under {@link copyInsert}. No staging, no idempotency:
+ * rows land in `table` exactly as given, and a duplicate key is a loud
+ * constraint error. A single COPY is one statement (its own transaction when
+ * none is open), so `sql` may be any connection handle — a transaction, a
+ * reserved connection, the pool. `table` and `columns` are internal constants
  * (never client input), interpolated as SQL identifiers.
+ */
+export async function copyInto(
+	sql: ISql,
+	table: string,
+	columns: readonly string[],
+	rows: CopyValue[][],
+): Promise<void> {
+	if (rows.length === 0) return
+	const writable =
+		await sql`copy ${sql(table)} (${sql.unsafe(columns.join(", "))}) from stdin (format binary)`.writable()
+	await new Promise<void>((resolve, reject) => {
+		writable.on("error", reject)
+		writable.on("finish", () => resolve())
+		writable.write(encodeBinaryCopy(rows), (err) => {
+			if (err) reject(err)
+			else writable.end()
+		})
+	})
+}
+
+/**
+ * COPY `rows` into `target` (a temp staging table shaped from `target`'s columns,
+ * then `INSERT … SELECT … ON CONFLICT DO NOTHING` — the idempotent ingest path).
+ * `tx` must be a transaction-scoped porsager `Sql`: the staging table drops on
+ * commit, and the staging COPY and final insert must commit together. `target`
+ * and `columns` are internal constants (never client input), interpolated as SQL
+ * identifiers — the same contract as {@link copyInto}.
  */
 export async function copyInsert(
 	tx: TransactionSql,
@@ -115,16 +145,7 @@ export async function copyInsert(
 	await tx.unsafe(
 		`create temp table ${staging} on commit drop as select ${cols} from ${target} with no data`,
 	)
-	const writable =
-		await tx`copy ${tx(staging)} (${tx.unsafe(cols)}) from stdin (format binary)`.writable()
-	await new Promise<void>((resolve, reject) => {
-		writable.on("error", reject)
-		writable.on("finish", () => resolve())
-		writable.write(encodeBinaryCopy(rows), (err) => {
-			if (err) reject(err)
-			else writable.end()
-		})
-	})
+	await copyInto(tx, staging, columns, rows)
 	await tx.unsafe(
 		`insert into ${target} (${cols}) select ${cols} from ${staging} on conflict do nothing`,
 	)

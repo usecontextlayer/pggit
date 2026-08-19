@@ -275,7 +275,7 @@ describe("GC integrity — edges, idempotence, exact reachable set (§4 GC-5/6/7
 		expect(first.deletedObjects).toBeGreaterThan(0)
 
 		const second = await fx.gc.gc(repo, { graceSeconds: 0 })
-		expect(second).toEqual({ deletedEdges: 0, deletedEncodings: 0, deletedObjects: 0 })
+		expect(second).toEqual({ deletedEdges: 0, deletedObjects: 0 })
 	})
 
 	it("GC-6: row sets and a clone are byte-identical after the second GC", async () => {

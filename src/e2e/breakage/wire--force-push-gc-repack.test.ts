@@ -2,10 +2,11 @@
  * WIRE — the encoding tier across a denied-push / GC / repack cycle, judged from a
  * real client. (Converted from `breakage/wire--force-push-gc-repack.ts`.)
  *
- * GC's `sweepEncodings` (design D7) must leave no encoding row pointing at a
- * reclaimed object OR a reclaimed BASE. A surviving delta whose anchor is gone is
- * exactly the shape that would ship an unresolvable REF_DELTA — the one
- * customer-visible corruption this tier could introduce.
+ * The tier's hygiene (design D7) is DDL since 0008: the FK cascades leave no
+ * encoding row pointing at a reclaimed object OR a reclaimed BASE. A surviving
+ * delta whose anchor is gone is exactly the shape that would ship an
+ * unresolvable REF_DELTA — the one customer-visible corruption this tier could
+ * introduce.
  *
  * The non-vacuous shape (design note N3): a KEPT ref whose root tree is a LATE
  * version of a lineage that is otherwise garbage, so the tree outlives its delta
@@ -188,7 +189,7 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 			expect(
 				c.error,
 				`${c.label} — gc reclaimed ${gcFirst.deletedObjects} objects / ` +
-					`${gcFirst.deletedEncodings} encodings; repair repack wrote ` +
+					`${gcFirst.deletedEdges} edges; repair repack wrote ` +
 					`${repackRepair.wholes} wholes + ${repackRepair.deltas} deltas`,
 			).toBeNull()
 		}
@@ -213,7 +214,7 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 		expect(
 			afterSecondGcError,
 			`second gc reclaimed ${gcSecond.deletedObjects} objects / ` +
-				`${gcSecond.deletedEncodings} encodings`,
+				`${gcSecond.deletedEdges} edges`,
 		).toBeNull()
 	})
 })

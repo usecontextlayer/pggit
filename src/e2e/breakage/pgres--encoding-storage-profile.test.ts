@@ -34,8 +34,9 @@
  * compression pass). It REPORTED the reloptions drift rather than bounding it ("a
  * policy question, not a hard bound") — but 0008's own comment is the claim that
  * the profile was copied, so the correct behaviour is parity and that is what is
- * asserted here. `autovacuum_vacuum_cost_delay=0` is the key 0005 gave git_object
- * and 0008 did not give the encoding leaves, so that assertion is RED today.
+ * asserted here. `autovacuum_vacuum_cost_delay=0` was the key 0005 gave
+ * git_object and 0008 originally did not give the encoding leaves; 0008 carries
+ * it now, and this pins it.
  */
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -299,7 +300,10 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			`${REPO}-narrow`,
 			runCommits({ blobChars: 120, count: 120, markStart: 0, salt: "narrow" }),
 		)
-		wide = await build(`${REPO}-wide`, wideStream(3000, 80, 400))
+		// 300 commits ⇒ ~9 anchors at ANCHOR_EVERY=32, each a ~100KB+ whole of the
+		// 3000-entry tree — comfortably past the 1MB oversize gate below (80 commits
+		// landed ~2 anchors ≈ 560KB, under its own precondition).
+		wide = await build(`${REPO}-wide`, wideStream(3000, 300, 400))
 	}, 300_000)
 
 	afterAll(async () => {

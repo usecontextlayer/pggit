@@ -21,9 +21,18 @@ import { type Kysely, sql } from "kysely"
 // no second compression pass) — inline STORAGE on the partitioned parent
 // propagates to partitions, like inline COMPRESSION does (0001_init.ts).
 //
-// Repack UPSERTs rows (a GC'd base forces a re-encode) and GC deletes rows for
-// reclaimed objects, so the leaf reloptions take the delete-aware profile the GC
-// sweep already gave git_object/git_edge (0005), not the insert-only profile.
+// The tier's hygiene (design D7) is DDL, not code: two FK cascades onto
+// `git_object` mean a reclaimed object's encoding row — and every delta row
+// anchored on it — dies inside the very DELETE that removes the object,
+// atomically per statement. GC therefore has no encoding sweep to run, a torn
+// tier is unrepresentable, and a no-op GC pass pays the tier nothing. The
+// object-side cascade looks rows up through the tier's own PK; the base-side
+// cascade needs the partial index below.
+//
+// Repack only ever ADDS rows (frozen policy, D4); deletion is entirely the
+// cascades'. The cascade churn is still real DELETE traffic, so the leaf
+// reloptions take the delete-aware profile the GC sweep already gave
+// git_object/git_edge (0005), not the insert-only profile.
 
 const ENCODING_PARTITIONS = 16
 
@@ -33,11 +42,13 @@ const ENCODING_LEAF_RELOPTS = [
 	"autovacuum_vacuum_insert_threshold = 10000",
 	"autovacuum_vacuum_scale_factor = 0.02",
 	"autovacuum_vacuum_threshold = 1000",
+	"autovacuum_vacuum_cost_delay = 0",
 	"autovacuum_freeze_min_age = 0",
 	"toast.autovacuum_vacuum_insert_scale_factor = 0.0",
 	"toast.autovacuum_vacuum_insert_threshold = 10000",
 	"toast.autovacuum_vacuum_scale_factor = 0.02",
 	"toast.autovacuum_vacuum_threshold = 1000",
+	"toast.autovacuum_vacuum_cost_delay = 0",
 	"toast.autovacuum_freeze_min_age = 0",
 ].join(", ")
 
@@ -55,7 +66,11 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 			primary key (repo_id, oid),
 			constraint git_pack_encoding_oid_len check (length(oid) = 20),
 			constraint git_pack_encoding_base_len check (base_oid is null or length(base_oid) = 20),
-			constraint git_pack_encoding_base_not_self check (base_oid is distinct from oid)
+			constraint git_pack_encoding_base_not_self check (base_oid is distinct from oid),
+			constraint git_pack_encoding_object_fk
+				foreign key (repo_id, oid) references git_object (repo_id, oid) on delete cascade,
+			constraint git_pack_encoding_base_fk
+				foreign key (repo_id, base_oid) references git_object (repo_id, oid) on delete cascade
 		) partition by hash (repo_id)
 	`.execute(db)
 
@@ -67,6 +82,15 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 				with (${sql.raw(ENCODING_LEAF_RELOPTS)})
 		`.execute(db)
 	}
+
+	// The base-side cascade's lookup path: deleting a git_object row must find the
+	// delta rows anchored on it. The object-side cascade rides the PK; this one
+	// needs its own index — partial, because whole encodings (base_oid NULL) can
+	// never match a non-null referenced key.
+	await sql`
+		create index git_pack_encoding_base on git_pack_encoding (repo_id, base_oid)
+			where base_oid is not null
+	`.execute(db)
 
 	// The repack drain's watermark, exactly the last_gc_at pattern (0004): stamped
 	// by the drain at pass start, compared against last_pushed_at for eligibility,

@@ -1,23 +1,22 @@
 /**
- * TRANSACTIONAL-INTEGRITY PROBE 1 — GC is not atomic across its three sweeps.
+ * TRANSACTIONAL-INTEGRITY PROBE 1 — a torn encoding tier is UNREPRESENTABLE.
  *
- * `createGc.gc()` runs: sweepObjects → sweepEdges → sweepEncodings, each an
- * independent batched loop of short transactions. Nothing makes the trio atomic
- * and nothing records how far it got. If the pass dies anywhere after the object
- * sweep and before the encoding sweep finishes (deploy, connection loss, OOM,
- * statement timeout — and sweepEdges is the SLOWEST sweep on a real repo:
- * 1.1M kind-3 rows per the design doc's W5), the derived tier is left holding
- * encoding rows whose base object no longer exists.
+ * `createGc.gc()` once ran three independent sweeps (objects, edges, encodings),
+ * and a pass dying between the object sweep and the encoding sweep left the
+ * derived tier holding rows whose object — or whose delta BASE — no longer
+ * existed. The 0008 FK cascades dissolved that state: a reclaimed object takes
+ * its encoding row, and every delta row anchored on it, inside the very DELETE
+ * that removes the object. There is no encoding sweep left to miss.
  *
- * This reproduces exactly that state using the REAL gc() code — only the encoding
- * sweep is made to fail, which is what a crash in sweepEdges looks like from the
- * tier's point of view — and then asks the two questions that matter:
+ * This pins that invariant with the REAL gc() code killed at the worst remaining
+ * point — mid-pass, after the object sweep, before the edge sweep — over the one
+ * fixture shape (design N3/N4) where a reachable delta's anchor dies:
  *
- *   Q1 (serve):  does a clone of the torn repo still succeed and fsck clean?
- *   Q2 (repack): does the next repack pass make progress?
- *
- * How WIDE that crash window actually is — the share of a GC pass that runs before
- * the encoding sweep starts — is measured by `perf/breakage/txn--gc-sweep-window.ts`.
+ *   the tier is CONSISTENT even in the torn state (no orphaned-base rows, no
+ *   ghost rows — asserted directly), and then:
+ *   Q1 (serve):  a clone of the torn repo still succeeds and fscks clean;
+ *   Q2 (repack): the next repack pass makes progress (re-encodes the swept
+ *                delta's object); a clean gc + repack converge.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -46,26 +45,36 @@ const RUNS = 50 // anchors land at lineage index 0 and 32; 33..50 is a PARTIAL s
 const KEEP_AT = 45 // a delta in that partial segment — the shape a new push extends
 const REWIND_TO = 20 // main rewinds far below the kept delta's anchor
 
-/** A porsager client whose `unsafe()` throws the moment GC reaches the ENCODING
- * sweep — i.e. the process dies during the (long) edge sweep that precedes it.
- * Everything before that point runs the real, unmodified GC code. */
-function killAtEncodingSweep(pg: Sql): Sql {
-	return new Proxy(pg, {
-		get(target, prop, receiver) {
-			if (prop !== "unsafe") return Reflect.get(target, prop, receiver)
-			const real = Reflect.get(target, prop, target) as Sql["unsafe"]
-			return (sql: string, ...rest: unknown[]) => {
-				if (sql.includes("git_pack_encoding")) {
-					throw new Error("SIMULATED CRASH: process died before the encoding sweep")
+/** A porsager client whose `unsafe()` throws the moment GC reaches the EDGE
+ * sweep — the process dying right after the object sweep, the worst point a pass
+ * can die at now that the encoding tier follows the object DELETEs by cascade.
+ * Everything before that point runs the real, unmodified GC code. Two traps this
+ * proxy must dodge: the pass runs on one reserved connection, so `reserve()`
+ * must be wrapped too (the sweeps go through ITS `unsafe`, not the pool's); and
+ * the live-set walk ALSO reaches `unsafe` naming `git_edge` (the pinned Kysely
+ * dialect executes the reachability CTE through it), so the trigger must be the
+ * sweep's DELETE specifically, or the pass dies before it sweeps anything. */
+function killAtEdgeSweep(pg: Sql): Sql {
+	const wrapUnsafe = <T extends object>(target: T): T =>
+		new Proxy(target, {
+			get(t, prop, receiver) {
+				if (prop === "unsafe") {
+					const real = Reflect.get(t, prop, t) as Sql["unsafe"]
+					return (sql: string, ...rest: unknown[]) => {
+						if (sql.includes("delete from git_edge")) {
+							throw new Error("SIMULATED CRASH: process died before the edge sweep")
+						}
+						return (real as (s: string, ...r: unknown[]) => unknown).call(t, sql, ...rest)
+					}
 				}
-				return (real as (s: string, ...r: unknown[]) => unknown).call(
-					target,
-					sql,
-					...rest,
-				)
-			}
-		},
-	}) as Sql
+				if (prop === "reserve") {
+					const real = Reflect.get(t, prop, t) as Sql["reserve"]
+					return async () => wrapUnsafe(await real.call(t))
+				}
+				return Reflect.get(t, prop, receiver)
+			},
+		})
+	return wrapUnsafe(pg)
 }
 
 /** Whether a repack pass survived, and what it reported. */
@@ -80,7 +89,7 @@ async function repackOutcome(run: () => Promise<{ wholes: number; deltas: number
 	}
 }
 
-describe("GC × crash — a torn sweep and the tier it leaves behind", () => {
+describe("GC × crash — the tier stays whole through a mid-pass death", () => {
 	let db: IsolatedDb
 	let src = ""
 	let root = ""
@@ -89,7 +98,6 @@ describe("GC × crash — a torn sweep and the tier it leaves behind", () => {
 	let anchorGone = false
 	let q1Fsck = ""
 	let q2: PassOutcome = { detail: "not run", ok: false }
-	let cleanSweptEncodings = -1
 	let q3: PassOutcome = { detail: "not run", ok: false }
 
 	beforeAll(async () => {
@@ -140,17 +148,17 @@ describe("GC × crash — a torn sweep and the tier it leaves behind", () => {
 		// ── The force push: main rewinds far below the anchor, `keep` survives.
 		await refs.setRef(REPO, "refs/heads/main", rewindTo)
 
-		// ── The crash: real GC, killed the instant it reaches the encoding sweep.
+		// ── The crash: real GC, killed the instant it reaches the edge sweep.
 		let crashed = false
 		try {
-			await createGc(killAtEncodingSweep(db.sql)).gc(REPO, {
+			await createGc(killAtEdgeSweep(db.sql)).gc(REPO, {
 				graceSeconds: 0,
 				maintain: false,
 			})
 		} catch {
 			crashed = true
 		}
-		if (!crashed) throw new Error("probe wrong: gc did not reach the encoding sweep")
+		if (!crashed) throw new Error("probe wrong: gc did not reach the edge sweep")
 
 		// ── The torn state, measured.
 		const [tornRow] = await db.sql<{ orphaned: number; ghosts: number }[]>`
@@ -213,8 +221,7 @@ describe("GC × crash — a torn sweep and the tier it leaves behind", () => {
 		q2 = await repackOutcome(() => repack.repack(REPO))
 
 		// Does a SECOND repack (after another clean gc) recover?
-		const clean = await gc.gc(REPO, { graceSeconds: 0, maintain: false })
-		cleanSweptEncodings = clean.deletedEncodings
+		await gc.gc(REPO, { graceSeconds: 0, maintain: false })
 		q3 = await repackOutcome(() => repack.repack(REPO))
 	}, 300_000)
 
@@ -225,10 +232,11 @@ describe("GC × crash — a torn sweep and the tier it leaves behind", () => {
 		if (root) rmSync(root, { force: true, recursive: true })
 	})
 
-	it("a GC that dies before its encoding sweep leaves no torn tier", () => {
+	it("a GC that dies mid-pass leaves no torn tier — the cascades make it unrepresentable", () => {
 		// The precondition that makes the next two assertions meaningful: the object
 		// sweep DID run, so the kept delta's anchor is genuinely gone from the
-		// inventory. The tier is what must not be left inconsistent by that.
+		// inventory. The 0008 FK cascades must have taken the dependent delta row
+		// with it inside that same DELETE.
 		expect(anchorGone).toBe(true)
 		expect(torn.orphaned, "encoding rows whose base OBJECT is gone").toBe(0)
 		expect(torn.ghosts, "encoding rows for objects that no longer exist").toBe(0)
@@ -243,7 +251,6 @@ describe("GC × crash — a torn sweep and the tier it leaves behind", () => {
 	}, 300_000)
 
 	it("recovery: a clean GC followed by a repack pass succeeds", () => {
-		expect(cleanSweptEncodings).toBeGreaterThanOrEqual(0)
 		expect(q3.ok, q3.detail).toBe(true)
 	}, 300_000)
 })

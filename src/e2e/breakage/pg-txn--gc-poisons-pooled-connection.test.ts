@@ -28,11 +28,13 @@
  * cancel, an OOM, a malformed object thrown out of the tree walk — leaks an open
  * aborted transaction into the pool. Nothing in pggit ever rolls it back.
  *
- * Three consequences, all pinned below:
- *   1. the very error the operator sees is WRONG: gc()'s `finally { drop table if
- *      exists gc_live_… }` runs on the poisoned connection and its 25P02 REPLACES
- *      the real cause, so the log says "current transaction is aborted" and never
- *      mentions the timeout;
+ * Three consequences, all pinned below (mechanism as ORIGINALLY found — the fix
+ * reshaped gc onto a reserved connection with an in-try ROLLBACK, D12, so the
+ * specific `gc_live_<id>` finally-drop named here no longer exists; the test now
+ * pins that the poisoning CANNOT recur):
+ *   1. the very error the operator sees was WRONG: the cleanup drop ran on the
+ *      poisoned connection and its 25P02 REPLACED the real cause, so the log said
+ *      "current transaction is aborted" and never mentioned the timeout;
  *   2. GC is dead from then on — every subsequent pass that lands on that
  *      connection fails the same way, and the drain has a pool of only
  *      `concurrency + 1` connections to lose (`server.ts`);

@@ -110,8 +110,14 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 				// A want whose closure is incomplete cannot be served (git rejects it
 				// too) — fail loud rather than ship a short pack. The have side may be
 				// incomplete (we just don't subtract what we lack), so only wants matter.
+				// Missing WANTS lead the list (the error's capped message shows the head,
+				// and git's own ERR names the want); the rest sorted, so the message is
+				// deterministic — the closure iterates in planner order.
 				if (want.missing.size > 0) {
-					throw new WantNotFoundError([...want.missing])
+					const missingWants = wants.filter((w) => want.missing.has(w))
+					const lead = new Set(missingWants)
+					const rest = [...want.missing].filter((o) => !lead.has(o)).sort()
+					throw new WantNotFoundError([...missingWants, ...rest])
 				}
 				const have =
 					haves.length > 0

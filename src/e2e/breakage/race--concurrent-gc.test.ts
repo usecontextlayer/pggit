@@ -1,14 +1,15 @@
 /**
  * RACE: two `createGc().gc()` passes on the SAME repo, concurrently.
  *
- * `gc.ts` documents this as SINGLE-INSTANCE ONLY — the live-set staging table is
- * named by repo id (`gc_live_<id>`), so a second pass's `truncate`/`drop` can wipe
- * the first pass's live set mid-sweep and the first pass's `NOT EXISTS` anti-join
- * then matches the whole REACHABLE set. The comment says exactly this. What it
- * does not say is what the damage looks like from a git client, or how little
- * concurrency it takes: `gc()` is exported with no lock, the drain serializes per
- * repo only because it happens to, and one extra caller (an operator script, a
- * second process, a retry) is enough.
+ * The defect this originally reproduced (hunt C1) is FIXED by design: the live
+ * set was a shared `gc_live_<id>` UNLOGGED table, so a second pass's
+ * `truncate`/`drop` could wipe the first pass's live set mid-sweep and its
+ * `NOT EXISTS` anti-join then matched the whole REACHABLE set. Since D12 the
+ * live set is a TEMP table on the pass's own reserved connection —
+ * session-private, collision-proof by construction. This test now PINS that
+ * property: `gc()` is still exported with no lock, so any two callers (an
+ * operator script, a second process, a retry) may overlap, and must not be able
+ * to destroy anything reachable.
  *
  * NOTHING here is unreachable-object trickery: the repo's ref is at the FULL tip
  * and every object is live, so a correct GC — at any concurrency — must delete

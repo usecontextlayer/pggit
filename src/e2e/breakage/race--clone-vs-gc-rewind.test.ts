@@ -5,8 +5,8 @@
  * The rewind (`setRef` backwards — the public way the platform moves refs)
  * orphans a whole span of history. A client that still names the old tip drives
  * `buildPack` to compute a closure that GC is concurrently deleting out from
- * under it, batch by batch. The delta tier makes this sharper: GC's
- * `sweepEncodings` (design D7) also removes any delta whose ANCHOR it reclaimed,
+ * under it, batch by batch. The delta tier makes this sharper: the 0008 FK
+ * cascades (design D7) take any delta whose ANCHOR the object sweep reclaims,
  * so the encoding tier is mutating mid-serve too.
  *
  * The verdict is the FAILURE MODE, compared against the same scenario on a plain

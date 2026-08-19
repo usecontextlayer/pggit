@@ -1,19 +1,17 @@
 /**
- * PROBE 5 — how WIDE is the window that probe 1's torn state needs?
+ * PROBE 5 — how do a GC pass's milliseconds divide between its sweeps?
  *
- * `gc()` sweeps objects -> edges -> encodings. The encoding sweep is the repair
- * that keeps the derived tier consistent, and it is scheduled LAST, behind the
- * edge sweep. This times each sweep so the exposure is a number, not a worry.
- *
- * Probe 1 (`src/e2e/breakage/txn--torn-gc-wedges-repack.test.ts`) shows WHAT a
- * crash between the object sweep and the encoding sweep leaves behind; this shows
- * HOW LIKELY that is — every millisecond before the encoding sweep starts is a
- * millisecond in which a deploy, a dropped connection, an OOM or a statement
- * timeout produces the torn tier. The edge sweep is the slowest on a real repo
- * (1.1M kind-3 rows per the design doc's W5), so it dominates that window.
+ * HISTORY (2026-08-16): this originally timed the window between the object
+ * sweep and the ENCODING sweep — the exposure in which a crash left probe 1's
+ * torn tier. D14 deleted the encoding sweep (the 0008 FK cascades take the
+ * dependent rows inside the object DELETEs), so that window no longer exists and
+ * probe 1 now pins its unrepresentability instead. What remains worth timing:
+ * the object-vs-edge sweep split — the edge sweep is the slowest on a real repo
+ * (1.1M kind-3 rows per the design doc's W5) — and the object sweep's own
+ * duration, which now carries the cascade work the encoding sweep used to do.
  *
  * It is a PERF harness, not a vitest test, because its verdict is a TIMING
- * MEASUREMENT — how the pass's milliseconds divide between the three sweeps. Like
+ * MEASUREMENT — how the pass's milliseconds divide between the sweeps. Like
  * `perf/delta-probe.ts` it is one-shot and diagnostic: not a gate, no threshold,
  * exits non-zero only if the pass itself throws.
  *
@@ -37,32 +35,41 @@ const RUNS = 300
 const REWIND_TO = 30
 
 /** Time every `unsafe()` statement, bucketed by which sweep issued it. */
+/** Times every `unsafe` statement by the table it names. Must wrap `reserve()`
+ * too: the reshaped gc (D12) runs its sweeps on a reserved connection's `unsafe`,
+ * not the pool's — a pool-only proxy would leave every bucket empty. */
 function timed(pg: Sql, into: Map<string, number>): Sql {
-	return new Proxy(pg, {
-		get(target, prop, receiver) {
-			if (prop !== "unsafe") return Reflect.get(target, prop, receiver)
-			const real = Reflect.get(target, prop, target) as Sql["unsafe"]
-			return async (sql: string, ...rest: unknown[]) => {
-				const bucket = sql.includes("git_pack_encoding")
-					? "encodings"
-					: sql.includes("git_edge")
-						? "edges"
-						: sql.includes("git_object")
-							? "objects"
-							: "other"
-				const t = performance.now()
-				try {
-					return await (real as (s: string, ...r: unknown[]) => Promise<unknown>).call(
-						target,
-						sql,
-						...rest,
-					)
-				} finally {
-					into.set(bucket, (into.get(bucket) ?? 0) + (performance.now() - t))
+	const wrap = <T extends object>(target: T): T =>
+		new Proxy(target, {
+			get(t, prop, receiver) {
+				if (prop === "reserve") {
+					const real = Reflect.get(t, prop, t) as Sql["reserve"]
+					return async () => wrap(await real.call(t))
 				}
-			}
-		},
-	}) as Sql
+				if (prop !== "unsafe") return Reflect.get(t, prop, receiver)
+				const real = Reflect.get(t, prop, t) as Sql["unsafe"]
+				return async (sql: string, ...rest: unknown[]) => {
+					const bucket = sql.includes("git_pack_encoding")
+						? "encodings"
+						: sql.includes("git_edge")
+							? "edges"
+							: sql.includes("git_object")
+								? "objects"
+								: "other"
+					const t0 = performance.now()
+					try {
+						return await (real as (s: string, ...r: unknown[]) => Promise<unknown>).call(
+							t,
+							sql,
+							...rest,
+						)
+					} finally {
+						into.set(bucket, (into.get(bucket) ?? 0) + (performance.now() - t0))
+					}
+				}
+			},
+		})
+	return wrap(pg)
 }
 
 async function main(): Promise<void> {
@@ -87,8 +94,8 @@ async function main(): Promise<void> {
 			maintain: false,
 		})
 		console.log(
-			`reclaimed: ${res.deletedObjects} objects, ${res.deletedEdges} edges, ` +
-				`${res.deletedEncodings} encodings\n`,
+			`reclaimed: ${res.deletedObjects} objects, ${res.deletedEdges} edges ` +
+				`(encodings cascade with the object sweep since 0008)\n`,
 		)
 
 		const total = [...perSweep.values()].reduce((a, b) => a + b, 0)
@@ -103,11 +110,12 @@ async function main(): Promise<void> {
 			),
 		)
 
-		const exposure = total - (perSweep.get("encodings") ?? 0)
+		// The old "exposure window before the encoding sweep" no longer exists (D14:
+		// cascades removed the sweep); what remains worth printing is the split.
+		const objectMs = perSweep.get("objects") ?? 0
 		console.log(
-			`\nexposure window = everything BEFORE the encoding sweep = ` +
-				`${exposure.toFixed(0)} ms of the ${total.toFixed(0)} ms pass ` +
-				`(${((exposure / total) * 100).toFixed(1)}%)`,
+			`\nobject sweep (now carrying the cascade work) = ${objectMs.toFixed(0)} ms ` +
+				`of the ${total.toFixed(0)} ms pass (${total > 0 ? ((objectMs / total) * 100).toFixed(1) : "0"}%)`,
 		)
 	} finally {
 		await db.drop()

@@ -1,20 +1,19 @@
 /**
  * NOT a race — a deterministic lifecycle defect found while hunting them, kept
- * here because it silently disables the entire delta tier for a repo.
+ * here because it silently disabled the entire delta tier for a repo.
  *
- * `createRepack(pg)` and `createGc(pg)` each build their OWN `createRepoResolver`
- * (repack.ts / gc.ts, first two lines of each factory). That resolver memoizes
- * name -> repos.id for its lifetime and is invalidated ONLY through the instance
- * `createRepoAdmin` was handed — the one `createGitDeps` shares with the object
- * and ref stores. `admin.deleteRepo()` therefore invalidates the SERVING stores
- * and leaves a long-lived Repack / Gc holding the DEAD id.
- *
- * A repo name deleted and re-created (the same workspace name provisioned again)
- * then resolves, inside those two components only, to a row that no longer
- * exists. `repack()` finds an empty pending set and reports `{wholes: 0,
- * deltas: 0}` — indistinguishable from "already fully covered" — forever. The
- * client-visible consequence is the exact symptom the delta work exists to fix:
- * that repo's clones stay undeltified, at full size, permanently.
+ * `createRepack(pg)` and `createGc(pg)` each built their OWN memoizing
+ * `createRepoResolver`, invalidated ONLY through the instance `createRepoAdmin`
+ * was handed — so `admin.deleteRepo()` invalidated the serving stores and left a
+ * long-lived Repack / Gc holding the DEAD id: a repo deleted and re-created
+ * under the same name resolved, inside those two components only, to a row that
+ * no longer existed, and `repack()` reported `{wholes: 0, deltas: 0}` —
+ * indistinguishable from "already fully covered" — forever. The fix: both
+ * components resolve the name FRESH each pass via the unmemoized `lookupRepoId`
+ * primitive; memoization stays only inside the `createGitDeps` composition,
+ * whose admin can actually invalidate it. This pins the correct behaviour: the
+ * client-visible bytes of a re-created repo's clone shrink exactly as a
+ * fresh-instance control's do.
  *
  * The check is git-observable and needs no DB assertion: clone the re-created
  * repo and compare the bytes that ARRIVED (the client's own pack files) against

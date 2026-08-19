@@ -6,7 +6,7 @@ import type { ReposId } from "@/database/models/public/Repos"
 import { commitParents, commitTreeOid, treeEntries } from "@/object/object"
 import { encodeDelta } from "@/pack/delta"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
-import { createRepoResolver } from "@/store/repo-resolver"
+import { lookupRepoId } from "@/store/repo-resolver"
 
 /**
  * Per-repo offline repack — the producer of the DERIVED pack-encoding tier
@@ -38,14 +38,22 @@ import { createRepoResolver } from "@/store/repo-resolver"
  *   and writes nothing.
  * - **Derived, never authoritative** (design D1). `git_object` stays the object
  *   inventory and raw-content authority. Absence of an encoding row is normal
- *   (serve falls back to raw); this pass only ever ADDS rows. Repairing GC damage
- *   needs no special path: GC's own sweep (D7) deletes a reclaimed object's
- *   encoding and any delta whose base it removed, so those objects simply
- *   re-enter the pending set here and are re-encoded whole.
+ *   (serve falls back to raw); this pass only ever ADDS rows.
+ * - **Repair mode** (design D15). The 0008 FK cascades can hole the tier: a live
+ *   delta's row dies with its reclaimed base. Holed objects re-enter the pending
+ *   set, but the lineage walk prunes at covered trees, so a holed SUBTREE under a
+ *   covered root would only ever be swept up WHOLE by phase 2 — permanently, since
+ *   rows are never rewritten (D4). So when any pending object PREDATES the repo's
+ *   last completed pass (it can only be a hole — new pushes are newer than the
+ *   stamp), the walk ignores the covered-tree prune for RECURSION only: covered
+ *   rows are never re-emitted, but the walk descends through them to re-delta the
+ *   holes against their surviving anchors.
  *
- * Scheduling: the drain gives repack its own `repos.last_repack_at` watermark
- * (same pattern as `last_gc_at`), serialized per repo AFTER GC so it encodes
- * survivors, not garbage.
+ * Scheduling: repack stamps its own `repos.last_repack_at` watermark on success —
+ * the pass-START `clock_timestamp()`, so an object ingested mid-pass (invisible to
+ * this pass's reads) stays newer than the stamp and the next pass treats it as
+ * ordinary new work, never as a hole. The drain serializes repack per repo AFTER
+ * GC (D5) so it encodes survivors, not garbage.
  */
 
 /** Anchor cadence: a segment holds one whole anchor plus at most K−1 deltas
@@ -68,6 +76,13 @@ const WRITE_BATCH = 1000
 /** Content bytes fetched per round-trip when reading pending objects. */
 const READ_BATCH_BYTES = 16_000_000
 
+/** Oids per read round-trip. `oid in ${pg(list)}` spends one bind parameter per
+ * oid and the extended protocol caps a statement at 65,534, so the sweep must
+ * bound itself by COUNT as well as bytes: many small objects hit this cap, few
+ * large ones hit the byte cap. Sized like GC's LIVE_LOAD_BATCH (bulk offline
+ * path), not the serve path's PACK_BATCH. */
+const READ_BATCH_OIDS = 10_000
+
 /** What one repack pass wrote. `deltas` counts encodings that reference a base;
  * `wholes` counts self-contained encodings (anchors, non-tree objects, and trees
  * whose delta lost to their whole form). A pass over an already-covered repo
@@ -76,8 +91,10 @@ export type RepackResult = { wholes: number; deltas: number }
 
 export type Repack = ReturnType<typeof createRepack>
 
-/** A pending object: present in the inventory, no encoding row yet. */
-type Pending = { oid: string; type: number; size: number }
+/** A pending object: present in the inventory, no encoding row yet. `stale` marks
+ * one created BEFORE the repo's last completed pass — possible only for a hole the
+ * FK cascades punched (D15), since anything pushed after that pass is newer. */
+type Pending = { oid: string; type: number; size: number; stale: boolean }
 
 /** An existing (or this-pass) encoding, as much of it as the policy reads. */
 type EncodingShape = { baseOid: string | null }
@@ -89,27 +106,48 @@ type EncodingShape = { baseOid: string | null }
  */
 export function createRepack(pg: Sql) {
 	const db = initKysely<Database>(pg)
-	const repos = createRepoResolver(db)
 
 	return {
 		async repack(repo: string): Promise<RepackResult> {
-			// A name never written has nothing to encode.
-			const id = await repos.resolveRepoId(repo)
+			// A name never written has nothing to encode. Resolved fresh every pass — a
+			// long-lived Repack outlives repo delete/re-create cycles (lookupRepoId).
+			const id = await lookupRepoId(db, repo)
 			if (id === null) return { deltas: 0, wholes: 0 }
 
+			// The watermark this pass will stamp on success: captured BEFORE the pending
+			// read (see the module doc's Scheduling note for why start, not end).
+			const [t0] = await pg<{ now: Date }[]>`select clock_timestamp() as now`
+			if (!t0) throw new Error("pggit repack: clock_timestamp returned no row")
+
 			// The pending set: inventory minus encodings. Objects past the driver-safe
-			// cap are excluded by design (see MAX_ENCODABLE_BYTES).
+			// cap are excluded by design (see MAX_ENCODABLE_BYTES). `stale` is judged
+			// against the repo's last stamp — false on a never-repacked repo, where the
+			// ordinary walk already visits everything.
 			const pending = await pg<Pending[]>`
-				select encode(o.oid, 'hex') as oid, o.type, o.size
+				select encode(o.oid, 'hex') as oid, o.type, o.size,
+					coalesce(o.created_at < r.last_repack_at, false) as stale
 				from git_object o
+				join repos r on r.id = o.repo_id
 				where o.repo_id = ${id}::bigint
 					and o.size < ${MAX_ENCODABLE_BYTES}
 					and not exists (
 						select 1 from git_pack_encoding e
 						where e.repo_id = o.repo_id and e.oid = o.oid
 					)`
-			if (pending.length === 0) return { deltas: 0, wholes: 0 }
+			const stamp = async (): Promise<void> => {
+				await pg`update repos set last_repack_at = ${t0.now} where id = ${id}::bigint`
+			}
+			if (pending.length === 0) {
+				await stamp()
+				return { deltas: 0, wholes: 0 }
+			}
 			const pendingByOid = new Map(pending.map((p) => [p.oid, p]))
+
+			// D15 repair: a stale pending object is a hole the FK cascades punched out
+			// of the tier. This pass walks THROUGH covered trees (recursion only) so
+			// holes re-delta against their surviving anchors instead of falling to the
+			// phase-2 whole sweep forever.
+			const repair = pending.some((p) => p.stale)
 
 			// Existing policy state, loaded once: each encoded oid's base (to find a
 			// predecessor's anchor) and each anchor's current segment fill.
@@ -202,27 +240,32 @@ export function createRepack(pg: Sql) {
 				parentTreeOid: string | null,
 			): Promise<void> {
 				if (treeOid === parentTreeOid) return
-				if (!pendingByOid.has(treeOid)) return
+				// A covered tree prunes the walk — every descendant was covered with it —
+				// EXCEPT in repair mode, where a hole may hide below it (D15): then the
+				// walk descends through covered trees but still never re-emits them.
+				if (!repair && !pendingByOid.has(treeOid)) return
 				const raw = await content(treeOid)
 
-				const predecessor = parentTreeOid ? encoded.get(parentTreeOid) : undefined
-				if (predecessor !== undefined && parentTreeOid !== null) {
-					const anchor = predecessor.baseOid ?? parentTreeOid
-					if ((segmentFill.get(anchor) ?? 0) < ANCHOR_EVERY - 1) {
-						const delta = encodeDelta(await content(anchor), raw)
-						const deflated = deflateSync(delta)
-						const whole = deflateSync(raw)
-						// git's own rule: keep a delta only when it beats the whole form.
-						if (deflated.length < whole.length) {
-							await emit(treeOid, anchor, delta.length, deflated)
+				if (pendingByOid.has(treeOid)) {
+					const predecessor = parentTreeOid ? encoded.get(parentTreeOid) : undefined
+					if (predecessor !== undefined && parentTreeOid !== null) {
+						const anchor = predecessor.baseOid ?? parentTreeOid
+						if ((segmentFill.get(anchor) ?? 0) < ANCHOR_EVERY - 1) {
+							const delta = encodeDelta(await content(anchor), raw)
+							const deflated = deflateSync(delta)
+							const whole = deflateSync(raw)
+							// git's own rule: keep a delta only when it beats the whole form.
+							if (deflated.length < whole.length) {
+								await emit(treeOid, anchor, delta.length, deflated)
+							} else {
+								await emit(treeOid, null, raw.length, whole)
+							}
 						} else {
-							await emit(treeOid, null, raw.length, whole)
+							await emitWhole(treeOid, raw) // segment full — this version anchors
 						}
 					} else {
-						await emitWhole(treeOid, raw) // segment full — this version anchors
+						await emitWhole(treeOid, raw) // no predecessor — first version anchors
 					}
-				} else {
-					await emitWhole(treeOid, raw) // no predecessor — first version anchors
 				}
 
 				// Recurse into changed subtrees, pairing by entry NAME (git's structural
@@ -262,11 +305,16 @@ export function createRepack(pg: Sql) {
 			for (const p of [...pendingByOid.values()]) {
 				sweep.push(p)
 				sweepBytes += p.size
-				if (sweepBytes >= READ_BATCH_BYTES) await flushSweep()
+				if (sweepBytes >= READ_BATCH_BYTES || sweep.length >= READ_BATCH_OIDS) {
+					await flushSweep()
+				}
 			}
 			await flushSweep()
 			await flush()
 
+			// Success only: a failed pass leaves the stamp alone, so the next pass
+			// still sees everything this one owed as stale and repairs it.
+			await stamp()
 			return { deltas, wholes }
 		},
 	}

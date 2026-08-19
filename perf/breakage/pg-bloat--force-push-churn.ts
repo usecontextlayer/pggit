@@ -232,7 +232,7 @@ async function main(): Promise<void> {
 					`${padr(r, 6)} ${pad(mb(sizes.git_object?.total ?? 0), 8)} ${pad(mb(sizes.git_edge?.total ?? 0), 8)} ` +
 						`${pad(mb(sizes.git_pack_encoding?.total ?? 0), 8)} ${pad(mb(sizes.repo_file?.total ?? 0), 8)} ` +
 						`${pad((((sizes.git_ref?.total ?? 0) / 1000) | 0).toFixed(0), 7)} ${pad(mb(total), 8)} ${pad(dead, 8)} ` +
-						`${pad(autovac, 8)} ${pad(gcRes.deletedObjects + gcRes.deletedEdges + gcRes.deletedEncodings, 8)} ` +
+						`${pad(autovac, 8)} ${pad(gcRes.deletedObjects + gcRes.deletedEdges, 8)} ` +
 						`${pad(mb(wal - wal0), 8)} ${pad(hz.ageXids, 8)}`,
 				)
 			}

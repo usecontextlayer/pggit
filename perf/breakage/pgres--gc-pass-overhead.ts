@@ -1,40 +1,37 @@
 /**
  * pgres — WHAT DOES A GC PASS COST NOW, AND WHAT DOES IT LEAVE BEHIND?
  *
- * Two questions the delta-pack change puts on the GC pass:
+ * HISTORY (2026-08-16): this harness originally priced `sweepEncodings` (concern
+ * C2) and the shared `gc_live_<id>` UNLOGGED staging table. D14 deleted the sweep
+ * (the 0008 FK cascades do the tier's bookkeeping inside the object DELETEs) and
+ * D12 replaced the shared staging table with a per-pass TEMP table on a reserved
+ * connection. The measurements stay meaningful in their new roles:
  *
- * 1. Concern C2 — `sweepEncodings` adds a query round to EVERY pass, including
- *    passes that reclaim nothing. The drain runs one pass per eligible repo on a
- *    hot cadence, so a fixed per-pass cost is paid per repo per interval. Priced
- *    here by running many no-op passes with the tier present vs absent.
+ * 1. Tier-presence overhead on a no-op pass — now a REGRESSION GUARD: with no
+ *    sweep left, the tier's presence should add ~nothing to a pass that reclaims
+ *    nothing. The paired twin-repo bound (≤15%) must hold trivially; it firing
+ *    again means someone reintroduced per-pass tier work.
  *
- * 2. The `gc_live_<id>` UNLOGGED staging table — `create if not exists` →
- *    `truncate` → `drop` on every pass, on the pooled connection, outside any
- *    transaction. Each create/drop cycle writes and deletes rows in the DATABASE's
- *    system catalogs (`pg_class`, `pg_attribute`, `pg_type`, `pg_depend`,
- *    `pg_index`, …). Those catalogs are shared by every repo and every schema, are
- *    never touched by `maintain()`, and a fleet drain runs this cycle once per repo
- *    per interval — forever. Measured here as catalog rows churned per GC pass.
+ * 2. Staging-table catalog churn — still real, mechanism changed: a TEMP table is
+ *    created and dropped per pass, and each cycle still writes and deletes rows in
+ *    the DATABASE's system catalogs (`pg_class`, `pg_attribute`, `pg_type`,
+ *    `pg_depend`, …), which are shared by every schema and never touched by
+ *    `maintain()`. Measured here as catalog rows churned per GC pass.
  *
- * Also asserted: after the loop, ZERO `gc_live_%` relations remain in the harness's
- * own schema (the `finally` drop actually fires on the happy path).
+ * Also asserted: after the loop, ZERO `gc_live_%` relations remain in the
+ * harness's own schema (TEMP tables live in `pg_temp` and die with their
+ * sessions, so any survivor here means the design regressed to schema tables).
  *
  * NOISE: `pg_stat_sys_tables` counters are DATABASE-wide and this Postgres is
  * shared, so an idle control window of the same duration is measured and printed
  * beside the loop. The loop's own rate must stand well clear of it to mean
  * anything.
  *
- * 3. Does that fixed cost SCALE with the tier? `sweepEncodings` selects victims
- *    with `where e.repo_id = $1 and (…)` under a `limit` — the limit applies AFTER
- *    the filter, so a pass with nothing to sweep must still walk every encoding row
- *    the repo owns before it can conclude the batch is empty. Arm 3 sweeps repo
- *    size to see whether the no-op overhead tracks tier size.
- *
  * FAILURE BOUND (non-zero exit): any `gc_live_%` relation survives the loop, OR
  * — from the PAIRED TWIN-REPO sweep, whose two arms are byte-identical repos
- * measured in alternation so drift cancels — `sweepEncodings` adds more than 15% to
- * a no-op pass (C2 made real). The 120-pass arm above it is reported for context
- * but NOT bounded: its two halves run in blocks minutes apart, and this shared box
+ * measured in alternation so drift cancels — the tier's presence adds more than
+ * 15% to a no-op pass. The 120-pass arm above it is reported for context but NOT
+ * bounded: its two halves run in blocks minutes apart, and this shared box
  * drifts by more than the effect, which flipped sign between runs.
  *
  *   npx tsx perf/breakage/pgres--gc-pass-overhead.ts --passes=120 --repos=12
@@ -184,7 +181,7 @@ async function main(): Promise<void> {
 		)
 		const overhead = median(withTier) / median(bare) - 1
 		console.log(
-			`\nsweepEncodings overhead on a NO-OP pass: ${(overhead * 100).toFixed(0)}% (median ${median(bare).toFixed(1)} → ${median(withTier).toFixed(1)} ms)`,
+			`\ntier-presence overhead on a NO-OP pass (regression guard; the sweep itself is gone, D14): ${(overhead * 100).toFixed(0)}% (median ${median(bare).toFixed(1)} → ${median(withTier).toFixed(1)} ms)`,
 		)
 
 		console.log("\n## system-catalog churn (DATABASE-wide — noisy, control included)\n")
@@ -213,7 +210,7 @@ async function main(): Promise<void> {
 			),
 		)
 		console.log(
-			"\nEvery GC pass creates and drops one `gc_live_<id>` UNLOGGED table. Those catalog rows are DEAD TUPLES in pg_class/pg_attribute/pg_depend — shared by every repo and every schema in the database, never vacuumed by `maintain()`, and produced once per repo per drain interval, forever.",
+			"\nEvery GC pass creates and drops one `gc_live` TEMP table (D12; the old shared `gc_live_<id>` UNLOGGED table is gone). The create/drop cycle still churns catalog rows in pg_class/pg_attribute/pg_depend — shared by every repo and schema in the database, never vacuumed by `maintain()`, produced once per repo per drain interval.",
 		)
 
 		// ── does the no-op sweep cost scale with the tier's SIZE? ───────────────
@@ -269,7 +266,7 @@ async function main(): Promise<void> {
 					"repo objects (= tier rows)",
 					"no-op pass, tier absent (ms)",
 					"no-op pass, tier present (ms)",
-					"added by sweepEncodings (ms)",
+					"added by tier presence (ms)",
 					"overhead",
 				],
 				scale,

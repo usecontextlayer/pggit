@@ -209,8 +209,8 @@ async function main(): Promise<void> {
 		await sampler
 
 		console.log(
-			`gc() reclaimed ${gcRes.deletedObjects} objects + ${gcRes.deletedEdges} edges + ` +
-				`${gcRes.deletedEncodings} encodings in ${(gcMs / 1000).toFixed(2)}s\n`,
+			`gc() reclaimed ${gcRes.deletedObjects} objects + ${gcRes.deletedEdges} edges ` +
+				`in ${(gcMs / 1000).toFixed(2)}s\n`,
 		)
 		console.log(
 			`${padr("t (ms)", 8)} ${pad("horizon lag (xids)", 20)} ${pad("longest open xact (s)", 22)}  oldest statement`,

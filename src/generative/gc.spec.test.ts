@@ -381,7 +381,6 @@ describe("§4 PBT — property-based GC differential", () => {
 						// Second pass is a no-op: deletes nothing, leaves the survivor set identical.
 						expect(second).toEqual({
 							deletedEdges: 0,
-							deletedEncodings: 0,
 							deletedObjects: 0,
 						})
 						expect(await objectOids(fx.db, repo)).toEqual(afterFirst)

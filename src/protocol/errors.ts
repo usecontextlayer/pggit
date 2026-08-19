@@ -21,9 +21,20 @@ export class GitProtocolError extends Error {
  * absent OIDs; `handleFetch` maps it to the ERR pkt-line. Distinct from a generic
  * `Error` out of the serve path (a real backend fault), which still propagates → 500.
  */
+/** Missing oids named in the message before the rest collapse into a count. */
+const MAX_REPORTED_OIDS = 8
+
 export class WantNotFoundError extends Error {
 	constructor(readonly oids: string[]) {
-		super(`upload-pack: not our ref ${oids.join(" ")}`)
+		// The message rides an ERR pkt-line, whose writer refuses payloads over
+		// pkt-line.ts's WRITER_MAX_PAYLOAD — a large missing closure (a GC racing
+		// the serve can orphan thousands of oids) must not overflow it, or the error
+		// path itself 500s exactly when the damage is largest. The thrower puts the
+		// missing WANTS at the head of `oids` (object-store.ts), so the capped
+		// prefix names what the client actually asked for, like canonical git's ERR.
+		const shown = oids.slice(0, MAX_REPORTED_OIDS).join(" ")
+		const rest = oids.length - MAX_REPORTED_OIDS
+		super(`upload-pack: not our ref ${shown}${rest > 0 ? ` (+${rest} more)` : ""}`)
 		this.name = "WantNotFoundError"
 	}
 }
