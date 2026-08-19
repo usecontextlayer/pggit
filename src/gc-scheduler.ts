@@ -1,5 +1,6 @@
 import type { Sql } from "postgres"
 import { createGc } from "@/store/gc"
+import type { EpochOutcome } from "@/store/reach-epoch"
 
 /**
  * Self-scheduling GC — the background drain that decides WHEN the per-repo
@@ -21,7 +22,7 @@ import { createGc } from "@/store/gc"
 /** One repo's outcome in a drain pass: the repo and what its GC reclaimed.
  * Emitted for EVERY repo the pass judged eligible (including zero-reclaim), so the
  * eligible set itself is observable (SCH-3). */
-export type DrainEntry = { repo: string; deletedObjects: number; deletedEdges: number }
+export type DrainEntry = { repo: string; deletedObjects: number; epoch: EpochOutcome }
 
 /** What one `drainOnce()` reclaimed, one entry per eligible repo. */
 export type DrainSummary = DrainEntry[]
@@ -81,12 +82,12 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 		try {
 			const [t] = await pg<{ t0: string }[]>`select clock_timestamp()::text as t0`
 			if (!t) throw new Error("pggit gc-scheduler: clock_timestamp() returned no row")
-			const { deletedObjects, deletedEdges } = await gc.gc(c.name, {
+			const { deletedObjects, epoch } = await gc.gc(c.name, {
 				graceSeconds: opts.graceSeconds,
 				maintain: false,
 			})
 			await pg`update repos set last_gc_at = ${t.t0}::timestamptz where id = ${c.id}::bigint`
-			return { deletedEdges, deletedObjects, repo: c.name }
+			return { deletedObjects, epoch, repo: c.name }
 		} catch (err) {
 			console.error(
 				`pggit gc-scheduler: GC of repo ${JSON.stringify(c.name)} failed (retried next pass):`,

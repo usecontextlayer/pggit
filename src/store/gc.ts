@@ -3,7 +3,20 @@ import type { ReservedSql, Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
 import { copyInto } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
-import { reachableClosure } from "@/store/reachability"
+import {
+	bitmapFromPositions,
+	concatSortedOids,
+	deleteEpoch,
+	type Epoch,
+	type EpochOutcome,
+	loadEpoch,
+	positionOf,
+	remapPositions,
+	splitOids,
+	unionHas,
+	writeEpoch,
+} from "@/store/reach-epoch"
+import { type OriginWalk, originClosure } from "@/store/reachability"
 import { lookupRepoId } from "@/store/repo-resolver"
 
 /**
@@ -18,7 +31,7 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * sweep `git_object` on that same connection in batched short transactions with a
  * server-side anti-join (`NOT EXISTS`) against that table plus a `created_at`
  * grace cutoff. Reachability itself is NOT re-derived here: it is exactly
- * `reachableClosure(omitBlobs=false)`, the one engine clone / fetch / connectivity
+ * `fullClosure(omitBlobs=false)`, the one engine clone / fetch / connectivity
  * already share, so GC can never disagree with them about what is reachable.
  */
 
@@ -47,14 +60,30 @@ export type GcOptions = { graceSeconds: number; batchLimit?: number; maintain?: 
 type GcHooks = { afterLiveSet?: () => Promise<void> }
 type InternalGcOptions = GcOptions & { _hooks?: GcHooks }
 
-/** What one GC pass reclaimed: the deleted `git_object` / `git_edge` row counts.
- * Derived `git_pack_encoding` rows are not counted: they follow the inventory by
- * FK `ON DELETE CASCADE` (0008), dying inside the object sweep's own DELETEs
- * rather than in a pass of their own. */
+/** What one GC pass reclaimed: the deleted `git_object` row count. Derived rows
+ * (`git_pack_encoding`, `git_commit`, `git_tag`) are not counted: they follow
+ * the inventory by FK `ON DELETE CASCADE` (0008/0009), dying inside the object
+ * sweep's own DELETEs rather than in passes of their own. `epoch` reports what
+ * the pass decided about the reachability epoch (chunk 5b) — the S6 gates
+ * (quiet drains SKIP the write, a rewind falls back LOUDLY to the full walk)
+ * observe it here. */
 export type GcResult = {
 	deletedObjects: number
-	deletedEdges: number
+	epoch: EpochOutcome
 }
+
+/** One pass's epoch decision, planned under the walk snapshot and applied
+ * after the sweep. The write-carrying variants hold the full payload
+ * (`writeEpoch`'s shape) so nothing is re-derived outside the snapshot. */
+type EpochPlan =
+	| { outcome: "unchanged" | "cleared" }
+	| {
+			outcome: "advanced" | "rebuilt"
+			epoch: number
+			tips: string[]
+			oids: Buffer
+			bitmaps: Map<string, Uint8Array>
+	  }
 
 export type Gc = ReturnType<typeof createGc>
 
@@ -86,7 +115,7 @@ export function createGc(pg: Sql) {
 			// fresh every pass — a long-lived Gc outlives repo delete/re-create cycles
 			// (lookupRepoId).
 			const id = await lookupRepoId(db, repo)
-			if (id === null) return { deletedEdges: 0, deletedObjects: 0 }
+			if (id === null) return { deletedObjects: 0, epoch: "unchanged" }
 
 			const batchLimit = opts.batchLimit ?? DEFAULT_BATCH_LIMIT
 
@@ -119,8 +148,20 @@ export function createGc(pg: Sql) {
 				await conn.unsafe(`drop table if exists ${LIVE_TABLE}`)
 				await conn.unsafe(`create temp table ${LIVE_TABLE} (oid bytea primary key)`)
 
-				const roots = await liveSet(conn, id)
-				await loadLive(conn, roots)
+				const { live, plan } = await livePlan(conn, id)
+				await loadLive(conn, live)
+
+				// Give every sweep statement statistics that are correct AT PLAN TIME.
+				// Autovacuum's analyze cadence is a race, not a guarantee: a burst of
+				// ingest (many repos pushed inside one naptime window) leaves the
+				// partitions' reltuples orders of magnitude under reality, and a victims
+				// anti-join planned in that gap flips from a single-pass Hash Anti Join
+				// to a per-row Nested Loop — observed burning >10 minutes of CPU on a
+				// 46k-row partition. The TEMP live table is never visible to autovacuum
+				// at all. All three ANALYZEs are milliseconds-to-seconds, offline-pass
+				// budget; correctness of the pass never depended on them, only its cost.
+				await conn.unsafe(`analyze ${LIVE_TABLE}`)
+				await conn.unsafe(`analyze git_object`)
 
 				// TEST SEAM (§5 in-flight safety): interpose a concurrent push here, between
 				// the live-set materialization and the object sweep.
@@ -129,34 +170,43 @@ export function createGc(pg: Sql) {
 				// 4. SWEEP objects: batched DELETE, each batch its own short transaction,
 				// anti-join `NOT EXISTS` against the live set, `created_at` past the grace
 				// cutoff. `clock_timestamp()` (not `now()`) so the cutoff advances per batch.
-				// Each DELETE also takes the reclaimed objects' derived `git_pack_encoding`
-				// rows — and every delta anchored on them — via the 0008 FK cascades: the
-				// tier can never be torn from the inventory, mid-pass or mid-crash, and
-				// needs no sweep of its own (design D7, expressed as DDL).
+				// Each DELETE also takes the reclaimed objects' derived rows — the
+				// `git_pack_encoding` encoding (and every delta anchored on it, 0008) and
+				// the `git_commit`/`git_tag` rows (0009) — via FK cascades: no derived
+				// surface can be torn from the inventory, mid-pass or mid-crash, and none
+				// needs a sweep of its own (design D7/D14, expressed as DDL).
 				const deletedObjects = await sweepObjects(conn, id, opts.graceSeconds, batchLimit)
 
-				// 5. SWEEP edges: drop every edge whose PARENT object no longer survives —
-				// run AFTER the object sweep, so a grace-retained object keeps its edges and a
-				// surviving (reachable) parent's edges (which point only at reachable children)
-				// never dangle.
-				const deletedEdges = await sweepEdges(conn, id, batchLimit)
-
-				// 6. MAINTENANCE (best-effort, not part of the counted deletion): reclaim the
-				// dead tuples + reindex the walk index. VACUUM cannot run in a txn block, so
+				// 5. MAINTENANCE (best-effort, not part of the counted deletion): reclaim
+				// the dead tuples the sweep produced. VACUUM cannot run in a txn block, so
 				// these are standalone statements run outside any transaction. Skipped when
-				// the pass reclaimed nothing (no dead tuples to chase) or the caller opted out
-				// (`maintain: false`, the drain's choice) — so a frequent per-repo drain never
-				// triggers a full-table VACUUM/REINDEX on its hot cadence; the leaf partitions'
-				// autovacuum (0001_init.ts) reclaims the GC churn. Observable-neutral either way.
-				if (opts.maintain !== false && deletedObjects + deletedEdges > 0) {
-					await maintain()
+				// the pass reclaimed nothing (no dead tuples to chase) or the caller opted
+				// out (`maintain: false`, the drain's choice) — so a frequent per-repo drain
+				// never triggers a full-table VACUUM on its hot cadence; the leaf
+				// partitions' autovacuum (0001_init.ts) reclaims the GC churn.
+				// Observable-neutral either way.
+				if (opts.maintain !== false && deletedObjects > 0) {
+					await maintain(conn)
+				}
+
+				// The reachability epoch (chunk 5b), written AFTER the sweep on this
+				// same reserved connection. Its tips/bits were computed under the
+				// walk's REPEATABLE READ snapshot and carried here in JS — a push
+				// landing mid-pass cannot smuggle in a tip the walk never covered
+				// (the serve-side guards reconcile that staleness at fetch time).
+				// The sweep cannot invalidate the payload: it deletes only
+				// UNREACHABLE objects, and every epoch member is reachable.
+				if (plan.outcome === "cleared") {
+					await deleteEpoch(conn, id)
+				} else if (plan.outcome === "advanced" || plan.outcome === "rebuilt") {
+					await writeEpoch(conn, id, plan)
 				}
 
 				// Loud, and only on the success path: a FAILED pass skips this drop (its
 				// connection may be unusable, and a cleanup failure must never replace the
 				// pass's real error) — the next pass on this connection heals the leftover.
 				await conn.unsafe(`drop table if exists ${LIVE_TABLE}`)
-				return { deletedEdges, deletedObjects }
+				return { deletedObjects, epoch: plan.outcome }
 			} finally {
 				conn.release()
 			}
@@ -164,40 +214,58 @@ export function createGc(pg: Sql) {
 	}
 
 	/**
-	 * The live set: the reachable closure from every ref tip, read under ONE
-	 * REPEATABLE READ snapshot so the ref-tip read and the multi-statement closure
-	 * walk cannot interleave with a concurrent push's ref update (§5 defense (a)).
+	 * The live set AND the epoch plan, from ONE walk under ONE REPEATABLE READ
+	 * snapshot, so the ref-tip read and the multi-statement walk cannot
+	 * interleave with a concurrent push's ref update (§5 defense (a)).
 	 *
-	 * `reachableClosure` is the shared engine and takes a `Kysely`, but the
+	 * Chunk 5b makes GC the epoch producer, and the epoch pays GC back: tips
+	 * identical to the stored epoch ⇒ the live set IS the epoch's array, no
+	 * walk at all; refs only advanced ⇒ `originClosure` walks only the
+	 * since-epoch delta (unmoved tips stop at themselves instantly) and the
+	 * old closure rides in by bitmap remap; anything else — a rewind, a
+	 * deleted ref, a current tip sitting INSIDE the old array — rebuilds from
+	 * a full walk, LOUDLY visible as `outcome: "rebuilt"`.
+	 *
+	 * Roots are the ref tip oids alone: the walk descends tag→target through
+	 * the `git_tag` rows (chunk 1's invariant, loud when violated), so peeled
+	 * targets add nothing — and the epoch's per-tip bitmaps must be keyed by
+	 * the REF oids exactly.
+	 *
+	 * `originClosure` is the shared engine and takes a `Kysely`, but the
 	 * kysely-postgres-js dialect drives queries by calling `.reserve()` on its
 	 * `postgres` client for EACH query — so a plain pooled Kysely would scatter the
-	 * closure's statements across connections (no shared snapshot), and a
+	 * walk's statements across connections (no shared snapshot), and a
 	 * transaction-scoped `Sql` has no `.reserve()` at all. So we pin ONE porsager
 	 * connection, open a REPEATABLE READ transaction on it, and back a Kysely with a
 	 * shim whose `reserve()` always returns that pinned connection with a no-op
-	 * `release()` — every closure statement then runs on the one snapshotted
+	 * `release()` — every walk statement then runs on the one snapshotted
 	 * connection. The transaction is read-only; it commits (releasing the snapshot)
 	 * before the sweep's own short write transactions begin.
 	 */
-	async function liveSet(conn: ReservedSql, id: ReposId): Promise<Set<string>> {
+	async function livePlan(
+		conn: ReservedSql,
+		id: ReposId,
+	): Promise<{ live: readonly string[]; plan: EpochPlan }> {
 		try {
 			await conn`begin isolation level repeatable read`
 			const pinned = pinnedKysely(conn)
-			const rows = await conn<{ oid: Buffer | null; peeled_oid: Buffer | null }[]>`
-				select oid, peeled_oid from git_ref where repo_id = ${id} and oid is not null
+			const rows = await conn<{ oid: Buffer | null }[]>`
+				select oid from git_ref where repo_id = ${id} and oid is not null
 			`
-			// Roots: every direct ref tip plus each annotated tag's peeled target. The
-			// closure over kinds (1,2,3,5) already descends tag→target, so the peeled
-			// target is redundant for the walk, but it is included to match §7 and stay
-			// correct even if a tag ref's edge were ever absent.
-			const tips = new Set<string>()
-			for (const r of rows) {
-				if (r.oid) tips.add(r.oid.toString("hex"))
-				if (r.peeled_oid) tips.add(r.peeled_oid.toString("hex"))
+			const tips = [
+				...new Set(rows.flatMap((r) => (r.oid ? [r.oid.toString("hex")] : []))),
+			].sort()
+			const epoch = await loadEpoch(pinned, id)
+			let out: { live: readonly string[]; plan: EpochPlan }
+			if (tips.length === 0) {
+				out = { live: [], plan: { outcome: epoch ? "cleared" : "unchanged" } }
+			} else if (epoch !== null && sameOids(tips, epoch.tips)) {
+				out = { live: splitOids(epoch.oids), plan: { outcome: "unchanged" } }
+			} else {
+				out = await planWalk(pinned, id, tips, epoch)
 			}
-			const { present } = await reachableClosure(pinned, id, [...tips], false)
 			await conn`commit`
-			return present
+			return out
 		} catch (err) {
 			// The caller `release()`s this connection back to the POOL with its session
 			// state intact, so a walk that dies with the transaction open (a statement
@@ -210,6 +278,125 @@ export function createGc(pg: Sql) {
 			await conn`rollback`.catch(() => {})
 			throw err
 		}
+	}
+
+	/** Walk and plan: the steady-state delta attempt first (when the shape
+	 * allows it), the full rebuild otherwise or when the attempt discovers the
+	 * old closure is no longer fully live. A current tip found INSIDE the old
+	 * epoch array but not among its tips is the rewind signature — a delta walk
+	 * from it would re-walk old history for nothing, so it short-circuits to
+	 * the rebuild. */
+	async function planWalk(
+		pinned: Kysely<Database>,
+		id: ReposId,
+		tips: string[],
+		epoch: Epoch | null,
+	): Promise<{ live: readonly string[]; plan: EpochPlan }> {
+		if (epoch !== null) {
+			const stopAt = new Set(epoch.tips)
+			const deltaEligible = tips.every(
+				(t) => stopAt.has(t) || positionOf(epoch.oids, t) === -1,
+			)
+			if (deltaEligible) {
+				const walk = await originClosure(pinned, id, tips, stopAt)
+				if (walk.missing.size > 0) return withheld(walk)
+				const advanced = buildAdvanced(tips, epoch, walk)
+				if (advanced !== null) return advanced
+			}
+		}
+		const walk = await originClosure(pinned, id, tips, new Set())
+		if (walk.missing.size > 0) return withheld(walk)
+		const oids = concatSortedOids(walk.masks.keys())
+		const bitmaps = new Map<string, Uint8Array>()
+		for (const [t, positions] of maskPositions(tips, walk, oids)) {
+			bitmaps.set(t, bitmapFromPositions(positions))
+		}
+		return {
+			live: [...walk.masks.keys()],
+			plan: {
+				bitmaps,
+				epoch: (epoch?.epoch ?? 0) + 1,
+				oids,
+				outcome: "rebuilt",
+				tips,
+			},
+		}
+	}
+
+	/** A walk that reported MISSING objects (a ref whose closure is incomplete —
+	 * external corruption or a mid-delete race) must never publish an epoch: a
+	 * bitmap serve answers with `missing: ∅` by construction, so a partial
+	 * epoch would convert a detectable incomplete closure into a silently short
+	 * pack. The stored epoch is dropped too — its guards cannot vouch for a
+	 * repo in this state. The pass still sweeps with the walked live set. */
+	function withheld(walk: OriginWalk): { live: readonly string[]; plan: EpochPlan } {
+		return { live: [...walk.masks.keys()], plan: { outcome: "cleared" } }
+	}
+
+	/** The steady-state epoch: new array = old ∪ walk delta; each tip's bitmap
+	 * = its walk mask ∪ the REMAPPED bitmaps of every old tip its walk hit.
+	 * Returns null — caller rebuilds — when a hit tip's bitmap row is gone
+	 * (cascaded mid-rewind) or the covered check fails: an old tip neither hit
+	 * nor inside the new live set means the closure genuinely shrank (a
+	 * deleted or rewound ref), and keeping its objects would leak them forever. */
+	function buildAdvanced(
+		tips: string[],
+		epoch: Epoch,
+		walk: OriginWalk,
+	): { live: readonly string[]; plan: EpochPlan } | null {
+		const fresh = [...walk.masks.keys()].filter((h) => positionOf(epoch.oids, h) === -1)
+		const oids = concatSortedOids([...splitOids(epoch.oids), ...fresh])
+		const bitmaps = new Map<string, Uint8Array>()
+		for (const [t, positions] of maskPositions(tips, walk, oids)) {
+			const bit = 1n << BigInt(tips.indexOf(t))
+			for (const [stop, bits] of walk.hits) {
+				if ((bits & bit) === 0n) continue
+				const old = epoch.bitmaps.get(stop)
+				if (old === undefined) return null
+				positions.push(...remapPositions(old, epoch.oids, oids))
+			}
+			bitmaps.set(t, bitmapFromPositions(positions))
+		}
+		for (const e of epoch.tips) {
+			if (walk.hits.has(e)) continue
+			const pos = positionOf(oids, e)
+			if (pos === -1 || !unionHas(bitmaps.values(), pos)) return null
+		}
+		return {
+			live: splitOids(oids),
+			plan: {
+				bitmaps,
+				epoch: epoch.epoch + 1,
+				oids,
+				outcome: "advanced",
+				tips,
+			},
+		}
+	}
+
+	/** Each present tip's walk-mask positions against `oids`. Hit remaps are the
+	 * caller's to append — a full walk has none. */
+	function maskPositions(
+		tips: string[],
+		walk: OriginWalk,
+		oids: Buffer,
+	): Map<string, number[]> {
+		const out = new Map<string, number[]>()
+		for (let i = 0; i < tips.length; i++) {
+			const t = tips[i] as string
+			const bit = 1n << BigInt(i)
+			const positions: number[] = []
+			for (const [oid, bits] of walk.masks) {
+				if (bits & bit) positions.push(positionOf(oids, oid))
+			}
+			out.set(t, positions)
+		}
+		return out
+	}
+
+	/** Set equality of two SORTED, DEDUPLICATED hex arrays. */
+	function sameOids(a: readonly string[], b: readonly string[]): boolean {
+		return a.length === b.length && a.every((v, i) => v === b[i])
 	}
 
 	/** A Kysely pinned to a single porsager connection: its dialect `reserve()`s the
@@ -239,9 +426,8 @@ export function createGc(pg: Sql) {
 	 * (`copyInto`, the bytea-safe bulk primitive — no staging and no transaction:
 	 * the oids are already unique, and each COPY is one statement), batched so the
 	 * JS payload stays bounded. */
-	async function loadLive(conn: ReservedSql, oids: Set<string>): Promise<void> {
-		if (oids.size === 0) return
-		const all = [...oids]
+	async function loadLive(conn: ReservedSql, oids: readonly string[]): Promise<void> {
+		const all = oids
 		for (let i = 0; i < all.length; i += LIVE_LOAD_BATCH) {
 			const chunk = all.slice(i, i + LIVE_LOAD_BATCH)
 			await copyInto(
@@ -286,47 +472,19 @@ export function createGc(pg: Sql) {
 		return total
 	}
 
-	/** Batched edge sweep: delete every `git_edge` row whose PARENT object no longer
-	 * exists in `git_object` (a deleted object's outgoing edges). No FK cascade exists
-	 * (0003_git_edge.ts), so dangling edges must be swept explicitly. Anti-join on the
-	 * parent only: a surviving parent is reachable, so all its children are reachable
-	 * and present — its edges never dangle. Like the object sweep, each batch picks a
-	 * `LIMIT`-bounded victim set then deletes by PRIMARY KEY `(repo_id, parent, child)`
-	 * — never `ctid`, which is per-partition and would reach into other tenants. */
-	async function sweepEdges(
-		conn: ReservedSql,
-		id: ReposId,
-		batchLimit: number,
-	): Promise<number> {
-		let total = 0
-		for (;;) {
-			const deleted = await conn.unsafe<{ n: number }[]>(
-				`with victims as (
-					select e.parent, e.child from git_edge e
-					where e.repo_id = $1::bigint
-						and not exists (
-							select 1 from git_object o where o.repo_id = e.repo_id and o.oid = e.parent
-						)
-					limit $2::int
-				)
-				delete from git_edge e using victims v
-				where e.repo_id = $1::bigint and e.parent = v.parent and e.child = v.child
-				returning 1 as n`,
-				[String(id), String(batchLimit)],
-			)
-			if (deleted.length === 0) break
-			total += deleted.length
-		}
-		return total
-	}
-
 	/** Post-sweep maintenance (best-effort): reclaim the dead tuples GC produced in
-	 * the heap + TOAST and refresh planner stats, then reindex the walk index.
-	 * `VACUUM` cannot run inside a transaction block, so these are standalone
-	 * statements run outside any txn. */
-	async function maintain(): Promise<void> {
-		await pg.unsafe(`vacuum (analyze) git_object`)
-		await pg.unsafe(`vacuum (analyze) git_edge`)
-		await pg.unsafe(`reindex index git_edge_walk`)
+	 * the heap + TOAST and refresh planner stats. `VACUUM` cannot run inside a
+	 * transaction block, so these are standalone statements run outside any txn.
+	 * The table list is exactly what the sweep DELETEs touch: `git_object` directly,
+	 * `git_pack_encoding` through the 0008 cascades (its rows die with their objects
+	 * and bases, so its dead tuples are this pass's too — the gap hunt finding M10
+	 * flagged). `git_commit`/`git_tag` cascade-churn as well but are bytes-tiny and
+	 * PK-only; their leaf autovacuum (0009's delete-aware profile) is enough. */
+	async function maintain(conn: ReservedSql): Promise<void> {
+		// On the pass's RESERVED connection (between transactions — VACUUM cannot
+		// run inside one): borrowing through the pool here self-deadlocks at
+		// `max: 1`, where the reserved connection IS the pool.
+		await conn.unsafe(`vacuum (analyze) git_object`)
+		await conn.unsafe(`vacuum (analyze) git_pack_encoding`)
 	}
 }
