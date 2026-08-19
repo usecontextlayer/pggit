@@ -1,27 +1,25 @@
 /**
- * mod — non-UTF-8 filenames: the git OBJECT layer is byte-faithful; the queryable
- * `repo_file` view's UTF-8 text is a KNOWN, ACCEPTED limitation (decision 2026-06-22).
+ * mod — non-UTF-8 filenames are REJECTED at push ingest (design D16).
  *
- * A git path is an arbitrary byte string (only NUL and `/` are forbidden). A tree
- * entry named `bad\xff\xfename.txt` is perfectly valid to canonical git and fsck-clean.
+ * A git path is an arbitrary byte string (only NUL and `/` are forbidden). A
+ * tree entry named `bad\xff\xfename.txt` is perfectly valid to canonical git and
+ * fsck-clean. pggit deliberately diverges: paths are UTF-8, judged on the raw
+ * entry-name bytes at the ingest boundary (`validateObject`, GitFormatError
+ * `non-utf8-path`), so the queryable `repo_file path text` projection is EXACT.
  *
- * What pggit GUARANTEES (asserted GREEN here): the canonical object data round-trips
- * byte-for-byte. The object store keeps tree content as raw `bytea`, so a clone back
- * is fsck-clean and the commit OID is identical — and because OIDs are content hashes,
- * an identical commit OID proves the tree (and the non-UTF-8 name bytes inside it)
- * survived exactly.
+ * This replaces the previous contract (byte-faithful objects + a documented
+ * lossy U+FFFD projection, decision 2026-06-22): the lossy decode was not
+ * injective, so two byte-distinct paths could collapse onto one projection row
+ * and the second was SILENTLY dropped from the published read surface (see
+ * `src/e2e/breakage/pg-corrupt--non-utf8-path-collision.test.ts`). Rejection at
+ * the boundary removes that class instead of handling it.
  *
- * The KNOWN LIMITATION (documented, not fixed — per the decision): the derived
- * `repo_file` view stores `path` as Postgres `text`, decoded via
- * `Buffer.toString("utf8")` (src/object/object.ts treeEntries), so non-UTF-8 name bytes
- * (0xff 0xfe) become U+FFFD. This affects ONLY the queryable text projection, never
- * the canonical objects/clone. A byte-exact view (path as `bytea`) was considered and
- * deliberately not adopted, to keep the view SQL-queryable as text; non-UTF-8 names
- * are pathological in practice. This test LOCKS both facts, so a future change to a
- * byte-exact view is a deliberate, test-updating decision rather than a silent drift.
+ * Asserted here: canonical git accepts the repo (the divergence is real and
+ * deliberate); pggit rejects the push at unpack; NOTHING lands (no objects, no
+ * ref); and the repo is not wedged — a clean-path push then succeeds.
  *
- * The live server wires `snapshots: createRepoFileProjection(db)` (server.ts), so the view
- * path under test is production's.
+ * The tree is hand-framed via plumbing: `git add` cannot create an
+ * invalid-UTF-8 filename from a Node argv (always UTF-8) or under LC_ALL=C.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -35,10 +33,9 @@ import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-describe("mod — non-UTF-8 filename: faithful objects, lossy text view (known limit)", () => {
+describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact", () => {
 	let isolated: IsolatedDb
 	let server: GitServer
-	let snapshots: ReturnType<typeof createRepoFileProjection>
 	let url: string
 	const dirs: string[] = []
 
@@ -54,7 +51,7 @@ describe("mod — non-UTF-8 filename: faithful objects, lossy text view (known l
 		isolated = await createIsolatedSchema(baseUrl)
 		const objects = createObjectStore(isolated.sql)
 		const refs = createRefStore(isolated.sql)
-		snapshots = createRepoFileProjection(isolated.sql)
+		const snapshots = createRepoFileProjection(isolated.sql)
 		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
 		url = `http://127.0.0.1:${server.port}/repo`
 	}, 120_000)
@@ -65,14 +62,13 @@ describe("mod — non-UTF-8 filename: faithful objects, lossy text view (known l
 		for (const d of dirs) rmSync(d, { force: true, recursive: true })
 	})
 
-	it("round-trips the non-UTF-8 name byte-exact in objects; view path is lossy (documented)", async () => {
+	it("rejects the push at unpack and leaves nothing behind; a clean push then lands", async () => {
 		const src = mkdtempSync(join(tmpdir(), "mod-badutf-"))
 		dirs.push(src)
 		await spawnGit(["init", "--quiet", src])
 
-		// Build the tree via plumbing: a normal shell/`git add` cannot create a file with
-		// invalid-UTF-8 bytes under LC_ALL=C. hash-object the blob, hand-frame a tree
-		// object `<mode> <name>\0<20-byte oid>`, and commit it.
+		// Build the tree via plumbing: hash-object the blob, hand-frame a tree object
+		// `<mode> <name>\0<20-byte oid>`, and commit it.
 		const blobHex = (
 			await spawnGit(["hash-object", "-w", "--stdin"], { cwd: src, input: "content\n" })
 		).stdout.trim()
@@ -93,45 +89,55 @@ describe("mod — non-UTF-8 filename: faithful objects, lossy text view (known l
 		).stdout.trim()
 		await spawnGit(["update-ref", "refs/heads/main", commitHex], { cwd: src })
 
-		// Sanity: canonical git considers this a clean repo.
+		// The divergence is real: canonical git considers this a clean repo.
 		const fsckSrc = await spawnGit(["fsck", "--full", "--strict"], { cwd: src })
 		expect(fsckSrc.code).toBe(0)
 
-		// Push to pggit (objects + ref + snapshot rebuild).
+		// pggit rejects it — the ingest-boundary validation fails the unpack, which
+		// fails every ref command; the client exits non-zero.
+		const push = await spawnGit(["push", url, "refs/heads/main:refs/heads/main"], {
+			cwd: src,
+		}).catch((e: unknown) => ({ code: 1, stderr: String(e) }))
+		expect(push.code, push.stderr).not.toBe(0)
+
+		// Nothing landed: no ref, no objects, no projection rows.
+		const [counts] = await isolated.sql<{ refs: number; objs: number; files: number }[]>`
+			select
+				(select count(*) from git_ref g join repos r on r.id = g.repo_id
+					where r.name = 'repo' and g.oid is not null)::int as refs,
+				(select count(*) from git_object o join repos r on r.id = o.repo_id
+					where r.name = 'repo')::int as objs,
+				(select count(*) from repo_file f join repos r on r.id = f.repo_id
+					where r.name = 'repo')::int as files`
+		expect(counts).toEqual({ files: 0, objs: 0, refs: 0 })
+
+		// Not wedged: a UTF-8-clean history pushes fine afterwards, and the projection
+		// holds its exact path.
+		await spawnGit(["update-ref", "-d", "refs/heads/main"], { cwd: src })
+		const okBlob = (
+			await spawnGit(["hash-object", "-w", "--stdin"], { cwd: src, input: "ok\n" })
+		).stdout.trim()
+		const okTree = Buffer.concat([
+			Buffer.from("100644 good-name.txt"),
+			Buffer.from([0]),
+			Buffer.from(okBlob, "hex"),
+		])
+		const okTreeHex = (
+			await spawnGit(["hash-object", "-w", "-t", "tree", "--stdin"], {
+				cwd: src,
+				input: okTree,
+			})
+		).stdout.trim()
+		const okCommit = (
+			await spawnGit(["commit-tree", okTreeHex, "-m", "ok"], { cwd: src, input: "" })
+		).stdout.trim()
+		await spawnGit(["update-ref", "refs/heads/main", okCommit], { cwd: src })
 		await spawnGit(["push", url, "refs/heads/main:refs/heads/main"], { cwd: src })
 
-		// GUARANTEE — the OBJECT layer is byte-faithful. Clone back (no checkout: the
-		// host FS may reject the bytes; we only care about the objects), fsck clean, and
-		// the commit OID is identical. An identical content-addressed OID proves the
-		// whole tree — including the exact 0xff 0xfe name bytes — round-tripped verbatim.
-		const dest = mkdtempSync(join(tmpdir(), "mod-badutf-clone-"))
-		dirs.push(dest)
-		await spawnGit(["clone", "--quiet", "--no-checkout", url, dest])
-		const fsckClone = await spawnGit(["fsck", "--full", "--strict"], { cwd: dest })
-		expect(fsckClone.code).toBe(0)
-		const clonedTip = (
-			await spawnGit(["rev-parse", "refs/heads/main"], { cwd: dest })
-		).stdout.trim()
-		expect(clonedTip).toBe(commitHex)
-
-		// KNOWN LIMITATION — the repo_file text view decodes the name lossily. The 0xff
-		// 0xfe pair becomes two U+FFFD at the Buffer.toString("utf8") boundary, so the
-		// stored path is NOT the true bytes. Documented + locked (see file header).
 		const files = await isolated.sql<{ path: string }[]>`
 			select f.path from repo_file f
 			join repos r on r.id = f.repo_id
-			where r.name = 'repo' and f.ref_name = 'refs/heads/main'
-			order by f.path collate "C"
-		`
-		expect(files).toHaveLength(1)
-		const stored = files[0]
-		if (!stored) throw new Error("expected exactly one file in the view")
-		expect(Buffer.from(stored.path, "utf8").equals(NAME)).toBe(false)
-		// Each invalid byte (0xff, 0xfe) decoded to U+FFFD (code point 0xFFFD). Asserted
-		// by code point so neither the replacement char nor its escape appears literally.
-		const codes = [...stored.path].map((ch) => ch.codePointAt(0))
-		expect(codes).toEqual([
-			0x62, 0x61, 0x64, 0xfffd, 0xfffd, 0x6e, 0x61, 0x6d, 0x65, 0x2e, 0x74, 0x78, 0x74,
-		])
+			where r.name = 'repo' and f.ref_name = 'refs/heads/main'`
+		expect(files).toEqual([{ path: "good-name.txt" }])
 	}, 120_000)
 })

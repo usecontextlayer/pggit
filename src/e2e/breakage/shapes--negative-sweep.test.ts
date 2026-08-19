@@ -212,7 +212,7 @@ shape("mode-churn", {
 	},
 })
 
-// 5. Adversarially-sorted / weird names, wide tree, non-UTF8 dir names.
+// 5. Adversarially-sorted / weird names, wide tree, exotic (valid-UTF-8) names.
 shape("weird-names", {
 	async build(dir) {
 		const names = [
@@ -579,15 +579,20 @@ shape("growing-gitlinks", {
 	}),
 })
 
-// C. growing dir whose subdirectory names are non-UTF8 and COLLIDE under the
-// repack's `toString("utf8")` name keying (0xff and 0xfe both decode to U+FFFD).
-shape("growing-nonutf8-collide", {
+// C. growing dir whose subdirectory names are exotic-but-VALID UTF-8: NFC "é"
+// beside NFD "é" (distinct byte sequences that render identically), a CJK name,
+// and a 4-byte emoji. This replaced the raw-non-UTF-8 collision shape D16 now
+// rejects at ingest (see pg-corrupt--non-utf8-path-collision for the rejection
+// contract). Unlike that old pair these CANNOT collide — valid-UTF-8 decode is
+// injective — which is exactly what this shape pins: they must key distinctly
+// through the repack's decoded names and survive the pipeline identical to git.
+shape("growing-utf8-exotic", {
 	async build(dir) {
 		const out: string[] = []
 		let mark = 0
 		let prev = 0
 		// fast-import quoted paths take C-style octal escapes for raw bytes.
-		const dirs = ["\\377", "\\376", "\\377\\376", "\\376\\377"]
+		const dirs = ["\\303\\251", "e\\314\\201", "\\344\\270\\255", "\\360\\237\\226\\245"]
 		for (let i = 0; i < 200; i++) {
 			const changes: string[] = []
 			for (const [k, d] of dirs.entries()) {
@@ -702,8 +707,9 @@ shape("orphan-anchor-tree-reuse", {
 	},
 })
 
-// I. everything at once: growing dir + gitlinks + symlinks + exec + non-UTF8 dirs
-//    + a deep path + a wide dir + mode churn + merges + tags, 400 commits.
+// I. everything at once: growing dir + gitlinks + symlinks + exec + NFC/NFD
+//    look-alike dirs (valid UTF-8 — raw non-UTF-8 is rejected at ingest since
+//    D16) + a deep path + a wide dir + mode churn + merges + tags, 400 commits.
 shape("monster", {
 	async build(dir) {
 		const out: string[] = []
@@ -725,8 +731,8 @@ shape("monster", {
 				`M 100755 :${blob(filler(`sh${i}`, 90))} bin/run${i % 13}.sh`,
 				`M 100644 :${blob(filler(`d${i}`, 120))} ${deep}/${uuidish(i)}.txt`,
 				`M 100644 :${blob(filler(`w${i}`, 60))} wide/${i % 500}.txt`,
-				`M 100644 :${blob(filler(`nu${i}`, 80))} "\\377/${uuidish(i)}"`,
-				`M 100644 :${blob(filler(`nu2${i}`, 80))} "\\376/${uuidish(i)}"`,
+				`M 100644 :${blob(filler(`nu${i}`, 80))} "\\303\\251/${uuidish(i)}"`,
+				`M 100644 :${blob(filler(`nu2${i}`, 80))} "e\\314\\201/${uuidish(i)}"`,
 			]
 			const phase = i % 4
 			const pm = blob(filler(`p${i}`, 25 + (i % 5)))
@@ -1035,7 +1041,7 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 			const gcRes = await gc.gc(name, { graceSeconds: 0 })
 			const res3 = await repack.repack(name)
 			console.log(
-				`shape ${name} — gc: ${gcRes.deletedObjects} objs / ${gcRes.deletedEncodings} encodings; repack3: ${res3.wholes}+${res3.deltas}`,
+				`shape ${name} — gc: ${gcRes.deletedObjects} objs / ${gcRes.deletedEdges} edges; repack3: ${res3.wholes}+${res3.deltas}`,
 			)
 			const gcd = join(mk(`${name}-gcd`), "c.git")
 			await spawnGit(["clone", "-q", "--bare", url, gcd])

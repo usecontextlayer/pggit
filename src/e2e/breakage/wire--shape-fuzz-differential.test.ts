@@ -62,14 +62,17 @@ function rng(seed: number): () => number {
 	}
 }
 
-/** Directory/file name bytes, including shapes that a utf8 decode collapses. */
+/** Directory/file name bytes — every fragment VALID UTF-8, since D16 rejects a
+ * non-UTF-8 path at ingest (that contract has its own tests:
+ * `pg-corrupt--non-utf8-path-collision`, `non-utf8-paths`). The exotic coverage
+ * lives in look-alikes a normalizing layer could collapse: NFC "é" beside NFD
+ * "é" (distinct bytes, identical rendering) and a case-folding pair. */
 const NAME_BYTES: Buffer[] = [
 	Buffer.from("alpha"),
 	Buffer.from("Alpha"), // case-collides with the above on case-folding paths
 	Buffer.from("beta"),
-	Buffer.from([0xe9]), // lone latin-1 byte: invalid utf8 → U+FFFD
-	Buffer.from([0xff]), // another invalid byte → the SAME U+FFFD
-	Buffer.from([0xc3, 0xa9]), // valid utf8 "é"
+	Buffer.from([0xc3, 0xa9]), // valid utf8 "é" (NFC)
+	Buffer.from([0x65, 0xcc, 0x81]), // valid utf8 "é" (NFD) — renders like NFC, distinct bytes
 	Buffer.from("nested"),
 	Buffer.from("wide"),
 	Buffer.from("a".repeat(120)),

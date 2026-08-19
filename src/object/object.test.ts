@@ -55,8 +55,13 @@ describe("treeEntries", () => {
 			treeEntry("40000", "sub", 0xcd),
 		])
 		expect(treeEntries(tree)).toEqual([
-			{ mode: "100644", name: "a.txt", oid: "ab".repeat(20) },
-			{ mode: "40000", name: "sub", oid: "cd".repeat(20) },
+			{
+				mode: "100644",
+				name: "a.txt",
+				nameBytes: Buffer.from("a.txt"),
+				oid: "ab".repeat(20),
+			},
+			{ mode: "40000", name: "sub", nameBytes: Buffer.from("sub"), oid: "cd".repeat(20) },
 		])
 	})
 
@@ -67,7 +72,12 @@ describe("treeEntries", () => {
 	it("names containing a space are split at the NUL, not the first space", () => {
 		const tree = treeEntry("100644", "my file.txt", 0x11)
 		expect(treeEntries(tree)).toEqual([
-			{ mode: "100644", name: "my file.txt", oid: "11".repeat(20) },
+			{
+				mode: "100644",
+				name: "my file.txt",
+				nameBytes: Buffer.from("my file.txt"),
+				oid: "11".repeat(20),
+			},
 		])
 	})
 

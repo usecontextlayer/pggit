@@ -26,8 +26,11 @@ function headerOids(content: Buffer, keys: Set<string>): string[] {
 
 /** One entry of a tree. `mode` is the raw stored value (`"40000"` for a subtree —
  * git zero-pads to `"040000"` only for display); `name` is the entry's own path
- * segment, not a full path. */
-export type TreeEntry = { mode: string; name: string; oid: string }
+ * segment, not a full path. `nameBytes` is the segment's RAW bytes (a zero-copy
+ * view into the tree body): ingest validation (design D16 — pggit paths are
+ * UTF-8) must judge the bytes themselves, since `name`'s decode is lossy and a
+ * literal U+FFFD in a valid name is indistinguishable from a replacement. */
+export type TreeEntry = { mode: string; name: string; nameBytes: Buffer; oid: string }
 
 /** A tree's entries — `<mode> <name>\0<20-byte oid>` repeated. */
 export function treeEntries(content: Buffer): TreeEntry[] {
@@ -44,9 +47,10 @@ export function treeEntries(content: Buffer): TreeEntry[] {
 			throw new GitFormatError("malformed-tree", `tree: malformed entry at offset ${pos}`)
 		}
 		const mode = content.subarray(pos, space).toString("latin1")
-		const name = content.subarray(space + 1, nul).toString("utf8")
+		const nameBytes = content.subarray(space + 1, nul)
+		const name = nameBytes.toString("utf8")
 		const oid = content.subarray(nul + 1, nul + 21).toString("hex")
-		entries.push({ mode, name, oid })
+		entries.push({ mode, name, nameBytes, oid })
 		pos = nul + 21
 	}
 	return entries

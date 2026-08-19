@@ -26,6 +26,14 @@ const RECEIVE_CAPS = [
 	`agent=${AGENT}`,
 ]
 
+/** Command lines decode with `fatal: true`: a refname reaches Postgres as
+ * `text`, so pggit requires valid UTF-8 (design D16 — a deliberate divergence
+ * from git's bytes-are-bytes refnames). A lossy decode would U+FFFD-rename the
+ * ref silently, and two distinct refnames can collide on one `git_ref` PK
+ * value. A name whose bytes cannot decode also cannot be echoed truthfully in a
+ * per-ref `ng`, so the rejection is protocol-level, like any malformed line. */
+const UTF8_STRICT = new TextDecoder("utf8", { fatal: true })
+
 export type RefCommand = { oldOid: Oid; newOid: Oid; ref: string }
 export type ReceiveRequest = { commands: RefCommand[]; caps: string[]; pack: Buffer }
 export type CommandResult = { ref: string; ok: boolean; reason?: string }
@@ -74,7 +82,14 @@ export function parseReceivePack(body: Buffer): ReceiveRequest {
 	let caps: string[] = []
 	for (const p of packets) {
 		if (p.type !== "data") continue
-		let line = p.payload.toString("utf8").replace(/\n$/, "")
+		let line: string
+		try {
+			line = UTF8_STRICT.decode(p.payload).replace(/\n$/, "")
+		} catch {
+			throw new GitProtocolError(
+				"receive-pack: command line is not valid UTF-8 (pggit refnames are UTF-8)",
+			)
+		}
 		const nul = line.indexOf("\0")
 		if (nul >= 0) {
 			caps = line

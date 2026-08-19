@@ -26,6 +26,7 @@ export type GitFormatErrorCode =
 	| "delta-target-size-mismatch"
 	// git object content
 	| "malformed-tree"
+	| "non-utf8-path"
 	| "malformed-oid"
 	| "missing-tree-header"
 	| "multiple-tree-headers"

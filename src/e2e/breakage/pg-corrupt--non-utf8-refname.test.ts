@@ -1,29 +1,30 @@
 /**
- * PG TYPE-BOUNDARY PROBE — a refname is BYTES; `git_ref.name` is `text`.
+ * PG TYPE-BOUNDARY PROBE — a git refname is BYTES; pggit refnames are UTF-8.
  *
  * git refnames are byte strings (only a small set of ASCII control/meta chars is
  * banned by check-ref-format). `refs/heads/caf\xe9` and `refs/heads/caf\xea` are
  * two DISTINCT, perfectly legal refs that canonical git stores and transfers
- * byte-exact (proved here against a file:// remote oracle).
+ * byte-exact (proved here against a file:// remote oracle — kept as the record
+ * of exactly what pggit diverges from).
  *
- * pggit decodes the receive-pack command line with `payload.toString("utf8")`
- * (protocol/receive-pack.ts parseReceivePack) and stores the result in
- * `git_ref.name text`. Every invalid byte becomes U+FFFD, so:
+ * pggit's contract (design D16, a deliberate divergence): a refname must be
+ * valid UTF-8, judged on the raw command-line bytes at the push boundary
+ * (`parseReceivePack` decodes with `fatal: true`). The alternative was silent
+ * corruption: a lossy decode turned every invalid byte into U+FFFD, so the
+ * stored refname was NOT the pushed refname (silent rename), and two distinct
+ * refnames COLLIDED on one `git_ref (repo_id, name)` PK value, surfacing as a
+ * spurious CAS failure. Rejection is protocol-level (HTTP 400) rather than a
+ * per-ref `ng`: a name whose bytes cannot decode cannot be echoed truthfully in
+ * a report-status line.
  *
- *   1. the stored refname is NOT the pushed refname (silent rename), and
- *   2. two distinct refnames COLLIDE on one `text` value — `git_ref`'s PK
- *      (repo_id, name) then rejects the second as a CAS failure.
+ * Asserted here: the push is REJECTED, NOTHING lands (no objects, no refs, no
+ * mangled row), and the repo is not wedged — a follow-up all-UTF-8 push of the
+ * same objects succeeds.
  *
- * `git_ref` is AUTHORITATIVE state (the ref namespace itself), not the derived
- * `repo_file` projection whose UTF-8 lossiness is a documented, accepted limit
- * (src/e2e/non-utf8-paths.test.ts). Nothing documents this one.
- *
- * The refs are created through `git update-ref --stdin -z` because argv from Node is
- * always UTF-8 encoded — plumbing is the only way to hand git these bytes — and the
- * control is a real `file://` bare remote: canonical git doing the same push.
- *
- * Converted from `breakage/pg-corrupt--non-utf8-refname.ts`, whose verdict was:
- * exit 0 = pggit matches the oracle; non-zero = reproduced, with the bytes printed.
+ * The refs are created through `git update-ref --stdin -z` because argv from
+ * Node is always UTF-8 encoded — plumbing is the only way to hand git these
+ * bytes — and the control is a real `file://` bare remote: canonical git doing
+ * the same push.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -62,25 +63,25 @@ function refLines(bytes: Buffer): string[] {
 		.sort()
 }
 
-const hexOf = (l: string): string => Buffer.from(l, "latin1").toString("hex")
-
 /** A push whose failure is data, not a thrown error. */
 type PushOutcome = { code: number; stderr: string }
 async function tryPush(args: string[], cwd: string): Promise<PushOutcome> {
 	return spawnGit(args, { cwd }).catch((e: unknown) => ({ code: 1, stderr: String(e) }))
 }
 
-describe("pg-corrupt — non-UTF-8 refnames through git_ref.name text", () => {
+describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let srcRefs: string[] = []
 	let oracleRefs: string[] = []
-	let clonedRefs: string[] = []
-	let storedHex: string[] = []
 	let push: PushOutcome = { code: 0, stderr: "" }
+	let storedNamesHex: string[] = []
+	let storedObjects = -1
+	let retryPush: PushOutcome = { code: 1, stderr: "not run" }
+	let advertisedAfterRetry: string[] = []
+	let mainOid = ""
 	let soloPush: PushOutcome = { code: 0, stderr: "" }
 	let soloStoredHex: string[] = []
-	let soloApplied = false
 	const dirs: string[] = []
 	const mk = (tag: string): string => {
 		const d = mkdtempSync(join(tmpdir(), `pggit-badref-${tag}-`))
@@ -91,8 +92,7 @@ describe("pg-corrupt — non-UTF-8 refnames through git_ref.name text", () => {
 	beforeAll(async () => {
 		const src = mk("src")
 		await spawnGit(["init", "-q", "-b", "main", "--ref-format=reftable", src])
-		await spawnGit(["hash-object", "-w", "--stdin"], { cwd: src, input: "one\n" })
-		// Two distinct commits, so a collision cannot be dismissed as "same value anyway".
+		// Two distinct commits, so the two bad refs carry different values.
 		const emptyTree = (
 			await spawnGit(["hash-object", "-w", "-t", "tree", "--stdin"], {
 				cwd: src,
@@ -108,6 +108,7 @@ describe("pg-corrupt — non-UTF-8 refnames through git_ref.name text", () => {
 				input: "",
 			})
 		).stdout.trim()
+		mainOid = c1
 		await spawnGit(["update-ref", "refs/heads/main", c1], { cwd: src })
 		await spawnGit(["update-ref", "--stdin", "-z"], {
 			cwd: src,
@@ -118,66 +119,41 @@ describe("pg-corrupt — non-UTF-8 refnames through git_ref.name text", () => {
 			input: createRefStdin(REF_EA, c2),
 		})
 		srcRefs = refLines((await spawnGit(["show-ref"], { cwd: src })).stdoutBytes)
-		console.log("SOURCE refs (hex of each show-ref line):")
-		for (const l of srcRefs) console.log(`  ${hexOf(l)}`)
 		if (srcRefs.length !== 3) throw new Error("fixture: expected 3 source refs")
 
-		// ── ORACLE: canonical git over a file:// remote ────────────────────────────
+		// ── ORACLE: canonical git over a file:// remote — the behaviour pggit
+		// deliberately diverges from (D16). ────────────────────────────────────────
 		const oracleDir = join(mk("oracle"), "o.git")
 		await spawnGit(["init", "-q", "--bare", "--ref-format=reftable", oracleDir])
-		const oraclePush = await spawnGit(["push", oracleDir, "refs/heads/*:refs/heads/*"], {
-			cwd: src,
-		})
-		console.log(`ORACLE push exit=${oraclePush.code}`)
+		await spawnGit(["push", oracleDir, "refs/heads/*:refs/heads/*"], { cwd: src })
 		oracleRefs = refLines((await spawnGit(["show-ref"], { cwd: oracleDir })).stdoutBytes)
-		console.log("ORACLE refs after push:")
-		for (const l of oracleRefs) console.log(`  ${hexOf(l)}`)
 
-		// ── SUBJECT: pggit ────────────────────────────────────────────────────────
+		// ── SUBJECT: pggit rejects the same push at the boundary. ─────────────────
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 
 		push = await tryPush(["push", url, "refs/heads/*:refs/heads/*"], src)
-		console.log(`pggit push exit=${push.code}`)
-		console.log(push.stderr.trim().replace(/^/gm, "  | "))
 
-		// What the server ACTUALLY stored, as bytes (bypassing every text decode).
+		// What actually landed, as bytes (bypassing every text decode): must be
+		// nothing — no oid-bearing ref rows, no ingested objects.
 		const stored = await db.sql<{ h: string }[]>`
 			select encode(convert_to(g.name, 'UTF8'), 'hex') as h
 			from git_ref g join repos r on r.id = g.repo_id
-			where r.name = ${REPO} order by g.name`
-		storedHex = stored.map((r) => r.h)
-		console.log("git_ref.name rows (hex of the STORED bytes):")
-		for (const h of storedHex) console.log(`  ${h}`)
+			where r.name = ${REPO} and g.oid is not null order by g.name`
+		storedNamesHex = stored.map((r) => r.h)
+		const [objs] = await db.sql<{ n: number }[]>`
+			select count(*)::int as n from git_object o
+			join repos r on r.id = o.repo_id where r.name = ${REPO}`
+		storedObjects = objs?.n ?? -1
 
-		// What a client sees on the wire.
-		const advertised = refLines(
+		// The repo is not wedged: the same objects under an all-UTF-8 refspec land.
+		retryPush = await tryPush(["push", url, "refs/heads/main:refs/heads/main"], src)
+		advertisedAfterRetry = refLines(
 			(await spawnGit(["-c", "protocol.version=2", "ls-remote", url])).stdoutBytes,
 		)
-		console.log("pggit ls-remote lines (hex):")
-		for (const l of advertised) console.log(`  ${hexOf(l)}`)
 
-		// And what a real clone materializes.
-		const dest = join(mk("clone"), "c.git")
-		await spawnGit([
-			"-c",
-			"protocol.version=2",
-			"clone",
-			"-q",
-			"--mirror",
-			"--ref-format=reftable",
-			url,
-			dest,
-		])
-		clonedRefs = refLines((await spawnGit(["show-ref"], { cwd: dest })).stdoutBytes)
-		console.log("pggit CLONE refs (hex):")
-		for (const l of clonedRefs) console.log(`  ${hexOf(l)}`)
-
-		// ── PHASE 2: ONE non-UTF-8 ref, no collision possible ─────────────────────
-		// Isolates the RENAME from the COLLISION. A single `refs/heads/caf\xe9`
-		// cannot hit `git_ref`'s PK — so whatever happens here is the decode alone.
-		console.log("── phase 2: a SINGLE non-UTF-8 ref into a fresh repo ──")
+		// ── SOLO: one bad ref, no sibling refs — the decode alone, rejected. ──────
 		const solo = mk("solo")
 		await spawnGit(["init", "-q", "-b", "main", "--ref-format=reftable", solo])
 		const st = (
@@ -195,16 +171,11 @@ describe("pg-corrupt — non-UTF-8 refnames through git_ref.name text", () => {
 		})
 		const soloUrl = `http://127.0.0.1:${server.port}/${SOLO_REPO}`
 		soloPush = await tryPush(["push", soloUrl, "refs/heads/*:refs/heads/*"], solo)
-		console.log(`  push exit=${soloPush.code}`)
-		console.log(soloPush.stderr.trim().replace(/^/gm, "    | "))
-		const soloRows = await db.sql<{ h: string; oid: string }[]>`
-			select encode(convert_to(g.name, 'UTF8'), 'hex') as h, encode(g.oid, 'hex') as oid
+		const soloRows = await db.sql<{ h: string }[]>`
+			select encode(convert_to(g.name, 'UTF8'), 'hex') as h
 			from git_ref g join repos r on r.id = g.repo_id
 			where r.name = ${SOLO_REPO} and g.oid is not null order by g.name`
 		soloStoredHex = soloRows.map((r) => r.h)
-		soloApplied = soloRows.some((r) => r.oid.startsWith(sc.slice(0, 8)))
-		console.log("  stored refs (name hex → oid):")
-		for (const r of soloRows) console.log(`    ${r.h} → ${r.oid.slice(0, 8)}`)
 	}, 300_000)
 
 	afterAll(async () => {
@@ -213,34 +184,27 @@ describe("pg-corrupt — non-UTF-8 refnames through git_ref.name text", () => {
 		for (const d of dirs) rmSync(d, { force: true, recursive: true })
 	})
 
-	it("the oracle harness is sound: a file:// push preserves the refs byte-exact", () => {
+	it("the oracle records the divergence: a file:// push preserves the refs byte-exact", () => {
 		expect(oracleRefs).toEqual(srcRefs)
 	})
 
-	it("pggit's ref namespace matches canonical git's for the SAME push", () => {
-		expect(clonedRefs.map(hexOf)).toEqual(oracleRefs.map(hexOf))
+	it("pggit REJECTS the push carrying non-UTF-8 refnames", () => {
+		expect(push.code, push.stderr).not.toBe(0)
 	})
 
-	it("git_ref holds a row whose name bytes are the pushed refname", () => {
-		const missing = [REF_E9, REF_EA]
-			.map((want) => want.toString("hex"))
-			.filter((wantHex) => !storedHex.includes(wantHex))
-		expect(missing).toEqual([])
+	it("nothing landed: no ref rows (exact OR mangled), no ingested objects", () => {
+		expect(storedNamesHex).toEqual([])
+		expect(storedObjects).toBe(0)
 	})
 
-	it("pggit accepts a push canonical git accepts", () => {
-		expect(push.code).toBe(0)
+	it("the repo is not wedged: an all-UTF-8 push of the same objects then succeeds", () => {
+		expect(retryPush.code, retryPush.stderr).toBe(0)
+		expect(advertisedAfterRetry.some((l) => l.endsWith("refs/heads/main"))).toBe(true)
+		expect(advertisedAfterRetry.some((l) => l.startsWith(mainOid))).toBe(true)
 	})
 
-	it("a lone non-UTF-8 refname is stored under the bytes that were pushed", () => {
-		// The decode alone, no PK collision involved.
-		expect(soloStoredHex).toContain(REF_E9.toString("hex"))
-	})
-
-	it("client and server agree about whether the lone-ref push happened", () => {
-		// A push that reported FAILURE must not have applied the ref — otherwise the
-		// server holds a ref under a name the client never asked for, and the two
-		// disagree about whether the push happened at all.
-		expect(soloPush.code !== 0 && soloApplied).toBe(false)
+	it("a lone non-UTF-8 refname is rejected the same way, nothing stored", () => {
+		expect(soloPush.code, soloPush.stderr).not.toBe(0)
+		expect(soloStoredHex).toEqual([])
 	})
 })

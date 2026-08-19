@@ -26,6 +26,10 @@ export type DerivedEdge = { child: string; kind: number }
 /** A tree entry pointing at a commit in *another* repo — no blob, no edge here. */
 const GITLINK_MODE = "160000"
 
+/** Strict decoder for tree-entry names: `fatal: true` throws on invalid UTF-8
+ * instead of substituting U+FFFD (see the D16 note in `validateObject`). */
+const UTF8_STRICT = new TextDecoder("utf8", { fatal: true })
+
 /**
  * Validate an OID parsed from a commit/tag header. `commitParents`/`commitTreeOid`/
  * `referencedOids` take whatever follows the header key verbatim — a forged object
@@ -59,7 +63,10 @@ function countHeader(content: Buffer, key: string): number {
 /**
  * fsck-grade structural validation at the ingest boundary (§5.1, invariant §10.2):
  * reject the malformed objects that OID-wellformedness and tree parsing do not
- * catch. A commit must not carry more than one `tree` header (git fsck:
+ * catch — plus pggit's own D16 rule that tree-entry names are valid UTF-8 (which
+ * canonical fsck does not require; see the branch below for why). A tree is
+ * parsed here for that check, so `malformed-tree` also surfaces from this call
+ * for tree objects. A commit must not carry more than one `tree` header (git fsck:
  * multipleTrees — `commitTreeOid` would otherwise silently take the first and drop
  * the rest, recording an edge to a tree the object does not actually root). An
  * annotated tag must carry exactly one `object` header (git fsck: missingObject /
@@ -73,6 +80,26 @@ function countHeader(content: Buffer, key: string): number {
  * lands.
  */
 export function validateObject(type: GitObjectType, content: Buffer): void {
+	if (type === "tree") {
+		// D16: pggit paths are UTF-8, judged on the entry's RAW bytes at ingest —
+		// a deliberate divergence from git's bytes-are-bytes paths. Decoded lossily,
+		// a non-UTF-8 name becomes U+FFFD in the `repo_file path text` projection,
+		// where two byte-distinct names can collapse onto one row and the second is
+		// SILENTLY dropped from the published read surface. Rejecting the push here
+		// (the same unpack-fails channel as any malformed object) makes the
+		// projection exact instead. Stored pre-enforcement data is untouched: serve
+		// paths never run this, and objects remain byte-faithful bytea.
+		for (const e of treeEntries(content)) {
+			try {
+				UTF8_STRICT.decode(e.nameBytes)
+			} catch {
+				throw new GitFormatError(
+					"non-utf8-path",
+					`tree entry name is not valid UTF-8 (pggit paths are UTF-8): 0x${e.nameBytes.subarray(0, 48).toString("hex")}`,
+				)
+			}
+		}
+	}
 	if (type === "commit" && countHeader(content, "tree") > 1) {
 		throw new GitFormatError(
 			"multiple-tree-headers",
