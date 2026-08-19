@@ -1,8 +1,8 @@
-import { encodePktLine } from "@/protocol/pkt-line"
+import { encodePktLine, WRITER_MAX_PAYLOAD } from "@/protocol/pkt-line"
 
 // One band pkt-line is a band byte + payload, together within the pkt-line writer
-// cap (65515) — so a single payload slice is at most 65514 bytes.
-const MAX_BAND_DATA = 65514
+// cap — so a single payload slice leaves one byte for the band channel.
+const MAX_BAND_DATA = WRITER_MAX_PAYLOAD - 1
 
 /**
  * Multiplex `data` onto sideband-64k's data channel: each ≤MAX_BAND_DATA slice

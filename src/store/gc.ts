@@ -26,19 +26,16 @@ import { lookupRepoId } from "@/store/repo-resolver"
 const DEFAULT_BATCH_LIMIT = 10_000
 
 /**
- * Per-repo reachability GC — the one piece of the Postgres-native redesign (§7)
- * that the rest of the spine deferred. See `docs/2026-06-24-force-commit-gc-design.md`
- * for the design; the observable contract is §4 of that doc, and the authoritative
- * algorithm is §7 of `internal/archived/2026-06-22-pggit-postgres-native-storage-
- * redesign.md`.
+ * Per-repo reachability GC. See `docs/2026-06-24-force-commit-gc-design.md`
+ * for its observable contract and algorithm.
  *
- * The mechanism (data-structures-first): materialize the LIVE set — the reachable
- * closure from every ref tip — into a TEMP table on ONE reserved connection, then
- * sweep `git_object` on that same connection in batched short transactions with a
- * server-side anti-join (`NOT EXISTS`) against that table plus a `created_at`
- * grace cutoff. Reachability itself is NOT re-derived here: it is exactly
- * `fullClosure(omitBlobs=false)`, the one engine clone / fetch / connectivity
- * already share, so GC can never disagree with them about what is reachable.
+ * The mechanism (data-structures-first): plan the LIVE set from the reachability
+ * epoch when possible, otherwise through `originClosure`, and materialize it into
+ * a TEMP table on ONE reserved connection. Then sweep `git_object` on that same
+ * connection in batched short transactions with a server-side anti-join
+ * (`NOT EXISTS`) against the table plus a `created_at` grace cutoff. The epoch
+ * plan and live set come from one snapshot, so serving and reclamation share the
+ * same reachability truth.
  */
 
 /** Tunables for one GC pass. `graceSeconds` is REQUIRED — no silent default: an
@@ -54,10 +51,12 @@ const DEFAULT_BATCH_LIMIT = 10_000
  * frequent per-repo pass never triggers a full-table VACUUM on the hot cadence
  * (autovacuum reclaims the GC churn instead). Maintenance is observable-neutral —
  * it changes dead-tuple bloat, never the row/clone state. */
+export const GcGraceSecondsSchema = z.number().finite().nonnegative()
+
 const GcOptionsSchema = z
 	.object({
 		batchLimit: z.number().int().positive().default(DEFAULT_BATCH_LIMIT),
-		graceSeconds: z.number().finite().nonnegative(),
+		graceSeconds: GcGraceSecondsSchema,
 		maintain: z.boolean().default(true),
 	})
 	.strict()
@@ -78,9 +77,8 @@ type InternalGcOptions = GcOptions & { _hooks?: GcHooks }
  * (`git_pack_encoding`, `git_commit`, `git_tag`) are not counted: they follow
  * the inventory by FK `ON DELETE CASCADE` (0008/0009), dying inside the object
  * sweep's own DELETEs rather than in passes of their own. `epoch` reports what
- * the pass decided about the reachability epoch (chunk 5b) — the S6 gates
- * (quiet drains SKIP the write, a rewind falls back LOUDLY to the full walk)
- * observe it here. */
+ * the pass decided about the reachability epoch, including quiet-drain skips
+ * and loud rewind rebuilds. */
 export type GcResult = {
 	deletedObjects: number
 	epoch: EpochOutcome
@@ -91,13 +89,7 @@ export type GcResult = {
  * (`writeEpoch`'s shape) so nothing is re-derived outside the snapshot. */
 type EpochPlan =
 	| { outcome: "unchanged" | "cleared" }
-	| {
-			outcome: "advanced" | "rebuilt"
-			epoch: number
-			tips: string[]
-			oids: Buffer
-			bitmaps: Map<string, Uint8Array>
-	  }
+	| (Epoch & { outcome: "advanced" | "rebuilt" })
 
 type AdvanceAttempt =
 	| {
@@ -211,7 +203,7 @@ export function createGc(pg: Sql) {
 					await maintain(conn)
 				}
 
-				// The reachability epoch (chunk 5b), written AFTER the sweep on this
+				// The reachability epoch, written AFTER the sweep on this
 				// same reserved connection. Its tips/bits were computed under the
 				// walk's REPEATABLE READ snapshot and carried here in JS — a push
 				// landing mid-pass cannot smuggle in a tip the walk never covered
@@ -249,7 +241,7 @@ export function createGc(pg: Sql) {
 	 * a full walk, LOUDLY visible as `outcome: "rebuilt"`.
 	 *
 	 * Roots are the ref tip oids alone: the walk descends tag→target through
-	 * the `git_tag` rows (chunk 1's invariant, loud when violated), so peeled
+	 * the `git_tag` rows (the derived-row invariant is loud when violated), so peeled
 	 * targets add nothing — and the epoch's per-tip bitmaps must be keyed by
 	 * the REF oids exactly.
 	 *

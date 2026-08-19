@@ -1,10 +1,12 @@
 import { deflateSync } from "node:zlib"
 import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
+import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
-import { treeEntries } from "@/object/object"
-import { encodeDelta } from "@/pack/delta"
+import { isTreeEntryMode } from "@/object/object"
+import { indexTreeEntries, pairTreeEntries } from "@/object/tree-diff"
+import { DELTA_SIZE_MIN, encodeDelta } from "@/pack/delta"
 import { lookupRepoId } from "@/store/repo-resolver"
 
 /**
@@ -16,7 +18,7 @@ import { lookupRepoId } from "@/store/repo-resolver"
  *
  * What one pass produces, and the invariants the e2e suite pins:
  *
- * - **Coverage.** Every `git_object` row (under {@link MAX_ENCODABLE_BYTES}) ends
+ * - **Coverage.** Every `git_object` row (under {@link MAX_INLINE_BYTEA_BYTES}) ends
  *   up with exactly one encoding row: `deflate(delta vs its anchor)` for a tree in
  *   a lineage when the delta wins, `deflate(raw)` otherwise. `data_size` is the
  *   inflated length of what `data` holds — the delta PROGRAM's length for a delta
@@ -59,15 +61,6 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * against it. K=32 sits at the measured size optimum (≈√N) on the motivating
  * repo — see docs/2026-08-15-delta-pack-design.md D2 before changing it. */
 export const ANCHOR_EVERY = 32
-
-/**
- * Objects at/over this size get NO encoding row: the porsager driver decodes a
- * `bytea` result as `\x`+hex (double the bytes), so reading a value this large
- * back out of the encoding table would hit the same V8 string cap the object
- * store's chunked reader exists for (object-store.ts BIG_OBJECT_BYTES) — and the
- * serve path already handles encoding-less objects via that chunked fallback.
- */
-const MAX_ENCODABLE_BYTES = 200_000_000
 
 /** Encoding rows per COPY round-trip when writing a pass's output. */
 const WRITE_BATCH = 1000
@@ -119,7 +112,7 @@ export function createRepack(pg: Sql) {
 			if (!t0) throw new Error("pggit repack: clock_timestamp returned no row")
 
 			// The pending set: inventory minus encodings. Objects past the driver-safe
-			// cap are excluded by design (see MAX_ENCODABLE_BYTES). `stale` is judged
+			// cap are excluded by design (see MAX_INLINE_BYTEA_BYTES). `stale` is judged
 			// against the repo's last stamp — false on a never-repacked repo, where the
 			// ordinary walk already visits everything.
 			const pending = await pg<Pending[]>`
@@ -128,7 +121,7 @@ export function createRepack(pg: Sql) {
 				from git_object o
 				join repos r on r.id = o.repo_id
 				where o.repo_id = ${id}::bigint
-					and o.size < ${MAX_ENCODABLE_BYTES}
+					and o.size < ${MAX_INLINE_BYTEA_BYTES}
 					and not exists (
 						select 1 from git_pack_encoding e
 						where e.repo_id = o.repo_id and e.oid = o.oid
@@ -243,7 +236,7 @@ export function createRepack(pg: Sql) {
 				// EXCEPT in repair mode, where a hole may hide below it (D15): then the
 				// walk descends through covered trees but still never re-emits them.
 				if (!repair && !pendingByOid.has(treeOid)) return
-				const raw = await content(treeOid)
+				const current = indexTreeEntries(await content(treeOid))
 
 				// Recurse into changed subtrees FIRST, pairing by entry NAME (git's
 				// structural unit): same directory name on both sides, different oid.
@@ -258,21 +251,21 @@ export function createRepack(pg: Sql) {
 				// a delta's anchor comes from its PREDECESSOR's stored row (an earlier
 				// commit's walk), never from this commit's own emit order.
 				if (parentTreeOid !== null) {
-					const before = new Map(
-						treeEntries(await content(parentTreeOid))
-							.filter((e) => e.mode === "40000")
-							.map((e) => [e.name, e.oid]),
-					)
-					for (const entry of treeEntries(raw)) {
-						if (entry.mode !== "40000") continue
-						const prior = before.get(entry.name)
-						if (prior !== undefined && prior !== entry.oid) {
-							await encodeTreePair(entry.oid, prior)
+					const previous = indexTreeEntries(await content(parentTreeOid))
+					for (const pair of pairTreeEntries(previous, current)) {
+						if (
+							pair.state === "paired" &&
+							isTreeEntryMode(pair.before.mode) &&
+							isTreeEntryMode(pair.after.mode) &&
+							pair.before.oid !== pair.after.oid
+						) {
+							await encodeTreePair(pair.after.oid, pair.before.oid)
 						}
 					}
 				}
 
 				if (pendingByOid.has(treeOid)) {
+					const raw = current.content
 					const predecessor = parentTreeOid ? encoded.get(parentTreeOid) : undefined
 					if (predecessor !== undefined && parentTreeOid !== null) {
 						const anchor = predecessor.baseOid ?? parentTreeOid
@@ -285,7 +278,7 @@ export function createRepack(pg: Sql) {
 							// served VERBATIM as a REF_DELTA, and git's patch-delta rejects
 							// sub-minimum programs, so an empty-target delta would be
 							// client-fatal on the wire.
-							if (delta.length >= 4 && deflated.length < whole.length) {
+							if (delta.length >= DELTA_SIZE_MIN && deflated.length < whole.length) {
 								await emit(treeOid, anchor, delta.length, deflated)
 							} else {
 								await emit(treeOid, null, raw.length, whole)
@@ -337,9 +330,8 @@ export function createRepack(pg: Sql) {
 	 * The commit walk, precomputed: every commit's root tree beside its FIRST
 	 * parent's root tree (null for a root commit or a parent GC has removed), in
 	 * deterministic oldest-first topological order (Kahn; ties broken by oid).
-	 * Parent ORDER is first-class in `git_commit.parents` (spine chunk 1), so the
-	 * walk reads rows — the per-commit body re-parse this function used to do is
-	 * deleted with the edge-set's orderlessness that forced it.
+	 * Parent ORDER is first-class in `git_commit.parents`; the walk reads it
+	 * directly from the derived commit rows.
 	 */
 	async function commitDiffOrder(
 		id: ReposId,

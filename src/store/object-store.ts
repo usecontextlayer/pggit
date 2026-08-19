@@ -3,6 +3,7 @@ import { deflateSync } from "node:zlib"
 import { sql } from "kysely"
 import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
+import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
 import { OBJECT_TYPE_CODE, objectTypeFromCode } from "@/database/object-type-codes"
@@ -11,27 +12,24 @@ import { computeGenerations, requireGeneration } from "@/object/commit-graph"
 import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/derive"
 import { computeOid, type GitObjectType } from "@/object/object"
 import { isOid, type Oid, parseOid } from "@/oid"
-import { encodeDelta } from "@/pack/delta"
+import { DELTA_SIZE_MIN, encodeDelta } from "@/pack/delta"
 import { encodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, packHeader, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
 import { throwMissingDerivedRow } from "@/store/derived-row"
 import { ancestry, originClosure, routeServeSet } from "@/store/reachability"
+import { stampRepoPush } from "@/store/repo-activity"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */
 const PACK_BATCH = 1000
 
 /**
- * A stored object at/over this size is read in size-bounded chunks, never in one
- * round-trip. The porsager driver decodes a `bytea` RESULT from its text form
- * (`\x` + hex, DOUBLE the byte length), so a value over ~256MiB would build a JS
- * string past V8's max length and throw on the SERVE path — the read-side mirror of
- * the ingest string-cap that binary COPY fixed (a07/blb01). Kept well under the cap
- * so the doubled hex of a single chunk stays safely below it.
+ * A stored object at/over {@link MAX_INLINE_BYTEA_BYTES} is read in size-bounded
+ * chunks. The chunk size keeps each doubled-hex result safely below V8's string
+ * limit.
  */
-const BIG_OBJECT_BYTES = 200_000_000
 const READ_CHUNK_BYTES = 100_000_000
 
 /** Split `items` into consecutive batches of at most `size`. */
@@ -97,12 +95,11 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 
 	const store = {
 		/**
-		 * Build the served pack for a fetch: the want-closure minus the have-closure,
-		 * re-adding the explicit wants (promisor lazy-fetch roots — a partial clone may
-		 * want a blob reachable from a tree it already has, so it must not be
-		 * subtracted). The object count is known from the closure before any content is
-		 * read; content then streams in keyset batches into the pack encoder, so only
-		 * one batch of inflated content is ever held (never the whole repo).
+		 * Build the served pack for a fetch. `routeServeSet` dispatches wants by type,
+		 * applies git's commit-frontier semantics when haves exist, and preserves exact
+		 * blob wants for partial-clone lazy fetches. The resulting object count is known
+		 * before content is read; content then streams in keyset batches into the pack
+		 * encoder, so only one batch of inflated content is held at a time.
 		 */
 		async buildPack(
 			repoId: string,
@@ -119,7 +116,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			if (id === null) throw new WantNotFoundError(wants)
 
 			const route = await withPhase("closure", async () => {
-				// The one routed entry (spine chunk 2/R4): the router type-dispatches
+				// The one routed entry (R4): the router type-dispatches
 				// wants, peels tag chains, sends have-ful commit fetches through the
 				// frontier, and keeps have-less requests on the full closure. An exact
 				// blob want is served even under a blob filter — the promisor rule —
@@ -264,7 +261,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 							.select(["oid"])
 							.select(sql<number>`octet_length(content)`.as("size"))
 							.select(
-								sql<Buffer | null>`case when octet_length(content) < ${BIG_OBJECT_BYTES} then content end`.as(
+								sql<Buffer | null>`case when octet_length(content) < ${MAX_INLINE_BYTEA_BYTES} then content end`.as(
 									"content",
 								),
 							)
@@ -322,7 +319,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 								// git's patch-delta rejects programs under 4 bytes
 								// (DELTA_SIZE_MIN) — an empty-target delta would be
 								// client-fatal, so it ships whole instead.
-								delta.length >= 4 &&
+								delta.length >= DELTA_SIZE_MIN &&
 								deltaDeflated !== null &&
 								warmBase !== undefined &&
 								deltaDeflated.length < wholeDeflated.length
@@ -344,7 +341,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 					}
 				}
 				// The header count was fixed up front; a mismatch is a corrupt pack the
-				// client would reject cryptically — fail here, loudly, instead (D8).
+				// client would reject cryptically — fail here, loudly, instead.
 				if (emitted !== served.length) {
 					throw new Error(
 						`pggit: pack emitted ${emitted} objects, header promised ${served.length}`,
@@ -397,7 +394,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 				.select(["type"])
 				.select(sql<number>`octet_length(content)`.as("size"))
 				.select(
-					sql<Buffer | null>`case when octet_length(content) < ${BIG_OBJECT_BYTES} then content end`.as(
+					sql<Buffer | null>`case when octet_length(content) < ${MAX_INLINE_BYTEA_BYTES} then content end`.as(
 						"content",
 					),
 				)
@@ -470,7 +467,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		 * R5) the walk is `originClosure` with the tips as its STOP-SET — only the
 		 * NEW region is verified: objects under a tip GC's pinned snapshot saw are
 		 * live and cannot vanish mid-check, and a tip advanced after that snapshot
-		 * is covered by the grace window (D13), the same defense it has today.
+		 * is covered by the grace window (D13).
 		 * Anything NOT under a tip (a denied push's stored-but-unverified orphans)
 		 * is walked, not trusted. Without a boundary (first push, operator calls)
 		 * the stop-set is empty and the walk is the full closure.
@@ -531,9 +528,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		 * base on the want's chain — neg01) without over-readying a have whose
 		 * fork point lies deeper (git keeps negotiating there, and so do we).
 		 * Non-commit wants are SKIPPED, as git skips them — a blob want must
-		 * not hold negotiation open forever. The earlier directional check
-		 * against the bare common set never readied siblings and cost an extra
-		 * round per fetch.
+		 * not hold negotiation open forever.
 		 */
 		async readyToGiveUp(
 			repoId: string,
@@ -566,7 +561,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 	/** Insert objects as rows + their derived commit/tag rows, idempotent
 	 * (re-sent objects are skipped). Each object row and its complete derived set go
 	 * in ONE transaction from ONE derivation (§10.1) — so no commit/tag object ever
-	 * exists without its `git_commit`/`git_tag` row (spine chunk 1: "every stored
+	 * exists without its `git_commit`/`git_tag` row (the invariant: "every stored
 	 * commit has a row" is an invariant, not a hope).
 	 * Derivation validates at the boundary and throws on malformed content (§5.1),
 	 * aborting the ingest before any row lands. Returns every object's hex OID, in
@@ -599,7 +594,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		// derive NULL for every commit of a first push — and absorbing-NULL would
 		// freeze that forever. In-pack parents resolve locally; parents already in
 		// `git_commit` resolve by read; anything else is absent (denied-push residue)
-		// and derives absorbing NULL (spine chunk 1).
+		// and derives absorbing NULL.
 		const commitByHex = new Map(
 			entries.flatMap((e) => (e.commit ? [[e.hex, e.commit] as const] : [])),
 		)
@@ -679,11 +674,9 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		// (gc-scheduler.ts §2). Stamping post-commit guarantees `last_pushed_at` is never
 		// earlier than the commit of the orphan it announces, so a drain reading
 		// `t0 = clock_timestamp()` after these objects' commit can't settle
-		// `last_gc_at >= last_pushed_at` and lose that garbage — the same no-lost-garbage
-		// rule refs-store's post-commit `stampPushed` follows. A tiny single-row HOT update
-		// on the churn-tuned `repos` (0004) — reached only on a non-empty ingest (the empty
-		// case returned above).
-		await pg`update repos set last_pushed_at = clock_timestamp() where id = ${id}::bigint`
+		// `last_gc_at >= last_pushed_at` and lose that garbage. Reached only on a
+		// non-empty ingest (the empty case returned above).
+		await stampRepoPush(db, id)
 		return entries.map((e) => e.hex)
 	}
 
@@ -691,7 +684,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 	 * Read a single object's `content` in size-bounded chunks via `substring`, so a
 	 * blob larger than V8's max string length never reaches the porsager driver as one
 	 * over-cap `\x`+hex string — the serve-side mirror of the binary COPY ingest. Used
-	 * only for objects at/over BIG_OBJECT_BYTES (smaller content comes back inline).
+	 * only for objects at/over MAX_INLINE_BYTEA_BYTES (smaller content comes back inline).
 	 */
 	async function readContentChunked(
 		id: ReposId,

@@ -1,11 +1,10 @@
 import { commitTreeOid } from "@/object/object"
 import { diffFileLists, type TreeReader } from "@/object/tree-diff"
+import { ZERO_OID } from "@/oid"
 import { buildFileList, type ObjectReader } from "@/repo-view/build-file-list"
 import type { RepoFileProjection } from "@/repo-view/repo-file-projection"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
-
-const ZERO_OID = "0".repeat(40)
 
 export type SnapshotDeps = {
 	objects: ObjectStore
@@ -17,8 +16,8 @@ export type SnapshotDeps = {
  * ignored; a delete (zero oid) drops the snapshot; otherwise
  * the projection advances to the new tip — incrementally from its recorded basis
  * when the tip descends from it, by full rebuild when no basis exists, and NOT AT
- * ALL when a newer push already projected past this oid (the monotonic guard,
- * spine chunk 4). This side supplies only the tree-walking; the projection store
+ * ALL when a newer push already projected past this oid (the monotonic guard).
+ * This side supplies only the tree-walking; the projection store
  * selects the plan outside its transaction and rechecks the basis under the
  * branch lock before applying. Runs after the push commits; a failure here never
  * rolls back the git operation, and because the basis and rows move together, an
@@ -57,7 +56,7 @@ export async function syncRefSnapshot(
 /**
  * Rebuild a repo's entire projection from its current branch tips — the backfill
  * for an existing repo, and the "nuke and rebuild" backstop if the cache ever
- * drifts. Everything is re-derived from the canonical packs; `clearRepo` also
+ * drifts. Everything is re-derived from the canonical objects; `clearRepo` also
  * clears the recorded bases, so every branch takes the full-rebuild path.
  */
 export async function rebuildAllSnapshots(

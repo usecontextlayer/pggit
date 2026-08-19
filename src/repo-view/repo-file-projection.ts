@@ -12,7 +12,7 @@ export type RepoFileProjection = ReturnType<typeof createRepoFileProjection>
  * element, wire cap 65,534). */
 const APPLY_BATCH = 1000
 
-/** How the walking side of a push projection is supplied (spine chunk 4): the
+/** How the walking side of a push projection is supplied: the
  * SQL half (this module) selects no-op, full rebuild, incremental diff, or skip
  * from the recorded basis, calls back for the tree walk outside a transaction,
  * then rechecks that basis under the branch lock before applying. `fullList` is
@@ -40,7 +40,7 @@ export type ApplyOutcome = "noop" | "rebuilt" | "diffed" | "skipped"
  * It is a derived projection of the canonical objects — no duplicate blob bytes, no
  * orphan reaper — droppable and rebuildable at will.
  *
- * Maintenance is DIFF-DRIVEN since spine chunk 4: `repo_file_head` persists which
+ * Maintenance is DIFF-DRIVEN: `repo_file_head` persists which
  * commit each branch's rows reflect, and a push moves the projection FORWARD from
  * that basis — never rebuilds backwards, never infers the basis from the push
  * command (R12: an inferred basis makes a torn projection representable). A
@@ -169,9 +169,9 @@ export function createRepoFileProjection(pg: Sql, repoResolver?: RepoResolver) {
 		},
 	}
 
-	/** Replace a branch's rows wholesale (the full-rebuild path — today's code,
-	 * verbatim in shape): COPY into staging has no bind-parameter ceiling, so a
-	 * tip with any file count lands in a single statement. */
+	/** Replace a branch's rows wholesale on the full-rebuild path. COPY into
+	 * staging has no bind-parameter ceiling, so a tip with any file count lands
+	 * in a single statement. */
 	async function replaceBranchRows(
 		tx: TransactionSql,
 		id: ReposId,

@@ -135,8 +135,7 @@ async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer
 			)
 		}
 
-		// `done` (spec §4 shapes a/c): pack the delta directly. A clone has no haves, so
-		// the subtrahend is empty and we pack the whole want-closure.
+		// `done` (spec §4 shapes a/c): route and pack the requested objects directly.
 		return encodePackfileResponse(
 			await backend.buildPack(wants, common, omitBlobs, includeTag, thinPack),
 		)

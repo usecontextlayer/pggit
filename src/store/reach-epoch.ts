@@ -6,7 +6,7 @@ import type { Database } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
 
 /**
- * The reachability epoch (spine chunk 5b) — pggit's analog of git's `.bitmap`.
+ * The reachability epoch — pggit's analog of git's `.bitmap`.
  * A repo carries at most ONE live epoch: `oids`, the SORTED concatenation of
  * every live oid (20 bytes each, bit *i* ⇔ `oids[i*20..]`), plus one
  * CRoaring-portable bitmap per ref tip over that ordering. Produced by the GC
@@ -44,9 +44,9 @@ export type EpochLoad =
 	| { state: "ready"; epoch: Epoch }
 	| { state: "incomplete"; epoch: Epoch }
 
-/** What one GC pass decided about the epoch — `GcResult` surfaces it so the
- * S6 gates (rewind falls back LOUDLY, quiet drains skip the write) are
- * observable without log-scraping. `unchanged` = tips identical, nothing
+/** What one GC pass decided about the epoch — `GcResult` surfaces it so rewind
+ * rebuilds and quiet-drain skips are observable without log-scraping.
+ * `unchanged` = tips identical, nothing
  * written; `advanced` = steady-state delta over the prior epoch; `rebuilt` =
  * full walk (first epoch, or the loud rewind/deletion fallback); `cleared` =
  * no epoch is stored anymore — the repo has no refs, or the walk reported
@@ -97,12 +97,7 @@ export async function loadEpoch(db: Kysely<Database>, id: ReposId): Promise<Epoc
 export async function writeEpoch(
 	conn: ReservedSql,
 	id: ReposId,
-	payload: {
-		epoch: number
-		tips: string[]
-		oids: Buffer
-		bitmaps: Map<string, Uint8Array>
-	},
+	payload: Epoch,
 ): Promise<void> {
 	try {
 		await conn`begin`
@@ -150,9 +145,14 @@ export function concatSortedOids(hexes: Iterable<string>): Buffer {
 export function splitOids(oids: Buffer): string[] {
 	const out: string[] = []
 	for (let i = 0; i < oids.length; i += OID_BYTES) {
-		out.push(oids.toString("hex", i, i + OID_BYTES))
+		out.push(oidAtPosition(oids, i / OID_BYTES))
 	}
 	return out
+}
+
+/** Read the hex OID at one epoch bit position. */
+export function oidAtPosition(oids: Buffer, position: number): string {
+	return oids.toString("hex", position * OID_BYTES, (position + 1) * OID_BYTES)
 }
 
 /** Binary-search a hex oid's bit position in a concatenated sorted array;
@@ -198,7 +198,7 @@ export function oidsOfUnion(bitmaps: Iterable<Uint8Array>, oids: Buffer): string
 		}
 		const out: string[] = []
 		for (const p of acc.toUint32Array()) {
-			out.push(oids.toString("hex", p * OID_BYTES, (p + 1) * OID_BYTES))
+			out.push(oidAtPosition(oids, p))
 		}
 		return out
 	} finally {
@@ -233,7 +233,7 @@ export function remapPositions(
 	try {
 		const out: number[] = []
 		for (const p of bm.toUint32Array()) {
-			const hex = oldOids.toString("hex", p * OID_BYTES, (p + 1) * OID_BYTES)
+			const hex = oidAtPosition(oldOids, p)
 			if (dropHexes?.has(hex)) continue
 			const np = positionOf(newOids, hex)
 			if (np === -1) {

@@ -4,7 +4,7 @@ import { count } from "@/instrument"
 import { GitFormatError } from "@/object/format-error"
 import { computeOid, type GitObjectType } from "@/object/object"
 import type { Oid } from "@/oid"
-import { applyDelta } from "@/pack/delta"
+import { applyDelta, DELTA_SIZE_MIN } from "@/pack/delta"
 import { decodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 
 export type ParsedObject = {
@@ -52,6 +52,22 @@ function inflateOne(buf: Buffer): Promise<{ data: Buffer; compressedLength: numb
 		)
 		inf.end(buf)
 	})
+}
+
+/** Validate a delta program at the pack-ingest boundary. */
+function validateDeltaProgram(data: Buffer, declaredSize: number, offset: number): void {
+	if (data.length < DELTA_SIZE_MIN) {
+		throw new GitFormatError(
+			"delta-too-short",
+			`pack: delta program at ${offset} is ${data.length} bytes; git's minimum is ${DELTA_SIZE_MIN}`,
+		)
+	}
+	if (data.length !== declaredSize) {
+		throw new GitFormatError(
+			"size-mismatch",
+			`pack: delta program at ${offset} inflated to ${data.length} bytes, header declared ${declaredSize}`,
+		)
+	}
 }
 
 /**
@@ -126,18 +142,7 @@ export async function readPack(
 			// git's DELTA_SIZE_MIN (4 bytes) rejects shorter programs outright.
 			// The minimum lives HERE, at the wire boundary: our own encoder may
 			// legally produce a 2-byte program for an empty target internally.
-			if (data.length < 4) {
-				throw new GitFormatError(
-					"delta-too-short",
-					`pack: delta program at ${start} is ${data.length} bytes; git's minimum is 4`,
-				)
-			}
-			if (data.length !== size) {
-				throw new GitFormatError(
-					"size-mismatch",
-					`pack: delta program at ${start} inflated to ${data.length} bytes, header declared ${size}`,
-				)
-			}
+			validateDeltaProgram(data, size, start)
 			entries.set(start, { baseOffset: start - negOffset, delta: data, kind: "ofs" })
 		} else if (type === PACK_OBJ_TYPE.REF_DELTA) {
 			const baseOid = pack.subarray(offset, offset + 20).toString("hex")
@@ -145,18 +150,7 @@ export async function readPack(
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
 			count("bytesInflated", data.length)
 			offset += compressedLength
-			if (data.length < 4) {
-				throw new GitFormatError(
-					"delta-too-short",
-					`pack: delta program at ${start} is ${data.length} bytes; git's minimum is 4`,
-				)
-			}
-			if (data.length !== size) {
-				throw new GitFormatError(
-					"size-mismatch",
-					`pack: delta program at ${start} inflated to ${data.length} bytes, header declared ${size}`,
-				)
-			}
+			validateDeltaProgram(data, size, start)
 			entries.set(start, { baseOid, delta: data, kind: "ref" })
 		} else {
 			const typeName = CODE_TO_TYPE[type]

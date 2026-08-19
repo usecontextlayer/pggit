@@ -57,7 +57,7 @@ export async function startServer(
 	// its own scheduler over its `pg` — `createGitApp` stays scheduler-free.
 	//
 	// The drain runs on a DEDICATED connection pool, separate from the request path:
-	// each concurrent gc() reserves a connection for its whole reachable-closure walk,
+	// each concurrent gc() reserves a connection for its whole live-set plan and sweep,
 	// so sharing the request pool could starve clone/fetch/push under load. GC off the
 	// hot path means off the hot pool. Sized to `concurrency` (one reservation per
 	// concurrent repo) + 1 for the per-repo bookkeeping queries.

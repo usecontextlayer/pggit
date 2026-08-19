@@ -4,9 +4,15 @@ import TinyQueue from "tinyqueue"
 import type { Database } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
 import { GITLINK_MODE, isTreeEntryMode, treeEntries } from "@/object/object"
+import { type IndexedTree, indexTreeEntries } from "@/object/tree-diff"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { throwMissingDerivedRow } from "@/store/derived-row"
-import { loadEpoch, oidsOfUnion, remapPositions } from "@/store/reach-epoch"
+import {
+	loadEpoch,
+	oidAtPosition,
+	oidsOfUnion,
+	remapPositions,
+} from "@/store/reach-epoch"
 
 /** Oids looked up per round-trip. Kysely's `in`-expansion spends one bind per
  * oid; the wire caps a statement at 65,534 binds. */
@@ -83,7 +89,7 @@ async function loadTagTargets(
  * keeps blob bodies off the wire; presence is all a blob contributes). Type
  * judgment stays with the CALLER: an oid that arrives here can be a typed-edge
  * violation (a tree naming a commit — reject cleanly) or a commit/tag whose
- * derived row is missing (chunk 1's invariant broken — crash loud), and only
+ * derived row is missing (the derived-row invariant is broken — crash loud), and only
  * the walk knows which edge brought it. */
 async function loadObjectMeta(
 	db: Kysely<Database>,
@@ -116,7 +122,7 @@ type EdgeExpectation = "commit" | "tree" | "blob"
  * valid directory edge keeps an object alive even when a second, mistyped
  * edge also names it). Returns:
  * - "corruption": a COMMIT/TAG type here normally means the derived row is
- *   MISSING — chunk 1's invariant broken, crash loud, NEVER a sweepable
+ *   MISSING — the derived-row invariant is broken, crash loud, NEVER a sweepable
  *   "missing" (a healthy commit resolves via its row before this probe).
  * - "violation": the one exception — when ONLY tree/blob edges named the oid,
  *   the OBJECT may be healthy and the EDGE malformed; likewise a TREE/BLOB
@@ -166,19 +172,48 @@ async function loadObjectTypes(
 	return out
 }
 
+type PeeledTagChain =
+	| { state: "complete"; chain: string[]; terminal: string }
+	| { state: "missing"; chain: string[]; oid: string }
+
+/** Peel one known tag through the canonical derived-row loaders. Missing tag
+ * rows are corruption; an absent target is an ordinary incomplete chain. */
+async function peelTagChain(
+	db: Kysely<Database>,
+	id: ReposId,
+	tagOid: string,
+	typed: Map<string, number>,
+): Promise<PeeledTagChain> {
+	const chain: string[] = []
+	let current = tagOid
+	for (;;) {
+		chain.push(current)
+		const target = (await loadTagTargets(db, id, [current])).get(current)
+		if (target === undefined) throwMissingDerivedRow(current, PACK_OBJ_TYPE.TAG)
+
+		let targetType = typed.get(target)
+		if (targetType === undefined) {
+			targetType = (await loadObjectTypes(db, id, [target])).get(target)
+			if (targetType === undefined) return { chain, oid: target, state: "missing" }
+			typed.set(target, targetType)
+		}
+		if (targetType !== PACK_OBJ_TYPE.TAG) {
+			return { chain, state: "complete", terminal: target }
+		}
+		current = target
+	}
+}
+
 /**
- * The ONE reachability module (spine chunk 2) — shared by clone, connectivity,
- * and GC's live set, so they can never disagree about what is reachable. The
- * old recursive `git_edge` CTE is deleted with the table itself: walks read the
- * commit/tag ROWS (chunk 1) and tree CONTENT (`git_object` is the raw-content
- * authority, D1 — a deltified tree is never in any recursion path). Batched
- * primary-key point-reads are the whole query surface, so no statistics
- * staleness can flip a plan into a quadratic shape — the fragility class the
- * edge-CTE closure demonstrated is structurally unexpressible here.
+ * The ONE reachability module — shared by clone, connectivity,
+ * and GC's live set, so they can never disagree about what is reachable. Walks
+ * read the commit/tag rows and tree content (`git_object` is the raw-content
+ * authority, D1). Batched primary-key point-reads are the whole query surface,
+ * keeping traversal cost independent of planner statistics.
  *
  * Four walks share the loaders above: `fullClosure` (everything reachable),
- * `originClosure` (the same walk carrying per-origin masks — the epoch
- * producer's, chunk 5b), `frontier` (wants minus haves, git's
+ * `originClosure` (the same walk carrying the epoch producer's per-origin
+ * masks), `frontier` (wants minus haves, git's
  * mark_uninteresting), and `ancestry` (commit/tag ancestry as one recursive
  * CTE). The want-type router (`routeServeSet`) and the bitmap fast path
  * (`epochServe`) live INSIDE this module — type dispatch and epoch guards
@@ -198,12 +233,11 @@ type Frontier = { commits: string[]; objects: string[]; unknown: string[] }
  * commit rows for known-commit + unknown oids, tag rows for the unknown
  * remainder, then one `git_object` read for the rest that fetches CONTENT ONLY
  * for trees (a `case` guard keeps blob bodies off the wire; presence is all a
- * blob contributes). One tree parse yields subtrees AND blobs — the separate
- * blob-enumeration pass of the old closure is absorbed, not added. Returns the
+ * blob contributes). One tree parse yields both subtrees and blobs. Returns the
  * closure partitioned into present / missing.
  *
  * A commit or tag OBJECT whose derived row is absent is a LOUD error, never a
- * parse-the-body fallback — "every stored commit has its row" is chunk 1's
+ * parse-the-body fallback — "every stored commit has its row" is the
  * invariant, and reading through its violation would hide real corruption.
  */
 export async function fullClosure(
@@ -274,7 +308,7 @@ export async function fullClosure(
 			// parent that is no commit) is a MALFORMED GRAPH, judged like an
 			// absent object on this SERVE path: the want is refused — never an
 			// under-walk that silently skips descendants. A commit/tag with no
-			// derived row stays a LOUD crash (corruption, chunk 1).
+			// derived row stays a LOUD corruption crash.
 			const verdict = judgeProbedType(expected.get(oid), m.type)
 			if (verdict === "corruption") throwMissingDerivedRow(oid, m.type)
 			if (verdict === "violation") {
@@ -444,7 +478,7 @@ export async function originClosure(
 			// (a valid edge elsewhere must keep it un-sweepable) and expands it
 			// by its ACTUAL type — either way the violation is recorded and the
 			// epoch withheld. A commit/tag with no derived row stays a LOUD
-			// crash (corruption, chunk 1), never a sweepable "missing".
+			// corruption crash, never a sweepable "missing".
 			const verdict = judgeProbedType(expected.get(oid), m.type)
 			if (verdict === "corruption") throwMissingDerivedRow(oid, m.type)
 			if (verdict === "violation") {
@@ -555,12 +589,12 @@ export async function ancestry(
 	return row.reached
 }
 
-// ─────────────────────────── the frontier (chunk 2, S4) ───────────────────────────
+// ───────────────────────────────── the frontier ─────────────────────────────────
 
 /** INTERESTING = reachable from a want; UNINTERESTING = reachable from a have.
  * Both can hold; uninteresting wins (git's mark_uninteresting).
  * `uninterestingBits` carries PROVENANCE — a bitset over the haves (`1n << i`)
- * whose descent marked this commit — so the bitmap fast path (chunk 5b) can
+ * whose descent marked this commit — so the bitmap fast path can
  * tell which epoch tips justified each exclusion. 0n ⇔ not uninteresting. */
 type Mark = { interesting: boolean; uninterestingBits: bigint }
 
@@ -568,7 +602,7 @@ type Mark = { interesting: boolean; uninterestingBits: bigint }
  * `missing` is every absent object the walk needed (non-empty ⇒ the want's
  * closure is incomplete — refuse, or reject the push, caller's call);
  * `clientHas` is every oid PROVABLY held by the client — observed on the
- * boundary side of a diff — the only legal thin-pack bases (D8′, spent in S5). */
+ * boundary side of a diff — the only legal thin-pack bases (D8′). */
 export type ServeSet = {
 	served: Set<string>
 	missing: Set<string>
@@ -579,7 +613,7 @@ export type ServeSet = {
 	warmBases: Map<string, string>
 	/** The haves the want-side walk REACHED (marked interesting): each is in
 	 * every want's closure, so its own closure may be added to the serve set
-	 * without over-serving — the bitmap fast path's OR set (chunk 5b). */
+	 * without over-serving — the bitmap fast path's OR set. */
 	boundaryHits: Set<string>
 	/** True iff every exclusion the walk made is justified by a have in
 	 * `boundaryHits`. False means some pruning leaned on a have the wants never
@@ -610,7 +644,7 @@ function frontierBefore(
  * MINUS reachable-from-haves" is non-monotone, and stopping AT a have descends
  * past merge bases into an unbounded over-send). A JS priority queue pops in
  * descending generation, so in the finite region the strict
- * `gen(parent) < gen(child)` invariant (chunk 1) makes every UNINTERESTING mark
+ * `gen(parent) < gen(child)` invariant makes every UNINTERESTING mark
  * arrive before its commit is popped — exact, no date slop. Per new commit, its
  * root tree is diffed n-way against its parents' roots: boundary-parent sides
  * accumulate into `clientHas` and prune; interesting-parent sides only prune
@@ -719,8 +753,8 @@ export async function frontier(
 	}
 
 	// ── Phase 2: trees + blobs per new commit, n-way against parents' roots. ──
-	const treeCache = new Map<string, Buffer | null>()
-	const readTree = async (oid: string): Promise<Buffer | null> => {
+	const treeCache = new Map<string, IndexedTree | null>()
+	const readTree = async (oid: string): Promise<IndexedTree | null> => {
 		const hit = treeCache.get(oid)
 		if (hit !== undefined) return hit
 		const [row] = (
@@ -730,10 +764,10 @@ export async function frontier(
 					and type = ${PACK_OBJ_TYPE.TREE}
 			`.execute(db)
 		).rows
-		const content = row?.content ?? null
-		treeCache.set(oid, content)
-		if (content === null) missing.add(oid)
-		return content
+		const tree = row === undefined ? null : indexTreeEntries(row.content)
+		treeCache.set(oid, tree)
+		if (tree === null) missing.add(oid)
+		return tree
 	}
 	const blobCandidates = new Set<string>()
 
@@ -742,9 +776,9 @@ export async function frontier(
 	const serveWholeTree = async (treeOid: string): Promise<void> => {
 		if (served.has(treeOid)) return
 		served.add(treeOid)
-		const content = await readTree(treeOid)
-		if (content === null) return
-		for (const e of treeEntries(content)) {
+		const tree = await readTree(treeOid)
+		if (tree === null) return
+		for (const e of tree.entries) {
 			if (isTreeEntryMode(e.mode)) await serveWholeTree(e.oid)
 			else if (e.mode !== GITLINK_MODE && !omitBlobs) blobCandidates.add(e.oid)
 		}
@@ -770,12 +804,12 @@ export async function frontier(
 		// thin-pack serve may delta against it at serve time.
 		const warmBase = boundaryTrees[0]
 		if (warmBase !== undefined) warmBases.set(treeOid, warmBase)
-		const content = await readTree(treeOid)
-		if (content === null) return
+		const tree = await readTree(treeOid)
+		if (tree === null) return
 
 		type OldSide = {
 			boundary: boolean
-			entries: Map<string, { mode: string; oid: string }>
+			entries: IndexedTree["byName"]
 		}
 		const oldSides: OldSide[] = []
 		for (const [boundary, list] of [
@@ -783,20 +817,18 @@ export async function frontier(
 			[false, interestingTrees],
 		] as const) {
 			for (const oldOid of list) {
-				const oldContent = await readTree(oldOid)
-				if (oldContent === null) continue
-				const entries = new Map<string, { mode: string; oid: string }>()
-				for (const e of treeEntries(oldContent)) {
-					entries.set(e.name, { mode: e.mode, oid: e.oid })
+				const oldTree = await readTree(oldOid)
+				if (oldTree === null) continue
+				for (const e of oldTree.entries) {
 					// "Any oid seen on the old side" of a BOUNDARY diff is provably
 					// client-held — a boundary tree reachable from a stated have named it.
 					if (boundary && e.mode !== GITLINK_MODE) clientHas.add(e.oid)
 				}
-				oldSides.push({ boundary, entries })
+				oldSides.push({ boundary, entries: oldTree.byName })
 			}
 		}
 
-		for (const e of treeEntries(content)) {
+		for (const e of tree.entries) {
 			if (e.mode === GITLINK_MODE) continue
 			const sameOid = oldSides.some((s) => s.entries.get(e.name)?.oid === e.oid)
 			if (sameOid) continue
@@ -867,7 +899,7 @@ export async function frontier(
 }
 
 /**
- * The bitmap fast path (chunk 5b, R23) — answers a no-have, unfiltered request
+ * The bitmap fast path (R23) — answers a no-have, unfiltered request
  * from the stored epoch, or returns `fallback` when it cannot answer EXACTLY
  * (no epoch; a want that is neither an epoch tip nor a commit; a bitmap row
  * already cascaded away mid-rewind; or a walk whose exclusions leaned on a tip
@@ -926,41 +958,20 @@ async function epochServe(
 	// is recorded so a hit at the peeled commit can subtract it. Tips that peel
 	// to a non-commit carry no subtraction semantics (git's rule) — and cannot
 	// be reached by a commit walk — so they are simply not boundaries.
-	const boundaryOf = new Map<
-		string,
-		{ tip: string; chain: Set<string>; bits: Uint8Array }
-	>()
+	const boundaryOf = new Map<string, { chain: Set<string>; bits: Uint8Array }>()
 	for (const [tip, bits] of tipBitmaps) {
-		let current = tip
-		const chain = new Set<string>()
-		while (typed.get(current) === PACK_OBJ_TYPE.TAG) {
-			chain.add(current)
-			const [row] = (
-				await sql<{ target: string }>`
-					select encode(target_oid, 'hex') as target from git_tag
-					where repo_id = ${id}::bigint and oid = ${Buffer.from(current, "hex")}
-				`.execute(db)
-			).rows
-			if (!row) {
-				throwMissingDerivedRow(current, PACK_OBJ_TYPE.TAG)
-			}
-			if (typed.get(row.target) === undefined) {
-				const [t] = (
-					await sql<{ type: number }>`
-						select type from git_object
-						where repo_id = ${id}::bigint and oid = ${Buffer.from(row.target, "hex")}
-					`.execute(db)
-				).rows
-				if (!t) break
-				typed.set(row.target, t.type)
-			}
-			current = row.target
-		}
+		const peeled =
+			typed.get(tip) === PACK_OBJ_TYPE.TAG
+				? await peelTagChain(db, id, tip, typed)
+				: { chain: [], state: "complete" as const, terminal: tip }
+		if (peeled.state === "missing") continue
+		const current = peeled.terminal
+		const chain = new Set(peeled.chain)
 		if (typed.get(current) !== PACK_OBJ_TYPE.COMMIT) continue
 		// A commit tip beats a tag tip peeling to the same commit (no chain to
 		// subtract); first tag tip wins among equals — their peeled closures agree.
 		if (current === tip || !boundaryOf.has(current)) {
-			boundaryOf.set(current, { bits, chain, tip })
+			boundaryOf.set(current, { bits, chain })
 		}
 	}
 
@@ -975,7 +986,7 @@ async function epochServe(
 			for (const hex of oidsOfUnion([bound.bits], epoch.oids)) served.add(hex)
 		} else {
 			for (const pos of remapPositions(bound.bits, epoch.oids, epoch.oids, bound.chain)) {
-				served.add(epoch.oids.toString("hex", pos * 20, (pos + 1) * 20))
+				served.add(oidAtPosition(epoch.oids, pos))
 			}
 		}
 	}
@@ -1001,9 +1012,9 @@ async function epochServe(
  * the blob itself — the promisor rule verbatim (a partial-clone lazy
  * `want <blob>` is never subtracted and never an empty pack). Haves peel to
  * commits; non-commit haves carry no subtraction semantics and are dropped,
- * matching git. A have-less request (cold clone) takes `fullClosure` whole —
- * the frontier's per-commit diffing buys nothing without a boundary, and the
- * bitmap fast path (chunk 5b, S6) will slot in here.
+ * matching git. A have-less request (cold clone) uses the epoch fast path when
+ * its shape is exact, then falls back to `fullClosure`; frontier diffing buys
+ * nothing without a boundary.
  */
 export async function routeServeSet(
 	db: Kysely<Database>,
@@ -1013,7 +1024,7 @@ export async function routeServeSet(
 	omitBlobs: boolean,
 ): Promise<ServeSet> {
 	if (haves.length === 0) {
-		// The bitmap fast path (chunk 5b): a no-have, unfiltered fetch over an
+		// The bitmap fast path: a no-have, unfiltered fetch over an
 		// epoch-covered repo is answered from stored bitmaps — zero tree reads on
 		// a fully-drained repo. `blob:none` bypasses it (the epoch's bits carry
 		// no type information to subtract blobs by), and any shape the epoch
@@ -1042,36 +1053,11 @@ export async function routeServeSet(
 	/** Follow a tag chain, serving each tag object; returns the terminal non-tag
 	 * (or null when the chain dangles — recorded missing). */
 	const peelServing = async (tagOid: string, serve: boolean): Promise<string | null> => {
-		let current = tagOid
-		for (;;) {
-			if (serve) served.add(current)
-			const [row] = (
-				await sql<{ target: string }>`
-					select encode(target_oid, 'hex') as target from git_tag
-					where repo_id = ${id}::bigint and oid = ${Buffer.from(current, "hex")}
-				`.execute(db)
-			).rows
-			if (!row) {
-				// A stored tag object always has its row (chunk 1).
-				throwMissingDerivedRow(current, PACK_OBJ_TYPE.TAG)
-			}
-			const targetType = typed.get(row.target)
-			if (targetType === undefined) {
-				const [t] = (
-					await sql<{ type: number }>`
-						select type from git_object
-						where repo_id = ${id}::bigint and oid = ${Buffer.from(row.target, "hex")}
-					`.execute(db)
-				).rows
-				if (!t) {
-					missing.add(row.target)
-					return null
-				}
-				typed.set(row.target, t.type)
-			}
-			if (typed.get(row.target) !== PACK_OBJ_TYPE.TAG) return row.target
-			current = row.target
-		}
+		const peeled = await peelTagChain(db, id, tagOid, typed)
+		if (serve) for (const oid of peeled.chain) served.add(oid)
+		if (peeled.state === "complete") return peeled.terminal
+		missing.add(peeled.oid)
+		return null
 	}
 
 	const commitWants: string[] = []
@@ -1121,8 +1107,8 @@ export async function routeServeSet(
 				}
 	for (const o of served) result.served.add(o)
 	for (const o of missing) result.missing.add(o)
-	for (const t of treeWants) {
-		const sub = await fullClosure(db, id, [t], omitBlobs)
+	if (treeWants.length > 0) {
+		const sub = await fullClosure(db, id, treeWants, omitBlobs)
 		for (const o of sub.present) result.served.add(o)
 		for (const o of sub.missing) result.missing.add(o)
 	}

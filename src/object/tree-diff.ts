@@ -6,21 +6,17 @@ import {
 } from "@/object/object"
 
 /**
- * File-level tree diffing (spine chunk 4 / S3) — the deliberate NO-LIBRARY
- * exception: git's tree grammar is the fsck-critical parser this repo already
- * owns, and no library implements git tree-diff semantics, so a second grammar
- * implementation would be two truths for one concept. Entries pair by NAME per
- * directory (git's structural unit) and compare `(mode, oid)` — a mode-only
- * change (100644→100755, file↔symlink) is a change (R14). Unchanged subtrees
- * prune the walk whole: the cost is O(changed entries + touched directories),
- * never O(files at tip).
+ * Git tree comparison — the deliberate NO-LIBRARY exception. This repo already
+ * owns the fsck-critical tree grammar, and no library implements git tree-diff
+ * semantics. {@link IndexedTree} and {@link pairTreeEntries} own the structural
+ * rule shared by projection, frontier, and repack: entries pair by NAME within
+ * each directory.
  *
- * Gitlinks are INVISIBLE on both sides — they have no blob in this repo, so the
- * `repo_file` projection never rows them (`listFiles` skips them exactly as the
- * full rebuild always has), and a gitlink appearing, vanishing, or retargeting
- * diffs to nothing. This is the one deliberate divergence from `git diff-tree`
- * output, which does report them; the arbiter for this module is
- * "incremental ≡ full rebuild", not gitlink parity.
+ * {@link diffFileLists} layers the `repo_file` projection semantics on that
+ * pairing. It compares `(mode, oid)`, including mode-only changes, and prunes
+ * unchanged subtrees whole. Gitlinks are invisible to this projection because
+ * they name no blob stored in this repo; `listFiles` skips them on rebuild, so an
+ * incremental gitlink change must likewise produce no projected row change.
  */
 
 /** Reads a tree body by OID. The caller resolves the object; the stored
@@ -30,8 +26,52 @@ export type TreeReader = (oid: string) => Promise<Buffer>
 /** One projected file: full path from the root, raw stored mode, blob oid. */
 export type FileEntry = { path: string; mode: string; blobOid: string }
 
-async function entriesOf(read: TreeReader, treeOid: string): Promise<TreeEntry[]> {
-	return treeEntries(await read(treeOid))
+/** One parsed tree plus its name index, the structural unit shared by every
+ * tree-diff consumer. `content` remains available to consumers such as repack
+ * that also encode the body. */
+export type IndexedTree = {
+	content: Buffer
+	entries: TreeEntry[]
+	byName: ReadonlyMap<string, TreeEntry>
+}
+
+/** Parse a tree once and index its entries by their per-directory name. */
+export function indexTreeEntries(content: Buffer): IndexedTree {
+	const entries = treeEntries(content)
+	const byName = new Map<string, TreeEntry>()
+	for (const entry of entries) byName.set(entry.name, entry)
+	return {
+		byName,
+		content,
+		entries,
+	}
+}
+
+async function readIndexedTree(read: TreeReader, treeOid: string): Promise<IndexedTree> {
+	return indexTreeEntries(await read(treeOid))
+}
+
+export type TreeEntryPair =
+	| { state: "added"; after: TreeEntry }
+	| { state: "removed"; before: TreeEntry }
+	| { state: "paired"; before: TreeEntry; after: TreeEntry }
+
+/** Pair two directories by entry name, preserving after-side order before
+ * yielding names that exist only on the before side. */
+export function* pairTreeEntries(
+	before: IndexedTree,
+	after: IndexedTree,
+): Generator<TreeEntryPair> {
+	const afterNames = new Set<string>()
+	for (const entry of after.entries) {
+		afterNames.add(entry.name)
+		const previous = before.byName.get(entry.name)
+		if (previous === undefined) yield { after: entry, state: "added" }
+		else yield { after: entry, before: previous, state: "paired" }
+	}
+	for (const entry of before.byName.values()) {
+		if (!afterNames.has(entry.name)) yield { before: entry, state: "removed" }
+	}
 }
 
 /**
@@ -45,7 +85,7 @@ export async function listFiles(
 	prefix = "",
 ): Promise<FileEntry[]> {
 	const files: FileEntry[] = []
-	for (const e of await entriesOf(read, treeOid)) {
+	for (const e of treeEntries(await read(treeOid))) {
 		if (isTreeEntryMode(e.mode)) {
 			for (const f of await listFiles(read, e.oid, `${prefix}${e.name}/`)) files.push(f)
 		} else if (e.mode !== GITLINK_MODE) {
@@ -81,9 +121,8 @@ async function diffLevel(
 	diff: FileDiff,
 ): Promise<void> {
 	if (aOid === bOid) return
-	const before = new Map((await entriesOf(read, aOid)).map((e) => [e.name, e]))
-	const after = await entriesOf(read, bOid)
-	const afterNames = new Set<string>()
+	const before = await readIndexedTree(read, aOid)
+	const after = await readIndexedTree(read, bOid)
 
 	const addSide = async (e: TreeEntry, path: string): Promise<void> => {
 		if (isTreeEntryMode(e.mode)) {
@@ -100,14 +139,18 @@ async function diffLevel(
 		}
 	}
 
-	for (const be of after) {
-		afterNames.add(be.name)
-		const ae = before.get(be.name)
-		const path = prefix + be.name
-		if (ae === undefined) {
-			await addSide(be, path)
+	for (const pair of pairTreeEntries(before, after)) {
+		if (pair.state === "added") {
+			await addSide(pair.after, prefix + pair.after.name)
 			continue
 		}
+		if (pair.state === "removed") {
+			await removeSide(pair.before, prefix + pair.before.name)
+			continue
+		}
+		const ae = pair.before
+		const be = pair.after
+		const path = prefix + be.name
 		const aTree = isTreeEntryMode(ae.mode)
 		const bTree = isTreeEntryMode(be.mode)
 		if (aTree && bTree) {
@@ -126,8 +169,5 @@ async function diffLevel(
 				diff.upserts.push({ blobOid: be.oid, mode: be.mode, path })
 			}
 		}
-	}
-	for (const [name, ae] of before) {
-		if (!afterNames.has(name)) await removeSide(ae, prefix + name)
 	}
 }

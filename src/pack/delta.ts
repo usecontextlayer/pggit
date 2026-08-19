@@ -1,14 +1,13 @@
 import { GitFormatError } from "@/object/format-error"
 
-// The delta codec, both directions (gitformat-pack "Deltified representation"):
-// `applyDelta` reads — push ingest resolves every arriving delta through it — and
-// `encodeDelta` writes, for the derived pack-encoding tier. Spec §3.4's read-only
-// asymmetry ("the serve path emits none") is retired by the delta-pack design
-// (docs/2026-08-15-delta-pack-design.md).
+/** Git's minimum wire-valid delta program length. Enforced where programs enter
+ * or leave the wire; {@link applyDelta} deliberately accepts the codec's own
+ * two-byte empty-target program. */
+export const DELTA_SIZE_MIN = 4
 
 /**
  * Encode `target` as a git delta against `base` — the inverse of {@link applyDelta},
- * and the half of the delta codec the serve path has never had.
+ * and the write half of the shared delta codec.
  *
  * The contract, in full, because the executable spec is written against it:
  *

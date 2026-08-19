@@ -4,7 +4,7 @@
  * porsager decodes a `bytea` RESULT from its text form (`\x`+hex, DOUBLE the byte
  * length), so every large-bytea read on the serve path has to dodge V8's max string
  * length. The RAW path does: `object-store.ts` CASE-guards `content` at
- * `BIG_OBJECT_BYTES` (200 MB) and falls back to `readContentChunked`.
+ * `MAX_INLINE_BYTEA_BYTES` (200 MB) and falls back to `readContentChunked`.
  *
  * The NEW encoding read in the same query does not:
  *
@@ -19,7 +19,7 @@
  * string on the JS heap on every single clone.
  *
  * The sizes BRACKET the cap with crypto-random (incompressible) blobs: 64 MB is the
- * comfortable case, 190 MB sits just under `MAX_ENCODABLE_BYTES` where the doubled
+ * comfortable case, 190 MB sits just under `MAX_INLINE_BYTEA_BYTES` where the doubled
  * hex string is at its worst while an encoding row still gets written. The scale is
  * the test — do not shrink it.
  *
@@ -39,7 +39,7 @@ import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/bigbytea"
-/** Brackets BIG_OBJECT_BYTES / MAX_ENCODABLE_BYTES = 200 MB from below. */
+/** Brackets MAX_INLINE_BYTEA_BYTES = 200 MB from below. */
 const SIZES_MB = [64, 190]
 
 const mb = (n: number): string => `${(n / 1_000_000).toFixed(1)} MB`
@@ -69,7 +69,7 @@ for (const sizeMb of SIZES_MB) {
 
 		beforeAll(async () => {
 			console.log(`blob size: ${mb(size)} incompressible (crypto random)`)
-			console.log("caps: BIG_OBJECT_BYTES / MAX_ENCODABLE_BYTES = 200.0 MB")
+			console.log("cap: MAX_INLINE_BYTEA_BYTES = 200.0 MB")
 
 			src = mk("src")
 			await spawnGit(["init", "-q", "-b", "main", src])

@@ -7,6 +7,7 @@ import type { ReposId } from "@/database/models/public/Repos"
 import { isOid, ZERO_OID } from "@/oid"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { throwMissingDerivedRow } from "@/store/derived-row"
+import { stampRepoPush } from "@/store/repo-activity"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 export type RefRow = { name: string; oid: string; peeled?: string }
@@ -71,7 +72,7 @@ function classifyRefUpdate(cmd: RefUpdate): RefOp {
  * first non-tag, and a content-addressed tag chain is acyclic (an oid cannot embed
  * its own hash) hence finite. Computed at ref-write, so the chain's `git_tag` rows
  * and targets are already present (connectivity proved the chain on push).
- * Replaces the per-`ls-refs` app-side tag walk.
+ * Computing it at write time keeps `ls-refs` a direct row read.
  */
 async function peelRef(
 	exec: Kysely<Database>,
@@ -145,22 +146,6 @@ function logStampFailure(repo: string): (err: unknown) => void {
 			err,
 		)
 	}
-}
-
-/**
- * Stamp the repo's GC-activity watermark (`repos.last_pushed_at`) — a ref change
- * makes the prior tip a reclaim candidate, so the self-scheduling drain must judge
- * the repo eligible (gc-scheduler.ts §2). Called only when a ref ROW actually
- * changed (not on a no-op success like deleting an absent ref), so non-mutating
- * traffic never re-triggers GC. A tiny single-row HOT update on the churn-tuned
- * `repos` (0004); `clock_timestamp()` is the server-side wall clock.
- */
-async function stampPushed(exec: Kysely<Database>, repoId: ReposId): Promise<void> {
-	await exec
-		.updateTable("repos")
-		.set({ last_pushed_at: sql`clock_timestamp()` })
-		.where("id", "=", repoId)
-		.execute()
 }
 
 /** The three real CAS outcomes. `noop` is an unconditional delete of an absent
@@ -283,7 +268,7 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 				// fail the push (the client would see failure for an applied update — a
 				// torn report). The cost is the documented delayed-GC trade: this repo's
 				// garbage waits until some later push stamps it.
-				if (mutated) await stampPushed(db, id).catch(logStampFailure(repoId))
+				if (mutated) await stampRepoPush(db, id).catch(logStampFailure(repoId))
 				return results
 			}
 			// Atomic batch: take the per-ref row locks in a deterministic by-name order
@@ -316,7 +301,7 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 			// meant to prevent). Mirrors the non-atomic path, which already stamps after
 			// its CAS commits — and is best-effort for the same reason (the batch is
 			// already applied; a stamp failure must not turn success into a torn report).
-			if (anyMutated) await stampPushed(db, id).catch(logStampFailure(repoId))
+			if (anyMutated) await stampRepoPush(db, id).catch(logStampFailure(repoId))
 			return commands.map(() => true)
 		},
 

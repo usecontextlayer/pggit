@@ -13,7 +13,7 @@
  * (non-atomic) push path:
  *
  *   FAULT POINT A — the post-commit activity stamp. The CAS commits, then
- *     `stampPushed` runs `update repos set last_pushed_at = clock_timestamp()` as
+ *     `stampRepoPush` updates `repos.last_pushed_at` as
  *     a SEPARATE statement outside that transaction (deliberately: an in-txn
  *     stamp would lose garbage). If that statement fails, the ref has already
  *     moved.

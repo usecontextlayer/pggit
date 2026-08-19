@@ -6,8 +6,8 @@
  *
  *  - `git_pack_encoding.data_size` is `int4` and holds the inflated length of what
  *    `data` holds — the object's size for a whole row, the DELTA PROGRAM's length
- *    for a delta row. The design's own C5 notes the two are unlinked in code: the
- *    200 MB `MAX_ENCODABLE_BYTES` is what keeps `data_size` inside int4.
+ *    for a delta row. The shared 200 MB `MAX_INLINE_BYTEA_BYTES` ceiling keeps
+ *    `data_size` inside int4.
  *  - `encodeDelta` is TOTAL — it never refuses. On a pathological pair (successive
  *    versions of one tree that share NO 16-byte block) the program it emits is
  *    LARGER than the target, because every byte ships as an INSERT with a length

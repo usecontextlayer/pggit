@@ -4,7 +4,7 @@ import {
 	commitParents,
 	commitTreeOid,
 	type GitObjectType,
-	referencedOids,
+	tagTargetOid,
 	tagTargetType,
 	treeEntries,
 } from "@/object/object"
@@ -14,7 +14,7 @@ import { isOid, type Oid } from "@/oid"
  * Ingest-boundary validation and row derivation — the single place a pushed
  * object's content becomes queryable state. `validateObject` is pggit's fsck;
  * `deriveCommitRow`/`deriveTagRow` parse the content into the derived
- * `git_commit`/`git_tag` rows (spine chunk 1). Both run inside the ingest
+ * `git_commit`/`git_tag` rows. Both run inside the ingest
  * transaction, so a malformed object aborts the push before any row lands, and
  * deriving a row IS the validation of the headers it reads.
  */
@@ -36,12 +36,11 @@ const TREE_ENTRY_MODES = new Set([
 const UTF8_STRICT = new TextDecoder("utf8", { fatal: true })
 
 /**
- * Validate an OID parsed from a commit/tag header. `commitParents`/`commitTreeOid`/
- * `referencedOids` take whatever follows the header key verbatim — a forged object
- * could carry a non-OID there and yield a bogus row value — so reject it loudly at
- * the ingest boundary (§5.1). Tree-entry OIDs are exempt: `treeEntries` already
- * guarantees a 20-byte value, and the schema's `length(…) = 20` CHECKs are the
- * database-level backstop.
+ * Validate an OID parsed from a commit/tag header. The object parsing helpers take
+ * whatever follows the header key verbatim, so a forged object could yield a bogus
+ * row value; reject it loudly at the ingest boundary (§5.1). Tree-entry OIDs are
+ * exempt: `treeEntries` already guarantees a 20-byte value, and the schema's
+ * `length(…) = 20` CHECKs are the database-level backstop.
  */
 function assertOid(oid: string, context: string): Oid {
 	if (!isOid(oid)) {
@@ -138,7 +137,7 @@ export function validateObject(type: GitObjectType, content: Buffer): void {
 	}
 }
 
-/** The `git_commit` row derived from a commit's content (spine chunk 1). The
+/** The `git_commit` row derived from a commit's content. The
  * ordered `parents` list is the point: parent ORDER lives only in commit
  * content, and this row is where it becomes queryable. `generation` is
  * deliberately NOT here: it depends on the parents' rows, so the store computes
@@ -156,7 +155,7 @@ export function deriveCommitRow(content: Buffer): DerivedCommit {
 	}
 }
 
-/** The `git_tag` row derived from an annotated tag's content (spine chunk 1).
+/** The `git_tag` row derived from an annotated tag's content.
  * `targetType` stays the domain NAME here; the store serializes it to the stored
  * code at its own boundary. */
 export type DerivedTag = { targetOid: Oid; targetType: GitObjectType }
@@ -164,12 +163,8 @@ export type DerivedTag = { targetOid: Oid; targetType: GitObjectType }
 /** Parse a tag body into its `git_tag` row values. Loud on a missing target or
  * type header — deriving the row IS the validation of those headers. */
 export function deriveTagRow(content: Buffer): DerivedTag {
-	const target = referencedOids("tag", content)[0]
-	if (target === undefined) {
-		throw new GitFormatError("missing-tag-object", "annotated tag has no object header")
-	}
 	return {
-		targetOid: assertOid(target, "tag target"),
+		targetOid: assertOid(tagTargetOid(content), "tag target"),
 		targetType: tagTargetType(content),
 	}
 }

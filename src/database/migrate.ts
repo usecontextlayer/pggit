@@ -18,8 +18,8 @@ import * as m0012 from "./migrations/0012_reach_bitmaps"
 // The static set is what makes pggit's schema CONSUMER-MIGRATABLE: tsdown bundles these
 // imports into `dist`, so `import { migrateToLatest } from "@usecontextlayer/pggit"` works
 // from the published package (a fresh `ctx_pggit` in an e2e, or a production deploy) — not
-// just a developer running from source. Keys are the migration names; the map's sort order
-// IS the apply order, exactly as the old `0001…`-prefixed filenames sorted.
+// just a developer running from source. Keys are the migration names; their lexicographic
+// order IS the apply order.
 const MIGRATIONS: Record<string, Migration> = {
 	"0001_init": { down: m0001.down, up: m0001.up },
 	"0002_repo_file": { down: m0002.down, up: m0002.up },

@@ -1,5 +1,5 @@
 /**
- * Generation numbers over a batch of commits (spine chunk 1). A commit's
+ * Generation numbers over a batch of commits. A commit's
  * generation is `1 + max(generation(parents))` — git's commit-graph number — and
  * the finite region carries the strict invariant `gen(parent) < gen(child)` that
  * the frontier's exactness rests on. NULL means "no pruning" (git's

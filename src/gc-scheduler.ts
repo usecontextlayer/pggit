@@ -1,7 +1,6 @@
 import type { Sql } from "postgres"
 import { z } from "zod"
-import { createGc } from "@/store/gc"
-import type { EpochOutcome } from "@/store/reach-epoch"
+import { createGc, GcGraceSecondsSchema, type GcResult } from "@/store/gc"
 
 /**
  * Self-scheduling GC — the background drain that decides WHEN the per-repo
@@ -14,19 +13,18 @@ import type { EpochOutcome } from "@/store/reach-epoch"
  * pure poll loop over Postgres with NO coupling to the request path. One pass
  * (`drainOnce`) selects the eligible repos — `last_pushed_at > last_gc_at`
  * (or `last_gc_at is null`) — and runs `gc()` on each (per-repo serialized,
- * bounded concurrency), then advances `last_gc_at` to the pass's start time so a
- * push landing mid-pass re-qualifies the repo next loop (no lost garbage). `start`
- * is just `drainOnce` on a `setInterval`; all correctness lives in `drainOnce`,
- * which the tests drive directly (the timer is never in a test's critical path).
+ * bounded concurrency). A pass advances `last_gc_at` to its start time only after
+ * the repo's grace horizon; a younger repo remains eligible, and a push landing
+ * mid-pass also re-qualifies it (no lost garbage). `start` is just `drainOnce` on
+ * a `setInterval`; all correctness lives in `drainOnce`, which tests drive
+ * directly.
  */
 
 /** One repo's outcome in a drain pass: the repo and what its GC reclaimed.
  * Emitted for EVERY repo the pass judged eligible (including zero-reclaim), so the
  * eligible set itself is observable (SCH-3). */
-export type DrainEntry = {
+export type DrainEntry = GcResult & {
 	repo: string
-	deletedObjects: number
-	epoch: EpochOutcome
 	/** False while garbage YOUNGER than grace may still exist (the pass ran
 	 * inside the grace window): the repo deliberately stays eligible and is
 	 * re-drained next tick, so post-grace residue is never orphaned forever. */
@@ -46,7 +44,7 @@ const MAX_TIMER_MS = 2_147_483_647
 const GcSchedulerOptionsSchema = z
 	.object({
 		concurrency: z.number().int().positive(),
-		graceSeconds: z.number().finite().nonnegative(),
+		graceSeconds: GcGraceSecondsSchema,
 		intervalMs: z.number().int().positive().max(MAX_TIMER_MS),
 	})
 	.strict()

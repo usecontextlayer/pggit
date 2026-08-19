@@ -1,3 +1,4 @@
+import type { GitObjectType } from "@/object/object"
 import { isOid, type Oid, ZERO_OID } from "@/oid"
 import { AGENT, assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
@@ -188,7 +189,7 @@ export type ReceiveBackend = {
 	listRefNames: () => Promise<string[]>
 	/** The stored type of `oid`, or null when absent — the branch-tip policy
 	 * (git: a new value under refs/heads/ must be a commit). */
-	objectType: (oid: Oid) => Promise<"commit" | "tree" | "blob" | "tag" | null>
+	objectType: (oid: Oid) => Promise<GitObjectType | null>
 	/** Refresh the queryable file projection for a just-applied ref. Present only
 	 * when the (optional) queryable-view layer is wired; a plain remote omits it. */
 	syncRefSnapshot?: (ref: string, newOid: Oid) => Promise<void>

@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto"
-import { assertNever } from "@/assert-never"
 import { GitFormatError } from "@/object/format-error"
 import { type Oid, parseOid } from "@/oid"
 
@@ -67,11 +66,6 @@ export function isTreeEntryMode(mode: string): boolean {
  * it in THIS repo, so walks and projections skip it. */
 export const GITLINK_MODE = "160000"
 
-/** OIDs of a tree's entries (all kinds), in tree order. */
-function treeEntryOids(content: Buffer): string[] {
-	return treeEntries(content).map((e) => e.oid)
-}
-
 /** A commit's parent OIDs only (ancestry walk; excludes its tree). */
 export function commitParents(content: Buffer): string[] {
 	return headerOids(content, new Set(["parent"]))
@@ -91,7 +85,7 @@ export function commitTreeOid(content: Buffer): string {
 
 /**
  * The committer's epoch seconds — `git_commit.commit_time`, the frontier's
- * tiebreak within and without generation regions (spine chunk 1). Headers end at
+ * tiebreak within and without generation regions. Headers end at
  * the first blank line; continuation lines (a `mergetag` payload) start with a
  * space and can never match. Loud on absence or a non-numeric epoch: the row
  * derivation IS the ingest-side validation of this header.
@@ -133,21 +127,11 @@ export function tagTargetType(content: Buffer): GitObjectType {
 	throw new GitFormatError("missing-tag-type", "annotated tag has no type header")
 }
 
-/**
- * The OIDs an object directly references: a commit → its tree + parents, a tree
- * → its entries, a tag → its target, a blob → nothing. The basis of reachability
- * enumeration (fetch, connectivity).
- */
-export function referencedOids(type: GitObjectType, content: Buffer): string[] {
-	switch (type) {
-		case "blob":
-			return []
-		case "commit":
-			return headerOids(content, new Set(["tree", "parent"]))
-		case "tag":
-			return headerOids(content, new Set(["object"]))
-		case "tree":
-			return treeEntryOids(content)
+/** The annotated tag's target OID from its `object` header. */
+export function tagTargetOid(content: Buffer): string {
+	const [target] = headerOids(content, new Set(["object"]))
+	if (target === undefined) {
+		throw new GitFormatError("missing-tag-object", "annotated tag has no object header")
 	}
-	return assertNever(type)
+	return target
 }

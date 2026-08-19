@@ -1,3 +1,4 @@
+import { finished } from "node:stream/promises"
 import type { ISql, TransactionSql } from "postgres"
 import { assertNever } from "@/assert-never"
 
@@ -17,9 +18,8 @@ import { assertNever } from "@/assert-never"
  *    no chunking, whatever the column count.
  *
  * The staging hop keeps ingest idempotent (a re-sent object skips on the primary
- * key), exactly as the prior `onConflict().doNothing()` did. Caller runs it on a
- * transaction-scoped `Sql` so the staging COPY and the final insert commit
- * together; the temp table drops on commit.
+ * key). Caller runs it on a transaction-scoped `Sql` so the staging COPY and the
+ * final insert commit together; the temp table drops on commit.
  */
 
 /** One COPY field, tagged with the destination column's Postgres type so it
@@ -113,14 +113,9 @@ export async function copyInto(
 	if (rows.length === 0) return
 	const writable =
 		await sql`copy ${sql(table)} (${sql.unsafe(columns.join(", "))}) from stdin (format binary)`.writable()
-	await new Promise<void>((resolve, reject) => {
-		writable.on("error", reject)
-		writable.on("finish", () => resolve())
-		writable.write(encodeBinaryCopy(rows), (err) => {
-			if (err) reject(err)
-			else writable.end()
-		})
-	})
+	const completed = finished(writable, { cleanup: true })
+	writable.end(encodeBinaryCopy(rows))
+	await completed
 }
 
 /**
