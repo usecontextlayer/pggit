@@ -8,6 +8,10 @@ import * as m0005 from "./migrations/0005_gc_delete_autovacuum"
 import * as m0006 from "./migrations/0006_repo_file_path_pattern"
 import * as m0007 from "./migrations/0007_repo_delete_cascade"
 import * as m0008 from "./migrations/0008_pack_encoding"
+import * as m0009 from "./migrations/0009_commit_tag"
+import * as m0010 from "./migrations/0010_drop_git_edge"
+import * as m0011 from "./migrations/0011_repo_file_head"
+import * as m0012 from "./migrations/0012_reach_bitmaps"
 
 // The schema source of truth — a STATIC migration set built from explicit module imports,
 // not Kysely's `FileMigrationProvider` (which reads `.ts`/`.js` files off disk at runtime).
@@ -25,6 +29,10 @@ const MIGRATIONS: Record<string, Migration> = {
 	"0006_repo_file_path_pattern": { down: m0006.down, up: m0006.up },
 	"0007_repo_delete_cascade": { down: m0007.down, up: m0007.up },
 	"0008_pack_encoding": { down: m0008.down, up: m0008.up },
+	"0009_commit_tag": { down: m0009.down, up: m0009.up },
+	"0010_drop_git_edge": { down: m0010.down, up: m0010.up },
+	"0011_repo_file_head": { down: m0011.down, up: m0011.up },
+	"0012_reach_bitmaps": { down: m0012.down, up: m0012.up },
 }
 
 function migrationProvider(): MigrationProvider {
@@ -41,7 +49,8 @@ export async function migrateToLatest<T>(db: Kysely<T>): Promise<void> {
 	const { error, results } = await createMigrator(db).migrateToLatest()
 	for (const result of results ?? []) {
 		if (result.status === "Error") {
-			throw new Error(`migration failed: ${result.migrationName}`)
+			// `error` holds the actual failure; the result only names the migration.
+			throw new Error(`migration failed: ${result.migrationName}`, { cause: error })
 		}
 	}
 	if (error) throw error

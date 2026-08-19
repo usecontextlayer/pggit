@@ -15,6 +15,8 @@ export default interface ReposTable {
 	last_pushed_at: ColumnType<Date | null, Date | string | null, Date | string | null>
 
 	last_gc_at: ColumnType<Date | null, Date | string | null, Date | string | null>
+
+	last_repack_at: ColumnType<Date | null, Date | string | null, Date | string | null>
 }
 
 export type Repos = Selectable<ReposTable>

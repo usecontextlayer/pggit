@@ -7,10 +7,12 @@ import { type Kysely, sql } from "kysely"
 // git_object, that copy is 100% redundant — this is the slim path→blob index
 // alone; content is read by joining git_object on (repo_id, blob_oid).
 //
-// Keyed on the bigint repo_id (like the spine), HASH-partitioned. The per-push
-// refresh is delete-branch-then-insert (DELETEs + INSERTs, not a HOT-eligible
-// in-place UPDATE), so the leaves get aggressive dead-tuple vacuum and no
-// fillfactor reserve (§4.5).
+// Keyed on the bigint repo_id (like the spine), HASH-partitioned. The leaves get
+// aggressive dead-tuple vacuum and no fillfactor reserve (§4.5) — a choice
+// re-affirmed under the diff-driven maintenance that replaced the original
+// delete-branch-then-insert refresh (spine chunk 4, R18): the incremental path's
+// upsert IS HOT-eligible (mode/blob_oid are unindexed), but at 2–3 touched rows
+// per push a same-page reserve buys nothing worth 30% of every leaf's density.
 
 const FILE_PARTITIONS = 16
 

@@ -8,6 +8,8 @@
 		"kysely": "^0.29.2",
 		"kysely-postgres-js": "^3.0.0",
 		"postgres": "^3.4.9",
+		"roaring-wasm": "^1.1.0",
+		"tinyqueue": "^3.0.0",
 		"zod": "^4.4.3"
 	},
 	"description": "A battle-tested git server that runs on Postgres.",
