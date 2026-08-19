@@ -145,6 +145,29 @@ export function encodeReportStatus(
 	])
 }
 
+/**
+ * git's `check_refname_format` for a full ref name, as receive-pack applies it
+ * (builtin/receive-pack.c `update()`): the name must live under `refs/`, and no
+ * component may be empty, start with `.`, end with `.lock`, or contain `..`,
+ * `@{`, control bytes, space, or the `~^:?*[\` set; the name must not end with
+ * `/` or `.`. Returns null when well-formed. Validated HERE, at the wire
+ * boundary — a funny name that reached storage would poison every later
+ * advertisement and status line a git client parses.
+ */
+export function refNameProblem(ref: string): string | null {
+	if (!ref.startsWith("refs/")) return "funny refname (must be under refs/)"
+	if (ref.endsWith("/") || ref.endsWith(".")) return "funny refname"
+	if (ref.includes("..") || ref.includes("@{")) return "funny refname"
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: the control-byte ban IS the rule
+	if (/[\u0000-\u001f\u007f ~^:?*[\\]/.test(ref)) return "funny refname"
+	for (const component of ref.split("/")) {
+		if (component === "") return "funny refname (empty component)"
+		if (component.startsWith(".")) return "funny refname"
+		if (component.endsWith(".lock")) return "funny refname"
+	}
+	return null
+}
+
 /** Everything receive-pack needs from a single repo's storage. */
 export type ReceiveBackend = {
 	ingest: (pack: Buffer) => Promise<void>
@@ -155,6 +178,12 @@ export type ReceiveBackend = {
 	/** Is `ancestor` in `descendant`'s history (or equal)? The fast-forward
 	 * policy check — see the deny-non-FF rules on handleReceivePack. */
 	isAncestor: (ancestor: Oid, descendant: Oid) => Promise<boolean>
+	/** The repo's current ref NAMES — the directory/file conflict check's
+	 * existing side (git: `refs/heads/a` and `refs/heads/a/b` cannot coexist). */
+	listRefNames: () => Promise<string[]>
+	/** The stored type of `oid`, or null when absent — the branch-tip policy
+	 * (git: a new value under refs/heads/ must be a commit). */
+	objectType: (oid: Oid) => Promise<"commit" | "tree" | "blob" | "tag" | null>
 	/** Refresh the queryable file projection for a just-applied ref. Present only
 	 * when the (optional) queryable-view layer is wired; a plain remote omits it. */
 	syncRefSnapshot?: (ref: string, newOid: Oid) => Promise<void>
@@ -186,13 +215,34 @@ export async function handleReceivePack(
 	const useSideband = caps.includes("side-band-64k")
 	const atomic = caps.includes("atomic")
 
-	// rc3 boundary check: a ref name too long to store is rejected BEFORE ingest — so
-	// an all-unstorable push never ingests a pack (no orphaned objects), and the raw
-	// btree error never escapes as a 500.
-	const nameTooLong = commands.map(
-		(c) => Buffer.byteLength(c.ref, "utf8") > MAX_REF_NAME_BYTES,
+	// rc3 boundary check: a ref name too long to store, or malformed under git's
+	// check-ref-format rules, is rejected BEFORE ingest — so an all-unstorable
+	// push never ingests a pack (no orphaned objects), and the raw btree error
+	// never escapes as a 500. Directory/file conflicts (git: `refs/heads/a` vs
+	// `refs/heads/a/b`) are checked against the existing refs AND the batch's
+	// own applicable names — the loose-ref-filesystem rule git clients assume.
+	const nameProblem = commands.map((c) =>
+		Buffer.byteLength(c.ref, "utf8") > MAX_REF_NAME_BYTES
+			? "funny refname (too long to store)"
+			: refNameProblem(c.ref),
 	)
-	const anyApplicable = nameTooLong.length === 0 || nameTooLong.some((t) => !t)
+	const existingNames = await backend.listRefNames()
+	// Sequential, like git's ref-lock order: a later command clashes against the
+	// existing names PLUS the batch's earlier accepted names — `main` then
+	// `main/sub` applies the first and rejects the second, never both.
+	const acceptedNames: string[] = []
+	for (const [i, c] of commands.entries()) {
+		if (nameProblem[i] !== null) continue
+		const clashes = (other: string): boolean =>
+			other !== c.ref && (other.startsWith(`${c.ref}/`) || c.ref.startsWith(`${other}/`))
+		if (existingNames.some(clashes) || acceptedNames.some(clashes)) {
+			nameProblem[i] = "funny refname (directory/file conflict)"
+		} else {
+			acceptedNames.push(c.ref)
+		}
+	}
+	const anyApplicable =
+		nameProblem.length === 0 || nameProblem.some((problem) => problem === null)
 
 	let unpackStatus = "ok"
 	if (pack.length > 0 && anyApplicable) {
@@ -220,7 +270,7 @@ export async function handleReceivePack(
 	// disqualified, so it skips the closure walk.
 	const connected = await Promise.all(
 		commands.map((c, i) =>
-			nameTooLong[i] || c.newOid === ZERO_OID
+			nameProblem[i] !== null || c.newOid === ZERO_OID
 				? Promise.resolve(true)
 				: backend.isConnected(c.newOid),
 		),
@@ -233,9 +283,26 @@ export async function handleReceivePack(
 	// and already-disqualified commands skip it.
 	const fastForward = await Promise.all(
 		commands.map((c, i) =>
-			nameTooLong[i] || !connected[i] || c.oldOid === ZERO_OID || c.newOid === ZERO_OID
+			nameProblem[i] !== null ||
+			!connected[i] ||
+			c.oldOid === ZERO_OID ||
+			c.newOid === ZERO_OID
 				? Promise.resolve(true)
 				: backend.isAncestor(c.oldOid, c.newOid),
+		),
+	)
+	// Branch-tip typing (git's rule, observed on canonical receive-pack): a new
+	// value under refs/heads/ must be a COMMIT — a blob or tree tip is rejected
+	// per-ref as "invalid new value provided" (git's wording). Other namespaces
+	// (refs/tags/ especially) accept any object type.
+	const validTip = await Promise.all(
+		commands.map((c, i) =>
+			nameProblem[i] !== null ||
+			!connected[i] ||
+			c.newOid === ZERO_OID ||
+			!c.ref.startsWith("refs/heads/")
+				? Promise.resolve(true)
+				: backend.objectType(c.newOid).then((t) => t === "commit"),
 		),
 	)
 	// Per-command disqualification reason (null ⇒ applicable): a too-long name fails
@@ -243,15 +310,17 @@ export async function handleReceivePack(
 	// deny-non-FF policy fails deletions + non-fast-forward updates. A
 	// disqualified command never touches a ref.
 	const reasons = commands.map((c, i) =>
-		nameTooLong[i]
-			? "funny refname (too long to store)"
+		nameProblem[i] !== null
+			? (nameProblem[i] as string)
 			: !connected[i]
 				? "missing necessary objects"
-				: c.newOid === ZERO_OID
-					? "deletion denied (refs only advance)"
-					: fastForward[i]
-						? null
-						: "non-fast-forward (refs only advance)",
+				: !validTip[i]
+					? "invalid new value provided"
+					: c.newOid === ZERO_OID
+						? "deletion denied (refs only advance)"
+						: fastForward[i]
+							? null
+							: "non-fast-forward (refs only advance)",
 	)
 	if (atomic && reasons.some((r) => r !== null)) {
 		const failed = commands.map((c, i) => ({

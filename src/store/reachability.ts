@@ -80,9 +80,11 @@ async function loadTagTargets(
 }
 
 /** The walks' `git_object` probe: type + content (trees ONLY — a `case` guard
- * keeps blob bodies off the wire; presence is all a blob contributes). A
- * commit or tag object surfacing here means its derived row is missing —
- * chunk 1's invariant, broken — and throws rather than parsing through it. */
+ * keeps blob bodies off the wire; presence is all a blob contributes). Type
+ * judgment stays with the CALLER: an oid that arrives here can be a typed-edge
+ * violation (a tree naming a commit — reject cleanly) or a commit/tag whose
+ * derived row is missing (chunk 1's invariant broken — crash loud), and only
+ * the walk knows which edge brought it. */
 async function loadObjectMeta(
 	db: Kysely<Database>,
 	id: ReposId,
@@ -97,16 +99,32 @@ async function loadObjectMeta(
 			where o.repo_id = ${id}::bigint
 				and o.oid in (${sql.join(batch.map((h) => sql`${Buffer.from(h, "hex")}`))})
 		`.execute(db)
-		for (const r of rows.rows) {
-			if (r.type === PACK_OBJ_TYPE.COMMIT || r.type === PACK_OBJ_TYPE.TAG) {
-				throw new Error(
-					`pggit reachability: stored ${objectTypeFromCode(r.type)} ${r.oid} has no derived row — the chunk-1 invariant is broken (backfill missed, or a write path skipped derivation)`,
-				)
-			}
-			out.set(r.oid, { content: r.content, type: r.type })
-		}
+		for (const r of rows.rows) out.set(r.oid, { content: r.content, type: r.type })
 	}
 	return out
+}
+
+/** What an edge DECLARED the object to be: a commit's parent is a commit, its
+ * root (and a 40000 tree entry) is a tree, any other non-gitlink entry a blob.
+ * `null` = no expectation (roots, tag targets — any type is legal). The check
+ * catches the under-walk class: a mistyped edge would otherwise make the walk
+ * treat a subtree as a leaf and silently skip its descendants. */
+type EdgeExpectation = "commit" | "tree" | "blob"
+
+function expectationViolated(want: EdgeExpectation | undefined, type: number): boolean {
+	if (want === undefined) return false
+	if (want === "commit") return true // a real commit resolves via git_commit rows, never here
+	return type !== (want === "tree" ? PACK_OBJ_TYPE.TREE : PACK_OBJ_TYPE.BLOB)
+}
+
+/** The chunk-1 invariant, judged AFTER expectations: a commit/tag object with
+ * no derived row reached through an untyped edge is corruption, never data. */
+function assertDerivedRow(oid: string, type: number): void {
+	if (type === PACK_OBJ_TYPE.COMMIT || type === PACK_OBJ_TYPE.TAG) {
+		throw new Error(
+			`pggit reachability: stored ${objectTypeFromCode(type)} ${oid} has no derived row — the chunk-1 invariant is broken (backfill missed, or a write path skipped derivation)`,
+		)
+	}
 }
 
 /** The router's `git_object` probe: stored type by oid, no invariant judgment
@@ -177,11 +195,18 @@ export async function fullClosure(
 	const present = new Set<string>()
 	const missing = new Set<string>()
 	const visited = new Set<string>(roots)
+	const expected = new Map<string, EdgeExpectation>()
 	let frontier: Frontier = { commits: [], objects: [], unknown: [...new Set(roots)] }
 
-	const enqueue = (next: Frontier, bucket: keyof Frontier, oid: string): void => {
+	const enqueue = (
+		next: Frontier,
+		bucket: keyof Frontier,
+		oid: string,
+		expect?: EdgeExpectation,
+	): void => {
 		if (visited.has(oid)) return
 		visited.add(oid)
+		if (expect !== undefined) expected.set(oid, expect)
 		next[bucket].push(oid)
 	}
 
@@ -196,8 +221,8 @@ export async function fullClosure(
 		const commitRows = await loadCommitRows(db, id, commitProbe)
 		for (const [oid, r] of commitRows) {
 			present.add(oid)
-			enqueue(next, "objects", r.tree)
-			for (const par of r.parents) enqueue(next, "commits", par)
+			enqueue(next, "objects", r.tree, "tree")
+			for (const par of r.parents) enqueue(next, "commits", par, "commit")
 		}
 
 		// 2. Tag rows, for unknowns that were not commits.
@@ -216,15 +241,24 @@ export async function fullClosure(
 		]
 		const metas = await loadObjectMeta(db, id, objectProbe)
 		for (const [oid, m] of metas) {
+			// A typed-edge violation (commit.tree → blob, 40000 entry → blob, a
+			// parent that is no commit) is a MALFORMED GRAPH, judged like an
+			// absent object: connectivity rejects the push, a serve refuses the
+			// want — never an under-walk that silently skips descendants.
+			if (expectationViolated(expected.get(oid), m.type)) {
+				missing.add(oid)
+				continue
+			}
+			assertDerivedRow(oid, m.type)
 			present.add(oid)
 			if (m.type === PACK_OBJ_TYPE.TREE) {
 				if (m.content === null) {
 					throw new Error(`pggit reachability: tree ${oid} returned no content`)
 				}
 				for (const e of treeEntries(m.content)) {
-					if (isTreeEntryMode(e.mode)) enqueue(next, "objects", e.oid)
+					if (isTreeEntryMode(e.mode)) enqueue(next, "objects", e.oid, "tree")
 					else if (e.mode !== GITLINK_MODE && !omitBlobs) {
-						enqueue(next, "objects", e.oid)
+						enqueue(next, "objects", e.oid, "blob")
 					}
 				}
 			}
@@ -270,6 +304,7 @@ export async function originClosure(
 	const masks = new Map<string, bigint>()
 	const hits = new Map<string, bigint>()
 	const missing = new Set<string>()
+	const expected = new Map<string, EdgeExpectation>()
 
 	type MaskLevel = {
 		commits: Map<string, bigint>
@@ -288,6 +323,7 @@ export async function originClosure(
 		bucket: keyof MaskLevel,
 		oid: string,
 		bits: bigint,
+		expect?: EdgeExpectation,
 	): void => {
 		if (stopAt.has(oid)) {
 			hits.set(oid, (hits.get(oid) ?? 0n) | bits)
@@ -296,6 +332,7 @@ export async function originClosure(
 		const have = masks.get(oid) ?? 0n
 		const news = bits & ~have
 		if (news === 0n) return
+		if (expect !== undefined && have === 0n) expected.set(oid, expect)
 		masks.set(oid, have | news)
 		const pending = next[bucket].get(oid) ?? 0n
 		next[bucket].set(oid, pending | news)
@@ -323,8 +360,8 @@ export async function originClosure(
 		const commitRows = await loadCommitRows(db, id, commitProbe.keys())
 		for (const [oid, r] of commitRows) {
 			const bits = commitProbe.get(oid) as bigint
-			enqueue(next, "objects", r.tree, bits)
-			for (const par of r.parents) enqueue(next, "commits", par, bits)
+			enqueue(next, "objects", r.tree, bits, "tree")
+			for (const par of r.parents) enqueue(next, "commits", par, bits, "commit")
 		}
 
 		// 2. Tag rows, for unknowns that were not commits.
@@ -345,13 +382,30 @@ export async function originClosure(
 		)
 		const metas = await loadObjectMeta(db, id, objectProbe.keys())
 		for (const [oid, m] of metas) {
+			// Typed-edge violations are judged like absent objects (see
+			// fullClosure): the graph is malformed, so connectivity must fail
+			// and no epoch may claim the oid.
+			if (expectationViolated(expected.get(oid), m.type)) {
+				missing.add(oid)
+				masks.delete(oid)
+				continue
+			}
+			assertDerivedRow(oid, m.type)
 			if (m.type === PACK_OBJ_TYPE.TREE) {
 				if (m.content === null) {
 					throw new Error(`pggit reachability: tree ${oid} returned no content`)
 				}
 				const bits = objectProbe.get(oid) as bigint
 				for (const e of treeEntries(m.content)) {
-					if (e.mode !== GITLINK_MODE) enqueue(next, "objects", e.oid, bits)
+					if (e.mode !== GITLINK_MODE) {
+						enqueue(
+							next,
+							"objects",
+							e.oid,
+							bits,
+							isTreeEntryMode(e.mode) ? "tree" : "blob",
+						)
+					}
 				}
 			}
 		}
@@ -394,6 +448,54 @@ export async function ancestry(
 		)
 		select exists (
 			select 1 from anc join (values ${commons}) as c(oid) on c.oid = anc.oid
+		) as reached
+	`.execute(db)
+	return result.rows[0]?.reached ?? false
+}
+
+/** Does `want` share ANY ancestor with the `common` set — i.e. does a merge
+ * base exist? This is git's `ok_to_give_up` relation: an ACKed have marks its
+ * WHOLE ancestry common (upload-pack's mark_common descends parents), and a
+ * want is satisfiable once its own ancestry reaches that common region — so a
+ * SIBLING have (shared ancestor, not on the want's chain) readies exactly like
+ * canonical git. `ancestry` above is the STRICTER directional relation (want
+ * descends from a common) and stays the fast-forward check; the two are
+ * different concepts and both earn their names. */
+export async function sharesAncestry(
+	db: Kysely<Database>,
+	id: ReposId,
+	want: string,
+	commonBufs: Buffer[],
+): Promise<boolean> {
+	if (commonBufs.length === 0) return false
+	const commons = sql.join(commonBufs.map((b) => sql`(${b}::bytea)`))
+	const result = await sql<{ reached: boolean }>`
+		with recursive want_anc(oid) as (
+			select ${Buffer.from(want, "hex")}::bytea
+			union
+			select step.oid from want_anc a
+				cross join lateral (
+					select unnest(c.parents) as oid from git_commit c
+						where c.repo_id = ${id}::bigint and c.oid = a.oid
+					union all
+					select t.target_oid from git_tag t
+						where t.repo_id = ${id}::bigint and t.oid = a.oid
+				) as step
+		),
+		have_anc(oid) as (
+			select v.oid from (values ${commons}) as v(oid)
+			union
+			select step.oid from have_anc a
+				cross join lateral (
+					select unnest(c.parents) as oid from git_commit c
+						where c.repo_id = ${id}::bigint and c.oid = a.oid
+					union all
+					select t.target_oid from git_tag t
+						where t.repo_id = ${id}::bigint and t.oid = a.oid
+				) as step
+		)
+		select exists (
+			select 1 from want_anc w join have_anc h on h.oid = w.oid
 		) as reached
 	`.execute(db)
 	return result.rows[0]?.reached ?? false

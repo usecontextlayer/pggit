@@ -15,7 +15,12 @@ import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/obje
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, packHeader, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
-import { ancestry, originClosure, routeServeSet } from "@/store/reachability"
+import {
+	ancestry,
+	originClosure,
+	routeServeSet,
+	sharesAncestry,
+} from "@/store/reachability"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */
@@ -436,6 +441,21 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			return walk.missing.size === 0
 		},
 
+		/** The stored type of one object, or null when absent — the receive
+		 * policy's branch-tip check (refs/heads tips must be commits, git's
+		 * rule) needs the TYPE without pulling a possibly-huge content. */
+		async objectType(repoId: string, oid: string): Promise<GitObjectType | null> {
+			const id = await repos.resolveRepoId(repoId)
+			if (id === null) return null
+			const row = await db
+				.selectFrom("git_object")
+				.select("type")
+				.where("repo_id", "=", id)
+				.where("oid", "=", Buffer.from(oid, "hex"))
+				.executeTakeFirst()
+			return row === undefined ? null : objectTypeFromCode(row.type)
+		},
+
 		/** Seed objects directly (the differential harness + perf bench path): insert
 		 * each as a row, idempotently. Equivalent to `ingestPack` minus the pack codec. */
 		async putPack(
@@ -448,11 +468,15 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		},
 
 		/**
-		 * git's `ok_to_give_up`: ready once every want reaches a common have by commit/
-		 * tag ancestry (the haves form a cut below all wants, so the delta is well-
-		 * defined). One ancestry CTE (commit parents + tag targets) per want replaces
-		 * `reachesCommon`'s per-object BFS. Generation-number pruning is a deferred
-		 * §6.4 lever.
+		 * git's `ok_to_give_up`: ready once every want SHARES AN ANCESTOR with the
+		 * common set. An ACKed have marks its whole ancestry common (upload-pack's
+		 * mark_common descends parents), so a SIBLING have — shared base, not on
+		 * the want's own chain — readies exactly like canonical git; the frontier
+		 * then serves want-closure minus have-closure, which is minimal either
+		 * way. The earlier directional check (`ancestry`: want DESCENDS from a
+		 * common) never readied sibling haves and forced an extra negotiation
+		 * round per fetch (neg01). Generation-number pruning is a deferred §6.4
+		 * lever.
 		 */
 		async readyToGiveUp(
 			repoId: string,
@@ -464,7 +488,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			if (id === null) return false
 			const commonBufs = common.map((h) => Buffer.from(h, "hex"))
 			for (const want of wants) {
-				if (!(await ancestry(db, id, want, commonBufs))) return false
+				if (!(await sharesAncestry(db, id, want, commonBufs))) return false
 			}
 			return true
 		},

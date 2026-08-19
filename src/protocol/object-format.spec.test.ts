@@ -45,6 +45,8 @@ function recordingReceive() {
 			calls.isConnected++
 			return true
 		},
+		listRefNames: async () => [],
+		objectType: async () => "commit",
 	}
 	return { backend, calls }
 }

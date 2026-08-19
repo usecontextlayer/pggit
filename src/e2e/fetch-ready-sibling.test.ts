@@ -1,36 +1,20 @@
 /**
- * neg01 incremental-negotiation — `readyToGiveUp` walks reachability the WRONG
- * direction vs git's `ok_to_give_up`, so it never sends `ready` when a common
- * `have` is a SIBLING of the want (shares an ancestor with it but is not on the
- * want's ancestor chain).
+ * neg01 — `readyToGiveUp` must ready a SIBLING common have, like git's
+ * `ok_to_give_up`. An ACKed have marks its WHOLE ancestry common, and a want is
+ * satisfiable once its own ancestry reaches that common region — so a have that
+ * shares a base with the want but is not on its ancestor chain still readies.
  *
- * THE BUG (object-store.ts `ancestryReachesCommon`, lines ~400-423): it walks
- * COMMIT_PARENT/TAG_TARGET edges FROM each want, looking to land ON a common oid.
- * A sibling `have` is never on the want's ancestor chain, so `readyToGiveUp`
- * (~242-255) returns false even though git would give up. git readies when the
- * common set shares an ancestor that BOUNDS the wants — not when a want descends
- * into a have.
- *
- * Scenario (the finding's crisp wire form): main = c1←c2←c3, feature = c1←f1
- * (a sibling off c1). want=c3, have=f1, NO `done`. f1 and c3 share c1 (BASE).
+ * Scenario (the crisp wire form): main = c1←c2←c3, feature = c1←f1 (a sibling
+ * off c1). want=c3, have=f1, NO `done`. f1 and c3 share c1.
  *
  * ORACLE (verified live with real `git upload-pack --stateless-rpc` v2 on a
  * file:// bare repo with this exact history, same request bytes):
  *     acknowledgments\nACK <f1>\nready\n   + DELIM + packfile (6 objects)
- * pggit currently emits:
- *     acknowledgments\nACK <f1>\n          + flush, NO ready, NO pack
- * forcing extra negotiation rounds (~2x have/ACK traffic, an extra round-trip).
  *
- * This is a protocol-conformance / negotiation-efficiency divergence (NOT data
- * loss — both fetches complete and produce identical, minimal object sets). The
- * test asserts the CORRECT oracle behavior (`ready` is emitted), so it is
- * EXPECTED-RED until pggit's reachability direction is fixed. Drives a real git
- * client over the wire (push) + a raw v2 fetch POST matching the finding.
- *
- * NOTE: src/e2e/fetch-multiround.spec.test.ts currently enshrines the BUGGY behavior
- * (asserts `ACK f1` + no pack for this same sibling-have case). That spec is the
- * specification of the wrong contract; this regression test observes the real
- * divergence against canonical git.
+ * REGRESSION HISTORY: pggit's original check walked the WRONG direction (want
+ * DESCENDS from a common — `ancestry`), never readied sibling haves, and cost
+ * an extra negotiation round per fetch. Fixed 2026-08-19 by `sharesAncestry`
+ * (merge-base-exists); this test was the parked expected-RED repro until then.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -107,12 +91,7 @@ describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (g
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 
-	// DEFERRED (rc8, decision 2026-06-22): the real fix reworks readyToGiveUp to git's
-	// ok_to_give_up direction AND rewrites the fetch-multiround spec that encodes the
-	// current behavior. Low impact — an extra negotiation round-trip, never data loss
-	// (both fetches complete, fsck-clean, object sets equal source). The repro is kept
-	// but skipped until addressed deliberately with the git oracle.
-	it.skip("want=c3, have=f1 (sibling, no done) → emits `ready` + packfile, like git", async () => {
+	it("want=c3, have=f1 (sibling, no done) → emits `ready` + packfile, like git", async () => {
 		// The finding's crisp wire form: v2 fetch, want C3, have F1 (sibling), NO done.
 		const body = Buffer.concat([
 			pktLine("command=fetch\n"),

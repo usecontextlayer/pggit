@@ -63,6 +63,8 @@ describe("§8.4 generative — connectivity rejection over random graphs", () =>
 							isAncestor: (ancestor, descendant) =>
 								objects.isAncestor("r", ancestor, descendant),
 							isConnected: (oid) => objects.isConnected("r", oid),
+							listRefNames: async () => (await refs.listRefs("r")).map((r) => r.name),
+							objectType: (oid) => objects.objectType("r", oid),
 						}
 						const pack = writePack([{ content: commit, type: "commit" }])
 						const body = receiveBody(

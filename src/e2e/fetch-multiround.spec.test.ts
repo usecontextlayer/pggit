@@ -45,6 +45,7 @@ describe("M1 multi-round negotiation", () => {
 	let c3 = ""
 	let c2 = ""
 	let f1 = ""
+	let u1 = "" // an UNRELATED root — no merge base with main at all
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
@@ -67,6 +68,14 @@ describe("M1 multi-round negotiation", () => {
 		await spawnGit(["add", "."], { cwd: dir })
 		await spawnGit(["commit", "-q", "-m", "f1"], { cwd: dir })
 		f1 = (await spawnGit(["rev-parse", "feature"], { cwd: dir })).stdout.trim()
+		// An orphan branch: shares NOTHING with main — the only have shape that
+		// does not ready (a sibling have DOES, canonically: fetch-ready-sibling).
+		await spawnGit(["checkout", "-q", "--orphan", "unrelated"], { cwd: dir })
+		await spawnGit(["rm", "-rf", "--cached", "."], { cwd: dir })
+		writeFileSync(join(dir, "u.txt"), "unrelated\n")
+		await spawnGit(["add", "u.txt"], { cwd: dir })
+		await spawnGit(["commit", "-q", "-m", "u1"], { cwd: dir })
+		u1 = (await spawnGit(["rev-parse", "unrelated"], { cwd: dir })).stdout.trim()
 
 		await seedRepoIntoStore("repo", dir, { objects, refs })
 		backend = {
@@ -84,12 +93,15 @@ describe("M1 multi-round negotiation", () => {
 		if (dir) rmSync(dir, { force: true, recursive: true })
 	})
 
-	it("a non-cutting have → acknowledgments + ACK + flush, and NO packfile", async () => {
+	it("an UNRELATED have → acknowledgments + ACK + flush, and NO packfile", async () => {
+		// A have with NO merge base cannot satisfy the want — the only shape that
+		// keeps negotiating. (A SIBLING have that shares a base READIES, matching
+		// git's ok_to_give_up — pinned by fetch-ready-sibling.test.ts.)
 		const out = await handleUploadPack(
-			fetchRequest({ done: false, haves: [f1], wants: [c3] }),
+			fetchRequest({ done: false, haves: [u1], wants: [c3] }),
 			backend,
 		)
-		expect(ackSection(out)).toBe(`acknowledgments\nACK ${f1}\n`)
+		expect(ackSection(out)).toBe(`acknowledgments\nACK ${u1}\n`)
 		expect(out.toString("utf8")).not.toContain("packfile")
 		expect(sidebandDemux(out).band1.length).toBe(0)
 	})
