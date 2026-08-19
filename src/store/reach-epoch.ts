@@ -34,6 +34,16 @@ export type Epoch = {
 	bitmaps: Map<string, Uint8Array>
 }
 
+/** The three states a two-statement epoch read can observe. `incomplete` is a
+ * deliberate concurrency outcome: replacement may commit between the epoch
+ * row read and its epoch-pinned bitmap read, making the second query return
+ * fewer bitmaps. Consumers must walk/rebuild; they must never infer readiness
+ * again from `Map` membership. */
+export type EpochLoad =
+	| { state: "absent" }
+	| { state: "ready"; epoch: Epoch }
+	| { state: "incomplete"; epoch: Epoch }
+
 /** What one GC pass decided about the epoch — `GcResult` surfaces it so the
  * S6 gates (rewind falls back LOUDLY, quiet drains skip the write) are
  * observable without log-scraping. `unchanged` = tips identical, nothing
@@ -46,18 +56,16 @@ export type EpochOutcome = "unchanged" | "advanced" | "rebuilt" | "cleared"
 
 const OID_BYTES = 20
 
-/** Read a repo's live epoch, or null when none was ever produced. */
-export async function loadEpoch(
-	db: Kysely<Database>,
-	id: ReposId,
-): Promise<Epoch | null> {
+/** Read a repo's live epoch and name whether it is absent, ready, or caught
+ * mid-replacement with an incomplete bitmap set. */
+export async function loadEpoch(db: Kysely<Database>, id: ReposId): Promise<EpochLoad> {
 	const [row] = (
 		await sql<{ epoch: string; tips: Buffer; oids: Buffer }>`
 			select epoch::text as epoch, tips, oids from git_reach_epoch
 			where repo_id = ${id}::bigint
 		`.execute(db)
 	).rows
-	if (!row) return null
+	if (!row) return { state: "absent" }
 	// The bitmap read is PINNED to the epoch the first statement saw: a GC pass
 	// can replace the epoch between the two reads, and E's array combined with
 	// E+1's bitmaps would serve substituted objects. Pinned, a mid-replacement
@@ -69,11 +77,15 @@ export async function loadEpoch(
 	`.execute(db)
 	const bitmaps = new Map<string, Uint8Array>()
 	for (const b of bits.rows) bitmaps.set(b.tip, b.bits)
-	return {
+	const epoch = {
 		bitmaps,
 		epoch: Number(row.epoch),
 		oids: row.oids,
 		tips: splitOids(row.tips),
+	}
+	return {
+		epoch,
+		state: epoch.tips.every((tip) => bitmaps.has(tip)) ? "ready" : "incomplete",
 	}
 }
 

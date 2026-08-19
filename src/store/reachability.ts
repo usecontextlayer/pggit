@@ -588,6 +588,8 @@ export type ServeSet = {
 	boundaryExact: boolean
 }
 
+type EpochServeAttempt = { state: "fallback" } | { state: "served"; result: ServeSet }
+
 /** Queue entry priority: NULL generation ≡ infinity pops first; then generation
  * descending; `commit_time` descending breaks ties and orders NULL regions
  * (git's pre-generation heuristic — can only ever OVER-send, never under). */
@@ -866,7 +868,7 @@ export async function frontier(
 
 /**
  * The bitmap fast path (chunk 5b, R23) — answers a no-have, unfiltered request
- * from the stored epoch, or returns null when the epoch cannot answer EXACTLY
+ * from the stored epoch, or returns `fallback` when it cannot answer EXACTLY
  * (no epoch; a want that is neither an epoch tip nor a commit; a bitmap row
  * already cascaded away mid-rewind; or a walk whose exclusions leaned on a tip
  * the wants never reached — `boundaryExact` false, the fork-below-a-tip case).
@@ -887,42 +889,48 @@ async function epochServe(
 	db: Kysely<Database>,
 	id: ReposId,
 	wants: string[],
-): Promise<ServeSet | null> {
-	const epoch = await loadEpoch(db, id)
-	if (epoch === null) return null
+): Promise<EpochServeAttempt> {
+	const loadedEpoch = await loadEpoch(db, id)
+	if (loadedEpoch.state !== "ready") return { state: "fallback" }
+	const { epoch } = loadedEpoch
 	const tipSet = new Set(epoch.tips)
+	const tipBitmaps = [...epoch.bitmaps].filter(([tip]) => tipSet.has(tip))
 	const uniqueWants = [...new Set(wants)]
 	const tipWants = uniqueWants.filter((w) => tipSet.has(w))
 	const rest = uniqueWants.filter((w) => !tipSet.has(w))
-	// Every tip this serve might lean on needs its bitmap row; a rewound tip's
-	// row cascades away with its object mid-sweep (the 0012 FK), so absence
-	// here means "epoch mid-replacement" — walk instead.
-	for (const t of epoch.tips) if (!epoch.bitmaps.has(t)) return null
-
-	const orBits: Uint8Array[] = tipWants.map((t) => epoch.bitmaps.get(t) as Uint8Array)
+	const tipWantSet = new Set(tipWants)
+	const orBits = tipBitmaps.filter(([tip]) => tipWantSet.has(tip)).map(([, bits]) => bits)
 
 	if (rest.length === 0) {
 		return {
-			boundaryExact: true,
-			boundaryHits: new Set(),
-			clientHas: new Set(),
-			missing: new Set(),
-			served: new Set(oidsOfUnion(orBits, epoch.oids)),
-			warmBases: new Map(),
+			result: {
+				boundaryExact: true,
+				boundaryHits: new Set(),
+				clientHas: new Set(),
+				missing: new Set(),
+				served: new Set(oidsOfUnion(orBits, epoch.oids)),
+				warmBases: new Map(),
+			},
+			state: "served",
 		}
 	}
 
 	// Non-tip wants must be commits (anything else — tree, blob, a tag object
 	// pushed since the drain — is the router's slow path's business).
 	const typed = await loadObjectTypes(db, id, [...rest, ...epoch.tips])
-	if (!rest.every((w) => typed.get(w) === PACK_OBJ_TYPE.COMMIT)) return null
+	if (!rest.every((w) => typed.get(w) === PACK_OBJ_TYPE.COMMIT)) {
+		return { state: "fallback" }
+	}
 
 	// Boundary commits: each epoch tip peeled to its commit; a tag tip's chain
 	// is recorded so a hit at the peeled commit can subtract it. Tips that peel
 	// to a non-commit carry no subtraction semantics (git's rule) — and cannot
 	// be reached by a commit walk — so they are simply not boundaries.
-	const boundaryOf = new Map<string, { tip: string; chain: Set<string> }>()
-	for (const tip of epoch.tips) {
+	const boundaryOf = new Map<
+		string,
+		{ tip: string; chain: Set<string>; bits: Uint8Array }
+	>()
+	for (const [tip, bits] of tipBitmaps) {
 		let current = tip
 		const chain = new Set<string>()
 		while (typed.get(current) === PACK_OBJ_TYPE.TAG) {
@@ -952,34 +960,36 @@ async function epochServe(
 		// A commit tip beats a tag tip peeling to the same commit (no chain to
 		// subtract); first tag tip wins among equals — their peeled closures agree.
 		if (current === tip || !boundaryOf.has(current)) {
-			boundaryOf.set(current, { chain, tip })
+			boundaryOf.set(current, { bits, chain, tip })
 		}
 	}
 
 	const fr = await frontier(db, id, rest, [...boundaryOf.keys()], false)
-	if (!fr.boundaryExact) return null
+	if (!fr.boundaryExact) return { state: "fallback" }
 
 	const served = new Set(fr.served)
 	for (const hex of oidsOfUnion(orBits, epoch.oids)) served.add(hex)
-	for (const hitCommit of fr.boundaryHits) {
-		const bound = boundaryOf.get(hitCommit) as { tip: string; chain: Set<string> }
-		const bits = epoch.bitmaps.get(bound.tip) as Uint8Array
+	for (const [commit, bound] of boundaryOf) {
+		if (!fr.boundaryHits.has(commit)) continue
 		if (bound.chain.size === 0) {
-			for (const hex of oidsOfUnion([bits], epoch.oids)) served.add(hex)
+			for (const hex of oidsOfUnion([bound.bits], epoch.oids)) served.add(hex)
 		} else {
-			for (const pos of remapPositions(bits, epoch.oids, epoch.oids, bound.chain)) {
+			for (const pos of remapPositions(bound.bits, epoch.oids, epoch.oids, bound.chain)) {
 				served.add(epoch.oids.toString("hex", pos * 20, (pos + 1) * 20))
 			}
 		}
 	}
 
 	return {
-		boundaryExact: true,
-		boundaryHits: new Set(),
-		clientHas: new Set(),
-		missing: fr.missing,
-		served,
-		warmBases: new Map(),
+		result: {
+			boundaryExact: true,
+			boundaryHits: new Set(),
+			clientHas: new Set(),
+			missing: fr.missing,
+			served,
+			warmBases: new Map(),
+		},
+		state: "served",
 	}
 }
 
@@ -1007,10 +1017,10 @@ export async function routeServeSet(
 		// epoch-covered repo is answered from stored bitmaps — zero tree reads on
 		// a fully-drained repo. `blob:none` bypasses it (the epoch's bits carry
 		// no type information to subtract blobs by), and any shape the epoch
-		// cannot answer EXACTLY returns null and falls through to the walk.
+		// cannot answer EXACTLY returns `fallback` and falls through to the walk.
 		if (!omitBlobs) {
 			const fast = await epochServe(db, id, wants)
-			if (fast !== null) return fast
+			if (fast.state === "served") return fast.result
 		}
 		const { present, missing } = await fullClosure(db, id, wants, omitBlobs)
 		return {

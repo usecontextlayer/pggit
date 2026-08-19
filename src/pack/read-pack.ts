@@ -3,13 +3,14 @@ import { createInflate } from "node:zlib"
 import { count } from "@/instrument"
 import { GitFormatError } from "@/object/format-error"
 import { computeOid, type GitObjectType } from "@/object/object"
+import type { Oid } from "@/oid"
 import { applyDelta } from "@/pack/delta"
 import { decodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 
 export type ParsedObject = {
 	type: GitObjectType
 	content: Buffer
-	oid: string
+	oid: Oid
 }
 
 const CODE_TO_TYPE: Record<number, GitObjectType> = {

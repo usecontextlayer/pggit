@@ -1,6 +1,6 @@
 import { commitTreeOid } from "@/object/object"
 import { diffFileLists, type TreeReader } from "@/object/tree-diff"
-import { buildFileList } from "@/repo-view/build-file-list"
+import { buildFileList, type ObjectReader } from "@/repo-view/build-file-list"
 import type { RepoFileProjection } from "@/repo-view/repo-file-projection"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
@@ -18,11 +18,12 @@ export type SnapshotDeps = {
  * the projection advances to the new tip — incrementally from its recorded basis
  * when the tip descends from it, by full rebuild when no basis exists, and NOT AT
  * ALL when a newer push already projected past this oid (the monotonic guard,
- * spine chunk 4). This side supplies only the tree-walking; which plan applies is
- * the projection store's decision, under the branch's lock. Runs after the push
- * commits; a failure here never rolls back the git operation, and because the
- * basis and rows move together, an absorbed failure self-heals on the next push
- * (head didn't advance, so that push recomputes from the same basis).
+ * spine chunk 4). This side supplies only the tree-walking; the projection store
+ * selects the plan outside its transaction and rechecks the basis under the
+ * branch lock before applying. Runs after the push commits; a failure here never
+ * rolls back the git operation, and because the basis and rows move together, an
+ * absorbed failure self-heals on the next push (head didn't advance, so that
+ * push recomputes from the same basis).
  */
 export async function syncRefSnapshot(
 	deps: SnapshotDeps,
@@ -37,18 +38,19 @@ export async function syncRefSnapshot(
 		await deps.snapshots.dropRefSnapshot(repoId, refName)
 		return
 	}
-	const read: TreeReader = async (oid: string) => {
+	const readObject: ObjectReader = async (oid: string) => {
 		const obj = await deps.objects.getObject(repoId, oid)
 		if (!obj)
 			throw new Error(`repo-view: object ${oid} missing while building ${refName}`)
 		return obj
 	}
+	const readTree: TreeReader = async (oid) => (await readObject(oid)).content
 	const treeOf = async (commitOid: string): Promise<string> =>
-		commitTreeOid((await read(commitOid)).content)
+		commitTreeOid((await readObject(commitOid)).content)
 	await deps.snapshots.applyRefAdvance(repoId, refName, newOid, {
 		diffFrom: async (basisCommit) =>
-			diffFileLists(read, await treeOf(basisCommit), await treeOf(newOid)),
-		fullList: () => buildFileList(read, newOid),
+			diffFileLists(readTree, await treeOf(basisCommit), await treeOf(newOid)),
+		fullList: () => buildFileList(readObject, newOid),
 	})
 }
 

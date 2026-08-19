@@ -1,4 +1,6 @@
+import { assertNever } from "@/assert-never"
 import { label, withPhase } from "@/instrument"
+import type { Oid } from "@/oid"
 import { assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError, WantNotFoundError } from "@/protocol/errors"
 import {
@@ -19,22 +21,22 @@ export type AdvertisedRef = { name: string; oid: string; peeled?: string }
 
 /**
  * Everything the upload-pack service needs from a single repo's storage. The graph
- * logic lives in the store now (set-based SQL over the row+edge model), so this is
- * a thin set-oriented interface — no object-at-a-time walk. Tag peeling is read
- * straight off the ref (`peeled`), so there is no object-fetch on the serve path.
+ * logic lives behind the store's reachability router (derived commit/tag rows plus
+ * content-driven tree walks), so this stays a thin set-oriented interface. Tag
+ * peeling is read straight off the ref (`peeled`), with no protocol-layer walk.
  */
 export type RepoBackend = {
 	listRefs: () => Promise<AdvertisedRef[]>
 	getSymref: (name: string) => Promise<string | null>
 	/** The subset of `haves` the repo has — the negotiation common set. */
-	commonHaves: (haves: string[]) => Promise<string[]>
+	commonHaves: (haves: Oid[]) => Promise<Oid[]>
 	/** git's ok_to_give_up: does every want reach a common have by ancestry? */
-	readyToGiveUp: (wants: string[], common: string[]) => Promise<boolean>
-	/** The served pack: want-closure minus have-closure, plus the explicit wants
-	 * (and, when `includeTag`, annotated tags pointing into the served set). */
+	readyToGiveUp: (wants: Oid[], common: Oid[]) => Promise<boolean>
+	/** Pack the served set selected by the reachability router (and, when
+	 * `includeTag`, annotated tags pointing into that set). */
 	buildPack: (
-		wants: string[],
-		haves: string[],
+		wants: Oid[],
+		haves: Oid[],
 		omitBlobs: boolean,
 		includeTag: boolean,
 		thinPack: boolean,
@@ -155,9 +157,11 @@ export async function handleUploadPack(
 ): Promise<Buffer> {
 	const req = parseV2Request(body)
 	assertSupportedObjectFormat(req.capabilities)
-	if (req.command === "ls-refs") return handleLsRefs(req, backend)
-	if (req.command === "fetch") return handleFetch(req, backend)
-	throw new GitProtocolError(
-		`upload-pack: unsupported command ${JSON.stringify(req.command)}`,
-	)
+	switch (req.command) {
+		case "ls-refs":
+			return handleLsRefs(req, backend)
+		case "fetch":
+			return handleFetch(req, backend)
+	}
+	return assertNever(req.command)
 }

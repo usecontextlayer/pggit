@@ -40,6 +40,8 @@ export type CommandResult =
 	| { ref: string; ok: true }
 	| { ref: string; ok: false; reason: string }
 
+type CommandDecision = { kind: "apply" } | { kind: "reject"; reason: string }
+
 /**
  * v0 ref advertisement for receive-pack (push). An empty repo — the dominant
  * first-push state — emits the synthetic `0{40} capabilities^{}` line so the
@@ -202,8 +204,9 @@ export type ReceiveBackend = {
  * ADVANCE. Updates must be fast-forward (old reachable from new — checked here
  * as server policy; the CAS in the store keeps guarding concurrency, not
  * ancestry), and deletions are denied outright (a delete is the ultimate
- * non-FF; nothing legitimate deletes branches). Creates are unrestricted. This
- * is the server-side backstop that makes a `push --force` from ANY client a
+ * non-FF; nothing legitimate deletes branches). Creates skip the ancestry check,
+ * while the branch-tip rule below still requires `refs/heads/*` to name commits.
+ * This is the server-side backstop that makes a `push --force` from ANY client a
  * loud `ng` instead of a silent history overwrite — and since refs only move
  * forward, GC can never reclaim a commit that was rewound away. Note the pack
  * is ingested BEFORE policy runs (protocol order), so a denied push leaves
@@ -312,77 +315,95 @@ export async function handleReceivePack(
 			acceptedNames.push(c.ref)
 		}
 	}
-	// Per-command disqualification reason (null ⇒ applicable): a too-long name fails
-	// the storage boundary, a disconnected tip fails connectivity, and the
-	// deny-non-FF policy fails deletions + non-fast-forward updates. A
-	// disqualified command never touches a ref.
-	const reasons = commands.map((c, i) =>
-		nameProblem[i] !== null
-			? (nameProblem[i] as string)
-			: !connected[i]
-				? "missing necessary objects"
-				: !validTip[i]
-					? "invalid new value provided"
-					: c.newOid === ZERO_OID
-						? "deletion denied (refs only advance)"
-						: fastForward[i]
-							? null
-							: "non-fast-forward (refs only advance)",
+	// Per-command decision: a too-long name fails the storage boundary, a
+	// disconnected tip fails connectivity, and the deny-non-FF policy fails
+	// deletions + non-fast-forward updates. The discriminant carries whether the
+	// command may reach storage; no null sentinel is left for consumers to decode.
+	const evaluated = commands.map(
+		(
+			command,
+			i,
+		): {
+			command: RefCommand
+			decision: CommandDecision
+		} => {
+			const problem = nameProblem[i]
+			let decision: CommandDecision
+			if (typeof problem === "string") {
+				decision = { kind: "reject", reason: problem }
+			} else if (!connected[i]) {
+				decision = { kind: "reject", reason: "missing necessary objects" }
+			} else if (!validTip[i]) {
+				decision = { kind: "reject", reason: "invalid new value provided" }
+			} else if (command.newOid === ZERO_OID) {
+				decision = { kind: "reject", reason: "deletion denied (refs only advance)" }
+			} else if (!fastForward[i]) {
+				decision = { kind: "reject", reason: "non-fast-forward (refs only advance)" }
+			} else {
+				decision = { kind: "apply" }
+			}
+			return { command, decision }
+		},
 	)
-	const reasonFor = (i: number): string | null => {
-		const reason = reasons[i]
-		if (reason === undefined) {
-			throw new Error(`receive-pack: no decision produced for command ${i}`)
-		}
-		return reason
-	}
-	if (atomic && reasons.some((r) => r !== null)) {
-		const failed = commands.map((c, i) => ({
+	if (atomic && evaluated.some(({ decision }) => decision.kind === "reject")) {
+		const failed: CommandResult[] = evaluated.map(({ command, decision }) => ({
 			ok: false,
-			reason: reasonFor(i) ?? "atomic transaction failed",
-			ref: c.ref,
+			reason: decision.kind === "reject" ? decision.reason : "atomic transaction failed",
+			ref: command.ref,
 		}))
 		return encodeReportStatus(unpackStatus, failed, useSideband)
 	}
 
 	// Apply only the applicable commands; a disqualified one never touches a ref.
 	const oks = await backend.applyRefUpdates(
-		commands.filter((_, i) => reasons[i] === null),
+		evaluated
+			.filter(({ decision }) => decision.kind === "apply")
+			.map(({ command }) => command),
 		atomic,
 	)
 	let applied = 0
-	const results: CommandResult[] = commands.map((c, i) => {
-		const reason = reasonFor(i)
-		if (reason !== null) return { ok: false, reason, ref: c.ref }
-		return oks[applied++]
-			? { ok: true, ref: c.ref }
-			: {
-					ok: false,
-					reason: atomic
-						? "atomic transaction failed"
-						: "stale ref (compare-and-swap failed)",
-					ref: c.ref,
+	const outcomes = evaluated.map(
+		({
+			command,
+			decision,
+		}): {
+			command: RefCommand
+			result: CommandResult
+		} => {
+			if (decision.kind === "reject") {
+				return {
+					command,
+					result: { ok: false, reason: decision.reason, ref: command.ref },
 				}
-	})
+			}
+			const result: CommandResult = oks[applied++]
+				? { ok: true, ref: command.ref }
+				: {
+						ok: false,
+						reason: atomic
+							? "atomic transaction failed"
+							: "stale ref (compare-and-swap failed)",
+						ref: command.ref,
+					}
+			return { command, result }
+		},
+	)
+	const results = outcomes.map(({ result }) => result)
 
 	// Post-commit: refresh the queryable file projection for each applied ref. The
 	// view layer decides branch-filtering and build-vs-drop. Sequential — same-repo
 	// rebuilds must not race the shared-blob reaper.
-	for (const [i, c] of commands.entries()) {
-		const result = results[i]
-		if (result === undefined) {
-			throw new Error(`receive-pack: no result produced for ${JSON.stringify(c.ref)}`)
-		}
+	for (const { command, result } of outcomes) {
 		if (!result.ok) continue
 		// rc2: the queryable view is a DERIVED projection — a rebuild failure (e.g. a
 		// tip that is not a commit, which buildFileList cannot walk) must NEVER roll
 		// back or 500 an already-applied push (rebuild.ts's standing contract). Absorb
 		// it loudly to the log; the projection is rebuilt on the next push to the ref.
 		try {
-			await backend.syncRefSnapshot?.(c.ref, c.newOid)
+			await backend.syncRefSnapshot?.(command.ref, command.newOid)
 		} catch (err) {
 			console.error(
-				`pggit: snapshot refresh failed for ${c.ref} (the push is already applied):`,
+				`pggit: snapshot refresh failed for ${command.ref} (the push is already applied):`,
 				err,
 			)
 		}

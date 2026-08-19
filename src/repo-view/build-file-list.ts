@@ -1,7 +1,8 @@
 import { commitTreeOid } from "@/object/object"
 import { type FileEntry, listFiles, type TreeReader } from "@/object/tree-diff"
 
-export type { FileEntry, TreeReader as ObjectReader } from "@/object/tree-diff"
+export type ObjectReader = (oid: string) => Promise<{ content: Buffer }>
+export type { FileEntry } from "@/object/tree-diff"
 export type FileList = { files: FileEntry[] }
 
 /**
@@ -14,9 +15,10 @@ export type FileList = { files: FileEntry[] }
  * incremental projections can never disagree about what a tree contains.
  */
 export async function buildFileList(
-	read: TreeReader,
+	readObject: ObjectReader,
 	commitOid: string,
 ): Promise<FileList> {
-	const commit = await read(commitOid)
-	return { files: await listFiles(read, commitTreeOid(commit.content)) }
+	const commit = await readObject(commitOid)
+	const readTree: TreeReader = async (oid) => (await readObject(oid)).content
+	return { files: await listFiles(readTree, commitTreeOid(commit.content)) }
 }

@@ -3,6 +3,7 @@ import { PostgreSqlContainer } from "@testcontainers/postgresql"
 import { Command } from "commander"
 import type { Kysely } from "kysely"
 import postgres from "postgres"
+import { z } from "zod"
 import { createMigrator, migrateToLatest } from "./src/database/migrate"
 import { initKysely } from "./src/database/postgres"
 
@@ -15,8 +16,24 @@ import { initKysely } from "./src/database/postgres"
 const MODELS_FOLDER = "./src/database/models"
 const CODEGEN_IMAGE = "postgres:18-alpine"
 
-// biome-ignore lint/suspicious/noExplicitAny: actions run schema-agnostic DDL
-type DbAction = (db: Kysely<any>) => Promise<void>
+type DbAction = (db: Kysely<unknown>) => Promise<void>
+
+const ManageEnvSchema = z.object({
+	DATABASE_URL: z.string().min(1),
+})
+const ManageActionSchema = z.enum([
+	"biome",
+	"codegen",
+	"down",
+	"downup",
+	"drop",
+	"latest",
+	"reset",
+	"up",
+])
+const ManageArgsSchema = z.tuple([ManageActionSchema])
+type ManageAction = z.infer<typeof ManageActionSchema>
+type DbActionName = Exclude<ManageAction, "biome" | "codegen">
 
 async function latest(db: Parameters<DbAction>[0]): Promise<void> {
 	await migrateToLatest(db)
@@ -49,14 +66,19 @@ async function reset(db: Parameters<DbAction>[0]): Promise<void> {
 	await latest(db)
 }
 
-const DB_ACTIONS: Record<string, DbAction> = { down, downup, drop, latest, reset, up }
+const DB_ACTIONS: Record<DbActionName, DbAction> = {
+	down,
+	downup,
+	drop,
+	latest,
+	reset,
+	up,
+}
 
 /** Build a Kysely over the real DATABASE_URL, run one action, tear it down. */
-async function runDbAction(name: string): Promise<void> {
-	const url = process.env.DATABASE_URL
-	if (!url) throw new Error(`manage: DATABASE_URL is required for "${name}"`)
+async function runDbAction(name: DbActionName): Promise<void> {
 	const run = DB_ACTIONS[name]
-	if (!run) throw new Error(`manage: unknown action "${name}"`)
+	const { DATABASE_URL: url } = ManageEnvSchema.parse(process.env)
 	const db = initKysely(postgres(url))
 	try {
 		await run(db)
@@ -97,7 +119,7 @@ async function run(): Promise<void> {
 		.option("--ci")
 		.parse()
 
-	const action = program.args[0]
+	const [action] = ManageArgsSchema.parse(program.args)
 	const { autoCodegen, autoBiome, ci } = program.opts()
 
 	// A migrate action regenerates + reformats models afterward (unless --ci).

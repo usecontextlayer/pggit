@@ -38,12 +38,10 @@ async function gitDiff(dir: string, a: string, b: string): Promise<Change[]> {
 	return changes
 }
 
-/** An ObjectReader over an on-disk git repo (cat-file per oid). */
+/** A TreeReader over an on-disk git repo (cat-file per oid). */
 function repoReader(dir: string) {
 	return async (oid: string) => {
-		const type = (await spawnGit(["cat-file", "-t", oid], { cwd: dir })).stdout.trim()
-		const content = (await spawnGit(["cat-file", type, oid], { cwd: dir })).stdoutBytes
-		return { content, type: type as "blob" | "commit" | "tag" | "tree" }
+		return (await spawnGit(["cat-file", "tree", oid], { cwd: dir })).stdoutBytes
 	}
 }
 

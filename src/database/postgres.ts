@@ -8,20 +8,13 @@ import { recordQuery } from "@/instrument"
 // the caller owns the porsager client and injects it; each store builds its own
 // Kysely from it (so the app stays a mountable sub-app and per-schema test
 // isolation works), and keeps the raw client for the COPY ingest path.
-const EVENT_SIGNS = { error: "🔴", query: "🟢" } as const
-
-/** Wrap a porsager client in a typed Kysely. Dev builds log query/error events. */
+/** Wrap a porsager client in a typed Kysely. */
 export function initKysely<T>(pg: Sql): Kysely<T> {
 	return new Kysely<T>({
 		dialect: new PostgresJSDialect({ postgres: pg }),
 		log(event) {
 			if (event.level === "query" || event.level === "error") {
 				recordQuery(event.query.sql, event.queryDurationMillis)
-				if (process.env.NODE_ENV === "development") {
-					console.debug(
-						`${EVENT_SIGNS[event.level]} ${event.queryDurationMillis}ms ${event.query.sql}`,
-					)
-				}
 			}
 		},
 	})

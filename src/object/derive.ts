@@ -8,7 +8,7 @@ import {
 	tagTargetType,
 	treeEntries,
 } from "@/object/object"
-import { isOid } from "@/oid"
+import { isOid, type Oid } from "@/oid"
 
 /**
  * Ingest-boundary validation and row derivation — the single place a pushed
@@ -43,7 +43,7 @@ const UTF8_STRICT = new TextDecoder("utf8", { fatal: true })
  * guarantees a 20-byte value, and the schema's `length(…) = 20` CHECKs are the
  * database-level backstop.
  */
-function assertOid(oid: string, context: string): string {
+function assertOid(oid: string, context: string): Oid {
 	if (!isOid(oid)) {
 		throw new GitFormatError(
 			"malformed-oid",
@@ -144,7 +144,7 @@ export function validateObject(type: GitObjectType, content: Buffer): void {
  * deliberately NOT here: it depends on the parents' rows, so the store computes
  * it in the ingest batch's one topological pass (`computeGenerations`), never
  * per object. */
-export type DerivedCommit = { commitTime: number; parents: string[]; treeOid: string }
+export type DerivedCommit = { commitTime: number; parents: Oid[]; treeOid: Oid }
 
 /** Parse a commit body into its `git_commit` row values. Loud on any malformed
  * header (same ingest-aborting channel as `validateObject`). */
@@ -159,7 +159,7 @@ export function deriveCommitRow(content: Buffer): DerivedCommit {
 /** The `git_tag` row derived from an annotated tag's content (spine chunk 1).
  * `targetType` stays the domain NAME here; the store serializes it to the stored
  * code at its own boundary. */
-export type DerivedTag = { targetOid: string; targetType: GitObjectType }
+export type DerivedTag = { targetOid: Oid; targetType: GitObjectType }
 
 /** Parse a tag body into its `git_tag` row values. Loud on a missing target or
  * type header — deriving the row IS the validation of those headers. */

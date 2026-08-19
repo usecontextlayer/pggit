@@ -1,5 +1,6 @@
 import type { Kysely } from "kysely"
 import type { ReservedSql, Sql } from "postgres"
+import { z } from "zod"
 import { type Database, initKysely } from "@/database"
 import { copyInto } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
@@ -18,6 +19,11 @@ import {
 } from "@/store/reach-epoch"
 import { type OriginWalk, originClosure } from "@/store/reachability"
 import { lookupRepoId } from "@/store/repo-resolver"
+
+/** Default per-batch DELETE cap when the caller omits `batchLimit`. Large enough to
+ * sweep a typical force-commit orphan set in one or two batches, small enough to
+ * bound the dead-tuple burst and lock duration per transaction (§7). */
+const DEFAULT_BATCH_LIMIT = 10_000
 
 /**
  * Per-repo reachability GC — the one piece of the Postgres-native redesign (§7)
@@ -48,7 +54,15 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * frequent per-repo pass never triggers a full-table VACUUM on the hot cadence
  * (autovacuum reclaims the GC churn instead). Maintenance is observable-neutral —
  * it changes dead-tuple bloat, never the row/clone state. */
-export type GcOptions = { graceSeconds: number; batchLimit?: number; maintain?: boolean }
+const GcOptionsSchema = z
+	.object({
+		batchLimit: z.number().int().positive().default(DEFAULT_BATCH_LIMIT),
+		graceSeconds: z.number().finite().nonnegative(),
+		maintain: z.boolean().default(true),
+	})
+	.strict()
+
+export type GcOptions = z.input<typeof GcOptionsSchema>
 
 /**
  * Internal-only test seam (NOT part of the public `GcOptions` contract): hooks the
@@ -85,12 +99,15 @@ type EpochPlan =
 			bitmaps: Map<string, Uint8Array>
 	  }
 
-export type Gc = ReturnType<typeof createGc>
+type AdvanceAttempt =
+	| {
+			state: "ready"
+			live: readonly string[]
+			plan: EpochPlan & { outcome: "advanced" }
+	  }
+	| { state: "rebuild" }
 
-/** Default per-batch DELETE cap when the caller omits `batchLimit`. Large enough to
- * sweep a typical force-commit orphan set in one or two batches, small enough to
- * bound the dead-tuple burst and lock duration per transaction (§7). */
-const DEFAULT_BATCH_LIMIT = 10_000
+export type Gc = ReturnType<typeof createGc>
 
 /** The per-pass live-set staging table. TEMP, so the fixed name is safe: it is
  * created in the pass's own session (`pg_temp` resolves ahead of the schema's
@@ -111,22 +128,8 @@ export function createGc(pg: Sql) {
 
 	return {
 		async gc(repo: string, opts: InternalGcOptions): Promise<GcResult> {
-			const batchLimit = opts.batchLimit ?? DEFAULT_BATCH_LIMIT
-			if (!Number.isFinite(opts.graceSeconds) || opts.graceSeconds < 0) {
-				throw new Error(
-					`pggit gc: graceSeconds must be finite and nonnegative, got ${String(opts.graceSeconds)}`,
-				)
-			}
-			if (!Number.isInteger(batchLimit) || batchLimit <= 0) {
-				throw new Error(
-					`pggit gc: batchLimit must be a positive integer, got ${String(batchLimit)}`,
-				)
-			}
-			if (opts.maintain !== undefined && typeof opts.maintain !== "boolean") {
-				throw new Error(
-					`pggit gc: maintain must be boolean, got ${String(opts.maintain)}`,
-				)
-			}
+			const { _hooks, ...rawOptions } = opts
+			const options = GcOptionsSchema.parse(rawOptions)
 			// 1. Resolve the repo. A name never written has nothing to reclaim. Resolved
 			// fresh every pass — a long-lived Gc outlives repo delete/re-create cycles
 			// (lookupRepoId).
@@ -179,7 +182,7 @@ export function createGc(pg: Sql) {
 
 				// TEST SEAM (§5 in-flight safety): interpose a concurrent push here, between
 				// the live-set materialization and the object sweep.
-				await opts._hooks?.afterLiveSet?.()
+				await _hooks?.afterLiveSet?.()
 
 				// 4. SWEEP objects: batched DELETE, each batch its own short transaction,
 				// anti-join `NOT EXISTS` against the live set, `created_at` past the grace
@@ -189,7 +192,12 @@ export function createGc(pg: Sql) {
 				// the `git_commit`/`git_tag` rows (0009) — via FK cascades: no derived
 				// surface can be torn from the inventory, mid-pass or mid-crash, and none
 				// needs a sweep of its own (design D7/D14, expressed as DDL).
-				const deletedObjects = await sweepObjects(conn, id, opts.graceSeconds, batchLimit)
+				const deletedObjects = await sweepObjects(
+					conn,
+					id,
+					options.graceSeconds,
+					options.batchLimit,
+				)
 
 				// 5. MAINTENANCE (best-effort, not part of the counted deletion): reclaim
 				// the dead tuples the sweep produced. VACUUM cannot run in a txn block, so
@@ -199,7 +207,7 @@ export function createGc(pg: Sql) {
 				// never triggers a full-table VACUUM on its hot cadence; the leaf
 				// partitions' autovacuum (0001_init.ts) reclaims the GC churn.
 				// Observable-neutral either way.
-				if (opts.maintain !== false && deletedObjects > 0) {
+				if (options.maintain && deletedObjects > 0) {
 					await maintain(conn)
 				}
 
@@ -253,8 +261,10 @@ export function createGc(pg: Sql) {
 	 * connection, open a REPEATABLE READ transaction on it, and back a Kysely with a
 	 * shim whose `reserve()` always returns that pinned connection with a no-op
 	 * `release()` — every walk statement then runs on the one snapshotted
-	 * connection. The transaction is read-only; it commits (releasing the snapshot)
-	 * before the sweep's own short write transactions begin.
+	 * connection. The dialect recognizes a client with `"reserve" in handle`, so the
+	 * shim must expose `reserve` to both membership and property access. The
+	 * transaction is read-only; it commits (releasing the snapshot) before the
+	 * sweep's own short write transactions begin.
 	 */
 	async function livePlan(
 		conn: ReservedSql,
@@ -269,12 +279,19 @@ export function createGc(pg: Sql) {
 			const tips = [
 				...new Set(rows.flatMap((r) => (r.oid ? [r.oid.toString("hex")] : []))),
 			].sort()
-			const epoch = await loadEpoch(pinned, id)
+			const loadedEpoch = await loadEpoch(pinned, id)
+			const epoch = loadedEpoch.state === "absent" ? null : loadedEpoch.epoch
 			let out: { live: readonly string[]; plan: EpochPlan }
 			if (tips.length === 0) {
 				out = { live: [], plan: { outcome: epoch ? "cleared" : "unchanged" } }
-			} else if (epoch !== null && sameOids(tips, epoch.tips)) {
-				out = { live: splitOids(epoch.oids), plan: { outcome: "unchanged" } }
+			} else if (
+				loadedEpoch.state === "ready" &&
+				sameOids(tips, loadedEpoch.epoch.tips)
+			) {
+				out = {
+					live: splitOids(loadedEpoch.epoch.oids),
+					plan: { outcome: "unchanged" },
+				}
 			} else {
 				out = await planWalk(pinned, id, tips, epoch)
 			}
@@ -315,7 +332,9 @@ export function createGc(pg: Sql) {
 				const walk = await originClosure(pinned, id, tips, stopAt, "retain")
 				if (walk.missing.size > 0 || walk.violations.size > 0) return withheld(walk)
 				const advanced = buildAdvanced(tips, epoch, walk)
-				if (advanced !== null) return advanced
+				if (advanced.state === "ready") {
+					return { live: advanced.live, plan: advanced.plan }
+				}
 			}
 		}
 		const walk = await originClosure(pinned, id, tips, new Set(), "retain")
@@ -351,15 +370,11 @@ export function createGc(pg: Sql) {
 
 	/** The steady-state epoch: new array = old ∪ walk delta; each tip's bitmap
 	 * = its walk mask ∪ the REMAPPED bitmaps of every old tip its walk hit.
-	 * Returns null — caller rebuilds — when a hit tip's bitmap row is gone
+	 * Returns `rebuild` when a hit tip's bitmap row is gone
 	 * (cascaded mid-rewind) or the covered check fails: an old tip neither hit
 	 * nor inside the new live set means the closure genuinely shrank (a
 	 * deleted or rewound ref), and keeping its objects would leak them forever. */
-	function buildAdvanced(
-		tips: string[],
-		epoch: Epoch,
-		walk: OriginWalk,
-	): { live: readonly string[]; plan: EpochPlan } | null {
+	function buildAdvanced(tips: string[], epoch: Epoch, walk: OriginWalk): AdvanceAttempt {
 		const fresh = [...walk.masks.keys()].filter((h) => positionOf(epoch.oids, h) === -1)
 		const oids = concatSortedOids([...splitOids(epoch.oids), ...fresh])
 		const bitmaps = new Map<string, Uint8Array>()
@@ -368,7 +383,7 @@ export function createGc(pg: Sql) {
 			for (const [stop, bits] of walk.hits) {
 				if ((bits & bit) === 0n) continue
 				const old = epoch.bitmaps.get(stop)
-				if (old === undefined) return null
+				if (old === undefined) return { state: "rebuild" }
 				positions.push(...remapPositions(old, epoch.oids, oids))
 			}
 			bitmaps.set(t, bitmapFromPositions(positions))
@@ -376,7 +391,9 @@ export function createGc(pg: Sql) {
 		for (const e of epoch.tips) {
 			if (walk.hits.has(e)) continue
 			const pos = positionOf(oids, e)
-			if (pos === -1 || !unionHas(bitmaps.values(), pos)) return null
+			if (pos === -1 || !unionHas(bitmaps.values(), pos)) {
+				return { state: "rebuild" }
+			}
 		}
 		return {
 			live: splitOids(oids),
@@ -387,6 +404,7 @@ export function createGc(pg: Sql) {
 				outcome: "advanced",
 				tips,
 			},
+			state: "ready",
 		}
 	}
 
@@ -429,13 +447,12 @@ export function createGc(pg: Sql) {
 			get: (target, prop) =>
 				prop === "release" ? () => {} : Reflect.get(target, prop, target),
 		})
-		const handle = Object.assign(
-			() => {
-				throw new Error("pggit gc: pinned client used as a tagged template")
-			},
-			{ reserve: async () => nonReleasing },
-		)
-		return initKysely<Database>(handle as unknown as Sql)
+		const handle = new Proxy(conn, {
+			get: (target, prop) =>
+				prop === "reserve" ? async () => nonReleasing : Reflect.get(target, prop, target),
+			has: (target, prop) => prop === "reserve" || Reflect.has(target, prop),
+		})
+		return initKysely<Database>(handle)
 	}
 
 	/** Bulk-load the live OID set into the session's TEMP table via binary COPY

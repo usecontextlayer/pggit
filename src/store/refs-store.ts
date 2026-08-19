@@ -36,9 +36,8 @@ const toOidBuffer = (hex: string): Buffer => {
  */
 type RefOp =
 	| { kind: "create"; newOid: Buffer }
-	// `oldOid: null` ⇒ the client asserted no expected value (zero old-oid): an
-	// unconditional delete — drop the ref if present, a no-op success otherwise.
-	| { kind: "delete"; oldOid: Buffer | null }
+	| { kind: "delete-unconditional" }
+	| { kind: "delete-exact"; oldOid: Buffer }
 	| { kind: "update"; oldOid: Buffer; newOid: Buffer }
 
 function classifyRefUpdate(cmd: RefUpdate): RefOp {
@@ -47,10 +46,14 @@ function classifyRefUpdate(cmd: RefUpdate): RefOp {
 	// A zero new-oid is a delete regardless of the old-oid. git sends `<zero>
 	// <zero> ref` to delete a ref it knows no value for — including one that does
 	// not exist, which canonical receive-pack reports as a no-op success — so a
-	// zero old-oid here means "delete unconditionally" (oldOid null), never a
+	// zero old-oid here means "delete unconditionally", never a
 	// malformed command. The all-zeros sentinel is classified away here and never
 	// coerced into a real all-zero bytea.
-	if (del) return { kind: "delete", oldOid: create ? null : toOidBuffer(cmd.oldOid) }
+	if (del) {
+		return create
+			? { kind: "delete-unconditional" }
+			: { kind: "delete-exact", oldOid: toOidBuffer(cmd.oldOid) }
+	}
 	if (create) return { kind: "create", newOid: toOidBuffer(cmd.newOid) }
 	return {
 		kind: "update",
@@ -160,16 +163,14 @@ async function stampPushed(exec: Kysely<Database>, repoId: ReposId): Promise<voi
 		.execute()
 }
 
-/** The outcome of one CAS: `ok` is the report-status success the client sees;
- * `mutated` is whether a ref row actually changed. They differ only for an
- * unconditional delete of an absent ref — a no-op SUCCESS that mutated nothing,
- * which must NOT stamp activity. */
-type CasResult = { ok: boolean; mutated: boolean }
+/** The three real CAS outcomes. `noop` is an unconditional delete of an absent
+ * ref: report-status success, but no activity stamp. */
+type CasResult = { state: "applied" } | { state: "noop" } | { state: "rejected" }
 
 /**
  * Apply one ref change by compare-and-swap against the client's advertised old
  * oid, on the given executor (the db, or a transaction for an atomic batch).
- * Returns the report-status `ok` and whether a row actually changed (`mutated`).
+ * Returns the named applied/no-op/rejected outcome.
  * Non-ff is accepted by default — CAS guards concurrency, not ancestry (spec §3.6).
  */
 async function casRefUpdate(
@@ -188,22 +189,28 @@ async function casRefUpdate(
 				.onConflict((oc) => oc.doNothing())
 				.returningAll()
 				.execute()
-			const mutated = rows.length === 1
-			return { mutated, ok: mutated }
+			return { state: rows.length === 1 ? "applied" : "rejected" }
 		}
-		case "delete": {
-			// CAS the delete on the asserted old-oid; an unconditional delete (zero
-			// old-oid ⇒ null) drops the ref by name and succeeds even when it was
-			// already absent — git treats deleting a non-existent ref as a no-op. That
-			// no-op is `ok` but NOT a mutation (no row removed), so it does not stamp.
-			let q = exec
+		case "delete-unconditional": {
+			// A zero old-oid drops the ref by name and succeeds even when it was
+			// already absent — git treats deleting a non-existent ref as a no-op.
+			const rows = await exec
 				.deleteFrom("git_ref")
 				.where("repo_id", "=", repoId)
 				.where("name", "=", name)
-			if (op.oldOid !== null) q = q.where("oid", "=", op.oldOid)
-			const rows = await q.returningAll().execute()
-			const mutated = rows.length === 1
-			return { mutated, ok: op.oldOid === null || mutated }
+				.returningAll()
+				.execute()
+			return { state: rows.length === 1 ? "applied" : "noop" }
+		}
+		case "delete-exact": {
+			const rows = await exec
+				.deleteFrom("git_ref")
+				.where("repo_id", "=", repoId)
+				.where("name", "=", name)
+				.where("oid", "=", op.oldOid)
+				.returningAll()
+				.execute()
+			return { state: rows.length === 1 ? "applied" : "rejected" }
 		}
 		case "update": {
 			const peeled = await peelRef(exec, repoId, op.newOid)
@@ -215,8 +222,7 @@ async function casRefUpdate(
 				.where("oid", "=", op.oldOid)
 				.returningAll()
 				.execute()
-			const mutated = rows.length === 1
-			return { mutated, ok: mutated }
+			return { state: rows.length === 1 ? "applied" : "rejected" }
 		}
 	}
 	return assertNever(op)
@@ -261,8 +267,8 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 					// the three-way tear pg-txn--post-cas-failure-tears-push pins.
 					try {
 						const r = await casRefUpdate(db, id, cmd)
-						results.push(r.ok)
-						if (r.mutated) mutated = true
+						results.push(r.state !== "rejected")
+						if (r.state === "applied") mutated = true
 					} catch (err) {
 						console.error(
 							`pggit: ref update failed for ${JSON.stringify(cmd.ref)} (reported ng; the rest of the batch continues):`,
@@ -293,8 +299,8 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 				await db.transaction().execute(async (trx) => {
 					for (const cmd of ordered) {
 						const r = await casRefUpdate(trx, id, cmd)
-						if (!r.ok) throw new AtomicAbort()
-						if (r.mutated) anyMutated = true
+						if (r.state === "rejected") throw new AtomicAbort()
+						if (r.state === "applied") anyMutated = true
 					}
 				})
 			} catch (error) {

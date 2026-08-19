@@ -1,4 +1,5 @@
 import type { Sql } from "postgres"
+import { z } from "zod"
 import { createGc } from "@/store/gc"
 import type { EpochOutcome } from "@/store/reach-epoch"
 
@@ -35,18 +36,6 @@ export type DrainEntry = {
 /** What one `drainOnce()` reclaimed, one entry per eligible repo. */
 export type DrainSummary = DrainEntry[]
 
-/** Scheduler tunables (resolved from `env` / `startServer` opts). `graceSeconds`
- * is passed straight to `gc()`; `intervalMs` is the drain cadence (the debounce
- * window); `concurrency` caps repos GC'd at once per pass so one large-orphan repo
- * cannot head-of-line-block the rest. */
-export type GcSchedulerOptions = {
-	graceSeconds: number
-	intervalMs: number
-	concurrency: number
-}
-
-export type GcScheduler = ReturnType<typeof createGcScheduler>
-
 /** A candidate repo for one drain pass: its id + wire name. The pass-start
  * watermark is captured per-repo (in `drainRepo`, before that repo's GC snapshot)
  * and written back as `last_gc_at`. */
@@ -54,26 +43,25 @@ type Candidate = { id: string; name: string }
 
 const MAX_TIMER_MS = 2_147_483_647
 
-function assertSchedulerOptions(opts: GcSchedulerOptions): void {
-	if (!Number.isFinite(opts.graceSeconds) || opts.graceSeconds < 0) {
-		throw new Error(
-			`pggit gc-scheduler: graceSeconds must be finite and nonnegative, got ${String(opts.graceSeconds)}`,
-		)
-	}
-	if (
-		!Number.isInteger(opts.intervalMs) ||
-		opts.intervalMs <= 0 ||
-		opts.intervalMs > MAX_TIMER_MS
-	) {
-		throw new Error(
-			`pggit gc-scheduler: intervalMs must be an integer from 1 to ${MAX_TIMER_MS}, got ${String(opts.intervalMs)}`,
-		)
-	}
-	if (!Number.isInteger(opts.concurrency) || opts.concurrency <= 0) {
-		throw new Error(
-			`pggit gc-scheduler: concurrency must be a positive integer, got ${String(opts.concurrency)}`,
-		)
-	}
+const GcSchedulerOptionsSchema = z
+	.object({
+		concurrency: z.number().int().positive(),
+		graceSeconds: z.number().finite().nonnegative(),
+		intervalMs: z.number().int().positive().max(MAX_TIMER_MS),
+	})
+	.strict()
+
+/** Scheduler tunables (resolved from `env` / `startServer` opts). `graceSeconds`
+ * is passed straight to `gc()`; `intervalMs` is the drain cadence (the debounce
+ * window); `concurrency` caps repos GC'd at once per pass so one large-orphan repo
+ * cannot head-of-line-block the rest. */
+export type GcSchedulerOptions = z.infer<typeof GcSchedulerOptionsSchema>
+
+export type GcScheduler = ReturnType<typeof createGcScheduler>
+
+/** Resolve the scheduler's configuration before any resource is opened from it. */
+export function resolveGcSchedulerOptions(opts: GcSchedulerOptions): GcSchedulerOptions {
+	return GcSchedulerOptionsSchema.parse(opts)
 }
 
 /**
@@ -83,7 +71,11 @@ function assertSchedulerOptions(opts: GcSchedulerOptions): void {
  * per-repo GC primitive, which is reachability-safe.
  */
 export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
-	assertSchedulerOptions(opts)
+	return createGcSchedulerFromResolvedOptions(pg, resolveGcSchedulerOptions(opts))
+}
+
+/** Internal composition seam for `startServer`, which resolves before sizing its pool. */
+export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerOptions) {
 	const gc = createGc(pg)
 	let timer: ReturnType<typeof setInterval> | undefined
 	// The in-flight pass (if any). Doubles as the overlap guard (a tick skips while a
@@ -111,10 +103,11 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 	 * rest of the pass. `maintain: false`: the drain leans on autovacuum, never a
 	 * per-pass full-table VACUUM (gc.ts).
 	 */
-	async function drainRepo(c: Candidate): Promise<DrainEntry | null> {
+	type DrainAttempt = { outcome: "drained"; entry: DrainEntry } | { outcome: "failed" }
+
+	async function drainRepo(c: Candidate): Promise<DrainAttempt> {
 		try {
-			const [t] = await pg<{ t0: string }[]>`select clock_timestamp()::text as t0`
-			if (!t) throw new Error("pggit gc-scheduler: clock_timestamp() returned no row")
+			const [{ t0 }] = await pg<[{ t0: string }]>`select clock_timestamp()::text as t0`
 			const { deletedObjects, epoch } = await gc.gc(c.name, {
 				graceSeconds: opts.graceSeconds,
 				maintain: false,
@@ -128,18 +121,21 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 			// also fails when a push landed mid-pass (last_pushed_at > t0), the
 			// standing no-lost-garbage rule.
 			const settledRows = await pg<{ id: string }[]>`
-				update repos set last_gc_at = ${t.t0}::timestamptz
+				update repos set last_gc_at = ${t0}::timestamptz
 				where id = ${c.id}::bigint
 					and last_pushed_at + make_interval(secs => ${opts.graceSeconds}::float8)
-						<= ${t.t0}::timestamptz
+						<= ${t0}::timestamptz
 				returning id::text as id`
-			return { deletedObjects, epoch, repo: c.name, settled: settledRows.length > 0 }
+			return {
+				entry: { deletedObjects, epoch, repo: c.name, settled: settledRows.length > 0 },
+				outcome: "drained",
+			}
 		} catch (err) {
 			console.error(
 				`pggit gc-scheduler: GC of repo ${JSON.stringify(c.name)} failed (retried next pass):`,
 				err,
 			)
-			return null
+			return { outcome: "failed" }
 		}
 	}
 
@@ -149,7 +145,11 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 	async function drainOnce(): Promise<DrainSummary> {
 		const candidates = await selectCandidates()
 		const results = await mapPool(candidates, opts.concurrency, drainRepo)
-		return results.filter((e): e is DrainEntry => e !== null)
+		const summary: DrainSummary = []
+		for (const result of results) {
+			if (result.outcome === "drained") summary.push(result.entry)
+		}
+		return summary
 	}
 
 	/** Run the drain on `intervalMs`. The `inFlight` guard ensures passes never
@@ -169,7 +169,7 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 					inFlight = undefined
 				})
 		}, opts.intervalMs)
-		timer.unref?.()
+		timer.unref()
 	}
 
 	/** Halt the background drain and AWAIT any pass already in flight, so a caller may

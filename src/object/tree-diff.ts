@@ -1,6 +1,5 @@
 import {
 	GITLINK_MODE,
-	type GitObjectType,
 	isTreeEntryMode,
 	type TreeEntry,
 	treeEntries,
@@ -24,17 +23,15 @@ import {
  * "incremental ≡ full rebuild", not gitlink parity.
  */
 
-/** Reads a stored object's type + content by OID — this module only ever passes
- * oids taken from tree entries with tree modes, so `content` is a tree body. */
-export type TreeReader = (
-	oid: string,
-) => Promise<{ type: GitObjectType; content: Buffer }>
+/** Reads a tree body by OID. The caller resolves the object; the stored
+ * typed-edge invariant guarantees the content crossing into this core is a tree. */
+export type TreeReader = (oid: string) => Promise<Buffer>
 
 /** One projected file: full path from the root, raw stored mode, blob oid. */
 export type FileEntry = { path: string; mode: string; blobOid: string }
 
 async function entriesOf(read: TreeReader, treeOid: string): Promise<TreeEntry[]> {
-	return treeEntries((await read(treeOid)).content)
+	return treeEntries(await read(treeOid))
 }
 
 /**

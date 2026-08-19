@@ -10,9 +10,9 @@ import { count, withPhase } from "@/instrument"
 import { computeGenerations, requireGeneration } from "@/object/commit-graph"
 import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/derive"
 import { computeOid, type GitObjectType } from "@/object/object"
-import { isOid } from "@/oid"
+import { isOid, type Oid, parseOid } from "@/oid"
 import { encodeDelta } from "@/pack/delta"
-import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/object-header"
+import { encodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, packHeader, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
@@ -57,6 +57,25 @@ function toOidBuffer(oid: string): Buffer {
 export type StoredObject = {
 	type: GitObjectType
 	content: Buffer
+}
+
+type StoredEncoding =
+	| { kind: "none" }
+	| { kind: "whole"; dataSize: number; data: Buffer }
+	| { kind: "delta"; baseOid: string; dataSize: number; data: Buffer }
+
+type ServeRow = {
+	oid: string
+	type: number
+	encoding: StoredEncoding
+}
+
+type DeltaServeRow = ServeRow & {
+	encoding: Extract<StoredEncoding, { kind: "delta" }>
+}
+
+type WholeServeRow = ServeRow & {
+	encoding: Extract<StoredEncoding, { kind: "whole" }>
 }
 
 export type ObjectStore = ReturnType<typeof createObjectStore>
@@ -177,34 +196,49 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 					// The derived encoding beside the object's type (delta-pack design D1):
 					// a stored encoding is served as a verbatim byte copy — no deflate, no
 					// delta resolution; an object without one takes the raw path below.
-					type ServeRow = {
+					type RawServeRow = {
 						oid: string
 						type: number
 						base_oid: string | null
-						data_size: number | null
+						data_size: number
 						data: Buffer | null
 					}
-					const rows = await pg<ServeRow[]>`
+					const rawRows = await pg<RawServeRow[]>`
 						select encode(o.oid, 'hex') as oid, o.type,
-							encode(e.base_oid, 'hex') as base_oid, e.data_size, e.data
+							encode(e.base_oid, 'hex') as base_oid,
+							coalesce(e.data_size, 0) as data_size, e.data
 						from git_object o
 							left join git_pack_encoding e
 								on e.repo_id = o.repo_id and e.oid = o.oid
 						where o.repo_id = ${id}::bigint
 							and o.oid in ${pg(batch.map((h) => Buffer.from(h, "hex")))}`
+					const rows: ServeRow[] = rawRows.map((r) => ({
+						encoding:
+							r.data === null
+								? { kind: "none" }
+								: r.base_oid === null
+									? { data: r.data, dataSize: r.data_size, kind: "whole" }
+									: {
+											baseOid: r.base_oid,
+											data: r.data,
+											dataSize: r.data_size,
+											kind: "delta",
+										},
+						oid: r.oid,
+						type: r.type,
+					}))
 					const byOid = new Map(rows.map((r) => [r.oid, r]))
 
 					// D8′: a delta's base must be PROVABLY resolvable by the client — in
 					// this pack, or (under negotiated thin-pack) in `clientHas`, whose
 					// membership is proof by construction: a boundary tree reachable from
 					// a stated have named it.
-					const storedDeltaUsable = (r: ServeRow): boolean =>
-						r.data !== null &&
-						r.data_size !== null &&
-						r.base_oid !== null &&
-						(servedSet.has(r.base_oid) || (thinPack && clientHas.has(r.base_oid)))
-					const storedWholeUsable = (r: ServeRow): boolean =>
-						r.data !== null && r.data_size !== null && r.base_oid === null
+					const storedDeltaUsable = (r: ServeRow): r is DeltaServeRow =>
+						r.encoding.kind === "delta" &&
+						(servedSet.has(r.encoding.baseOid) ||
+							(thinPack && clientHas.has(r.encoding.baseOid)))
+					const storedWholeUsable = (r: ServeRow): r is WholeServeRow =>
+						r.encoding.kind === "whole"
 					// Emission priority per object: stored delta (byte copy, zero compute)
 					// → warm delta (R9: computed now against the client-held boundary tree
 					// — this OUTRANKS a stored whole, because a freshly-pushed tree's
@@ -258,15 +292,15 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 							// hard fault (a mid-clone repo deletion), never a short pack.
 							throw new Error(`pggit: object ${h} vanished while packing`)
 						}
-						if (storedDeltaUsable(r) && r.data !== null && r.data_size !== null) {
-							push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, r.data_size))
-							push(Buffer.from(r.base_oid as string, "hex"))
-							push(r.data)
+						if (storedDeltaUsable(r)) {
+							push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, r.encoding.dataSize))
+							push(Buffer.from(r.encoding.baseOid, "hex"))
+							push(r.encoding.data)
 							count("deltasServed")
-						} else if (!wantsContent(h, r) && r.data !== null && r.data_size !== null) {
+						} else if (!wantsContent(h, r) && storedWholeUsable(r)) {
 							// Stored whole, no better option: verbatim byte copy.
-							push(encodeObjectHeader(r.type as PackObjType, r.data_size))
-							push(r.data)
+							push(encodeObjectHeader(r.type, r.encoding.dataSize))
+							push(r.encoding.data)
 						} else {
 							const content = contentByOid.get(h)
 							if (!content) throw new Error(`pggit: no content read for ${h}`)
@@ -298,15 +332,11 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 								push(deltaDeflated)
 								count("deltasServed")
 								count("warmDeltasServed")
-							} else if (
-								storedWholeUsable(r) &&
-								r.data !== null &&
-								r.data_size !== null
-							) {
-								push(encodeObjectHeader(r.type as PackObjType, r.data_size))
-								push(r.data)
+							} else if (storedWholeUsable(r)) {
+								push(encodeObjectHeader(r.type, r.encoding.dataSize))
+								push(r.encoding.data)
 							} else {
-								push(encodeObjectHeader(r.type as PackObjType, content.length))
+								push(encodeObjectHeader(r.type, content.length))
 								push(wholeDeflated)
 							}
 						}
@@ -329,9 +359,9 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 
 		/** The subset of `haves` this repo actually has — the negotiation common set,
 		 * in one indexed lookup rather than a per-have probe. */
-		async commonHaves(repoId: string, haves: string[]): Promise<string[]> {
-			assertObjectIds(haves)
-			if (haves.length === 0) return []
+		async commonHaves(repoId: string, haves: string[]): Promise<Oid[]> {
+			const validatedHaves = haves.map(parseOid)
+			if (validatedHaves.length === 0) return []
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return []
 			// Batched: the have list is CLIENT-sized, one bind per oid,
@@ -339,7 +369,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			// unbatched client-sized value list, and it 500'd exactly at the wall
 			// (pg-corrupt--fetch-haves-value-list).
 			const present = new Set<string>()
-			for (const batch of batches(haves, PACK_BATCH)) {
+			for (const batch of batches(validatedHaves, PACK_BATCH)) {
 				const rows = await db
 					.selectFrom("git_object")
 					.select("oid")
@@ -354,7 +384,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			}
 			// Preserve the client's `have` order (the ACK lines echo it) — the `in`
 			// query returns rows in arbitrary order.
-			return haves.filter((h) => present.has(h))
+			return validatedHaves.filter((h) => present.has(h))
 		},
 		async getObject(repoId: string, oid: string): Promise<StoredObject | null> {
 			count("getObjectCalls")

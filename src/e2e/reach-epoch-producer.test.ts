@@ -15,7 +15,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { type Database, initKysely } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
-import { loadEpoch, oidsOfUnion, splitOids } from "@/store/reach-epoch"
+import { type Epoch, loadEpoch, oidsOfUnion, splitOids } from "@/store/reach-epoch"
 import { fullClosure } from "@/store/reachability"
 import {
 	type GcFixture,
@@ -75,10 +75,17 @@ describe("reach-epoch producer (chunk 5b)", () => {
 	 * and, for commit tips whose history the source repo still holds, CANONICAL
 	 * GIT's own closure (`rev-list --objects`), so a shared walk defect cannot
 	 * self-confirm through fullClosure alone. */
+	async function expectReadyEpoch(): Promise<Epoch> {
+		const loaded = await loadEpoch(db, id)
+		expect(loaded.state).toBe("ready")
+		if (loaded.state !== "ready") {
+			throw new Error(`expected ready epoch, got ${loaded.state}`)
+		}
+		return loaded.epoch
+	}
+
 	async function expectExactBitmaps(): Promise<void> {
-		const epoch = await loadEpoch(db, id)
-		expect(epoch).not.toBeNull()
-		if (epoch === null) return
+		const epoch = await expectReadyEpoch()
 		const refs = await fx.db.sql<{ oid: Buffer }[]>`
 			select oid from git_ref where repo_id = ${id} and oid is not null`
 		const tips = [...new Set(refs.map((r) => r.oid.toString("hex")))].sort()
@@ -114,16 +121,16 @@ describe("reach-epoch producer (chunk 5b)", () => {
 	it("the first drain REBUILDS an epoch whose bitmaps are the exact closures", async () => {
 		const result = await fx.gc.gc(REPO, { graceSeconds: 0 })
 		expect(result.epoch).toBe("rebuilt")
-		const epoch = await loadEpoch(db, id)
-		expect(epoch?.epoch).toBe(1)
-		expect(epoch?.tips).toContain(tagOid) // tag REF tips are the tag OBJECT oids
+		const epoch = await expectReadyEpoch()
+		expect(epoch.epoch).toBe(1)
+		expect(epoch.tips).toContain(tagOid) // tag REF tips are the tag OBJECT oids
 		await expectExactBitmaps()
 	})
 
 	it("a quiet drain SKIPS the write entirely", async () => {
 		const result = await fx.gc.gc(REPO, { graceSeconds: 0 })
 		expect(result.epoch).toBe("unchanged")
-		expect((await loadEpoch(db, id))?.epoch).toBe(1)
+		expect((await expectReadyEpoch()).epoch).toBe(1)
 	})
 
 	it("a refs-only advance produces a DELTA epoch that stays exact", async () => {
@@ -135,7 +142,7 @@ describe("reach-epoch producer (chunk 5b)", () => {
 
 		const result = await fx.gc.gc(REPO, { graceSeconds: 0 })
 		expect(result.epoch).toBe("advanced")
-		expect((await loadEpoch(db, id))?.epoch).toBe(2)
+		expect((await expectReadyEpoch()).epoch).toBe(2)
 		await expectExactBitmaps()
 	})
 
@@ -175,7 +182,7 @@ describe("reach-epoch producer (chunk 5b)", () => {
 		await fx.db.sql`delete from git_ref where repo_id = ${id}`
 		const result = await fx.gc.gc(REPO, { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
-		expect(await loadEpoch(db, id)).toBeNull()
+		expect((await loadEpoch(db, id)).state).toBe("absent")
 		// And a pass over the now-epochless empty repo has nothing to say.
 		expect((await fx.gc.gc(REPO, { graceSeconds: 0 })).epoch).toBe("unchanged")
 	})

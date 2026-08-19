@@ -13,15 +13,19 @@ export type RepoFileProjection = ReturnType<typeof createRepoFileProjection>
 const APPLY_BATCH = 1000
 
 /** How the walking side of a push projection is supplied (spine chunk 4): the
- * SQL half (this module) decides WHICH plan applies — no-op, full rebuild,
- * incremental diff, or skip — under the branch's lock, and calls back for the
- * tree-walk half it needs. `fullList` is the whole tip (`buildFileList`);
- * `diffFrom(basisCommit)` is the file-level difference basis→tip
- * (`diffFileLists`). */
+ * SQL half (this module) selects no-op, full rebuild, incremental diff, or skip
+ * from the recorded basis, calls back for the tree walk outside a transaction,
+ * then rechecks that basis under the branch lock before applying. `fullList` is
+ * the whole tip (`buildFileList`); `diffFrom(basisCommit)` is the file-level
+ * difference basis→tip (`diffFileLists`). */
 export type ProjectionPlanner = {
 	fullList: () => Promise<{ files: FileEntry[] }>
 	diffFrom: (basisCommit: string) => Promise<FileDiff>
 }
+
+type ApplyPlan =
+	| { kind: "rebuilt"; files: FileEntry[] }
+	| { kind: "diffed"; basis: string; diff: FileDiff }
 
 /** What one push projection did — surfaced for tests/observability; callers
  * ignore it. `skipped` is the monotonic guard: a newer push already projected
@@ -74,45 +78,44 @@ export function createRepoFileProjection(pg: Sql, repoResolver?: RepoResolver) {
 			planner: ProjectionPlanner,
 		): Promise<ApplyOutcome> {
 			const id = await repos.ensureRepoId(repoId)
-			const readBasis = async (): Promise<string | null> => {
+
+			// The query result's absence is consumed here at the database seam; it never
+			// becomes a nullable planning contract passed deeper into the projection.
+			// A basis moving mid-walk needs a same-branch push to land inside the walk
+			// window. Each retry starts from the fresher basis, so progress is monotone.
+			for (let attempt = 0; attempt < 3; attempt++) {
 				const [row] = await pg<{ commit: string }[]>`
 					select encode(commit_oid, 'hex') as commit from repo_file_head
 					where repo_id = ${id}::bigint and ref_name = ${refName}`
-				return row?.commit ?? null
-			}
+				if (row !== undefined && row.commit === newOid) return "noop"
 
-			// Bounded retries: a basis moving mid-walk needs a concurrent push to the
-			// SAME branch landing inside our walk window — rare, and each retry walks
-			// from the fresher basis, so progress is monotone.
-			for (let attempt = 0; attempt < 3; attempt++) {
-				const basis = await readBasis()
-				if (basis === newOid) return "noop"
-
-				// The descendant guard (one ancestry probe over the commit rows). The
-				// basis commit is reachable from the live tip whenever this passes, so
-				// its object — and every tree the diff walks — is GC-safe.
-				if (basis !== null) {
+				let plan: ApplyPlan
+				if (row === undefined) {
+					plan = { files: (await planner.fullList()).files, kind: "rebuilt" }
+				} else {
+					// The descendant guard (one ancestry probe over the commit rows). The
+					// basis commit is reachable from the live tip whenever this passes, so
+					// its object — and every tree the diff walks — is GC-safe.
+					const basis = row.commit
 					const forward = await ancestry(db, id, newOid, [Buffer.from(basis, "hex")])
 					if (!forward) return "skipped"
+					plan = { basis, diff: await planner.diffFrom(basis), kind: "diffed" }
 				}
-				const plan =
-					basis === null
-						? { files: (await planner.fullList()).files, kind: "rebuilt" as const }
-						: { diff: await planner.diffFrom(basis), kind: "diffed" as const }
 
 				const outcome = await pg.begin(async (tx): Promise<ApplyOutcome | "stale"> => {
 					await tx`select pg_advisory_xact_lock(hashtextextended(${`${id}/${refName}`}, 0))`
 					const [head] = await tx<{ commit: string }[]>`
 						select encode(commit_oid, 'hex') as commit from repo_file_head
 						where repo_id = ${id}::bigint and ref_name = ${refName} for update`
-					if ((head?.commit ?? null) !== basis) return "stale"
 
 					if (plan.kind === "rebuilt") {
+						if (head !== undefined) return "stale"
 						await replaceBranchRows(tx, id, refName, plan.files)
 						await tx`insert into repo_file_head (repo_id, ref_name, commit_oid)
 							values (${id}::bigint, ${refName}, ${Buffer.from(newOid, "hex")})`
 						return "rebuilt"
 					}
+					if (head?.commit !== plan.basis) return "stale"
 					for (let i = 0; i < plan.diff.removed.length; i += APPLY_BATCH) {
 						const chunk = plan.diff.removed.slice(i, i + APPLY_BATCH)
 						await tx`delete from repo_file

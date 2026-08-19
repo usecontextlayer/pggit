@@ -2,7 +2,11 @@ import { serve } from "@hono/node-server"
 import type { Hono } from "hono"
 import postgres from "postgres"
 import { env } from "@/env"
-import { createGcScheduler, type GcSchedulerOptions } from "@/gc-scheduler"
+import {
+	createGcSchedulerFromResolvedOptions,
+	type GcSchedulerOptions,
+	resolveGcSchedulerOptions,
+} from "@/gc-scheduler"
 import { createGitApp, createGitDeps } from "@/index"
 
 export type GitServer = {
@@ -46,8 +50,6 @@ export async function startServer(
 	if (!databaseUrl) {
 		throw new Error("pggit: PGGIT_DATABASE_URL is required to serve")
 	}
-	const pg = postgres(databaseUrl)
-	const app = createGitApp(createGitDeps(pg))
 
 	// Self-scheduling GC: the background drain that keeps storage bounded, off the
 	// request path (docs/2026-06-24-gc-scheduler-design.md §4). Enabled by default;
@@ -60,14 +62,18 @@ export async function startServer(
 	// hot path means off the hot pool. Sized to `concurrency` (one reservation per
 	// concurrent repo) + 1 for the per-repo bookkeeping queries.
 	const gcEnabled = opts.gc?.enabled ?? env.PGGIT_GC_ENABLED
-	const concurrency = opts.gc?.concurrency ?? env.PGGIT_GC_CONCURRENCY
-	const gcPg = gcEnabled ? postgres(databaseUrl, { max: concurrency + 1 }) : undefined
+	const gcOptions = resolveGcSchedulerOptions({
+		concurrency: opts.gc?.concurrency ?? env.PGGIT_GC_CONCURRENCY,
+		graceSeconds: opts.gc?.graceSeconds ?? env.PGGIT_GC_GRACE_SECONDS,
+		intervalMs: opts.gc?.intervalMs ?? env.PGGIT_GC_INTERVAL_MS,
+	})
+	const pg = postgres(databaseUrl)
+	const app = createGitApp(createGitDeps(pg))
+	const gcPg = gcEnabled
+		? postgres(databaseUrl, { max: gcOptions.concurrency + 1 })
+		: undefined
 	const scheduler = gcPg
-		? createGcScheduler(gcPg, {
-				concurrency,
-				graceSeconds: opts.gc?.graceSeconds ?? env.PGGIT_GC_GRACE_SECONDS,
-				intervalMs: opts.gc?.intervalMs ?? env.PGGIT_GC_INTERVAL_MS,
-			})
+		? createGcSchedulerFromResolvedOptions(gcPg, gcOptions)
 		: undefined
 
 	const server = await serveOnPort(app, opts.port ?? env.PGGIT_PORT)

@@ -1,4 +1,4 @@
-import { isOid } from "@/oid"
+import { isOid, type Oid } from "@/oid"
 import { AGENT } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"
@@ -25,8 +25,10 @@ export function encodeAdvertisement(): Buffer {
 	])
 }
 
+export type V2Command = "fetch" | "ls-refs"
+
 export type V2Request = {
-	command: string
+	command: V2Command
 	capabilities: string[]
 	args: string[]
 }
@@ -58,12 +60,17 @@ export function parseV2Request(body: Buffer): V2Request {
 		else if (line.startsWith("command=")) command = line.slice("command=".length)
 		else capabilities.push(line)
 	}
+	if (command !== "fetch" && command !== "ls-refs") {
+		throw new GitProtocolError(
+			`upload-pack: unsupported command ${JSON.stringify(command)}`,
+		)
+	}
 	return { args, capabilities, command }
 }
 
 export type FetchRequest = {
-	wants: string[]
-	haves: string[]
+	wants: Oid[]
+	haves: Oid[]
 	done: boolean
 	/** Partial-clone filter spec (e.g. `blob:none`), if the client sent one. */
 	filter?: string
@@ -83,8 +90,8 @@ export type FetchRequest = {
 const UNSUPPORTED_FETCH_ARG = /^(want-ref|deepen|shallow)\b/
 
 export function parseFetch(req: V2Request): FetchRequest {
-	const wants: string[] = []
-	const haves: string[] = []
+	const wants: Oid[] = []
+	const haves: Oid[] = []
 	let done = false
 	let filter: string | undefined
 	let includeTag = false
