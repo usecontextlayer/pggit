@@ -65,6 +65,10 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 	}
 
 	let deniedPush = ""
+	/** `lateTree`'s delta base after the first repack — null means it is not a delta. */
+	let keptAnchor: string | null = null
+	/** Whether GC actually reclaimed that anchor. */
+	let anchorGone = false
 	let gcFirst: GcResult
 	let gcSecond: GcResult
 	let repackRepair = { deltas: 0, wholes: 0 }
@@ -88,10 +92,32 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 			await spawnGit(["add", "."], { cwd: src })
 			await spawnGit(["commit", "-q", "-m", `side ${i}`], { cwd: src })
 		}
-		// The object that must outlive its anchor: `side`'s LAST root tree.
-		const lateTree = (
-			await spawnGit(["rev-parse", "side^{tree}"], { cwd: src })
-		).stdout.trim()
+		// Every TREE that exists only on the divergent lineage, newest first: the pool
+		// the kept tree is chosen from once repack has said which of them are deltas.
+		// "Only on side" matters twice — it is the garbage a denied push creates, and
+		// it guarantees the chosen tree's anchor is unreachable once the keeper is the
+		// only thing holding the tree alive.
+		const sideOnly = (
+			await spawnGit(["rev-list", "--objects", "side", "--not", "main"], { cwd: src })
+		).stdout
+			.split("\n")
+			.map((l) => l.trim().split(" ")[0] ?? "")
+			.filter((o) => /^[0-9a-f]{40}$/.test(o))
+		const types = (
+			await spawnGit(["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
+				cwd: src,
+				input: `${sideOnly.join("\n")}\n`,
+			})
+		).stdout
+		const sideTrees = new Set(
+			types
+				.split("\n")
+				.filter((l) => l.endsWith(" tree"))
+				.map((l) => l.split(" ")[0] ?? ""),
+		)
+		const sideTreesNewestFirst = sideOnly.filter((o) => sideTrees.has(o))
+		/** The object that must outlive its anchor; chosen after the repack below. */
+		let lateTree = ""
 
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
@@ -153,6 +179,29 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 		)
 
 		await repack.repack(REPO)
+		// The file's whole subject, established by MEASUREMENT rather than assumed:
+		// the kept tree has to BE a delta, or "still serves the kept tree whose delta
+		// anchor GC reclaimed" is a claim about an ordinary whole row. Which trees are
+		// deltas is repack's choice — the lineage's tip ROOT tree carries one entry
+		// and loses to its own whole form every time — so ask the tier which of the
+		// lineage's trees it deltified and keep the newest of those whose anchor is
+		// also side-only, so GC reclaims that anchor once the keeper is the only
+		// thing holding the tree alive.
+		const deltaBase = new Map(
+			(
+				await db.sql<{ oid: string; base: string }[]>`
+					select encode(oid, 'hex') as oid, encode(base_oid, 'hex') as base
+					from git_pack_encoding where base_oid is not null`
+			).map((r) => [r.oid, r.base]),
+		)
+		lateTree =
+			sideTreesNewestFirst.find((t) => {
+				const base = deltaBase.get(t)
+				return base !== undefined && sideTrees.has(base)
+			}) ?? ""
+		if (lateTree === "") throw new Error("fixture wrong: no side-only tree is a delta")
+		keptAnchor = deltaBase.get(lateTree) ?? null
+		console.log(`kept tree ${lateTree} → delta anchor ${keptAnchor ?? "<none>"}`)
 
 		// Keep exactly ONE late tree alive: a commit whose root tree is `side`'s last.
 		// Its delta anchor sits many versions back in a lineage nothing now reaches.
@@ -166,6 +215,12 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 		await spawnGit(["checkout", "-q", "main"], { cwd: src })
 
 		gcFirst = await gc.gc(REPO, { graceSeconds: 0 })
+		if (keptAnchor !== null) {
+			const [anchorRow] = await db.sql<{ n: number }[]>`
+				select count(*)::int as n from git_object
+				where oid = ${Buffer.from(keptAnchor, "hex")}`
+			anchorGone = anchorRow?.n === 0
+		}
 		clones.push(await cloneAndCheck("clone after gc (before repair repack)", "pre"))
 		repackRepair = await repack.repack(REPO)
 		clones.push(await cloneAndCheck("clone after repair repack", "post"))
@@ -182,6 +237,15 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 
 	it("has the fixture it needs: the divergent push is DENIED, not accepted", () => {
 		expect(deniedPush).not.toBe("ACCEPTED")
+	})
+
+	it("has the fixture it needs: the kept tree is a delta whose anchor GC reclaimed", () => {
+		expect(keptAnchor, "the kept tree was not stored as a delta").not.toBeNull()
+		expect(anchorGone, "GC did not reclaim the kept tree's delta anchor").toBe(true)
+		expect(
+			gcFirst.deletedObjects,
+			"GC reclaimed nothing — the denied push's garbage is still live",
+		).toBeGreaterThan(0)
 	})
 
 	it("clones fsck-clean both immediately after gc and after the repair repack", () => {

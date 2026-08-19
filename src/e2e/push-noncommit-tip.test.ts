@@ -2,26 +2,20 @@
  * a13 ref lifecycle — a `refs/heads/*` push whose tip is NOT a commit (a tree,
  * blob, or annotated-tag object) must NOT crash the response with HTTP 500.
  *
- * BUG: the post-commit snapshot refresh (`syncRefSnapshot` → `buildFileList` →
- * `commitTreeOid`) fires for every `refs/heads/*` ref and assumes the tip is a
- * commit. When the tip is a tree/blob/tag object, `commitTreeOid` throws
- * `GitFormatError: commit has no tree header`. That throw is NOT caught — it
- * escapes `handleReceivePack` (the snapshot loop at receive-pack.ts:201 has no
- * guard) and the app's `onError` turns it into HTTP 500 "internal server error".
+ * THE CONTRACT — canonical git's, observed against a `file://` bare-repo oracle:
+ * receive-pack REJECTS a branch pointing at a non-commit with a clean in-band
+ * `ng <ref> invalid new value provided` under HTTP 200, and writes NOTHING. All
+ * three non-commit types (tree, blob, annotated tag) are rejected under
+ * `refs/heads/*`; the same objects are legal under `refs/tags/*`
+ * (typed-graph-policy pins that half through a real `git push`).
  *
- * Two ways this diverges from canonical git, both observed against a `file://`
- * bare-repo oracle:
- *   1. Canonical receive-pack REJECTS a branch pointing at a non-commit with a
- *      clean in-band `ng <ref> ...` (status 200) and writes NOTHING ("invalid
- *      new value provided"). pggit answers HTTP 500 instead.
- *   2. Worse: pggit's ref CAS has ALREADY committed by the time the snapshot
- *      rebuild throws (the throw is post-commit, by design "never rolls back"),
- *      so the repo is left with an illegal branch ref pointing at a tree while
- *      the client sees only a 500 and cannot tell the push half-succeeded.
- *
- * The contract: a branch-tip-non-commit push must be answered with HTTP 200 and
- * a git-report-status body (an `ng` rejection, or — if pggit chooses to accept
- * non-commit branch tips — an `ok`), but NEVER a 500 / "internal server error".
+ * ORIGINATED as the breakage probe for the post-commit snapshot refresh
+ * (`syncRefSnapshot` → `buildFileList` → `commitTreeOid`), which assumed every
+ * `refs/heads/*` tip was a commit and threw `commit has no tree header` for a
+ * tree/blob/tag tip — escaping the handler as HTTP 500 AFTER the ref CAS had
+ * already committed, leaving an illegal branch ref the client never learned about.
+ * Fixed by the branch-tip type policy that now runs before the CAS, so the ref is
+ * never written and the client reads a clean rejection.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -141,19 +135,18 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 				`branch->${name}: must not leak internal server error`,
 			).not.toContain("internal server error")
 
-			// If the server rejected (ng), the ref must NOT have been written; if it
-			// accepted (ok), it may be present. The illegal state — ref written AND a
-			// 500 returned — is the bug. Assert no torn state: a written bad ref must
-			// have been reported ok.
+			// Canonical git's outcome, per type: an in-band `ng` naming the ref, and no
+			// ref in the store. (git's own wording is `invalid new value provided`.)
+			expect(res.text, `branch->${name}: must be rejected in-band like git`).toContain(
+				`ng refs/heads/bad-${name}`,
+			)
 			const stored = Object.fromEntries(
 				(await refs.listRefs(repo)).map((r) => [r.name, r.oid]),
 			)
-			const written = stored[`refs/heads/bad-${name}`] !== undefined
-			const reportedOk = res.text.includes(`ok refs/heads/bad-${name}`)
 			expect(
-				written ? reportedOk : true,
-				`branch->${name}: ref written to store but not reported ok (torn state)`,
-			).toBe(true)
+				stored[`refs/heads/bad-${name}`],
+				`branch->${name}: a rejected command must write no ref`,
+			).toBeUndefined()
 		}
 	})
 })

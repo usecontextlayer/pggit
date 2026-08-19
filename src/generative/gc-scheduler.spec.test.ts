@@ -11,7 +11,14 @@
  *   (b) appear in the returned `DrainSummary` iff it received any storage-mutating
  *       op. Because every repo here is created by (and only by) such ops and starts
  *       with `last_gc_at IS NULL`, the eligible set === ALL touched repos. So the
- *       summary's repo set must equal the set of touched repos.
+ *       summary's repo set must equal the set of touched repos; AND
+ *   (c) carry `settled: true` in that summary — with `graceSeconds: 0` the settle
+ *       stamp must land for every repo the pass drained; AND
+ *   (d) be GONE from a second, immediately following `drainOnce()`. That second pass
+ *       is the only place the `last_pushed_at <= last_gc_at` state — the one the
+ *       eligibility predicate exists to EXCLUDE — is ever constructed here, so it is
+ *       what pins over-selection. (b) alone cannot: a repo row is created by its
+ *       first push, so an "untouched repo" has no row to be wrongly selected.
  *
  * This GENERALISES the example-based scheduler cases: SCH-3 (drains exactly the
  * eligible set), SCH-6 (end-to-end reclamation through the loop), SCH-8 (tenant
@@ -29,11 +36,9 @@
  * `graceSeconds: 0`, never a wall-clock sleep; the `setInterval` `start()` is
  * never exercised (only `drainOnce()` is driven).
  *
- * RED now because `createGcScheduler.drainOnce()` is a TDD stub that throws
- * "pggit gc-scheduler: not implemented (TDD stub)" and the store does not yet
- * stamp `repos.last_pushed_at`, so the eligible set is unobservable and nothing is
- * reclaimed. GREEN once the scheduler drains exactly the eligible set and reclaims
- * each repo to its reachable closure per §6.
+ * Originated as the TDD spec for the scheduler (§6) and ran RED against a throwing
+ * stub, before the store stamped `repos.last_pushed_at` at all; it now pins the
+ * shipped contract.
  */
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -283,11 +288,29 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 
 					// (b) Eligible set is observable and exact: the summary lists EXACTLY the
 					// repos that received any storage-mutating op (each had last_gc_at NULL, so
-					// touched ⟺ eligible). A wrong impl that drains too few (misses a delete-only
-					// repo) or too many (sweeps an untouched repo) fails here.
+					// touched ⟺ eligible). This catches an impl that drains too FEW — a
+					// delete-only repo missed, or a repo already settled by an earlier
+					// candidate's pass reappearing. It cannot catch draining too many: a repo
+					// row exists only once something pushed to it, so an "untouched repo" has
+					// no row to be wrongly selected. (d) is where over-selection is pinned.
 					const touched = repos.filter((_, i) => states[i]?.touched).sort()
 					const drained = summary.map((entry) => entry.repo).sort()
 					expect(drained).toEqual(touched)
+
+					// (c) Every drained repo SETTLED. With graceSeconds: 0 the settle predicate
+					// (`last_pushed_at + 0 <= t0`) must fire for every repo the pass reclaimed,
+					// so this reads the stamp directly instead of inferring it from (d).
+					expect(
+						summary.filter((entry) => !entry.settled).map((entry) => entry.repo),
+						"a drained repo did not settle",
+					).toEqual([])
+
+					// (d) The over-selection direction. Every repo is now in the
+					// `last_pushed_at <= last_gc_at` state the predicate exists to exclude, and
+					// nothing has pushed since, so an immediate second pass must drain NOTHING.
+					// A predicate that over-selects, or a settle stamp that never landed, fails
+					// here — the states (b) is structurally unable to reach.
+					expect(await scheduler.drainOnce()).toEqual([])
 
 					// (a) Per-repo differential: after the single drain, each repo's surviving
 					// Postgres objects == its real-git reachable closure over its current refs.

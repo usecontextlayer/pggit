@@ -10,10 +10,15 @@
  * This is the layer that would catch a wrong opcode bit, a mis-sized header, or a
  * delta whose declared source size disagrees with the base git actually holds.
  *
- * The pack writer below is TEST-ONLY and deliberately temporary: `write-pack.ts`
- * cannot emit deltas yet, which is chunk 3. When chunk 3 lands, these tests should
- * build their packs through the REAL writer — at which point this helper's continued
- * existence would mean the production path is not being exercised.
+ * The pack writer below is TEST-ONLY, and stays that way: `writePack` is the
+ * UNDELTIFIED writer by design, so retargeting these tests at it would test the
+ * wrong path. Production emits deltas from the encoding tier — the push-side
+ * encoder in `store/object-store.ts` and the repack pass in `store/repack.ts` —
+ * and that emitter is itself git-verified end to end by the e2e serve suites
+ * (`pack-encoding-serve`, `thin-pack-serve`: a real `git clone` of a repacked
+ * repo, fsck-clean and object-identical). What THIS file owns is narrower and
+ * covered nowhere else: that `encodeDelta`'s bytes are a format canonical git
+ * accepts, isolated from the tier that decides which deltas to emit.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -248,7 +253,7 @@ describe("encodeDelta — canonical git reads what we write", () => {
 	})
 })
 
-describe("encodeDelta — a full clone of a deltified repo stays fsck-clean", () => {
+describe("fixture sanity — git's own repack of this shape produces delta chains", () => {
 	let src = ""
 	beforeAll(async () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: 40 })

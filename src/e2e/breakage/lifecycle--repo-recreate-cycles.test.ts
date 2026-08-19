@@ -10,10 +10,10 @@
  * write or serve stale bytes. Each cycle ends with a clone compared byte-for-byte
  * against a file:// reference remote holding the same visible history.
  *
- * Converted from `breakage/lifecycle--repo-recreate-cycles.ts`, mechanically and
- * at full scale (90 seed commits, five delete/recreate cycles). The source exits
- * 1 when a cycle reproduces the bug; the assertions here state the correct
- * outcome, so a reproduction is RED.
+ * Full scale: 90 seed commits, five delete/recreate cycles.
+ *
+ * Originated as breakage probe `lifecycle--repo-recreate-cycles.ts` (exit 1 when
+ * a cycle resurrected state from a previous incarnation); fixed.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"

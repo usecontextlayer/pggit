@@ -296,6 +296,21 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 		})
 		await spawnGit(["branch", "keep-base", orphanBase], { cwd: orphanDir })
 
+		// The named precondition, established rather than assumed: a generation that
+		// derived NULL is ABSORBING and is never backfilled by a later push. If it were,
+		// this case would quietly become an ordinary differential over a fully-generated
+		// history — still green, and no longer the shape the file exists for.
+		const [gen] = await db.sql<{ generation: number | null }[]>`
+			select c.generation
+			from git_commit c
+			join repos r on r.id = c.repo_id
+			where r.name = ${orphanRepo} and c.oid = ${Buffer.from(tip, "hex")}`
+		expect(gen, "the tip commit row is missing entirely").toBeDefined()
+		expect(
+			gen?.generation,
+			"the tip's generation was backfilled — NULL is absorbing",
+		).toBeNull()
+
 		const fromGit = await fetchedSet(orphanDir, "refs/heads/main", "refs/heads/keep-base")
 		const fromPggit = await fetchedSet(url, "refs/heads/main", "refs/heads/keep-base")
 		expect([...fromPggit].sort()).toEqual([...fromGit].sort())

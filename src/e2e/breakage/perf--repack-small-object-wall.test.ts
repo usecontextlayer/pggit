@@ -2,29 +2,33 @@
  * Repack's small-object bind-parameter wall (breakage probe
  * `perf--repack-small-object-wall.ts`).
  *
- * PROBE: does `createRepack().repack()` have a hard object-count wall?
+ * `createRepack().repack()` has NO hard object-count wall: the pass completes and
+ * covers the whole inventory at every fixture size, on repos `git repack -adf`
+ * handles fine.
  *
- * Repack's phase-2 coverage sweep batches pending objects by BYTES only
- * (16 MB per round-trip) and feeds the batch to a `oid in (…)` value list. A repo
- * of many SMALL objects therefore packs an unbounded number of oids into one
- * query. porsager refuses at 65,534 bind parameters (Postgres' int16 ceiling), so
- * the whole pass throws — no partial progress, no encoding tier, forever.
+ * THE DEFECT THIS PINS: repack's phase-2 coverage sweep once batched pending
+ * objects by BYTES only (a 16 MB round-trip) and fed each batch to an
+ * `oid in (…)` value list, so a repo of many SMALL objects packed an unbounded
+ * number of oids into one query. porsager refuses at 65,534 bind parameters
+ * (Postgres' int16 ceiling), and the whole pass threw — no partial progress, no
+ * encoding tier, forever. The sweep now also flushes on oid COUNT, so the batch
+ * is bounded on both axes.
  *
  * Black-box: one commit with W tiny files, seeded through `putPack`, then
  * `repack()`. Comparator: `git repack -adf` on the same repo.
  *
  * Routed here rather than to `perf/breakage/` because the probe's only verdict is
- * a correctness one — "repack() throws on a repo `git repack -adf` handles fine".
- * There is no measured threshold to exceed; the wall timings it printed survive as
- * console output beside the assertion.
+ * a correctness one — whether repack throws on a repo `git repack -adf` handles
+ * fine. There is no measured threshold to exceed; the wall timings it printed
+ * survive as console output beside the assertion.
  *
  * FIXTURE SCALE IS THE TEST. The sizes straddle 65,534 — 10k and 60k below the
  * ceiling, 70k and 100k above it. Shrinking them moves the fixture off the
- * boundary the defect lives on, and the suite goes green while the bug stands.
+ * boundary the defect lived on, and the suite would go green having exercised
+ * nothing near it.
  *
- * The assertion encodes CORRECT behaviour (the pass completes and covers the
- * inventory), so the over-ceiling cases are expected RED until the batcher bounds
- * itself by oid COUNT as well as bytes.
+ * Originated as breakage probe `perf--repack-small-object-wall.ts`, which
+ * reproduced the bind-parameter wall; fixed.
  */
 import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

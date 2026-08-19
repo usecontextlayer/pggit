@@ -1,8 +1,9 @@
 /**
  * GC isolation & concurrency — `docs/2026-06-24-force-commit-gc-design.md` §4,
  * items GC-8, GC-9, GC-10. OBSERVABLE-ONLY: every assertion is on real-`git`
- * behaviour (clone/fetch/fsck), Postgres rows (`git_object`/`git_edge` via the
- * scaffold's `objectOids`/`countObjects`/`derivedRows`/`countDerivedRows`), or the `gc()`
+ * behaviour (clone/fetch/fsck), Postgres rows (`git_object` plus the derived
+ * `git_commit`/`git_tag` rows, via the scaffold's
+ * `objectOids`/`countObjects`/`derivedRows`/`countDerivedRows`), or the `gc()`
  * return value. Nothing here probes GC internals (temp tables, batch/transaction
  * counts, advisory locks, CTE/SQL shape) — those stay free to change. Grace is
  * made deterministic with `graceSeconds` + `ageObjects`, never a wall-clock sleep.
@@ -56,13 +57,13 @@ describe("GC isolation & concurrency (§4: GC-8, GC-9, GC-10)", () => {
 		await teardownGcFixture(fx)
 	})
 
-	// GC-8 — Tenant isolation. GC on repo A never deletes any object/edge of repo
-	// B. We push two repos that share NO content (distinct file paths + bodies →
-	// disjoint blob/tree/commit oids), orphan A's old objects via a store rewind,
-	// then GC only A with grace=0. Repo B must be byte-for-byte untouched: its
-	// git_object / git_edge row counts and oid sets are unchanged, and a clone of
-	// B is still complete + fsck-clean.
-	it("GC-8: GC on repo A leaves repo B's objects, edges, and clone untouched", async () => {
+	// GC-8 — Tenant isolation. GC on repo A never deletes any object or derived row
+	// of repo B. We push two repos that share NO content (distinct file paths +
+	// bodies → disjoint blob/tree/commit oids), orphan A's old objects via a store
+	// rewind, then GC only A with grace=0. Repo B must be byte-for-byte untouched:
+	// its git_object and derived-row counts and oid sets are unchanged, and a clone
+	// of B is still complete + fsck-clean.
+	it("GC-8: GC on repo A leaves repo B's objects, derived rows, and clone untouched", async () => {
 		const repoA = "gc8-a"
 		const repoB = "gc8-b"
 

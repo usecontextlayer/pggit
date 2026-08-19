@@ -207,6 +207,18 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 			expect(a.cloneError, at).toBeNull()
 			expect(a.fsckAfterCloneError, at).toBeNull()
 		}
+		// The omission proof. Every other assertion in this file is satisfied by a
+		// full unfiltered clone — a checkout of a repo that already holds every blob
+		// is clean and identical — so `blob:none` is only honored if pggit lands the
+		// same number of blobs the git control does, and the control lands none.
+		expect(
+			arms[1]?.localBlobs,
+			"the git control is not blob-light — the fixture proves nothing",
+		).toBe(0)
+		expect(
+			arms[0]?.localBlobs,
+			"pggit's blobless clone landed blobs the git control did not",
+		).toBe(arms[1]?.localBlobs)
 	})
 
 	it("checks out through the promisor blob path, still fsck-clean", () => {

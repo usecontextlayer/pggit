@@ -20,14 +20,15 @@ import { spawnGit } from "@/testing/spawn-git"
  * (grace protects recent).
  *
  * OBSERVABLE-ONLY: every assertion is on the real `git` oracle
- * (clone/fetch/fsck/rev-list), Postgres rows (`git_object`/`git_edge` via
- * `db.sql`), or the `gc()` return value. Nothing here probes GC internals
- * (temp tables, batch counts, CTE/transaction shape) — those stay free to
- * change. Grace is made deterministic by controlling `graceSeconds` and
- * `created_at` (`ageObjects`), never by sleeping on the wall clock.
+ * (clone/fetch/fsck/rev-list), Postgres rows (`git_object` plus the derived
+ * `git_commit`/`git_tag` rows via `db.sql`), or the `gc()` return value. Nothing
+ * here probes GC internals (temp tables, batch counts, CTE/transaction shape) —
+ * those stay free to change. Grace is made deterministic by controlling
+ * `graceSeconds` and `created_at` (`ageObjects`), never by sleeping on the wall
+ * clock.
  *
- * RED now: `createGc` is a throwing stub, so every `gc()` call rejects with
- * "pggit gc: not implemented (TDD stub)". GREEN once GC honours the §4 contract.
+ * ORIGINATED as the TDD suite written against a throwing `createGc` stub; GC has
+ * honoured the §4 contract since, and these cases are its regression gate.
  */
 describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 	let fx: GcFixture
@@ -93,9 +94,9 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 	})
 
 	// GC-2 — Unreachable reclaimed. An object unreachable from all refs AND older
-	// than grace is absent from `git_object` after GC, and its `git_edge` rows are
-	// gone (no FK cascade — edges of deleted objects must be swept too).
-	it("GC-2: removes orphaned objects and their edges after a rewind (grace=0, aged)", async () => {
+	// than grace is absent from `git_object` after GC, and no derived
+	// `git_commit`/`git_tag` row survives for it either.
+	it("GC-2: removes orphaned objects and their derived rows after a rewind (grace=0, aged)", async () => {
 		const repo = "gc2-reclaim"
 
 		// Push c1, capture its reachable closure, then rewind to c2 (independent

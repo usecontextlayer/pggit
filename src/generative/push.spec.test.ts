@@ -49,12 +49,7 @@ describe("§8.4 generative — push to an empty repo (M2) differential", () => {
 							{ cwd: client },
 						)
 
-						// 1. Every object reachable on the client is now in the store.
-						for (const oid of await allObjectOids(client)) {
-							expect(await objects.hasObject("repo", oid)).toBe(true)
-						}
-
-						// 2. The stored refs are EXACTLY the client's branches + tags. listRefs
+						// 1. The stored refs are EXACTLY the client's branches + tags. listRefs
 						//    order is unspecified, so sort both sides (refsOf already sorts).
 						//    Compare name+oid only — `peeled` is derived metadata, not ref state.
 						const stored = (await refs.listRefs("repo"))
@@ -62,9 +57,12 @@ describe("§8.4 generative — push to an empty repo (M2) differential", () => {
 							.sort((a, b) => a.name.localeCompare(b.name))
 						expect(stored).toEqual(await refsOf(client))
 
-						// 3. Differential: a fresh git clones the server back to a byte-identical
+						// 2. Differential: a fresh git clones the server back to a byte-identical
 						//    object set, fsck-clean. --no-checkout: the server has no HEAD symref
 						//    after a bare push, and we only care about the object closure.
+						//    This subsumes a per-object `hasObject` sweep of the store: an object
+						//    the ingest dropped cannot come back out of the pack, and unlike the
+						//    sweep this also catches OVER-serving.
 						back = mkdtempSync(join(tmpdir(), "pggit-push-back-"))
 						await spawnGit([
 							"clone",

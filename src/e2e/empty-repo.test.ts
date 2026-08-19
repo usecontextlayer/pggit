@@ -53,8 +53,7 @@ describe("M0 — empty (unborn) repo", () => {
 				`http://127.0.0.1:${server.port}/empty`,
 				dest,
 			])
-			// allObjectOids returns [""] for an empty repo (split of empty stdout).
-			expect((await allObjectOids(dest)).filter(Boolean)).toEqual([])
+			expect(await allObjectOids(dest)).toEqual([])
 			// Unborn HEAD propagated the SERVER's branch, not the client's override.
 			const head = (
 				await spawnGit(["symbolic-ref", "--short", "HEAD"], { cwd: dest })

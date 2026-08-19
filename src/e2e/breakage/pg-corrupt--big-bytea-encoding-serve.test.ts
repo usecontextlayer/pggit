@@ -60,6 +60,13 @@ for (const sizeMb of SIZES_MB) {
 		let url = ""
 		let src = ""
 		let payload = Buffer.alloc(0)
+		/** The big blob's `git_pack_encoding` row, or null when repack wrote none. */
+		let encodingRow: {
+			n: number
+			data_size: number
+			data_len: number
+			stored: number
+		} | null = null
 		const dirs: string[] = []
 		const mk = (tag: string): string => {
 			const d = mkdtempSync(join(tmpdir(), `pggit-bigb-${tag}-`))
@@ -97,8 +104,8 @@ for (const sizeMb of SIZES_MB) {
 				`repack: ${r.wholes} wholes + ${r.deltas} deltas in ${Date.now() - t}ms (${rss()})`,
 			)
 
-			// Diagnostic: the exact size of the unguarded read the serve path is about to
-			// make. `data` comes back as `\x`+hex, so the JS string is TWICE `data_len`.
+			// The exact size of the unguarded read the serve path is about to make.
+			// `data` comes back as `\x`+hex, so the JS string is TWICE `data_len`.
 			const [row] = await db.sql<
 				{ n: number; data_size: number; data_len: number; stored: number }[]
 			>`
@@ -109,11 +116,8 @@ for (const sizeMb of SIZES_MB) {
 				from git_pack_encoding e
 					join repos rr on rr.id = e.repo_id
 				where rr.name = ${REPO} and e.oid = ${Buffer.from(bigOid, "hex")}`
-			if (!row || row.n === 0) {
-				console.log(
-					"NOTE: the big blob got NO encoding row (over the cap) — raw path only",
-				)
-			} else {
+			encodingRow = row ?? null
+			if (row && row.n > 0) {
 				console.log(
 					`encoding row: data_size=${mb(row.data_size)} data=${mb(row.data_len)} ` +
 						`stored=${mb(row.stored)} → serve reads a ${mb(row.data_len * 2)} hex string`,
@@ -127,6 +131,21 @@ for (const sizeMb of SIZES_MB) {
 			payload = Buffer.alloc(0)
 			for (const d of dirs) rmSync(d, { force: true, recursive: true })
 			console.log(`peak ${rss()}`)
+		})
+
+		it("has the fixture it needs: the big blob got an encoding row", () => {
+			// Repack covers every object under MAX_INLINE_BYTEA_BYTES, and both sizes
+			// here sit below it. Without the row, the second test drives the raw
+			// chunked path — not the unguarded `e.data` read this file exists to probe
+			// — and passes identically.
+			expect(
+				encodingRow?.n,
+				"no encoding row — the unguarded e.data read is never exercised",
+			).toBe(1)
+			expect(
+				encodingRow?.data_len ?? 0,
+				"the encoding row carries no bytes, so the doubled-hex read is not on the serve path",
+			).toBeGreaterThan(0)
 		})
 
 		it("clones fsck-clean and returns the blob byte-identical", async () => {

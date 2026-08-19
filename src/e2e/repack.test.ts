@@ -1,11 +1,13 @@
 /**
- * At-rest re-ingest invariant (testing #10). The Postgres-native redesign stores
- * objects as rows and drops the pack-blob soft-delete model (`packs.dead_at`, the
- * TTL reaper, the offline repack worker) entirely — GC becomes a reachability
- * set-difference DELETE (redesign §7), a deferred follow-up. What still must hold
- * here: re-ingesting a consolidated `git repack` pack over the same history is
- * idempotent at the served layer — the SERVED object set + refs stay byte-
- * identical and fsck-clean.
+ * At-rest re-ingest invariant (testing #10): re-ingesting a consolidated
+ * `git repack` pack over the same history is idempotent at the served layer — the
+ * SERVED object set and refs stay byte-identical and fsck-clean.
+ *
+ * That is this file's whole subject, and it is covered nowhere else. Objects are
+ * rows here, so the pack-blob soft-delete model (`packs.dead_at`, the TTL reaper,
+ * the offline repack worker) does not exist; reclamation is GC's reachability
+ * set-difference DELETE, whose behaviour belongs to the GC suites
+ * (gc-integrity, gc-reclamation, the gc property, and the clone-vs-GC races).
  */
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -90,9 +92,4 @@ describe("M3 — at-rest repack invariant", () => {
 		expect(await cloneBackObjects()).toEqual(objectsBefore)
 		expect(await refs.listRefs("repo")).toEqual(refsBefore)
 	})
-
-	// GC in the redesign is a reachability set-difference DELETE with a grace
-	// window (redesign §7), a deferred follow-up; pin these when it lands.
-	it.todo("GC deletes unreachable objects while preserving ref-closure connectivity")
-	it.todo("a clone concurrent with GC returns a consistent object set")
 })

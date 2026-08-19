@@ -48,7 +48,7 @@ export async function allObjectOids(dir: string): Promise<string[]> {
 		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
 		{ cwd: dir },
 	)
-	return list.stdout.trim().split("\n").sort()
+	return list.stdout.trim().split("\n").filter(Boolean).sort()
 }
 
 /**
@@ -108,6 +108,11 @@ export async function packObjectOids(dir: string, packFile: string): Promise<str
 	for (const line of out.stdout.split("\n")) {
 		const m = line.match(/^([0-9a-f]{40}) (commit|tree|blob|tag) /)
 		if (m?.[1]) oids.push(m[1])
+	}
+	// git never writes an empty pack, so zero parsed rows means verify-pack's
+	// output format moved and the scrape above went blind — fail, don't return [].
+	if (oids.length === 0) {
+		throw new Error(`packObjectOids: parsed zero objects from verify-pack -v ${idx}`)
 	}
 	return oids.sort()
 }

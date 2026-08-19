@@ -31,7 +31,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact", () => {
 	let isolated: IsolatedDb
@@ -89,16 +89,25 @@ describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact
 		).stdout.trim()
 		await spawnGit(["update-ref", "refs/heads/main", commitHex], { cwd: src })
 
-		// The divergence is real: canonical git considers this a clean repo.
-		const fsckSrc = await spawnGit(["fsck", "--full", "--strict"], { cwd: src })
-		expect(fsckSrc.code).toBe(0)
+		// The divergence is real: canonical git considers this a clean repo. spawnGit
+		// rejects on any non-zero exit, so this call IS the assertion.
+		await spawnGit(["fsck", "--full", "--strict"], { cwd: src })
 
 		// pggit rejects it — the ingest-boundary validation fails the unpack, which
-		// fails every ref command; the client exits non-zero.
+		// fails every ref command; the client exits non-zero. Only a git failure is
+		// expected here: a spawn fault or transport error must propagate rather than
+		// be laundered into the non-zero exit the assertions below read.
 		const push = await spawnGit(["push", url, "refs/heads/main:refs/heads/main"], {
 			cwd: src,
-		}).catch((e: unknown) => ({ code: 1, stderr: String(e) }))
+		}).catch((e: unknown) => {
+			if (e instanceof GitCommandError) return e
+			throw e
+		})
 		expect(push.code, push.stderr).not.toBe(0)
+		// The REASON, not just the failure: pggit's D16 path rule, reported in-band on
+		// the unpack status line the client prints back.
+		expect(push.stderr).toMatch(/not valid UTF-8/)
+		expect(push.stderr).toMatch(/unpack/)
 
 		// Nothing landed: no ref, no objects, no projection rows.
 		const [counts] = await isolated.sql<{ refs: number; objs: number; files: number }[]>`

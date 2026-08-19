@@ -1,204 +1,107 @@
 /**
- * Large-blob behavior over V8's maximum string length (0x1fffffe8 ≈ 512M chars).
+ * Large blobs past V8's maximum string length (0x1fffffe8 ≈ 512M chars) — the
+ * ingest and the serve halves of one contract, over one fixture.
  *
- * Merged from a07-large-blob-string-cap.bug + blb01-large-blob-serve-string-cap.bug.
- * Both halves exercise a blob whose raw inflated content exceeds ~256MiB, so a
- * `bytea` value round-tripped through the porsager driver's text wire form
- * (`'\x' + hex`, DOUBLE the byte length) would exceed V8's hard string cap and
- * throw `Cannot create a string longer than 0x1fffffe8 characters`.
+ * A blob whose raw inflated content exceeds ~256MiB cannot round-trip through the
+ * porsager driver's TEXT wire form for `bytea` (`'\x' + hex`, DOUBLE the byte
+ * length): the string exceeds V8's hard cap. Both directions must therefore move
+ * the bytes AS bytes — ingest writes raw (binary COPY), and serve reads the value
+ * back in chunks rather than as one decoded string. Postgres itself takes `bytea`
+ * to ~1GB and canonical git stores blobs this size happily, so anything smaller
+ * than this is pggit refusing what git accepts.
  *
- *   - a07 covers the INGEST half: a push carrying such a blob must report
- *     `unpack ok` and land the ref (raw-bytes binary COPY, no JS string).
- *   - blb01 covers the SERVE half: a previously-pushed >256MiB blob must be
- *     FETCHable (HTTP 200 + packfile), never a write-only 500.
+ * THE CONTRACT: a push carrying such a blob reports `unpack ok` and lands its ref,
+ * and a subsequent v2 fetch of that blob answers HTTP 200 with a pack of exactly
+ * ONE object whose oid is the blob's — the bytes that went in came back.
  *
- * Each original `describe` is preserved verbatim as its own block so the two
- * bug rationales and their assertions stay independent.
+ * The ref is a TAG: tags legally hold ANY object type (canonical git accepts a
+ * blob-tipped tag, probed live), which isolates the string-cap subject from the
+ * branch-tips-must-be-commits policy without faking a commit wrapper.
+ *
+ * ORIGINATED as two breakage probes over the same shape — a07 (INGEST: the push
+ * came back with an unpacker error and no ref) and blb01 (SERVE: the blob stored
+ * but every fetch died with `RPC failed; HTTP 500`, i.e. write-only storage). Both
+ * fixed; merged into one describe because two byte-identical 270MB fixtures were
+ * paying twice for one shape.
  */
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { computeOid } from "@/object/object"
+import { readPack } from "@/pack/read-pack"
 import { writePack } from "@/pack/write-pack"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { pktLineUnpack } from "@/testing/pkt-oracle"
+import { packObjectCount, pktLineUnpack, sidebandDemux } from "@/testing/pkt-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
 
 const ZERO = "0".repeat(40)
+const TAG = "huge"
+/** 270_000_000 bytes > 0x1fffffe8 / 2 ≈ 268_435_443, so this value's hex text form
+ * — in EITHER direction — exceeds V8's max string length. */
+const SIZE = 270_000_000
 
-/**
- * a07 (large-blobs) — a push carrying a single blob larger than V8's maximum
- * string length (0x1fffffe8 ≈ 512MB) is rejected with an unpacker error, where
- * canonical git accepts it.
- *
- * Root cause: on ingest the object's raw inflated `content` Buffer is bound as a
- * Postgres `bytea` parameter; the driver hex-encodes the bytea into a JS string
- * (`'\x' + buf.toString('hex')`), which DOUBLES the byte length. A blob whose
- * content exceeds ~256MiB therefore produces a string longer than V8's hard cap
- * (`Cannot create a string longer than 0x1fffffe8 characters`), the insert
- * throws, ingest aborts, and the ref is never created. Postgres itself accepts
- * `bytea` up to ~1GB and real git happily stores blobs of this size, so pggit is
- * rejecting a push that canonical git accepts.
- *
- * Observable contract (driven over the receive-pack wire, asserting only the wire
- * outcome + stored state — no implementation detail): the report-status must say
- * `unpack ok` and the pushed ref must land, exactly as a bare-repo control would.
- *
- * RED now: the report comes back with an unpacker error and the ref is absent.
- * GREEN once ingest stores large blobs without round-tripping their content
- * through a JS string (e.g. binary bytea bind / COPY).
- */
-describe("a07 — large-blob push over V8 string cap", () => {
+describe("large blob past the V8 string cap — pushed, then fetched back", () => {
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let objects: ObjectStore
 	let refs: RefStore
-
-	/** A receive-pack POST body that pushes `objects` and creates `refs/tags/<name>` —
-	 * tags legally hold ANY object type (canonical git accepts a blob-tipped tag,
-	 * probed live), so the V8 string-cap subject stays isolated from the
-	 * branch-tips-must-be-commits policy without faking a commit wrapper. */
-	function pushBody(
-		newOid: string,
-		branch: string,
-		objects: { type: "blob" | "commit" | "tag" | "tree"; content: Buffer }[],
-	): Buffer {
-		return Buffer.concat([
-			encodePktLine(Buffer.from(`${ZERO} ${newOid} refs/tags/${branch}\0report-status`)),
-			encodePkt({ type: "flush" }),
-			writePack(objects),
-		])
-	}
+	let blobOid = ""
+	let report = ""
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
 		app = createGitApp({ objects, refs })
-	}, 180_000)
 
-	afterAll(async () => {
-		await db?.drop()
-	})
+		// Deterministic fill, no randomness: the size is what matters, and the same
+		// bytes must be reproducible for the served-oid comparison below.
+		const content = Buffer.alloc(SIZE)
+		for (let i = 0; i < SIZE; i += 4096) content.writeUInt32LE((i * 2654435761) >>> 0, i)
+		blobOid = computeOid("blob", content)
 
-	it("ingests a ~257MB blob and creates the ref (real git accepts it)", async () => {
-		// 270_000_000 bytes > 0x1fffffe8 / 2 ≈ 268_435_443, so the hex-encoded bytea
-		// parameter string would exceed V8's max string length.
-		const size = 270_000_000
-		// Incompressible content so the pack stays large and the stored bytea is the
-		// full size (a zero blob would compress away but the stored raw is identical
-		// length; random just makes the wire transfer representative).
-		const content = Buffer.alloc(size)
-		for (let i = 0; i < size; i += 4096) content.writeUInt32LE((i * 2654435761) >>> 0, i)
-
-		const blobOid = computeOid("blob", content)
-		const branch = "huge"
-		const body = pushBody(blobOid, branch, [{ content, type: "blob" }])
-
-		const res = await app.request(`/r/git-receive-pack`, {
+		const body = Buffer.concat([
+			encodePktLine(Buffer.from(`${ZERO} ${blobOid} refs/tags/${TAG}\0report-status`)),
+			encodePkt({ type: "flush" }),
+			writePack([{ content, type: "blob" }]),
+		])
+		const res = await app.request("/r/git-receive-pack", {
 			body: new Uint8Array(body),
 			method: "POST",
 		})
 		expect(res.status).toBe(200)
-
-		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
-		// Canonical git: the pack unpacks and the ref is created.
-		expect(report).toContain("unpack ok")
-		expect(report).toContain(`ok refs/tags/${branch}`)
-
-		const stored = (await refs.listRefs("r")).find(
-			(r) => r.name === `refs/tags/${branch}`,
-		)
-		expect(stored?.oid).toBe(blobOid)
-		expect(await objects.hasObject("r", blobOid)).toBe(true)
-	}, 120_000)
-})
-
-/**
- * blb01 (large-blobs, SERVE side) — a blob larger than V8's max string length
- * (0x1fffffe8 ≈ 512M chars) can be PUSHED but never FETCHED back: it is write-only.
- *
- * a07 fixed the INGEST half (raw-bytes binary COPY, no JS string) and asserts a
- * ~257MB blob stores + the ref lands. But it never reads the blob back, so the
- * SERVE half stayed broken: `buildPack` reads `git_object.content` through the
- * porsager driver, which decodes a `bytea` result from its text wire form
- * (`'\x' + hex`, DOUBLE the byte length). A blob over ~256MiB therefore makes the
- * driver build a string longer than V8's hard cap and throw
- * `Cannot create a string longer than 0x1fffffe8 characters`. That escapes
- * `buildPack` (object-store.ts) as a bare Error → Hono onError → HTTP 500, so a
- * real `git clone`/`fetch` of the blob dies with `RPC failed; HTTP 500 / expected
- * 'packfile'`. The object is durably stored yet unreadable.
- *
- * Observable contract (driven over the wire, asserting only the wire outcome): the
- * push report is `unpack ok` AND a subsequent v2 fetch of the stored blob returns
- * HTTP 200 with a packfile — never a 500. Verified live at :8080: push exit 0,
- * clone → HTTP 500 + the string-cap error in the server log.
- *
- * RED now: the fetch returns 500. GREEN once the serve path reads large `bytea`
- * as raw bytes (e.g. a binary COPY-out / cursor) instead of through a JS string,
- * symmetric to the ingest COPY.
- */
-describe("blb01 — large blob is write-only (serve over V8 string cap)", () => {
-	let db: IsolatedDb
-	let app: ReturnType<typeof createGitApp>
-	let objects: ObjectStore
-	let refs: RefStore
-	const branch = "huge"
-	let blobOid: string
-
-	/** A receive-pack POST body that pushes a single blob and points refs/tags/<name>
-	 * at it (a TAG holds any object type in canonical git — this isolates
-	 * the SERVE-side string-cap bug from the non-commit-tip snapshot bug). */
-	function pushBlobBody(blobOid: string, branch: string, content: Buffer): Buffer {
-		return Buffer.concat([
-			encodePktLine(Buffer.from(`${ZERO} ${blobOid} refs/tags/${branch}\0report-status`)),
-			encodePkt({ type: "flush" }),
-			writePack([{ content, type: "blob" }]),
-		])
-	}
-
-	beforeAll(async () => {
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		objects = createObjectStore(db.sql)
-		refs = createRefStore(db.sql)
-		app = createGitApp({ objects, refs })
-
-		// 270_000_000 bytes > 0x1fffffe8 / 2 ≈ 268_435_443, so the bytea READ result's
-		// text form (`\x`+hex, doubled) exceeds V8's max string length. Same sizing +
-		// deterministic fill as a07 (no randomness).
-		const size = 270_000_000
-		const content = Buffer.alloc(size)
-		for (let i = 0; i < size; i += 4096) content.writeUInt32LE((i * 2654435761) >>> 0, i)
-		blobOid = computeOid("blob", content)
-
-		const res = await app.request("/r/git-receive-pack", {
-			body: new Uint8Array(pushBlobBody(blobOid, branch, content)),
-			method: "POST",
-		})
-		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
-		// Sanity: the blob ingests fine (a07's fix). The bug is purely on serve.
-		expect(report).toContain("unpack ok")
-		expect(await objects.hasObject("r", blobOid)).toBe(true)
-	}, 180_000)
+		report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
+	}, 300_000)
 
 	afterAll(async () => {
 		await db?.drop()
 	})
 
-	it("serves a fetch of a >256MiB stored blob (HTTP 200 packfile), never a 500", async () => {
+	it("ingests a ~257MB blob and lands the ref", async () => {
+		expect(report).toContain("unpack ok")
+		expect(report).toContain(`ok refs/tags/${TAG}`)
+		const stored = (await refs.listRefs("r")).find((r) => r.name === `refs/tags/${TAG}`)
+		expect(stored?.oid).toBe(blobOid)
+		expect(await objects.hasObject("r", blobOid)).toBe(true)
+	})
+
+	it("serves it back — one object in the pack, and it is the blob that went in", async () => {
 		const res = await app.request("/r/git-upload-pack", {
 			body: new Uint8Array(
 				fetchRequest({ done: true, objectFormat: "sha1", wants: [blobOid] }),
 			),
 			method: "POST",
 		})
-		// RED: buildPack reads the blob's bytea through a JS string → V8 cap → 500.
-		// The stored-but-unfetchable blob is the bug; a clone/fetch must succeed.
 		expect(res.status).toBe(200)
 		const body = Buffer.from(await res.arrayBuffer())
-		// The served upload-pack result carries the packfile (sideband band-1 frames it).
-		expect(body.includes(Buffer.from("PACK"))).toBe(true)
-	}, 120_000)
+		// A `PACK` substring proves nothing — every upload-pack response carries that
+		// header, an EMPTY pack included. The count and the parsed object are the
+		// observables that tell "blob served" from "200 with nothing in it".
+		expect(packObjectCount(body)).toBe(1)
+		const served = await readPack(sidebandDemux(body).band1)
+		// readPack hashes what it parsed, so a matching oid IS byte identity.
+		expect(served.map((o) => `${o.type} ${o.oid}`)).toEqual([`blob ${blobOid}`])
+	}, 180_000)
 })

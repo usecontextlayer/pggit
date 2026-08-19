@@ -39,10 +39,9 @@ import {
  * (passed as `{ sql }`) for the row helpers. No other test touches `public`, so this
  * stays isolated from the schema-per-file tests sharing the container.
  *
- * RED now because: the store does NOT yet stamp `repos.last_pushed_at` (stays
- * NULL after a push → SCH-9's stamp assertion fails) and `startServer` ignores
- * its `gc` opts (no drain is ever started → SCH-10's self-GC poll times out with
- * orphans never reclaimed). GREEN once §6 is implemented.
+ * ORIGINATED as the TDD suite written while the store did not stamp
+ * `repos.last_pushed_at` and `startServer` ignored its `gc` opts entirely — no
+ * drain was ever started. Both landed per §6; this is their regression gate.
  */
 describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	let db: Kysely<Database>
@@ -129,8 +128,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	// and a clone is fsck-clean at the latest tree. The SAME workload against a
 	// `createGitApp` served with NO scheduler reclaims nothing over the same window
 	// — proving GC runs only because the server wired it (not as a clone side
-	// effect). RED now: `startServer` ignores `gc` opts, so the self-GC poll times
-	// out (orphans never reclaimed).
+	// effect).
 	it("SCH-10: an enabled startServer reclaims orphans on its cadence; an unscheduled mount does not", async () => {
 		// Part 1 — an enabled server reclaims orphans via its OWN interval. Scoped so
 		// its scheduler is STOPPED (close()) before Part 2 (and SCH-9) run: it shares
@@ -198,10 +196,8 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 
 	// SCH-9 — Disabled = inert. With `gc.enabled: false` no drain ever runs:
 	// pushes still stamp `repos.last_pushed_at`, but no object is reclaimed and the
-	// server serves exactly as today. RED now: the store does not yet stamp
-	// `last_pushed_at` (stays NULL), so the stamp assertion fails. (The "orphans
-	// persist" assertion must hold in BOTH states — disabling stops the drain, not
-	// the stamp.)
+	// server serves exactly as today. (The "orphans persist" assertion must hold in
+	// BOTH states — disabling stops the drain, not the stamp.)
 	it("SCH-9: a disabled startServer never reclaims, yet still stamps last_pushed_at and serves clean", async () => {
 		const disabled = await startServer({
 			databaseUrl: baseUrl,

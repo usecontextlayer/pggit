@@ -7,9 +7,10 @@
  * Scenario (the crisp wire form): main = c1←c2←c3, feature = c1←f1 (a sibling
  * off c1). want=c3, have=f1, NO `done`. f1 and c3 share c1.
  *
- * ORACLE (verified live with real `git upload-pack --stateless-rpc` v2 on a
- * file:// bare repo with this exact history, same request bytes):
- *     acknowledgments\nACK <f1>\nready\n   + DELIM + packfile (6 objects)
+ * ORACLE: real `git upload-pack --stateless-rpc` v2 over the same source repo, fed
+ * the same request bytes, in the same run — its acknowledgments section is the
+ * expectation, so a shift in git's readying rules fails this test instead of aging
+ * out of a comment.
  *
  * REGRESSION HISTORY: pggit's original check asked whether the want descends
  * from a BARE common, so a sibling have never readied and every such fetch
@@ -31,26 +32,10 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
-import { sidebandDemux } from "@/testing/pkt-oracle"
+import { packObjectCount, sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
-
-/** Encode one pkt-line: `<4-hex-len><payload>`. */
-function pktLine(payload: string): Buffer {
-	const body = Buffer.from(payload, "utf8")
-	const head = Buffer.from((body.length + 4).toString(16).padStart(4, "0"), "ascii")
-	return Buffer.concat([head, body])
-}
-
-/** The data packets BEFORE the first delim — the acknowledgments section text. */
-function ackSection(out: Buffer): string {
-	const { packets } = decodePktStream(out)
-	const delim = packets.findIndex((p) => p.type === "delim")
-	const end = delim < 0 ? packets.length : delim
-	return packets
-		.slice(0, end)
-		.map((p) => (p.type === "data" ? p.payload.toString("utf8") : ""))
-		.join("")
-}
+import { ackSection, spawnUploadPack } from "@/testing/upload-pack-oracle"
+import { fetchRequest } from "@/testing/wire-fetch"
 
 describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (git ok_to_give_up)", () => {
 	let db: IsolatedDb
@@ -95,15 +80,8 @@ describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (g
 	})
 
 	it("want=c3, have=f1 (sibling, no done) → emits `ready` + packfile, like git", async () => {
-		// The finding's crisp wire form: v2 fetch, want C3, have F1 (sibling), NO done.
-		const body = Buffer.concat([
-			pktLine("command=fetch\n"),
-			pktLine("object-format=sha1\n"),
-			Buffer.from("0001", "ascii"), // delim
-			pktLine(`want ${c3}\n`),
-			pktLine(`have ${f1}\n`),
-			Buffer.from("0000", "ascii"), // flush
-		])
+		// The crisp wire form: v2 fetch, want C3, have F1 (sibling), NO done.
+		const body = fetchRequest({ haves: [f1], objectFormat: "sha1", wants: [c3] })
 		const res = await fetch(`${url}/git-upload-pack`, {
 			body,
 			headers: {
@@ -115,8 +93,14 @@ describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (g
 		expect(res.status).toBe(200)
 		const out = Buffer.from(await res.arrayBuffer())
 
-		// ORACLE: f1 shares c1 with c3, so ok_to_give_up readies. pggit must agree.
-		expect(ackSection(out)).toBe(`acknowledgments\nACK ${f1}\nready\n`)
+		// ORACLE: the same bytes through real `git upload-pack --stateless-rpc`. The
+		// `ready` check on the oracle's own transcript establishes that this fixture
+		// still reaches the readying path at all — without it, two sides that both
+		// stopped readying would agree their way to green.
+		const oracle = await spawnUploadPack(src, body)
+		expect(ackSection(oracle)).toContain("ready\n")
+		expect(ackSection(out)).toBe(ackSection(oracle))
+		expect(packObjectCount(out)).toBe(packObjectCount(oracle))
 		const { packets } = decodePktStream(out)
 		expect(packets.some((p) => p.type === "delim")).toBe(true)
 		expect(sidebandDemux(out).band1.subarray(0, 4).toString("latin1")).toBe("PACK")

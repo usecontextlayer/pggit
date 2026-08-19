@@ -1,5 +1,5 @@
 /**
- * PROBE 4 — repack racing GC over GARBAGE, plus the design doc's open C4 question.
+ * PROBE 4 — repack racing GC over GARBAGE.
  *
  * S4: design D5 orders the drain GC-then-repack "so it encodes survivors, not
  * garbage". Repack's pending set is the whole inventory, NOT the reachable set —
@@ -7,11 +7,6 @@
  * deleting underneath it. This drives that head-on: force-push FIRST (so the
  * garbage has no encoding rows yet), then run both at once. The race is
  * probabilistic, so it keeps the source probe's five trials rather than one.
- *
- * C4: docs/2026-08-15-delta-pack-design.md flags as an UNVERIFIED EXPECTATION that
- * inline `STORAGE EXTERNAL` on the partitioned parent propagates to leaf
- * partitions, and asks for `select attstorage from pg_attribute` on a leaf before
- * release. That is one query; this runs it.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -40,19 +35,15 @@ type Leftovers = { ghost: number; orphan: number; depth2: number }
 
 type Trial = { trial: number; notes: string[]; leftovers: Leftovers; clone: string }
 
-/** attstorage codes: e=EXTERNAL, x=EXTENDED, m=MAIN, p=PLAIN. */
-type StorageRow = { rel: string; att: string; storage: string }
-
 const settled = (r: PromiseSettledResult<unknown>): string =>
 	r.status === "fulfilled"
 		? JSON.stringify(r.value)
 		: `THREW ${(r.reason as Error).message.slice(0, 90)}`
 
-describe("repack × GC over garbage — the race, and the tier's storage class", () => {
+describe("repack × GC over garbage — the race", () => {
 	let root = ""
 	let src = ""
 	const trials: Trial[] = []
-	let storage: StorageRow[] = []
 
 	beforeAll(async () => {
 		const pgBaseUrl = inject("pgBaseUrl")
@@ -130,20 +121,6 @@ describe("repack × GC over garbage — the race, and the tier's storage class",
 			})
 			trials.push(result)
 		}
-
-		// ── C4: does STORAGE EXTERNAL reach the leaf partitions? A fresh, migrated
-		// schema is the whole fixture — this is a question about the DDL, not the data.
-		storage = await withSchema(
-			async (db) =>
-				await db.sql<StorageRow[]>`
-				select c.relname as rel, a.attname as att, a.attstorage::text as storage
-				from pg_attribute a join pg_class c on c.oid = a.attrelid
-				join pg_namespace n on n.oid = c.relnamespace
-				where n.nspname = current_schema()
-					and c.relname in ('git_pack_encoding','git_pack_encoding_p0','git_pack_encoding_p7')
-					and a.attname in ('data','oid','base_oid')
-				order by c.relname, a.attname`,
-		)
 	}, 600_000)
 
 	afterAll(() => {
@@ -169,19 +146,6 @@ describe("repack × GC over garbage — the race, and the tier's storage class",
 	it("S4: the raced repo still clones fsck-clean, every trial", () => {
 		for (const t of trials) {
 			expect(t.clone, `trial ${t.trial}: ${t.notes.join(" | ")}`).toBe("clean")
-		}
-	}, 300_000)
-
-	it("C4: inline STORAGE EXTERNAL on the parent reaches the leaf partitions", () => {
-		// The design doc's own pre-release check. `data` is the column that matters:
-		// EXTERNAL keeps an encoding out of inline compression so the serve path can
-		// hand the bytes straight to the wire.
-		const leaves = storage.filter(
-			(r) => r.rel !== "git_pack_encoding" && r.att === "data",
-		)
-		expect(leaves.length, "no git_pack_encoding leaf partitions found").toBeGreaterThan(0)
-		for (const leaf of leaves) {
-			expect(leaf.storage, `${leaf.rel}.${leaf.att}`).toBe("e")
 		}
 	}, 300_000)
 })

@@ -73,6 +73,10 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 	let src = ""
 	let rows: EncodingAudit[] = []
 	let baselineBytes = 0
+	/** Delta rows the repack actually stored — zero makes three tests below vacuous. */
+	let deltaRowCount = 0
+	/** Inflated length of the largest stored delta PROGRAM, in bytes. */
+	let maxProgram = 0
 	const dirs: string[] = []
 	const mk = (tag: string): string => {
 		const d = mkdtempSync(join(tmpdir(), `pggit-dsz-${tag}-`))
@@ -174,10 +178,10 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 				join git_object o on o.repo_id = e.repo_id and o.oid = e.oid
 			where rr.name = ${REPO}`
 
-		let maxProgram = 0
 		let maxDeltaRow = ""
 		for (const row of rows) {
 			if (row.base_oid === null) continue
+			deltaRowCount++
 			const len = inflateSync(row.data).length
 			if (len > maxProgram) {
 				maxProgram = len
@@ -185,14 +189,9 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 			}
 		}
 		console.log(
-			`audited ${rows.length} rows; ${rows.filter((r) => r.base_oid !== null).length} deltas; ` +
+			`audited ${rows.length} rows; ${deltaRowCount} deltas; ` +
 				`largest delta PROGRAM ${mb(maxProgram)} (${maxDeltaRow.slice(0, 8)})`,
 		)
-		if (maxProgram < 1_000_000) {
-			console.log(
-				"NOTE: no multi-MB delta program was produced — the large-program seam is weakly covered",
-			)
-		}
 	}, 1_800_000)
 
 	afterAll(async () => {
@@ -202,6 +201,20 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 		await base?.drop()
 		rows = []
 		for (const d of dirs) rmSync(d, { force: true, recursive: true })
+	})
+
+	it("has the fixture it needs: stored deltas, one of them a multi-MB program", () => {
+		// Both named subjects live in delta rows: with none stored, the delta-must-win
+		// guard judges only whole encodings and the large-program seam is never
+		// reached, while every test below still passes.
+		expect(
+			deltaRowCount,
+			"the delta-must-win guard needs stored deltas to judge",
+		).toBeGreaterThan(0)
+		expect(
+			maxProgram,
+			"the large-program seam needs a multi-MB delta program",
+		).toBeGreaterThan(1_000_000)
 	})
 
 	it("data_size is the inflated byte length of what `data` holds", () => {

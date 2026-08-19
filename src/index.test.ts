@@ -1,10 +1,11 @@
 import { Hono } from "hono"
 import postgres from "postgres"
-import { describe, expect, it } from "vitest"
+import { describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 
 // A client that is never queried by /health, so no real Postgres is needed.
@@ -15,6 +16,42 @@ const app = createGitApp({
 })
 
 const A = "a".repeat(40)
+
+/** The persistence grammar's slash-delimited repoId (<kind>/<owner>/<ws>/<user>). */
+const SLASHED_REPO = "claude/slate/ws/user"
+
+/** A minimal v2 `ls-refs` request: command + delim + flush (no args → every ref). */
+const LS_REFS_REQUEST = Buffer.concat([
+	encodePktLine(Buffer.from("command=ls-refs\n")),
+	encodePkt({ type: "delim" }),
+	encodePkt({ type: "flush" }),
+])
+
+/**
+ * An app over a real isolated schema in which EXACTLY `SLASHED_REPO` holds
+ * `refs/heads/main`. Routing assertions read the far side of the boundary: a
+ * repoId parse that drops a segment, or keeps a mount prefix, resolves a
+ * different (empty) repo whose ls-refs answer is a bare flush.
+ */
+async function backedApp(): Promise<{ backed: Hono; db: IsolatedDb }> {
+	const db = await createIsolatedSchema(inject("pgBaseUrl"))
+	const deps = createGitDeps(db.sql)
+	await deps.refs.setRef(SLASHED_REPO, "refs/heads/main", A)
+	return { backed: createGitApp(deps), db }
+}
+
+/** POST an ls-refs body to `path` on `target` and render the response as text. */
+async function lsRefs(
+	target: Hono,
+	path: string,
+): Promise<{ status: number; body: string }> {
+	const res = await target.request(path, {
+		body: new Uint8Array(LS_REFS_REQUEST),
+		headers: { "git-protocol": "version=2" },
+		method: "POST",
+	})
+	return { body: pktLineUnpack(Buffer.from(await res.arrayBuffer())), status: res.status }
+}
 
 /** POST a raw body to a git service route. */
 function post(path: string, body: Buffer, headers: Record<string, string> = {}) {
@@ -56,15 +93,24 @@ describe("createGitApp", () => {
 	// The persistence three-repo grammar uses slash-delimited repoIds
 	// (<kind>/<owner>/<ws>[/<user>]). Routing must treat the repoId as the opaque
 	// slash-containing string the store already keys on — not a single segment.
-	it("routes a slash-containing repoId to the upload-pack advert", async () => {
-		const res = await app.request(
-			"/claude/slate/ws-1/user-1/info/refs?service=git-upload-pack",
-			{ headers: { "git-protocol": "version=2" } },
-		)
-		expect(res.status).toBe(200)
-		expect(res.headers.get("Content-Type")).toBe(
-			"application/x-git-upload-pack-advertisement",
-		)
+	// Driven through ls-refs, whose answer depends on WHICH repo was resolved: a
+	// parser that kept only the first segment answers for an empty repo instead.
+	it("routes a slash-containing repoId to the repo that holds the ref", async () => {
+		const { backed, db } = await backedApp()
+		try {
+			expect(await lsRefs(backed, `/${SLASHED_REPO}/git-upload-pack`)).toEqual({
+				body: `${A} refs/heads/main\n0000\n`,
+				status: 200,
+			})
+			// The negative half: a sibling repoId under the same first segment is a
+			// DIFFERENT repo, so it answers a bare flush.
+			expect(await lsRefs(backed, "/claude/slate/ws/other/git-upload-pack")).toEqual({
+				body: "0000\n",
+				status: 200,
+			})
+		} finally {
+			await db.drop()
+		}
 	})
 })
 
@@ -125,31 +171,23 @@ describe("createGitApp — server-boundary error responses", () => {
 	})
 })
 
-// The embed-into-a-host factory: a mounted host (packages/platform) builds the
-// git-app deps from its own `pg` and mounts createGitApp(createGitDeps(pg)).
-describe("createGitDeps", () => {
-	it("composes the mountable deps (objects + refs + repo_file projection) from a pg", () => {
-		const deps = createGitDeps(pg)
-		expect(deps.objects).toBeDefined()
-		expect(deps.refs).toBeDefined()
-		expect(deps.snapshots).toBeDefined()
-	})
-})
-
 // The mount contract: a host MUST embed this app with `app.mount` (which strips
 // the mount prefix) — NOT `app.route` (which leaves it in c.req.path and corrupts
-// the parsed repoId). Pinned here because it's silent + easy to get wrong.
+// the parsed repoId). Pinned here because it's silent + easy to get wrong: the
+// leaked prefix would resolve the repoId `git/claude/slate/ws/user`, a different
+// (empty) repo, which only a repoId-dependent response can distinguish.
 describe("mounted under a host prefix", () => {
 	it("parses the repoId mount-relative when embedded with app.mount", async () => {
-		const host = new Hono()
-		host.mount("/git", app.fetch)
-		const res = await host.request(
-			"/git/claude/slate/ws/user/info/refs?service=git-upload-pack",
-			{ headers: { "git-protocol": "version=2" } },
-		)
-		expect(res.status).toBe(200)
-		expect(res.headers.get("Content-Type")).toBe(
-			"application/x-git-upload-pack-advertisement",
-		)
+		const { backed, db } = await backedApp()
+		try {
+			const host = new Hono()
+			host.mount("/git", backed.fetch)
+			expect(await lsRefs(host, `/git/${SLASHED_REPO}/git-upload-pack`)).toEqual({
+				body: `${A} refs/heads/main\n0000\n`,
+				status: 200,
+			})
+		} finally {
+			await db.drop()
+		}
 	})
 })

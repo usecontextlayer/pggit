@@ -52,7 +52,10 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 	})
 
 	/** The documented external read surface: the canonical "files at a ref" query —
-	 * the slim repo_file index joined to git_object for content. */
+	 * the slim repo_file index joined to git_object for content. Byte-ordered
+	 * (`collate "C"`, matching `indexRows` below) so it agrees with the git oracle's
+	 * ordering for every path: the database's default collation is linguistic and
+	 * reorders punctuation (`a-b.txt` vs `ab.txt`) against git's byte order. */
 	async function queryFiles(repoId: string, ref: string): Promise<FileRow[]> {
 		const rows = await db.sql<FileRow[]>`
 			select f.path, f.mode, o.content
@@ -60,7 +63,7 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			join repos r on r.id = f.repo_id
 			join git_object o on o.repo_id = f.repo_id and o.oid = f.blob_oid
 			where r.name = ${repoId} and f.ref_name = ${ref}
-			order by f.path
+			order by f.path collate "C"
 		`
 		return rows.map((r) => ({ content: r.content, mode: r.mode, path: r.path }))
 	}
@@ -101,7 +104,9 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 				return { content, mode: e.mode, path: e.path }
 			}),
 		)
-		return files.sort((a, b) => a.path.localeCompare(b.path))
+		// Byte order, matching the SQL side's `collate "C"` — `localeCompare` is a
+		// linguistic sort that would order punctuated paths differently from git.
+		return files.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)))
 	}
 
 	function newRepo(prefix: string): string {

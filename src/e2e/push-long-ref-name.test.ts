@@ -1,20 +1,26 @@
 /**
- * Push of over-long / unstorable ref names — storage-error isolation and
- * non-atomic state divergence.
+ * Ref-name limits at the receive-pack boundary — the storable-name cap and the
+ * state a rejection must not leave behind.
  *
- * Merged from two regression bugs (originals: nam01 + nam02), kept as separate
- * describe blocks since each drives the receive-pack path differently (nam01 via
- * an in-process app.request, nam02 via real `git push` over the wire):
+ * Two describes, each driving the boundary differently (nam01 via an in-process
+ * app.request, nam02 via real `git push` over the wire):
  *
- *   - nam01 — over-long incompressible ref name must reject in-band, not 500
- *   - nam02 — mixed non-atomic push (valid + over-long ref) must not diverge
+ *   - nam01 — the cap pinned in BOTH directions, and no orphaned objects behind a
+ *     rejection
+ *   - nam02 — a mixed non-atomic push (valid + over-long ref) reports per-ref status
+ *     in-band; client and server never disagree about what landed
  *
- * Both share the same ROOT CAUSE: `git_ref`'s primary key is a btree on
- * `(repo_id, name)`, and a btree index entry cannot exceed ~2704 bytes. An
- * INCOMPRESSIBLE ref name of ~2800 bytes overflows the btree cap and the INSERT
- * in `casRefUpdate` throws a raw Postgres error that escapes the receive-pack
- * handler and becomes an HTTP 500 — diverging from canonical git, which rejects
- * the over-long ref cleanly in-band (`ng`/`! [remote rejected]`) at HTTP 200.
+ * THE RULE: receive-pack rejects a ref name longer than MAX_REF_NAME_BYTES (2000)
+ * BEFORE ingest, as an in-band `ng <ref> funny refname (too long to store)` under
+ * HTTP 200 — the shape canonical git answers with when its own backend cannot lock
+ * the ref.
+ *
+ * ORIGINATED as the breakage probe for `git_ref`'s btree primary key on
+ * (repo_id, name): an INCOMPRESSIBLE ~2800-byte name overflows the ~2704-byte
+ * index-entry cap, and the raw Postgres error escaped the handler as an HTTP 500
+ * after the pack had already been ingested — a torn half-push behind an opaque
+ * status. Fixed by the boundary cap, which is why the over-long fixtures here stay
+ * incompressible: that is the shape that used to reach the btree.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
@@ -60,46 +66,21 @@ async function postReceivePack(
 }
 
 /**
- * nam01 naming / storage-error isolation — pushing a ref whose name is too long
- * to fit a Postgres btree index entry must be rejected CLEANLY in-band, and must
- * leave NO half-written state.
+ * nam01 — the ref-name cap in both directions, and the state a rejection leaves.
  *
- * BUG: `handleReceivePack` wraps `backend.ingest(pack)` in try/catch (→ in-band
- * `unpack failed`) but does NOT wrap `backend.applyRefUpdates()`. The ref CAS in
- * `casRefUpdate` (create path) inserts the ref name into `git_ref`, whose primary
- * key is a btree on `(repo_id, name)`. A sufficiently long, INCOMPRESSIBLE ref
- * name overflows the btree entry cap and Postgres throws
- *   `PostgresError: index row size NNNN exceeds btree version 4 maximum 2704
- *    for index "git_ref_pkey"`.
- * That error is uncaught: it escapes `handleReceivePack` AFTER the pack has been
- * ingested+committed, and the app's `onError` turns it into HTTP 500. Two
- * divergences from canonical git, both observed against a `file://` bare oracle:
- *   1. The oracle REJECTS the over-long ref cleanly in-band — `remote: error:
- *      cannot lock ref ...` / `! [remote rejected] ... (failed to update refs)`,
- *      push exits non-zero, NO transport-level 500. pggit answers HTTP 500.
- *   2. The oracle writes NOTHING. pggit's pack was already committed when the ref
- *      insert threw, so the repo is left with orphaned, unreachable objects (a
- *      subsequent clone reports an empty repository) — a torn half-push the
- *      client cannot see behind the opaque 500.
- *
- * CONTRACT (oracle): an over-long ref push must be answered HTTP 200 with a
- * git-report-status `ng <ref> <reason>` body — NEVER a 500 / "internal server
- * error" — and must leave the repo with ZERO objects (the failed ref means no
- * reachable history, so no objects should have been committed either).
- *
- * EXPECTED-RED until pggit guards the ref-apply storage error: today the push
- * 500s and leaves orphaned objects in `git_object`.
- *
- * Note on compressibility: the btree row-size cap is measured on the post-TOAST
- * (pglz-compressed) datum, so a repeated-character name of the same length slips
- * under the limit. The name MUST be incompressible to overflow the index — here
- * a deterministic SHA-256 hex chain (no Math.random / Date.now).
+ * The cap is a byte-count rule applied before ingest, so the pair pins it: a name
+ * of exactly 2000 bytes is ACCEPTED and stored; 2001 comes back as an in-band `ng`.
+ * The historical over-long name (2832 incompressible bytes — the shape that used to
+ * reach the btree and 500) is the third case, and carries the state assertion: a
+ * rejected push leaves ZERO objects, because the boundary check runs before ingest.
  */
-describe("nam01 — over-long incompressible ref name must reject in-band, not 500", () => {
+describe("nam01 — the storable ref-name cap, pinned in both directions", () => {
 	/**
 	 * Deterministic incompressible hex string of exactly `len` chars: a SHA-256 chain
 	 * seeded by a fixed string, hex-concatenated and truncated. High-entropy hex does
-	 * not compress under pglz, so 2832 such chars overflow the 2704-byte btree cap.
+	 * not compress under pglz, so a name built from it is genuinely unstorable in the
+	 * btree PK past ~2704 bytes — the storage pressure the boundary cap keeps off the
+	 * store, and the reason a compressible name of the same length proves nothing.
 	 */
 	function incompressibleName(len: number): string {
 		let seed = Buffer.from("pggit-nam01")
@@ -116,8 +97,13 @@ describe("nam01 — over-long incompressible ref name must reject in-band, not 5
 	let src: string
 	let commitOid = ""
 	let pack: Buffer
-	// 2832 chars overflows the btree's 2704-byte index-entry cap (matches the
-	// observed `index row size 2832 exceeds ... 2704`).
+	// receive-pack's own MAX_REF_NAME_BYTES: the boundary rejects anything longer,
+	// in-band, rather than letting the btree PK raise an opaque storage error.
+	const MAX_REF_NAME_BYTES = 2000
+	const refAtCap = `refs/heads/${incompressibleName(MAX_REF_NAME_BYTES - "refs/heads/".length)}`
+	const refOverCap = `refs/heads/${incompressibleName(MAX_REF_NAME_BYTES + 1 - "refs/heads/".length)}`
+	// 2832 chars also overflows the btree's 2704-byte index-entry cap (the observed
+	// `index row size 2832 exceeds ... 2704`) — the original reproduction.
 	const longRef = `refs/heads/${incompressibleName(2832 - "refs/heads/".length)}`
 
 	beforeAll(async () => {
@@ -150,6 +136,36 @@ describe("nam01 — over-long incompressible ref name must reject in-band, not 5
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 
+	it("stores a name of exactly the cap and rejects one byte more, in-band", async () => {
+		expect(Buffer.byteLength(refAtCap, "utf8")).toBe(MAX_REF_NAME_BYTES)
+		expect(Buffer.byteLength(refOverCap, "utf8")).toBe(MAX_REF_NAME_BYTES + 1)
+		const repo = "nam01-cap"
+		const refs = createRefStore(db.sql)
+
+		// At the cap: accepted, reported `ok`, and durably stored.
+		const atCap = await postReceivePack(
+			app,
+			repo,
+			receiveBody([`${ZERO} ${commitOid} ${refAtCap}`], pack),
+		)
+		expect(atCap.status).toBe(200)
+		expect(atCap.text, "a name AT the cap must be accepted").toContain(`ok ${refAtCap}`)
+		expect((await refs.listRefs(repo)).map((r) => r.name)).toContain(refAtCap)
+
+		// One byte over: rejected in-band with git's `funny refname` wording, and no
+		// ref written — the cap is a boundary rule, not a storage accident.
+		const overCap = await postReceivePack(
+			app,
+			repo,
+			receiveBody([`${ZERO} ${commitOid} ${refOverCap}`], pack),
+		)
+		expect(overCap.status).toBe(200)
+		expect(overCap.text, "one byte over the cap must be `ng`'d").toContain(
+			`ng ${refOverCap} funny refname (too long to store)`,
+		)
+		expect((await refs.listRefs(repo)).map((r) => r.name)).not.toContain(refOverCap)
+	})
+
 	it("answers 200 report-status (ng) and leaves no orphaned objects", async () => {
 		const repo = "nam01-reflimit"
 		const res = await postReceivePack(
@@ -167,8 +183,11 @@ describe("nam01 — over-long incompressible ref name must reject in-band, not 5
 		expect(res.text, "must not leak a 500 / internal server error").not.toContain(
 			"internal server error",
 		)
-		// The ref must be reported as failed (ng), never silently dropped or ok'd.
-		expect(res.text, "over-long ref must be reported `ng`").toContain("ng ")
+		// The ref must be reported as failed (ng) naming the ref and git's reason,
+		// never silently dropped or ok'd.
+		expect(res.text, "over-long ref must be reported `ng`").toContain(
+			`ng ${longRef} funny refname (too long to store)`,
+		)
 
 		// Contract 2: no orphaned objects. The oracle writes NOTHING on a rejected
 		// ref; pggit must not leave the committed pack closure dangling unreachable.
@@ -186,51 +205,31 @@ describe("nam01 — over-long incompressible ref name must reject in-band, not 5
 })
 
 /**
- * nam02 ref-naming / non-atomic state divergence — a SINGLE non-atomic push that
- * carries one valid ref (`refs/heads/ok`) and one ref whose name is so long it
- * cannot be stored leaves the server and the client disagreeing about what landed.
+ * nam02 — a SINGLE non-atomic push carrying one valid ref (`refs/heads/ok`) and one
+ * unstorably-long ref: client and server must agree about what landed.
  *
- * ROOT CAUSE (same family as nam-01 / a11 / a13): `git_ref`'s primary key is a
- * btree on `(repo_id, name)`, and a btree index entry cannot exceed ~2704 bytes.
- * An *incompressible* ref name of ~2800 bytes (real git imposes no such limit —
- * `git push` happily sends it) makes the INSERT in `casRefUpdate` throw a raw
- * Postgres error: `index row size NNNN exceeds btree version 4 maximum 2704 for
- * index "git_ref_pkey"`. In the NON-atomic apply loop (`applyRefUpdates`, the
- * default push mode) each command runs as its own statement with NO surrounding
- * transaction or try/catch: `refs/heads/ok` is applied and COMMITTED, then the
- * over-long ref's INSERT throws, the error escapes `applyRefUpdates` →
- * `handleReceivePack`, and the app's `onError` turns it into HTTP 500.
+ * THE CONTRACT: a non-atomic push applies each command on its own, so the valid ref
+ * lands and the over-long one comes back `ng` — every command answered per-ref
+ * in-band at HTTP 200, exactly as a canonical `file://` remote answers (there the
+ * 2800-char name overflows the filesystem instead of a btree, and git prints
+ * `! [remote rejected]` for that ref alone). The push exits non-zero because one
+ * command was rejected; that is agreement, not divergence.
  *
- * OBSERVED DIVERGENCE (reproduced live against http://127.0.0.1:8080):
- *   - The client gets `error: RPC failed; HTTP 500` and NO report-status pkt-line,
- *     so git reports `Everything up-to-date` / `the remote end hung up` and treats
- *     the WHOLE push as failed — the client believes nothing was pushed.
- *   - But the server DB already holds `git_ref` = {HEAD, refs/heads/ok}, and a
- *     fresh clone checks out `refs/heads/ok`: the good branch was DURABLY applied
- *     server-side while the client believes it landed nothing.
- *
- * ORACLE (canonical git, `file://` bare): every push command gets a per-ref in-band
- * status the client can read — `ok refs/heads/ok` / `ng <long> ...` (or, where the
- * backend rejects the whole batch, `! [remote rejected]` for BOTH) — at the HTTP
- * level a clean 200, NEVER a 500. Client and server always agree on which refs
- * landed.
- *
- * CONTRACT asserted here: a mixed non-atomic push must be answered with an
- * HTTP-level success the client can read AND client+server must agree on the
- * applied set — pggit must not 500 while silently committing one of the refs.
- *
- * EXPECTED-RED until pggit catches the per-command apply failure and turns it into
- * an in-band `ng` (status 200) instead of leaking it as a 500. This test drives
- * real `git push` over the wire and observes the divergence directly.
+ * ORIGINATED as the breakage probe for the un-guarded per-command apply loop: the
+ * over-long name's INSERT threw the raw btree error, which escaped as HTTP 500 with
+ * NO report-status — so git reported the whole push as failed ("the remote end hung
+ * up") while `refs/heads/ok` was already durably committed server-side, a state the
+ * client could not see. Fixed by the pre-ingest name check, which turns it into a
+ * per-ref `ng`.
  */
 describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diverge", () => {
 	/**
 	 * A deterministic, INCOMPRESSIBLE ref-name tail of `len` lowercase-hex chars.
 	 * Chained SHA-256 hex is high-entropy, so Postgres' btree TOAST compression
-	 * cannot shrink it below the 2704-byte index-entry ceiling — which is exactly
-	 * what makes the over-long-name INSERT throw. (A repeated/compressible name of
-	 * the same length does NOT reproduce — the live server accepts it.) No
-	 * Math.random / Date.now: the bytes are a pure function of the fixed seed.
+	 * cannot shrink it below the 2704-byte index-entry ceiling — the pressure that
+	 * used to reach the storage layer, and the reason a repeated/compressible name of
+	 * the same length is not the same fixture. No Math.random / Date.now: the bytes
+	 * are a pure function of the fixed seed.
 	 */
 	function incompressibleHex(len: number): string {
 		let out = ""
@@ -304,17 +303,21 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 		// And the core divergence: the client must not believe the push failed
 		// wholesale while the server durably kept one of the refs. If `ok` landed
 		// server-side, the client's push must have SUCCEEDED (exit 0) and reported it.
-		if (okAppliedServerSide) {
-			// No divergence: refs/heads/ok landed in-band, so the client was TOLD it landed
-			// (git prints `* [new branch] main -> ok`). The push still exits non-zero because
-			// the over-long ref was rejected in-band — which is correct, and exactly what the
-			// file:// oracle does too (a 2800-char ref overflows the filesystem there); the
-			// non-zero exit is NOT a divergence. The bug was a 500 with NO report-status, so
-			// the client saw a wholesale failure while refs/heads/ok had durably landed.
-			expect(
-				outcome.stderr,
-				"refs/heads/ok landed server-side, so the client must have been told in-band ([new branch]), not seen a wholesale failure",
-			).toMatch(/\[new branch]/)
-		}
+		// The valid half MUST land: a non-atomic push applies each command on its own,
+		// so the over-long ref's rejection cannot take `refs/heads/ok` down with it.
+		expect(
+			okAppliedServerSide,
+			`refs/heads/ok never landed — stored: ${[...stored].join(", ")}`,
+		).toBe(true)
+		// And the client was TOLD it landed (git prints `* [new branch] main -> ok`).
+		// The push still exits non-zero because the over-long ref was rejected in-band
+		// — correct, and exactly what the file:// oracle does too (a 2800-char ref
+		// overflows the filesystem there); the non-zero exit is NOT the divergence. The
+		// divergence was a 500 with NO report-status, leaving the client believing the
+		// whole push failed while refs/heads/ok had durably landed.
+		expect(
+			outcome.stderr,
+			"refs/heads/ok landed server-side, so the client must have been told in-band ([new branch]), not seen a wholesale failure",
+		).toMatch(/\[new branch]/)
 	})
 })

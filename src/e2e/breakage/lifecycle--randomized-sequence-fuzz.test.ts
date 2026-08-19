@@ -7,12 +7,13 @@
  * mirror clone from pggit, `fsck --strict`, and object/ref set equality against
  * a mirror clone of the reference.
  *
- * Converted from `breakage/lifecycle--randomized-sequence-fuzz.ts` (exploration
- * 7), mechanically and at full scale: a 140-commit seed and 40 rounds. The
- * source took `--seed=` / `--rounds=` off argv; in the test lane both are pinned
- * constants, the same discipline the generative differentials use so the gate is
- * deterministic. The source exits 1 on any mismatch; the assertions here state
- * the correct outcome, so a live reproduction is RED.
+ * Full scale: a 140-commit seed and 40 rounds. The originating script took
+ * `--seed=` / `--rounds=` off argv; in the test lane both are pinned constants,
+ * the same discipline the generative differentials use so the gate is
+ * deterministic.
+ *
+ * Originated as exploration-7 probe `lifecycle--randomized-sequence-fuzz.ts`
+ * (exit 1 on any mismatch against the file:// oracle); fixed.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"

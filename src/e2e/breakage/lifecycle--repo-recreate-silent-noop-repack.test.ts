@@ -27,11 +27,14 @@
  *   3. a mirror clone taken between (1) and (2) receives a pack N times larger
  *      than the one taken after (2): the tier really was absent on the wire
  *
- * Converted from `breakage/lifecycle--repo-recreate-silent-noop-repack.ts` at
- * full scale (200 append-only run commits). The source exits 1 when the bug
- * reproduces; here every assertion states the CORRECT outcome — the long-lived
- * components do the work, the fresh ones find nothing left, and the two clones
- * are the same size — so a live reproduction is RED.
+ * Full scale: 200 append-only run commits. Every assertion states the contract —
+ * the long-lived components do the work, the fresh ones find nothing left, and
+ * the two clones are the same size.
+ *
+ * Originated as breakage probe
+ * `lifecycle--repo-recreate-silent-noop-repack.ts` (exit 1 when the silent no-op
+ * reproduced); fixed by resolving the repo name fresh per pass through the
+ * unmemoized `lookupRepoId` primitive.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"

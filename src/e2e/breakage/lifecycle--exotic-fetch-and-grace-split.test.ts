@@ -3,12 +3,17 @@
  * pggit TWICE: once with no encoding tier, once after repack. A difference
  * between the two is the tier's fault; identical failure in both is pre-existing.
  *
- * Converted from `breakage/lifecycle--exotic-fetch-and-grace-split.ts`
- * (exploration 8), mechanically and at full scale: four probes × two tier states
- * over 120-commit repos, then the grace-split sequence over a 140-commit repo.
- * The differential IS the property — the source exits 1 on a DIFF, so the
- * assertion here states the correct outcome (the two runs agree) and a live
- * divergence shows up RED.
+ * The tier differential alone would be pggit-vs-pggit — a probe that fails the
+ * same way in both arms compares equal — so every probe ALSO runs against a
+ * `file://` bare remote of the identical history, which decides what the right
+ * answer was. Two of the four shapes (`--depth=1`, `fetch --unshallow`) sit
+ * outside pggit's scope: it does not implement the v2 `shallow` feature, so the
+ * contract there is a loud client-side failure against a control that succeeds.
+ *
+ * Originated as exploration-8 probe `lifecycle--exotic-fetch-and-grace-split.ts`
+ * (exit 1 on a DIFF), converted mechanically and at full scale: four probes ×
+ * two tier states over 120-commit repos, then the grace-split sequence over a
+ * 140-commit repo.
  *
  * Each (probe, tier-state) run gets its own isolated schema, exactly as the
  * source did: the no-tier run must never see a repack the tier run performed.
@@ -117,10 +122,24 @@ function at<T>(xs: T[], i: number): T {
 	return v
 }
 
-type Probe = { name: string; run: (url: string, dest: string) => Promise<string> }
+/**
+ * `contract` says what the probe is held to against a `file://` bare remote of the
+ * identical history:
+ *   "oracle"      — pggit must produce exactly what canonical git produces.
+ *   "unsupported" — pggit deliberately does not implement the v2 `shallow`
+ *                   (deepen) feature, so the contract is a LOUD client-side
+ *                   failure where the control succeeds (the a10 transport suite
+ *                   owns that decision).
+ */
+type Probe = {
+	name: string
+	contract: "oracle" | "unsupported"
+	run: (url: string, dest: string) => Promise<string>
+}
 
 const PROBES: Probe[] = [
 	{
+		contract: "oracle",
 		name: "mirror clone",
 		run: async (url, dest) => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
@@ -129,6 +148,7 @@ const PROBES: Probe[] = [
 		},
 	},
 	{
+		contract: "oracle",
 		name: "partial clone --filter=blob:none + checkout (lazy fetch)",
 		run: async (url, dest) => {
 			await spawnGit([
@@ -148,6 +168,7 @@ const PROBES: Probe[] = [
 		},
 	},
 	{
+		contract: "unsupported",
 		name: "shallow clone --depth=1",
 		run: async (url, dest) => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--depth=1", url, dest])
@@ -156,6 +177,7 @@ const PROBES: Probe[] = [
 		},
 	},
 	{
+		contract: "unsupported",
 		name: "clone then deepen (fetch --unshallow)",
 		run: async (url, dest) => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--depth=5", url, dest])
@@ -168,7 +190,23 @@ const PROBES: Probe[] = [
 	},
 ]
 
-type ProbeOutcome = { name: string; noTier: string; withTier: string }
+type ProbeOutcome = {
+	name: string
+	contract: Probe["contract"]
+	noTier: string
+	withTier: string
+	/** The same probe against a `file://` bare remote of the identical history. */
+	control: string
+}
+
+/** Normalise a probe failure so the runs are comparable: only the REASON matters. */
+function normalizeThrow(err: unknown): string {
+	const raw = (err as Error).message.split("\n").pop() ?? ""
+	return `THREW: ${raw
+		.replace(/(?:http|file):\/\/\S+/g, "<url>")
+		.replace(/\/\S*T\/\S+/g, "<tmp>")
+		.slice(0, 200)}`
+}
 
 describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 	let root = ""
@@ -207,13 +245,7 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 				try {
 					result = await probe.run(url, dest)
 				} catch (err) {
-					// normalise the ephemeral port + temp paths out of the message so the
-					// two runs are comparable; only the git-visible failure REASON matters
-					const raw = (err as Error).message.split("\n").pop() ?? ""
-					result = `THREW: ${raw
-						.replace(/http:\/\/\S+/g, "<url>")
-						.replace(/\/\S*T\/\S+/g, "<tmp>")
-						.slice(0, 200)}`
+					result = normalizeThrow(err)
 				}
 				rmSync(dest, { force: true, recursive: true })
 				rmSync(src, { force: true, recursive: true })
@@ -224,8 +256,35 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 			}
 		}
 
+		// THE ORACLE: one `file://` bare remote holding the identical history. The
+		// tier differential alone is pggit-vs-pggit — a probe that fails the same way
+		// in both arms compares equal — so every probe is also run against canonical
+		// git, which decides what the right answer was.
+		const ctlSrc = dir("ctl-src")
+		await buildSource(ctlSrc, 120)
+		const ctlCommits = await revList(ctlSrc, "main")
+		const ctl = dir("ctl.git")
+		await spawnGit(["init", "-q", "--bare", "-b", "main", ctl])
+		// Without this the control silently ignores `--filter` and full-clones, which
+		// would make the blobless probe a comparison against a non-filtering server.
+		await spawnGit(["config", "uploadpack.allowFilter", "true"], { cwd: ctl })
+		await spawnGit(
+			["push", "-q", ctl, `${at(ctlCommits, ctlCommits.length - 1)}:refs/heads/main`],
+			{ cwd: ctlSrc },
+		)
+
 		for (const [index, probe] of PROBES.entries()) {
+			const ctlDest = dir(`ctl-d-${index}`)
+			let control: string
+			try {
+				control = await probe.run(`file://${ctl}`, ctlDest)
+			} catch (err) {
+				control = normalizeThrow(err)
+			}
+			rmSync(ctlDest, { force: true, recursive: true })
 			outcomes.push({
+				contract: probe.contract,
+				control,
 				name: probe.name,
 				noTier: await runProbe(probe, index, false),
 				withTier: await runProbe(probe, index, true),
@@ -297,6 +356,38 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 				.filter((o) => o.noTier !== o.withTier)
 				.map((o) => `${o.name}: no-tier=${o.noTier} | w/ tier=${o.withTier}`),
 		).toEqual([])
+	})
+
+	it("answers every implemented fetch shape exactly as the file:// oracle does", () => {
+		const oracled = outcomes.filter((o) => o.contract === "oracle")
+		expect(oracled.length).toBeGreaterThan(0)
+		for (const o of oracled) {
+			expect(o.control, `${o.name}: the file:// control itself failed`).not.toMatch(
+				/^THREW:/,
+			)
+		}
+		expect(
+			oracled
+				.filter((o) => o.noTier !== o.control)
+				.map((o) => `${o.name}: pggit=${o.noTier} | file://=${o.control}`),
+		).toEqual([])
+	})
+
+	it("fails loudly on the shapes it does not implement, which the oracle serves", () => {
+		// pggit does not implement the v2 shallow (deepen) feature; the a10 transport
+		// suite pins that as a deliberate scope choice with a LOUD failure. Both halves
+		// matter here: a silent success would be the original bug, and a control that
+		// also failed would mean the probe proves nothing about pggit.
+		const unsupported = outcomes.filter((o) => o.contract === "unsupported")
+		expect(unsupported.length).toBeGreaterThan(0)
+		for (const o of unsupported) {
+			expect(o.noTier, `${o.name}: pggit did not refuse an unimplemented shape`).toMatch(
+				/^THREW:/,
+			)
+			expect(o.control, `${o.name}: the file:// control must serve it`).not.toMatch(
+				/^THREW:/,
+			)
+		}
 	})
 
 	it("converges the repack after a grace split", () => {

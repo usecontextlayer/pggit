@@ -1,38 +1,17 @@
 import { describe, expect, it } from "vitest"
-import { decodePktStream, encodePkt, encodePktLine, type Pkt } from "@/protocol/pkt-line"
-import {
-	encodeAdvertisement,
-	encodeLsRefsResponse,
-	encodePackfileResponse,
-	parseFetch,
-	parseV2Request,
-} from "@/protocol/v2"
+import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
+import { parseFetch, parseV2Request } from "@/protocol/v2"
+
+/**
+ * v2 request DECODE — the happy path of `parseV2Request`/`parseFetch` (the
+ * malformed and boundary cases are v2.parse.spec.test.ts's). The v2 ENCODE
+ * surfaces (advertisement, ls-refs response, packfile section) are goldens in
+ * upload-pack-wire.spec.test.ts and live there only: a second, looser copy here
+ * used to pass while the capability set drifted underneath it.
+ */
 
 const A = "a".repeat(40)
 const B = "b".repeat(40)
-const C = "c".repeat(40)
-const T = "d".repeat(40)
-
-function dataLines(buf: Buffer): string[] {
-	return decodePktStream(buf)
-		.packets.filter((p): p is Extract<Pkt, { type: "data" }> => p.type === "data")
-		.map((p) => p.payload.toString("utf8").replace(/\n$/, ""))
-}
-
-describe("v2 advertisement", () => {
-	it("advertises version 2 + only-honored capabilities, ending in flush", () => {
-		const adv = encodeAdvertisement()
-		const lines = dataLines(adv)
-		expect(lines[0]).toBe("version 2")
-		expect(lines).toContain("ls-refs=unborn")
-		expect(lines).toContain("object-format=sha1")
-		expect(lines.some((l) => l === "fetch" || l.startsWith("fetch="))).toBe(true)
-		expect(lines.some((l) => l.startsWith("agent=pggit"))).toBe(true)
-		// we do NOT advertise shallow/filter/ref-in-want (not honored in M0)
-		expect(lines.some((l) => l.includes("shallow"))).toBe(false)
-		expect(decodePktStream(adv).packets.at(-1)).toEqual({ type: "flush" })
-	})
-})
 
 describe("parseV2Request / parseFetch", () => {
 	it("parses an ls-refs command and its args", () => {
@@ -63,37 +42,5 @@ describe("parseV2Request / parseFetch", () => {
 		expect(fetch.wants).toEqual([A, B])
 		expect(fetch.done).toBe(true)
 		expect(fetch.haves).toEqual([])
-	})
-})
-
-describe("encodeLsRefsResponse", () => {
-	it("emits oid+ref, symref-target for HEAD, peeled for tags, then flush", () => {
-		const out = encodeLsRefsResponse([
-			{ name: "HEAD", oid: C, symrefTarget: "refs/heads/master" },
-			{ name: "refs/heads/master", oid: C },
-			{ name: "refs/tags/v1", oid: T, peeled: C },
-		])
-		expect(dataLines(out)).toEqual([
-			`${C} HEAD symref-target:refs/heads/master`,
-			`${C} refs/heads/master`,
-			`${T} refs/tags/v1 peeled:${C}`,
-		])
-		expect(decodePktStream(out).packets.at(-1)).toEqual({ type: "flush" })
-	})
-})
-
-describe("encodePackfileResponse", () => {
-	it("wraps the pack in a packfile section + band-1 sideband + flush", () => {
-		const pack = Buffer.from("PACK and then some bytes \x00\x01\xff")
-		const { packets } = decodePktStream(encodePackfileResponse(pack))
-		const data = packets.filter(
-			(p): p is Extract<Pkt, { type: "data" }> => p.type === "data",
-		)
-		expect(data[0]?.payload.toString("utf8")).toBe("packfile\n")
-		const bands = data.slice(1)
-		expect(bands.every((p) => p.payload[0] === 1)).toBe(true)
-		const reassembled = Buffer.concat(bands.map((p) => p.payload.subarray(1)))
-		expect(reassembled).toEqual(pack)
-		expect(packets.at(-1)).toEqual({ type: "flush" })
 	})
 })

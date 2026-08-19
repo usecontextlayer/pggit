@@ -4,12 +4,13 @@
  * runs backwards), criss-cross merges, and identical-content branches. Each
  * shape is repacked, gc'd, force-moved and cloned against a file:// oracle.
  *
- * Converted from `breakage/lifecycle--merge-revert-history-shapes.ts`
- * (exploration 9), mechanically and at full scale: a 120-commit append-only seed,
- * two 25-commit feature lineages, an octopus merge, a criss-cross pair, a twin
- * root, then a collapse (every branch force-moved back to commit 10) followed by
- * gc(0) and a repair repack. The source exits 1 on a mismatch; the assertions
- * here state the correct outcome, so a live reproduction is RED.
+ * Full scale: a 120-commit append-only seed, two 25-commit feature lineages, an
+ * octopus merge, a criss-cross pair, a twin root, then a collapse (every branch
+ * force-moved back to commit 10) followed by gc(0) and a repair repack.
+ *
+ * Originated as exploration-9 probe
+ * `lifecycle--merge-revert-history-shapes.ts` (exit 1 on a mismatch against the
+ * file:// oracle); fixed.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"

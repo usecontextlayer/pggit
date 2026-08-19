@@ -14,6 +14,11 @@
  * this column is the fix), `commit_time` is the committer epoch, tag rows carry
  * target + type, and the 0009 backfill derives for pre-0009 data exactly what
  * ingest derives — including absorbing NULL for denied-push residue.
+ *
+ * Every fixture oid is minted by real `git hash-object`, and the tree/parents/
+ * commit_time expectations are read back with `git log`, so the fixture and the
+ * store cannot agree through one shared hash or header parser. `generation` stays
+ * ours — it is pggit's own concept, asserted against the design.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -21,7 +26,6 @@ import { join } from "node:path"
 import type { Migration } from "kysely/migration"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
-import { computeOid } from "@/object/object"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
@@ -52,6 +56,46 @@ function tagBytes(target: string, type: string, name: string): Buffer {
 }
 
 const FAKE_TREE = "ab".repeat(20)
+
+/**
+ * The oid oracle: one throwaway repo for the whole file. `--literally` is what
+ * lets `hash-object` store objects whose tree/parent targets the repo does not
+ * hold — exactly the seam these fixtures sit on (content → row, no connectivity).
+ */
+let oracleRepo = ""
+
+beforeAll(async () => {
+	oracleRepo = mkdtempSync(join(tmpdir(), "pggit-s1-oracle-"))
+	await spawnGit(["init", "-q", "-b", "main"], { cwd: oracleRepo })
+}, 120_000)
+
+afterAll(() => {
+	if (oracleRepo) rmSync(oracleRepo, { force: true, recursive: true })
+})
+
+/** Canonical git's oid for these exact bytes. */
+async function gitOid(type: "commit" | "tag", content: Buffer): Promise<string> {
+	const out = await spawnGit(
+		["hash-object", "-w", "-t", type, "--literally", "--stdin"],
+		{ cwd: oracleRepo, input: content },
+	)
+	return out.stdout.trim()
+}
+
+/** Canonical git's reading of a stored commit — tree, parents in CONTENT order,
+ * committer epoch: the same three columns ingest derives. */
+async function gitCommitFacts(
+	oid: string,
+): Promise<{ commitTime: string; parents: string[]; tree: string }> {
+	const out = await spawnGit(["log", "-1", "--format=%T|%P|%ct", oid], {
+		cwd: oracleRepo,
+	})
+	const [tree, parents, commitTime] = out.stdout.trim().split("|")
+	if (tree === undefined || parents === undefined || commitTime === undefined) {
+		throw new Error(`unexpected git log output for ${oid}: ${out.stdout}`)
+	}
+	return { commitTime, parents: parents.split(" ").filter(Boolean), tree }
+}
 
 type CommitRow = {
 	oid: string
@@ -89,7 +133,7 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 		let parent: string | null = null
 		for (let i = 0; i < 5; i++) {
 			const content = commitBytes(FAKE_TREE, parent ? [parent] : [], `c${i}`, EPOCH + i)
-			const oid = computeOid("commit", content)
+			const oid = await gitOid("commit", content)
 			commits.push({ content, oid })
 			parent = oid
 		}
@@ -106,23 +150,25 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 		expect(rows.size).toBe(5)
 		for (const [i, c] of commits.entries()) {
 			const row = rows.get(c.oid)
+			// Every expectation but `generation` is git's own reading of the object.
+			const facts = await gitCommitFacts(c.oid)
 			expect(row?.generation).toBe(i + 1)
-			expect(row?.tree).toBe(FAKE_TREE)
-			expect(BigInt(row?.commit_time ?? 0n)).toBe(BigInt(EPOCH + i))
-			expect(row?.parents).toEqual(i === 0 ? [] : [commits[i - 1]?.oid])
+			expect(row?.tree).toBe(facts.tree)
+			expect(BigInt(row?.commit_time ?? 0n)).toBe(BigInt(facts.commitTime))
+			expect(row?.parents).toEqual(facts.parents)
 		}
 	})
 
 	it("a merge commit's parents preserve CONTENT order; generation is 1+max", async () => {
 		const store = createObjectStore(db.sql)
 		const a = commitBytes(FAKE_TREE, [], "a")
-		const aOid = computeOid("commit", a)
+		const aOid = await gitOid("commit", a)
 		const b = commitBytes(FAKE_TREE, [aOid], "b")
-		const bOid = computeOid("commit", b)
+		const bOid = await gitOid("commit", b)
 		// Parents deliberately [bOid, aOid] — descending-generation order, so a
 		// sorted or set-shaped store would betray itself here.
 		const m = commitBytes(FAKE_TREE, [bOid, aOid], "m")
-		const mOid = computeOid("commit", m)
+		const mOid = await gitOid("commit", m)
 		await store.putPack("merge", [
 			{ content: m, type: "commit" },
 			{ content: b, type: "commit" },
@@ -130,6 +176,9 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 		])
 
 		const rows = await commitRows("merge")
+		// git's own parent reading first (the oracle), then the literal that says
+		// which order this fixture deliberately chose.
+		expect(rows.get(mOid)?.parents).toEqual((await gitCommitFacts(mOid)).parents)
 		expect(rows.get(mOid)?.parents).toEqual([bOid, aOid])
 		expect(rows.get(aOid)?.generation).toBe(1)
 		expect(rows.get(bOid)?.generation).toBe(2)
@@ -139,9 +188,9 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 	it("an absent parent derives NULL, absorbing — the parent arriving later changes NOTHING", async () => {
 		const store = createObjectStore(db.sql)
 		const orphanParent = commitBytes(FAKE_TREE, [], "never-pushed-first")
-		const orphanParentOid = computeOid("commit", orphanParent)
+		const orphanParentOid = await gitOid("commit", orphanParent)
 		const child = commitBytes(FAKE_TREE, [orphanParentOid], "child")
-		const childOid = computeOid("commit", child)
+		const childOid = await gitOid("commit", child)
 
 		// 1. Child arrives WITHOUT its parent (denied-push residue shape).
 		await store.putPack("orphan", [{ content: child, type: "commit" }])
@@ -161,20 +210,19 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 		// 4. NULL propagates: a NEW descendant of the NULL child is NULL too, even
 		// beside a finite-generation parent (max over a NULL region is unknowable).
 		const grandchild = commitBytes(FAKE_TREE, [childOid, orphanParentOid], "grandchild")
+		const grandchildOid = await gitOid("commit", grandchild)
 		await store.putPack("orphan", [{ content: grandchild, type: "commit" }])
-		expect(
-			(await commitRows("orphan")).get(computeOid("commit", grandchild))?.generation,
-		).toBeNull()
+		expect((await commitRows("orphan")).get(grandchildOid)?.generation).toBeNull()
 	})
 
 	it("tag rows: target + stored type code, chains included", async () => {
 		const store = createObjectStore(db.sql)
 		const c = commitBytes(FAKE_TREE, [], "tagged")
-		const cOid = computeOid("commit", c)
+		const cOid = await gitOid("commit", c)
 		const t1 = tagBytes(cOid, "commit", "v1")
-		const t1Oid = computeOid("tag", t1)
+		const t1Oid = await gitOid("tag", t1)
 		const t2 = tagBytes(t1Oid, "tag", "v1-signed")
-		const t2Oid = computeOid("tag", t2)
+		const t2Oid = await gitOid("tag", t2)
 		await store.putPack("tags", [
 			{ content: c, type: "commit" },
 			{ content: t1, type: "tag" },
@@ -240,14 +288,14 @@ describe("spine S1 — 0009 backfill derives rows for pre-0009 data", () => {
 		await m0009.down?.(db.db)
 
 		const a = commitBytes(FAKE_TREE, [], "a")
-		const aOid = computeOid("commit", a)
+		const aOid = await gitOid("commit", a)
 		const b = commitBytes(FAKE_TREE, [aOid], "b")
-		const bOid = computeOid("commit", b)
+		const bOid = await gitOid("commit", b)
 		const ghost = "cd".repeat(20) // parent object the repo never held
 		const c = commitBytes(FAKE_TREE, [ghost, bOid], "c")
-		const cOid = computeOid("commit", c)
+		const cOid = await gitOid("commit", c)
 		const tag = tagBytes(bOid, "commit", "v1")
-		const tagOid = computeOid("tag", tag)
+		const tagOid = await gitOid("tag", tag)
 
 		await db.sql`insert into repos (name) values ('prebackfill')`
 		const [{ id }] = await db.sql<[{ id: string }]>`

@@ -5,38 +5,27 @@
  * (over-eager ⇒ a wrong delta sent too early; under-eager ⇒ a loop). A non-cutting
  * `have` (off a sibling branch) must yield acknowledgments+flush and NO pack;
  * adding a cutting `have` must flip to `ready`+delim+pack in one response (git's
- * t5702 ready-delim lock). The negotiation logic lives in the store now (ancestry
- * CTE over the edge table), so this drives a store-backed backend rather than an
- * in-memory map.
+ * t5702 ready-delim lock). Each transcript is compared against real
+ * `git upload-pack --stateless-rpc` fed the IDENTICAL request bytes, so ACK order,
+ * `ready` timing and the ready-delim lock are a differential against canonical git
+ * rather than a transcription of one. The negotiation logic lives in the store now
+ * (ancestry CTE over the edge table), so this drives a store-backed backend rather
+ * than an in-memory map.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { decodePktStream, type Pkt } from "@/protocol/pkt-line"
+import { decodePktStream } from "@/protocol/pkt-line"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { sidebandDemux } from "@/testing/pkt-oracle"
+import { packObjectCount, sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { ackSection, spawnUploadPack } from "@/testing/upload-pack-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
-
-/** The data packets before the delim — the acknowledgments section text. */
-function ackSection(out: Buffer): string {
-	const { packets } = decodePktStream(out)
-	const delim = packets.findIndex((p) => p.type === "delim")
-	const end = delim < 0 ? packets.length : delim
-	return packets
-		.slice(0, end)
-		.map((p) =>
-			p.type === "data"
-				? (p as Extract<Pkt, { type: "data" }>).payload.toString("utf8")
-				: "",
-		)
-		.join("")
-}
 
 describe("M1 multi-round negotiation", () => {
 	let db: IsolatedDb
@@ -97,21 +86,28 @@ describe("M1 multi-round negotiation", () => {
 		// A have with NO merge base cannot satisfy the want — the only shape that
 		// keeps negotiating. (A SIBLING have that shares a base READIES, matching
 		// git's ok_to_give_up — pinned by fetch-ready-sibling.test.ts.)
-		const out = await handleUploadPack(
-			fetchRequest({ done: false, haves: [u1], wants: [c3] }),
-			backend,
-		)
-		expect(ackSection(out)).toBe(`acknowledgments\nACK ${u1}\n`)
+		const request = fetchRequest({ done: false, haves: [u1], wants: [c3] })
+		const out = await handleUploadPack(request, backend)
+		// The oracle: real `git upload-pack --stateless-rpc` over the same history,
+		// same request bytes. The `not ready` check pins that this shape still IS the
+		// keeps-negotiating one — otherwise a readying oracle and a readying pggit
+		// would agree while the test's subject vanished.
+		const oracle = await spawnUploadPack(dir, request)
+		expect(ackSection(oracle)).not.toContain("ready")
+		expect(ackSection(out)).toBe(ackSection(oracle))
+		expect(packObjectCount(oracle)).toBeNull()
 		expect(out.toString("utf8")).not.toContain("packfile")
 		expect(sidebandDemux(out).band1.length).toBe(0)
 	})
 
 	it("adding a cutting have → acknowledgments + ready, then DELIM + pack in one response", async () => {
-		const out = await handleUploadPack(
-			fetchRequest({ done: false, haves: [f1, c2], wants: [c3] }),
-			backend,
-		)
-		expect(ackSection(out)).toBe(`acknowledgments\nACK ${f1}\nACK ${c2}\nready\n`)
+		const request = fetchRequest({ done: false, haves: [f1, c2], wants: [c3] })
+		const out = await handleUploadPack(request, backend)
+		// The oracle again — including ACK ORDER, which is git's request order and is
+		// exactly what a hand-transcribed literal cannot keep honest.
+		const oracle = await spawnUploadPack(dir, request)
+		expect(ackSection(oracle)).toContain("ready\n")
+		expect(ackSection(out)).toBe(ackSection(oracle))
 		const { packets } = decodePktStream(out)
 		expect(packets.some((p) => p.type === "delim")).toBe(true)
 		expect(sidebandDemux(out).band1.subarray(0, 4).toString("latin1")).toBe("PACK")

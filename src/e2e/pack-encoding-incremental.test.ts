@@ -44,6 +44,7 @@ describe("repack — incremental passes", () => {
 	let repack: Repack
 	let src = ""
 	let firstPassRows = new Map<string, string>()
+	let secondPass: Awaited<ReturnType<Repack["repack"]>>
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
@@ -60,7 +61,7 @@ describe("repack — incremental passes", () => {
 		// (putPack is idempotent for the objects both histories share).
 		await appendRuns(src, INITIAL_RUNS, EXTRA_RUNS)
 		await seedRepoIntoStore(REPO, src, { objects, refs })
-		await repack.repack(REPO)
+		secondPass = await repack.repack(REPO)
 	}, 300_000)
 
 	afterAll(async () => {
@@ -98,6 +99,12 @@ describe("repack — incremental passes", () => {
 		expect(counts?.encodings).toBe(counts?.objects)
 		// And the growth was real: pass 2 had genuinely new objects to cover.
 		expect(Number(counts?.objects)).toBeGreaterThan(firstPassRows.size)
+	})
+
+	it("deltifies in the incremental pass — the star invariant has rows to judge", () => {
+		// Without this the no-rot invariant below is unfalsifiable: a pass that emitted
+		// zero deltas has zero delta-on-delta rows and reports a clean star.
+		expect(secondPass.deltas, "the incremental pass emitted no deltas").toBeGreaterThan(0)
 	})
 
 	it("holds the star invariant AFTER the incremental pass — no chain rot", async () => {

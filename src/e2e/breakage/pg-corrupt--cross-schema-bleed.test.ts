@@ -12,7 +12,8 @@
  *                the cross-schema question this test asks is now answered
  *                structurally for the live set; the probe still earns its keep
  *                on the remaining unqualified names below)
- *   gc.ts        `vacuum (analyze) git_object`, `reindex index git_edge_walk`
+ *   gc.ts        `vacuum (analyze) git_object`, `vacuum (analyze)
+ *                git_pack_encoding`
  *   copy-insert  `create temp table copy_stg_${target}`  (target-named)
  *
  * If any of those resolved database-globally instead of per-schema, two schemas
@@ -136,9 +137,16 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 		console.log(
 			`repos.id per schema: ${ids.join(" / ")} (identical ⇒ gc_live_N collides by name)`,
 		)
-		if (ids[0] !== ids[1]) {
-			console.log("NOTE: ids differ — the id-collision surface is NOT exercised")
-		}
+		// The premise, not an observation: `repos.id` is a per-schema identity
+		// sequence and each schema is freshly migrated, so both sides must mint the
+		// SAME id for the same repo name. If they ever diverge, every id-named
+		// object below (`gc_live_<id>`, `copy_stg_<target>`) lands in a distinct
+		// name per schema and the collision surface this file exists to probe is
+		// not exercised at all — while both rounds still pass.
+		expect(
+			ids[0],
+			"the id-collision surface requires both schemas to mint the same repos.id",
+		).toBe(ids[1])
 	}, 900_000)
 
 	afterAll(async () => {

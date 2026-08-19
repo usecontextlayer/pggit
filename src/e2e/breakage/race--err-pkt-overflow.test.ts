@@ -227,14 +227,24 @@ describe("race — the in-band refusal path's pkt-line size ceiling", () => {
 			const capHit = srv.some((s) => /exceeds writer cap/.test(s))
 			observed.push(`iter ${i} gcAt=+${delay}ms ${verdict}${capHit ? "+pktcap" : ""}`)
 			rmSync(dest, { force: true, recursive: true })
-			if (capHit) {
+			// Break on the BEHAVIOUR — an HTTP 500 is the degradation, whether or not
+			// the writer cap named itself in the log. The cap substring stays purely
+			// as attribution, exactly as part 1 uses it: a reworded internal message
+			// must not be able to turn this loop green.
+			if (verdict === "HTTP500" || capHit) {
 				capHits.push(
 					`iteration ${i} (gc at +${delay}ms): ${verdict} — ` +
-						`${srv.find((s) => /writer cap/.test(s))?.slice(0, 120) ?? "?"}`,
+						`${srv.find((s) => /writer cap/.test(s))?.slice(0, 120) ?? srv[0]?.slice(0, 120) ?? "?"}`,
 				)
 			}
 		}
 
 		expect(capHits, observed.join("\n")).toEqual([])
+		// …and a run where every fetch failed for an unrelated reason is not a pass
+		// either: at least one iteration has to have reached the serve path.
+		expect(
+			observed.filter((o) => o.includes("OK") || o.includes("PROTO")).length,
+			observed.join("\n"),
+		).toBeGreaterThan(0)
 	}, 1_800_000)
 })

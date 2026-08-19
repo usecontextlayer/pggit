@@ -1,13 +1,17 @@
 /**
- * BREAKAGE — `createRepack().repack()` throws on any repo whose objects are many
- * and small: >65,533 pending objects inside one 16 MB read window.
+ * `repack` completes on a repo whose objects are MANY and SMALL — more than
+ * 65,534 pending objects gathered into a single read batch — and the repo stays
+ * clonable and object-identical afterwards.
  *
- * Converted from `breakage/shapes--repack-param-limit-many-small-objects.ts`
- * (exit 0 = correct behavior · exit 1 = bug reproduced). The verdict is a pure
- * CORRECTNESS property over a hermetically-built repo, so it lands here as a
- * plain e2e test. The assertions encode the CORRECT outcome, so this file is RED
- * today: `repack` throws `MAX_PARAMETERS_EXCEEDED` before either `it` can reach
- * its post-repack clone.
+ * THE DEFECT THIS PINS: repack's phase-2 coverage sweep once batched only by
+ * BYTES (a 16 MB window) and then read that batch with `oid in ${pg(list)}`,
+ * which spends ONE bind parameter per oid. Postgres' extended protocol caps a
+ * statement at 65,535 parameters (porsager enforces 65,534) and the query
+ * already spends one on `repo_id`, so any repo whose objects average under
+ * ~244 bytes crossed the parameter ceiling before it crossed 16 MB and the pass
+ * threw `MAX_PARAMETERS_EXCEEDED` before writing anything. The sweep is now
+ * bounded by oid COUNT as well as bytes, matching every other batched read in
+ * the codebase.
  *
  * TWO SHAPES, both perfectly ordinary git repos:
  *
@@ -15,36 +19,27 @@
  *   B. 66,000 commits over one file     (~13.8 MB of content, mean 209 B/object)
  *
  * Nothing adversarial about either CONTENT; the only unusual property is object
- * COUNT relative to total bytes. Real git handles both (the control `file://`
- * remote clones them fsck-clean), and so does pggit's wire path — push and the
- * PRE-repack clone both succeed and are object-identical to the source. Only
- * `repack` fails.
+ * COUNT relative to total bytes. Neither shape is exotic: phase 1 only encodes
+ * TREES that pair with a same-path predecessor, so every commit object, every
+ * blob and every predecessor-less tree falls through to the sweep — meaning ANY
+ * repo with ≳65.5k commits reaches it (git.git ~70k, the Linux kernel ~1.2M),
+ * as does any repo of small blobs, as does the first repack of any repo whose
+ * initial commit carries ≳65.5k objects.
  *
- * THE DEFECT — `src/store/repack.ts`, phase-2 coverage sweep:
+ * THE CONTRACT, asserted per shape: real git serves the shape (the control
+ * `file://` remote clones it fsck-clean), pggit's wire path serves it (push and
+ * the pre-repack clone are object-identical to the source), `repack` does real
+ * work, an immediately repeated `repack` is a no-op — the old failure threw
+ * before emitting anything and reproduced identically on every retry, so
+ * convergence is the observable that separates "the pass completed" from "the
+ * pass keeps failing the same way" — and the post-repack clone is still
+ * fsck-clean and object-identical.
  *
- *     for (const p of [...pendingByOid.values()]) {
- *         sweep.push(p)
- *         sweepBytes += p.size
- *         if (sweepBytes >= READ_BATCH_BYTES) await flushSweep()   // 16 MB
- *     }
- *
- * and `flushSweep` issues `... where oid in ${pg(sweep.map(...))}` — one bind
- * PARAMETER per oid. Postgres' extended protocol caps a statement at 65535
- * parameters (porsager enforces 65534) and the query already spends one on
- * `repo_id`. The batch is bounded by BYTES and never by COUNT, so the sweep is
- * safe only while pending objects average more than ~244 bytes each.
- *
- * WHY IT IS NOT EXOTIC: phase 1 only ever encodes TREES that pair with a same-path
- * predecessor. Every commit object, every blob, and every tree with no predecessor
- * falls through to this sweep. Commit objects are ~200 bytes — so ANY repo with
- * ≳65.5k commits trips it (git.git ~70k, the Linux kernel ~1.2M), as does any repo
- * whose blobs are small (generated records, i18n keys, fixtures, empty files, the
- * per-run `stderr` files in a ContextLayer workspace repo), as does the first
- * repack of any repo whose initial commit carries ≳65.5k objects.
- *
- * BLAST RADIUS: the pass throws before writing anything, and throws again at
- * exactly the same point on every retry — the repo never gets an encoding tier.
- * Wired to the drain (design W1) it is a permanently failing background task.
+ * Originated as breakage probe `shapes--repack-param-limit-many-small-objects.ts`
+ * (exit 0 = correct behavior · exit 1 = bug reproduced), which reproduced the
+ * bind-parameter ceiling; fixed. The retry-convergence assertion is folded in
+ * from the retired `lifecycle--repack-bind-parameter-ceiling` probe, which
+ * covered the same defect at the same boundary.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -174,12 +169,17 @@ describe("repack — the bind-parameter ceiling on many small objects", () => {
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: pre })
 			expect(await objectList(pre)).toBe(srcObjs)
 
-			// THE DEFECT LANDS HERE: today this throws `MAX_PARAMETERS_EXCEEDED` out of
-			// the phase-2 coverage sweep, on a repo real git serves fine. Correct
-			// behavior is a completed pass that encodes the whole pending inventory.
+			// THE DEFECT LANDED HERE: the phase-2 coverage sweep threw
+			// `MAX_PARAMETERS_EXCEEDED` on a repo real git serves fine. The contract is
+			// a completed pass that encodes the whole pending inventory.
 			const res = await repack.repack(tag)
 			console.log(`shape ${tag} — repack: ${res.wholes} wholes + ${res.deltas} deltas`)
 			expect(res.wholes + res.deltas).toBeGreaterThan(0)
+
+			// The old failure threw before emitting anything and reproduced identically
+			// on every retry, so it never self-healed. A completed pass converges: the
+			// pending set is empty, and a second call encodes nothing.
+			expect(await repack.repack(tag)).toEqual({ deltas: 0, wholes: 0 })
 
 			const post = join(mk("post"), "c.git")
 			await spawnGit(["clone", "-q", "--bare", url, post])

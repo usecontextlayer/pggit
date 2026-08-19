@@ -196,6 +196,12 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 		}
 
 		expect(corrupt, observed.join("\n")).toEqual([])
+		// A mis-set-up oracle that failed every round would certify the standard
+		// vacuously: only rounds that actually completed a fetch are evidence.
+		expect(
+			observed.filter((v) => v.endsWith("OK")).length,
+			observed.join("\n"),
+		).toBeGreaterThan(0)
 	}, 600_000)
 
 	it("pggit: a fetch git reported as successful is never CORRUPT", async () => {
@@ -241,5 +247,11 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 		}
 
 		expect(breaks, verdicts.join("\n")).toEqual([])
+		// Only CORRUPT is a break, so a server that 500'd or refused every raced
+		// fetch passes this test having served nothing. Require some to succeed.
+		expect(
+			verdicts.filter((v) => v.endsWith("OK")).length,
+			verdicts.join("\n"),
+		).toBeGreaterThan(0)
 	}, 900_000)
 })

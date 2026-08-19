@@ -7,9 +7,9 @@ import { buildFileList } from "@/repo-view/build-file-list"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
-import { loadAllObjects } from "@/testing/git-fixtures"
+import { loadAllObjects, parseLsTree } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 /**
  * Spine S3's differential gate: over ANY sequence of pushes, the diff-driven
@@ -86,23 +86,31 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 	): Promise<string | null> {
 		for (const op of ops) {
 			const full = join(dir, op.path)
-			try {
-				if (op.kind === "set") {
-					rmSync(full, { force: true, recursive: true })
-					mkdirSync(dirname(full), { recursive: true })
-					writeFileSync(full, op.content)
-				} else if (op.kind === "del") {
-					rmSync(full, { force: true, recursive: true })
-				} else if (op.kind === "chmod") {
+			if (op.kind === "set") {
+				rmSync(full, { force: true, recursive: true })
+				mkdirSync(dirname(full), { recursive: true })
+				writeFileSync(full, op.content)
+			} else if (op.kind === "del") {
+				rmSync(full, { force: true, recursive: true })
+			} else if (op.kind === "chmod") {
+				// The one PROVEN no-op: the generator can chmod a path that is not in the
+				// index (never created, or already deleted), which git refuses with
+				// `Unable to process path <p>`. Every other git failure — and every fs
+				// failure above — fails the property, rather than silently erasing the
+				// mode-flip dimension from every generated push.
+				try {
 					await spawnGit(["update-index", "--chmod=+x", op.path], { cwd: dir })
-				} else {
-					// file↔directory swap at one fixed path.
-					rmSync(full, { force: true, recursive: true })
-					mkdirSync(full, { recursive: true })
-					writeFileSync(join(full, "nested.txt"), `swap-${n}\n`)
+				} catch (e) {
+					const knownNoop =
+						e instanceof GitCommandError &&
+						e.stderr.includes(`Unable to process path ${op.path}`)
+					if (!knownNoop) throw e
 				}
-			} catch {
-				// chmod on an untracked/absent path etc. — the op is a no-op, fine.
+			} else {
+				// file↔directory swap at one fixed path.
+				rmSync(full, { force: true, recursive: true })
+				mkdirSync(full, { recursive: true })
+				writeFileSync(join(full, "nested.txt"), `swap-${n}\n`)
 			}
 		}
 		await spawnGit(["add", "-A"], { cwd: dir })
@@ -158,7 +166,20 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 							tip = next
 							await pushAndProject(repo, dir, tip)
 
-							// The oracle: a from-scratch file list of the same tip.
+							// The oracle: real git's own file list at the same tip. Anchoring the
+							// row set to `git ls-tree -r` (rather than to a second pggit walk)
+							// is what makes a decoder defect SHARED by both projection paths
+							// visible here.
+							const lsTree = parseLsTree(
+								(await spawnGit(["ls-tree", "-r", tip], { cwd: dir })).stdout,
+							)
+								.map((e) => `${e.path} ${e.mode} ${e.oid}`)
+								.sort()
+							const rows = await projectedRows(repo)
+							expect(rows).toEqual(lsTree)
+
+							// The secondary property this file is named for: the diff-driven
+							// projection equals a from-scratch rebuild of the same tip.
 							const read = async (oid: string) => {
 								const obj = await objects.getObject(repo, oid)
 								if (!obj) throw new Error(`missing ${oid}`)
@@ -167,7 +188,7 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 							const full = (await buildFileList(read, tip)).files
 								.map((f) => `${f.path} ${f.mode} ${f.blobOid}`)
 								.sort()
-							expect(await projectedRows(repo)).toEqual(full)
+							expect(rows).toEqual(full)
 							expect(await projectedHead(repo)).toBe(tip)
 						}
 					} finally {
@@ -175,7 +196,10 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 					}
 				},
 			),
-			{ numRuns: 6 },
+			// Pinned seed (424_242) for a deterministic gate, matching the sibling
+			// specs — this property spawns real git and seeds Postgres per candidate,
+			// so an unpinned failure is both nondeterministic and expensive to replay.
+			{ numRuns: 6, seed: 424_242 },
 		)
 	}, 600_000)
 

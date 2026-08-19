@@ -1,34 +1,23 @@
 /**
- * mal04 ref-in-want — a v2 `fetch` carrying a `want-ref <ref>` line (the
- * `ref-in-want` capability) is served as a SILENT EMPTY clone instead of failing
- * loudly.
+ * mal04 ref-in-want — a v2 `fetch` whose only want is a `want-ref <ref>` line fails
+ * LOUDLY; it is never served as a silent empty clone.
  *
- * THE BUG: `parseFetch` (src/protocol/v2.ts) recognizes only `want <oid>`,
- * `have <oid>`, `filter <spec>`, `include-tag`, and `done`. A `want-ref refs/…`
- * arg starts with `want-ref ` — which does NOT match `arg.startsWith("want ")`
- * (the char after `want` is `-`, not a space) — so the line is SILENTLY DROPPED.
- * With `wants = []`, `handleFetch` falls through to its "zero-want = no-op"
- * branch and `buildPack` emits an EMPTY packfile, yielding HTTP 200 + a 4-object-
- * free `PACK` body.
+ * pggit deliberately does not advertise `ref-in-want` (see the v2 advertisement:
+ * "No shallow / ref-in-want"). Per the charter, an unimplemented capability a client
+ * nonetheless drives must surface a client-readable error — a `GitProtocolError`
+ * (4xx) or an in-band `ERR …`, the way the unsupported-command and
+ * unsupported-object-format paths already answer — and never HTTP 200 carrying an
+ * empty pack.
  *
- * THE ORACLE EXPECTATION: pggit deliberately does NOT advertise `ref-in-want`
- * (see encodeAdvertisement in v2.ts: "No shallow / ref-in-want"). Per the charter,
- * an unimplemented capability that a client nonetheless drives must FAIL LOUDLY —
- * never silently hand back an empty clone. A request whose ONLY want is a
- * `want-ref` must surface a client-readable error (a `GitProtocolError` → 4xx, or
- * an in-band `ERR …`), exactly as the unsupported-command / unsupported-object-
- * format paths already do. It must NOT be an HTTP 200 carrying an empty pack.
+ * The request is raw wire on purpose: real git emits `want-ref` only when the server
+ * advertised `ref-in-want`, so an adversarial or hand-built client is the only way
+ * to reach the path.
  *
- * Observed against the live wire: HTTP 200, body `000dpackfile … 0025PACK…0000`
- * (an empty pack — zero objects). This raw-wire request is the only way to reach
- * the path (real git emits `want-ref` only when the server advertised
- * `ref-in-want`, which pggit does not), so this is a raw/adversarial-client
- * divergence, but a silent-empty one all the same.
- *
- * EXPECTED-RED until pggit either (a) rejects an unrecognized `want-*` arg loudly
- * in parseFetch / handleFetch, or (b) implements ref-in-want. The test drives a
- * real git push to seed a non-empty repo, then puts the raw `want-ref` fetch body
- * on the wire and asserts the response is NOT a silent empty-pack 200.
+ * ORIGINATED as the breakage probe for `parseFetch` matching only `want <oid>`: a
+ * `want-ref refs/…` line does not start with `want ` (the next char is `-`), so it
+ * was SILENTLY DROPPED, `wants` came out empty, and the zero-want branch answered
+ * HTTP 200 with an empty pack — a clone that succeeded and delivered nothing. Fixed
+ * by rejecting the unadvertised argument at the parse boundary.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

@@ -1,20 +1,20 @@
 /**
- * a11 concurrency — two concurrent `--atomic` pushes that update the SAME two
- * refs in OPPOSITE order race for the per-ref row locks. Postgres detects the
- * lock cycle and aborts one transaction with a deadlock error (SQLSTATE 40P01).
+ * a11 concurrency — two concurrent `--atomic` pushes that update the SAME two refs
+ * in OPPOSITE order race for the per-ref row locks. Postgres detects the lock cycle
+ * and aborts one transaction (SQLSTATE 40P01); either way — deadlock victim or
+ * cleanly serialized loser — the losing batch must come back as an in-band
+ * whole-batch rejection (every ref `ng`) under HTTP 200, exactly like any other
+ * lost CAS. A lock conflict is a concurrency outcome the server absorbs and
+ * reports; canonical git never answers a push with a server error for one.
  *
- * BUG: `applyRefUpdates` (atomic path) only catches its own `AtomicAbort`; a
- * Postgres deadlock re-throws, escapes `handleReceivePack`, and the app's
- * `onError` turns it into HTTP 500 "internal server error". Canonical git never
- * answers a push with a server error because of a lock conflict — the losing
- * push must get a clean in-band rejection (the atomic batch failed, every ref
- * `ng`), status 200, exactly like any other lost CAS. A deadlock is a
- * concurrency outcome the server must absorb and report, not leak as a 500.
+ * This drives two concurrent git-receive-pack POSTs and asserts the observables:
+ * both responses are HTTP 200 report-status bodies (never a 500 / "internal server
+ * error"), the loop actually produced contention (else the suite proves nothing),
+ * exactly one batch commits whole, and the final ref state is never a torn mix.
  *
- * This drives the real wire (two concurrent git-receive-pack POSTs) and asserts
- * the observable contract: BOTH responses are HTTP 200 git-report-status bodies
- * (never a 500 / "internal server error"), exactly one batch commits whole, the
- * loser applies nothing, and the final ref state is one consistent batch.
+ * ORIGINATED as the breakage probe for the atomic apply path catching only its own
+ * `AtomicAbort`: a Postgres deadlock re-threw, escaped the handler, and became an
+ * HTTP 500 the client could not read as a per-ref result. Fixed.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -111,9 +111,11 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 
 	it("absorbs the deadlock: both responses are 200 report-status, never 500", async () => {
 		// One repo per attempt; loop to make the lock cycle near-certain to fire.
+		const ATTEMPTS = 8
 		let saw500 = false
 		let torn = ""
-		for (let attempt = 0; attempt < 8; attempt++) {
+		let contended = 0
+		for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
 			const repo = `dl${attempt}`
 			// Seed r1=r2=base via a plain push so both updates are real CAS updates.
 			await postReceivePack(
@@ -172,6 +174,17 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 			for (const r of [resA, resB]) {
 				if (r.status === 500 || r.text.includes("internal server error")) saw500 = true
 			}
+			// The contention signal: one response rejecting the WHOLE batch in-band.
+			// Both batches move the same two refs off `base`, so a loser is inevitable
+			// — unless the fixture stopped racing them, which is what this counts.
+			if (
+				[resA, resB].some(
+					(r) =>
+						r.text.includes("ng refs/heads/r1") && r.text.includes("ng refs/heads/r2"),
+				)
+			) {
+				contended++
+			}
 
 			// State must reflect exactly one whole batch (or, if both serialized
 			// cleanly, the later winner) — never a torn mix of a1+b2 etc.
@@ -188,8 +201,14 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 
 		// The atomicity invariant must hold regardless (rolled-back victim).
 		expect(torn).toBe("")
-		// The bug: a deadlock victim is reported as HTTP 500 instead of a clean
-		// in-band atomic rejection. Canonical git never 500s on a lock conflict.
+		// A deadlock victim must be a clean in-band atomic rejection, never an HTTP
+		// 500 — canonical git never 500s on a lock conflict.
 		expect(saw500).toBe(false)
+		// ...and the two assertions above are only worth anything if the batches
+		// actually collided: two pushes that never overlapped satisfy both.
+		expect(
+			contended,
+			`no whole-batch rejection in ${ATTEMPTS} attempts — the pushes never contended, so nothing above was exercised`,
+		).toBeGreaterThan(0)
 	})
 })

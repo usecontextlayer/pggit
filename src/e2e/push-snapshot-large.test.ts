@@ -1,19 +1,27 @@
 /**
- * a06 scale-objects bug — the queryable-view snapshot insert is NOT chunked under
- * the Postgres bind-parameter ceiling.
+ * a06 scale-objects — the queryable-view snapshot insert stays under the Postgres
+ * bind-parameter ceiling.
  *
- * The object-store ingest path chunks its INSERTs (INSERT_BATCH=1000) so a large
- * push lands under the 65534-parameter wire cap. But the post-commit `repo_file`
- * snapshot rebuild (`repo-file-projection.applyRefAdvance`'s full-rebuild path) does ONE un-chunked
- * multi-row INSERT of every file at the tip. `repo_file` has 5 bound columns, so a
- * single commit whose tree holds >= 13107 files binds >= 65535 parameters and the
- * driver throws MAX_PARAMETERS_EXCEEDED. The exception escapes the receive-pack
- * handler -> HTTP 500 -> the client's push dies ("the remote end hung up
- * unexpectedly", exit 1) EVEN THOUGH the objects + ref already committed.
+ * `repo_file` binds 5 columns per row, so a single commit whose tree holds 13107
+ * files needs 65535 parameters — one past the 65534 wire cap — if the post-commit
+ * projection rebuild issues ONE multi-row INSERT. The contract: a push of that tree
+ * succeeds like canonical git's, AND the projection actually holds all 13107 rows
+ * at the pushed tip.
  *
- * The live server wires `snapshots: createRepoFileProjection(db)` (server.ts), so this
- * reproduces production. Canonical git accepts a 13107-file push without error;
- * pggit must too. Observed via the wire: the push exits 0 and the ref is created.
+ * The row count is the load-bearing half. A projection failure is absorbed by
+ * design (the rebuild runs after the ref CAS has committed, and its throw is logged
+ * rather than propagated, since the push has already succeeded), so the push
+ * exiting 0 and the ref being advertised hold whether the insert wrote every row or
+ * none. Only reading `repo_file` tells "the chunked insert landed" from "the insert
+ * threw and was logged".
+ *
+ * ORIGINATED as the breakage probe for that un-chunked INSERT: the driver raised
+ * MAX_PARAMETERS_EXCEEDED, which at the time escaped the receive-pack handler as an
+ * HTTP 500 and killed the client's push ("the remote end hung up unexpectedly")
+ * even though objects and ref had committed. Fixed by chunking the rebuild.
+ *
+ * The live server wires `snapshots: createRepoFileProjection(db)`, and so does this
+ * fixture — the path under test is production's.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -27,7 +35,7 @@ import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-describe("a06 — repo_file snapshot insert exceeds the bind-parameter ceiling", () => {
+describe("a06 — repo_file snapshot insert stays under the bind-parameter ceiling", () => {
 	let isolated: IsolatedDb
 	let server: GitServer
 	let url: string
@@ -71,5 +79,19 @@ describe("a06 — repo_file snapshot insert exceeds the bind-parameter ceiling",
 		// The ref must be advertised back — proving the push succeeded end to end.
 		const lsRemote = await spawnGit(["ls-remote", url])
 		expect(lsRemote.stdout).toMatch(/refs\/heads\/(main|master)/)
+
+		// ...and the projection really holds every file at the pushed tip. Without
+		// this the whole fixture passes on a projection that wrote nothing.
+		const tip = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+		const [files] = await isolated.sql<{ n: number }[]>`
+			select count(*)::int as n
+			from repo_file f join repos r on r.id = f.repo_id
+			where r.name = 'repo'`
+		expect(files?.n).toBe(N)
+		const [head] = await isolated.sql<{ commit_oid: Buffer; ref_name: string }[]>`
+			select h.ref_name, h.commit_oid
+			from repo_file_head h join repos r on r.id = h.repo_id
+			where r.name = 'repo'`
+		expect(head?.commit_oid.toString("hex")).toBe(tip)
 	}, 120_000)
 })

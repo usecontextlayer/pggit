@@ -29,10 +29,9 @@ import {
  * stay free to change. Determinism comes from the scheduler's `graceSeconds`,
  * never a wall-clock wait.
  *
- * RED now: `createGcScheduler(...).drainOnce()` is a TDD stub that throws
- * "pggit gc-scheduler: not implemented (TDD stub)", and the store does not yet
- * stamp `repos.last_pushed_at` (so it stays NULL after a push). GREEN once the
- * activity-stamp and drain loop honour the §6 contract.
+ * ORIGINATED as the TDD suite written against a throwing `createGcScheduler` stub
+ * and a store that never stamped `repos.last_pushed_at`. The activity stamp and
+ * the drain loop honour the §6 contract now; this is their regression gate.
  */
 describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", () => {
 	let fx: GcFixture

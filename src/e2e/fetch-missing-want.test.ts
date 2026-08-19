@@ -1,28 +1,23 @@
 /**
- * fetch of a `want` the repo does NOT have must error CLEANLY — never an
- * unhandled HTTP 500 transport breakdown.
+ * A `want` the repo does NOT have is answered the way canonical upload-pack answers
+ * it: IN-BAND. Two describes over one contract —
+ *   - mal: in-process, per shape. A well-formed but absent OID comes back HTTP 200
+ *     carrying `ERR upload-pack: not our ref <oid>`; a want that is not a 40-hex OID
+ *     at all never reaches the store — it is a malformed request, rejected at the
+ *     wire boundary with HTTP 400.
+ *   - mal01: the same absent OID through a real `git fetch`, asserting what the
+ *     CLIENT prints: `fatal: remote error: upload-pack: not our ref <oid>`, with no
+ *     HTTP 5xx and no `expected 'packfile'`.
  *
- * Merged from two regression suites for the same root-cause bug:
- *   - mal (mal-missing-want-500): in-process Hono assertion that a v2 fetch for
- *     an absent want (well-formed-but-absent OID AND garbage non-hex OID) returns
- *     a client-readable status < 500, never an unhandled 500.
- *   - mal01 (mal01-fetch-want-for-an-object-absent-from-a): end-to-end real-git
- *     client over the wire, asserting the oracle contract — the fetch fails, but
- *     cleanly (no HTTP 5xx, no `expected 'packfile'`, message names "not our ref").
+ * The empty-repo case does not reach this path at all (an empty repo short-circuits
+ * to an empty pack), so both fixtures seed real objects first and then want a
+ * DIFFERENT, absent OID.
  *
- * THE BUG (EXPECTED-RED until pggit is fixed):
- *   `object-store.buildPack` throws a bare `Error("upload-pack: wanted objects
- *   missing from store: …")` (object-store.ts:101) when a want's closure is
- *   incomplete. That is not a `GitProtocolError`, so `createGitApp`'s onError
- *   maps it to HTTP 500 ("internal server error"). Real git's upload-pack instead
- *   answers IN-BAND with `ERR upload-pack: not our ref <oid>` (HTTP 200), and the
- *   client prints `fatal: remote error: upload-pack: not our ref <oid>`.
- *
- *   The empty-repo case does NOT trigger it (buildPack short-circuits to an empty
- *   pack when the repo id is null), so the repo must already hold objects — hence
- *   each suite seeds a real object/commit first, then `want`s a DIFFERENT, absent
- *   OID. `Buffer.from("zzzz","hex")` silently yields an empty OID, so a garbage
- *   want hits the same path with an empty oid in the message.
+ * ORIGINATED as the breakage probe for `buildPack` throwing a bare Error for an
+ * incomplete want closure: not being a `GitProtocolError`, it fell through to the
+ * app's onError as HTTP 500, and the client died with `RPC failed; HTTP 500` /
+ * `fatal: expected 'packfile'` instead of reading git's own diagnosis. Fixed by the
+ * typed WantNotFoundError and its in-band ERR encoding.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -44,16 +39,22 @@ describe("mal — fetch of a want absent from the store must not 500", () => {
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 
-	async function postFetch(repo: string, want: string): Promise<number> {
+	async function postFetch(
+		repo: string,
+		want: string,
+	): Promise<{ status: number; text: string }> {
 		const res = await app.request(`/${repo}/git-upload-pack`, {
 			body: fetchRequest({ done: true, objectFormat: "sha1", wants: [want] }),
 			headers: { "Git-Protocol": "version=2" },
 			method: "POST",
 		})
-		return res.status
+		return {
+			status: res.status,
+			text: Buffer.from(await res.arrayBuffer()).toString("utf8"),
+		}
 	}
 
-	it("returns a client-readable error (< 500), never an unhandled 500", async () => {
+	it("answers an absent want in-band (200 + ERR) and a malformed one at the boundary (400)", async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		try {
 			const objects = createObjectStore(db.sql)
@@ -64,10 +65,16 @@ describe("mal — fetch of a want absent from the store must not 500", () => {
 			// `want` for a DIFFERENT, absent object exercises the missing-want throw.
 			await objects.putPack("malmw", [{ content: Buffer.from("hi\n"), type: "blob" }])
 
-			// Well-formed 40-hex OID the (now non-empty) repo does not have.
-			expect(await postFetch("malmw", "c".repeat(40))).toBeLessThan(500)
-			// Garbage non-hex OID — coerces to an empty buffer, same buildPack throw.
-			expect(await postFetch("malmw", "zzzz")).toBeLessThan(500)
+			// A well-formed 40-hex OID the (now non-empty) repo does not have: a client
+			// condition, so upload-pack says so IN-BAND under a 200, naming the oid —
+			// exactly the text real git prints back (pinned end-to-end by mal01 below).
+			const absent = await postFetch("malmw", ABSENT_OID)
+			expect(absent.status).toBe(200)
+			expect(absent.text).toContain(`ERR upload-pack: not our ref ${ABSENT_OID}`)
+			// A want that is not an object id at all never reaches the store — it is a
+			// malformed request, rejected at the wire boundary.
+			const garbage = await postFetch("malmw", "zzzz")
+			expect(garbage.status).toBe(400)
 		} finally {
 			await db?.drop()
 		}
@@ -124,15 +131,8 @@ describe("mal01 — fetch of a want absent from a non-empty repo errors cleanly 
 			expect(outcome.failed).toBe(true)
 
 			// ...but it must fail like the ORACLE — a clean, client-readable protocol
-			// error, NOT an HTTP 500 transport breakdown.
-			//
-			// Current (buggy) pggit emits:
-			//   error: RPC failed; HTTP 500 …  /  fatal: expected 'packfile'
-			// Real git emits:
-			//   fatal: remote error: upload-pack: not our ref <oid>
-			//
-			// These two assertions are RED on current code and GREEN once pggit
-			// answers the missing want in-band.
+			// error (`fatal: remote error: upload-pack: not our ref <oid>`), NOT the
+			// `RPC failed; HTTP 500` / `expected 'packfile'` transport breakdown.
 			expect(outcome.stderr).not.toMatch(/HTTP 5\d\d/)
 			expect(outcome.stderr).not.toMatch(/expected 'packfile'/)
 			// And the message names the absent ref, the way real git does.

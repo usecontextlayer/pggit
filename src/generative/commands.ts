@@ -11,6 +11,13 @@
  * not currently valid are skipped — so a generated list NEVER makes `git` exit
  * non-zero. fast-check shrinks the list (drop commands) to localize a failure.
  *
+ * Every skip is a silent `return`, so a regression that makes a whole command kind
+ * unreachable (branches never recorded, merges always skipped, tags never created)
+ * would degrade every candidate in EVERY consuming differential to a linear
+ * single-branch repo without reddening any of them. `commands.test.ts` is where that
+ * is caught: it folds each candidate's realized shape in from the real-git oracle and
+ * floors the corpus, so the silent-skip design cannot silently empty the corpus.
+ *
  * The differential ASSERTION is NOT here — it runs in the §7 properties AFTER the
  * whole list is replayed. This module only manufactures the candidate repo.
  *

@@ -178,6 +178,31 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 					bump(
 						`repack ${repackErr === undefined ? "ok" : `err(${msg(repackErr).slice(0, 60)})`}`,
 					)
+					// The verdict this mode exists for: migration 0008's cascade owns one
+					// direction — no `git_pack_encoding` row may outlive its `repos` row.
+					// A repack that wrote encodings for a repo the cascade just removed
+					// leaves exactly that orphan, and neither the throw nor the silence
+					// tells you which happened.
+					const [orphans] = await db.sql<{ n: number }[]>`
+						select count(*)::int as n from git_pack_encoding e
+							where not exists (select 1 from repos r where r.id = e.repo_id)`
+					if ((orphans?.n ?? 0) > 0) {
+						problems.push(
+							`repack left ${orphans?.n} git_pack_encoding row(s) with no repos row`,
+						)
+					}
+					// If a writer resurrected the repo row, what it serves must be sound.
+					const survivors = await db.sql`select 1 from repos where name = ${repo}`.then(
+						(r) => r.length,
+					)
+					if (survivors > 0) {
+						try {
+							await spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
+							await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+						} catch (e) {
+							problems.push(`REPO SURVIVED THE DELETE BUT IS NOT SERVABLE: ${msg(e)}`)
+						}
+					}
 				} else {
 					await spawnGit(["reset", "-q", "--hard", tip], { cwd: client })
 					writeFileSync(join(client, "del.txt"), `del ${i} ${Date.now()}\n`)
@@ -226,5 +251,8 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 		}
 
 		expect(breaks, JSON.stringify(tally, null, 2)).toEqual([])
+		// A run in which the delete always won is not a pass: the soundness checks
+		// above only bite on a clone that actually served something.
+		expect(tally["clone ok"] ?? 0, JSON.stringify(tally, null, 2)).toBeGreaterThan(0)
 	}, 1_800_000)
 })

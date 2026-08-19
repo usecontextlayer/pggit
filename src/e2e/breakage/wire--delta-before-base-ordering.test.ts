@@ -1,25 +1,29 @@
 /**
  * WIRE — the ORDER pggit emits deltas in, and the client-side resolver that order
- * stresses. (Converted from `breakage/wire--delta-before-base-ordering.ts`.)
+ * stresses.
  *
  * `buildPack` emits in closure order, and the closure CTE seeds at the wants (the
  * ref tips) and expands outward — so newer objects come first and a star delta's
  * ANCHOR (an older version of the same path) always lands AFTER the delta that
- * references it. Measured on the append-only shape that motivated this work: 100%
- * of served REF_DELTAs precede their base in the pack, where canonical git's own
- * packs are 0%. Legal (REF_DELTA resolution is by OID, not offset) but it is the
- * worst case for both client-side resolvers, and it means nothing in the stream can
- * be resolved until the whole pack has arrived — relevant to the streaming/TTFB
- * question this work left open.
+ * references it. The originating probe measured that on the append-only shape
+ * this work targets: 100% of served REF_DELTAs preceded their base in the pack,
+ * where canonical git's own packs are 0%. Legal (REF_DELTA resolution is by OID,
+ * not offset) but it is the worst case for both client-side resolvers, and it
+ * means nothing in the stream can be resolved until the whole pack has arrived —
+ * relevant to the streaming/TTFB question this work left open.
  *
  * So this file does two things:
- *   1. Measures the ratio and requires that NO majority of deltas precede their
- *      bases (currently RED — the pathology reproduces).
+ *   1. Measures the ratio and requires that NO majority of served deltas precede
+ *      their bases, over a fixture built to produce a deltified pack (a
+ *      zero-delta serve fails loudly rather than passing vacuously).
  *   2. Drives the OTHER client resolver: `git unpack-objects`, which git uses
  *      instead of `index-pack` for a fetch under `fetch.unpackLimit`. It resolves
  *      out-of-order REF_DELTAs from a deferred list rather than a second pass, and
  *      no other test reaches it. Both a full clone and a small incremental fetch
  *      are forced down that path.
+ *
+ * Originated as breakage probe `wire--delta-before-base-ordering.ts`, which
+ * measured the delta-ahead-of-base ratio; fixed.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"

@@ -111,7 +111,9 @@ describe("M2 — concurrent push race + malformed-pack rejection", () => {
 		})
 		expect(res.status).toBe(200) // the failure is reported in-band, not as HTTP error
 		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
-		expect(report).toMatch(/^unpack [^\n]*\n/) // `unpack <error>`
+		// `unpack <error>` — and specifically NOT `unpack ok`, which the previous
+		// wildcard matched and which is the one outcome this case must never see.
+		expect(report).toMatch(/^unpack (?!ok\n)[^\n]+\n/)
 		expect(report).toContain("ng refs/heads/bad unpacker error")
 		expect(
 			(await refs.listRefs("badrepo")).find((r) => r.name === "refs/heads/bad"),

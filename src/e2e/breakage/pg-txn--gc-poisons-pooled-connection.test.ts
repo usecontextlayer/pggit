@@ -53,9 +53,16 @@
  * REINDEX, a VACUUM FULL, a migration, or gc's own `maintain()` all take
  * conflicting locks) meeting that statement_timeout.
  *
- * The source script exits non-zero when the poisoning reproduces; the assertions
- * below encode the CORRECT contract (the connection comes back clean, GC and
- * repack survive, request traffic is untouched), so a reproduction is red.
+ * THE CONTRACT, in order: the fault fires at all (the walk aborts with 57014, a
+ * cancelled statement — everything after it is vacuous over an undisturbed pool),
+ * gc reports that REAL cause rather than a 25P02 from its own cleanup, the
+ * borrowed connection returns to the pool with no open transaction, gc and repack
+ * keep working on that pool, ordinary clones through it are untouched, and a clean
+ * gc+repack leaves it serving.
+ *
+ * Originated as breakage probe `pg-txn--gc-poisons-pooled-connection.ts`, which
+ * reproduced the poisoning (exit non-zero); fixed by reshaping gc onto a reserved
+ * connection with an in-try ROLLBACK (D12).
  */
 import { randomUUID } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -282,6 +289,18 @@ describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () =
 		await db?.drop()
 		if (root) rmSync(root, { force: true, recursive: true })
 		if (src) rmSync(src, { force: true, recursive: true })
+	})
+
+	it("the fault fired at all: the live-set walk was aborted mid-transaction", () => {
+		// The barrier for everything below. If the `access exclusive` lock on git_ref
+		// plus statement_timeout=1200 did not abort the walk, gc simply completed:
+		// `strandedState` is null, no probe breaks, and all four tests below pass
+		// having injected nothing.
+		expect(
+			gcErr,
+			"the statement_timeout never aborted the live-set walk — nothing below is exercised",
+		).not.toBe("none")
+		expect(gcErr).toMatch(/57014|canceling statement/i)
 	})
 
 	it("reports the REAL cause of an aborted pass, not a 25P02 from its own cleanup", () => {

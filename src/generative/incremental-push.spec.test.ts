@@ -1,13 +1,20 @@
 /**
  * §8.4 generative kernel differential — INCREMENTAL PUSH (M2). Push a generated
  * client repo to an empty server, then DIVERGE the client (replay more commands)
- * and push again. The second push advances existing branches by compare-and-swap
- * and sends a THIN pack — deltas against base objects that live only in the store,
- * which the ingest path must resolve. After both pushes the server must hold
- * exactly the client's refs and full object closure, fsck-clean on clone-back.
+ * and push again. After both pushes the server must hold exactly the client's refs
+ * and full object closure, fsck-clean on clone-back, and at least one ref that
+ * ALREADY EXISTED must have moved — the compare-and-swap fast-forward path, which a
+ * server that ignored `oldOid` and blind-set every ref would also have to satisfy on
+ * the final state alone.
+ *
+ * WHAT THIS DOES NOT PIN: pack THINNESS. git decides on its own whether to delta the
+ * second push against bases it knows the server has, and the client-side observables
+ * here (refs, clone-back object set) are identical either way. Thin-pack INGEST is
+ * pinned where it is observable — `src/store/thin-pack.test.ts` (a hand-built pack
+ * whose REF_DELTA base lives only in the store) and `src/e2e/thin-pack-serve.test.ts`.
  *
  * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
- * A failure is a real CAS / thin-pack-ingest bug.
+ * A failure is a real CAS / ingest bug.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -30,7 +37,7 @@ import { spawnGit } from "@/testing/spawn-git"
 const REFSPEC = ["refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"]
 
 describe("§8.4 generative — incremental push (M2) differential", () => {
-	it("CAS-updates refs and ingests a thin pack on a second push", async () => {
+	it("CAS-advances an existing ref and ingests the second push's full closure", async () => {
 		const baseUrl = inject("pgBaseUrl")
 
 		await fc.assert(
@@ -53,10 +60,13 @@ describe("§8.4 generative — incremental push (M2) differential", () => {
 							const url = `http://127.0.0.1:${server.port}/repo`
 
 							await spawnGit(["push", url, ...REFSPEC], { cwd: client })
+							// The server's ref state BEFORE the divergence — the baseline that makes
+							// "a ref advanced" distinguishable from "a ref was created".
+							const afterFirst = await refs.listRefs("repo")
 
-							// Diverge the client, then push again: existing branches advance
-							// (compare-and-swap fast-forward) and the pack is THIN — its delta
-							// bases live only in the store from the first push.
+							// Diverge the client, then push again: existing branches advance under
+							// compare-and-swap, and the second pack's delta bases live only in the
+							// store from the first push.
 							await extendRepoFromCommands(model, divergeCommands)
 							fc.pre(model.commitCount > baseCommitCount) // a real second push
 							await spawnGit(["push", url, ...REFSPEC], { cwd: client })
@@ -68,13 +78,21 @@ describe("§8.4 generative — incremental push (M2) differential", () => {
 								.sort((a, b) => a.name.localeCompare(b.name))
 							expect(stored).toEqual(await refsOf(client))
 
-							// 2. Every object reachable on the client is in the store.
-							for (const oid of await allObjectOids(client)) {
-								expect(await objects.hasObject("repo", oid)).toBe(true)
-							}
+							// 2. The CAS half: a ref that existed after the FIRST push now names a
+							//    different oid. Without this the whole property is satisfied by a
+							//    server that only ever creates refs — the final-state comparison
+							//    above cannot tell an update from a create.
+							expect(
+								stored.filter((r) =>
+									afterFirst.some((p) => p.name === r.name && p.oid !== r.oid),
+								),
+								"no existing ref advanced — the fast-forward CAS path is unexercised",
+							).not.toEqual([])
 
 							// 3. Differential: a fresh git clones the server back to a byte-identical,
-							//    fsck-clean object set — proving the thin pack ingested correctly.
+							//    fsck-clean object set. This subsumes a per-object `hasObject` sweep
+							//    of the store — an object the ingest dropped cannot come back out of
+							//    the pack — and additionally catches over-serving.
 							back = mkdtempSync(join(tmpdir(), "pggit-incpush-back-"))
 							await spawnGit([
 								"clone",

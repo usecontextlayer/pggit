@@ -17,13 +17,31 @@ import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { allObjectOids, objectsByType, seedRepoIntoStore } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	objectsByType,
+	parseLsTree,
+	seedRepoIntoStore,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+
+/** The distinct blob OIDs a branch's tree needs on disk — the git-derived oracle for
+ * what a promisor checkout of that branch must fault back. `ls-tree -r` lists leaf
+ * entries only, and two paths with identical content share one blob, hence the Set. */
+async function blobsOf(dir: string, branch: string): Promise<string[]> {
+	const out = await spawnGit(["ls-tree", "-r", branch], { cwd: dir })
+	return [...new Set(parseLsTree(out.stdout).map((e) => e.oid))]
+}
 
 describe("§8.4 generative — blobless partial clone (M1) differential", () => {
 	it("transfers exactly the non-blob closure, then lazily faults HEAD's blobs", async () => {
 		const baseUrl = inject("pgBaseUrl")
+		// How many candidates actually had blobs to fault. The generator can produce a
+		// branch whose tree is empty (delete every file, then commit), and for those the
+		// assertion below correctly demands that NOTHING arrived — so without this floor
+		// a corpus of only-empty trees would prove nothing about serving blob wants.
+		let candidatesWithBlobs = 0
 
 		await fc.assert(
 			fc.asyncProperty(repoCommands({ maxCommands: 25 }), async (commands) => {
@@ -61,10 +79,18 @@ describe("§8.4 generative — blobless partial clone (M1) differential", () => 
 								.sort(),
 						)
 
-						// Checking out HEAD's branch must lazily fault its blobs back from
-						// us — `checkout` throws if any needed blob can't be served.
+						// Checking out HEAD's branch must lazily fault its blobs back from us —
+						// and it must fault EXACTLY that branch's blob set. `checkout` exiting 0
+						// proves nothing on its own: it succeeds having faulted zero blobs when
+						// the branch's tree carries none. So snapshot the object set, check out,
+						// and require the growth to be precisely the git-derived blob set.
+						const beforeFault = await allObjectOids(dest)
 						await spawnGit(["checkout", model.currentBranch], { cwd: dest })
 						await spawnGit(["fsck"], { cwd: dest })
+
+						const wanted = await blobsOf(src, model.currentBranch)
+						if (wanted.length > 0) candidatesWithBlobs++
+						expect(await allObjectOids(dest)).toEqual([...beforeFault, ...wanted].sort())
 					} finally {
 						await server?.close()
 						await isolated.drop()
@@ -76,5 +102,10 @@ describe("§8.4 generative — blobless partial clone (M1) differential", () => 
 			}),
 			{ numRuns: 12, seed: 424_242 },
 		)
+		console.log(`[partial corpus] candidates-with-blobs=${candidatesWithBlobs}`)
+		expect(
+			candidatesWithBlobs,
+			"no candidate needed a blob faulted — the promisor round-trip is unexercised",
+		).toBeGreaterThan(0)
 	})
 })

@@ -55,7 +55,7 @@ import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { type GitServer, serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { buildGitEnv, spawnGit } from "@/testing/spawn-git"
 
 const RUNS = 700
 const BOUND_MS = 45_000
@@ -74,13 +74,7 @@ function gitBounded(
 		const t0 = Date.now()
 		const child = spawn("git", ["-c", "gc.auto=0", ...args], {
 			cwd,
-			env: {
-				...Object.fromEntries(
-					Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")),
-				),
-				GIT_CONFIG_GLOBAL: "/dev/null",
-				GIT_CONFIG_NOSYSTEM: "1",
-			},
+			env: buildGitEnv(),
 		})
 		let out = ""
 		child.stdout.on("data", (d) => {

@@ -41,11 +41,9 @@ import { spawnGit } from "@/testing/spawn-git"
  * the orphans past the cutoff with `ageObjects`, never by sleeping on the wall
  * clock.
  *
- * RED now because `createGcScheduler` is a TDD stub: `drainOnce()` throws "pggit
- * gc-scheduler: not implemented (TDD stub)", and the store does not yet stamp
- * `repos.last_pushed_at`, so a pushed repo never becomes eligible. GREEN once the
- * store stamps `last_pushed_at` per push and `drainOnce()` drains the eligible set
- * per §6 (these tests assert that intended behaviour, not the stub's throw).
+ * ORIGINATED as the TDD suite written against a throwing `createGcScheduler` stub
+ * and a store that never stamped `repos.last_pushed_at`, so a pushed repo never
+ * became eligible. Both landed per §6; these cases are their regression gate.
  */
 describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6, SCH-7)", () => {
 	let fx: GcFixture

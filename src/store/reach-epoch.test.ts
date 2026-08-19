@@ -31,6 +31,8 @@ describe("reach-epoch position math", () => {
 				expect(splitOids(buf)).toEqual(sorted)
 				for (const [i, h] of sorted.entries()) expect(positionOf(buf, h)).toBe(i)
 			}),
+			// Pinned seed (424_242) for a deterministic gate, matching the sibling specs.
+			{ seed: 424_242 },
 		)
 	})
 
@@ -56,6 +58,8 @@ describe("reach-epoch position math", () => {
 				const bits = bitmapFromPositions(members.map((h) => positionOf(buf, h)))
 				expect(oidsOfUnion([bits], buf)).toEqual(members)
 			}),
+			// Pinned seed (424_242) for a deterministic gate, matching the sibling specs.
+			{ seed: 424_242 },
 		)
 	})
 

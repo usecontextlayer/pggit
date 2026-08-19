@@ -2,6 +2,20 @@ import { describe, expect, it } from "vitest"
 import { applyDelta } from "@/pack/delta"
 import { expectGitFormatError } from "@/testing/format-error"
 
+/** The delta header's LEB128 size varint (LSB group first), per gitformat-pack —
+ * re-derived here so the hand vectors own the format rather than importing it. */
+function sizeVarint(value: number): number[] {
+	const out: number[] = []
+	let v = value
+	do {
+		let b = v & 0x7f
+		v = Math.floor(v / 128)
+		if (v > 0) b |= 0x80
+		out.push(b)
+	} while (v > 0)
+	return out
+}
+
 describe("applyDelta", () => {
 	it("applies copy + insert instructions (hand-built vector)", () => {
 		const base = Buffer.from("hello world") // 11 bytes
@@ -25,6 +39,48 @@ describe("applyDelta", () => {
 		// then COPY op 0x80 with no offset/size bytes ⇒ offset 0, size 0 → 0x10000
 		const delta = Buffer.from([0x80, 0x80, 0x04, 0x80, 0x80, 0x04, 0x80])
 		expect(applyDelta(base, delta).equals(base)).toBe(true)
+	})
+
+	// The two WIDE COPY present-bit forms below are unreachable from our own
+	// encoder — `pushCopies` splits every run at 0xFFFF, so it never needs a third
+	// size byte, and no base a test can hold reaches a 2^24 offset. Real git emits
+	// both on large near-identical blobs, so they arrive from FOREIGN packs, where
+	// the bytes are attacker-controlled; hand vectors are the only way to reach
+	// them.
+	it("reads a COPY whose size is carried in the third (0x40) size byte", () => {
+		const base = Buffer.alloc(0x1_0008, 0x41)
+		base.write("HEAD", 0, "latin1")
+		base.write("MIDL", 0x8000, "latin1")
+		base.write("PAST", 0x1_0000, "latin1") // beyond the copied range
+		const delta = Buffer.from([
+			...sizeVarint(base.length),
+			...sizeVarint(0x1_0004),
+			0xc0, // COPY: offset bytes absent (⇒ 0), third size byte present…
+			0x01, // …⇒ size = 0x01 << 16 = 65536, both low size bytes zero
+			0x04, // INSERT 4 literal bytes — a mis-consumed size byte derails here
+			...Buffer.from("TAIL", "latin1"),
+		])
+		const got = applyDelta(base, delta)
+		expect(got.length).toBe(0x1_0004)
+		expect(got.subarray(0, 0x1_0000).equals(base.subarray(0, 0x1_0000))).toBe(true)
+		expect(got.subarray(0x1_0000).toString("latin1")).toBe("TAIL")
+	})
+
+	it("reads a COPY at an offset carried in the fourth (0x08) offset byte", () => {
+		// A fourth offset byte is only needed past 16 MiB, so the base must be that
+		// large. What is pinned is that the byte is consumed and scaled by 2^24; the
+		// branch's `+=` (rather than `|=`) arithmetic only becomes observable past
+		// 2^31, which no test-sized base can reach.
+		const base = Buffer.alloc(0x100_0010, 0x2e)
+		base.write("WIDE", 0x100_0000, "latin1")
+		const delta = Buffer.from([
+			...sizeVarint(base.length),
+			...sizeVarint(4),
+			0x98, // COPY: fourth offset byte present + first size byte present…
+			0x01, // …⇒ offset = 0x01 * 2^24 = 16,777,216
+			0x04, // …⇒ size = 4
+		])
+		expect(applyDelta(base, delta).toString("latin1")).toBe("WIDE")
 	})
 
 	it("round-trips a sub-minimum internal program (the wire boundary owns git's DELTA_SIZE_MIN)", () => {

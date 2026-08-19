@@ -7,6 +7,11 @@
  * `check_refname_format` as receive-pack applies it, plus the loose-ref
  * directory/file conflict (`refs/heads/a` vs `refs/heads/a/b`) checked in
  * git's sequential lock order.
+ *
+ * The two vector lists below are NAMED REGRESSIONS — each string is a rule someone
+ * had to discover. The general agreement with canonical git is pinned generatively
+ * against a spawned `git check-ref-format` in `src/generative/refname.spec.test.ts`;
+ * a new rule learned the hard way still belongs here, by name.
  */
 import { describe, expect, it } from "vitest"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"

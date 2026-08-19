@@ -21,12 +21,12 @@
  * `file://` bare remote driven through the identical dance. Partial-clone filters
  * (`blob:none`, `tree:0`) are exercised against the repacked repo too.
  *
- * The REF_DELTA count logged per shape is the proof the delta path was actually
- * on: a shape that serves 0 deltas proves nothing about deltified serving. The
- * source script printed it as a diagnostic rather than asserting a floor (a shape
- * like `tags` or `blob-edges` legitimately serves none), and so does this test —
- * it reads the count through `{ instrument: true }` + `collectedRuns()`, which is
- * why the app is built instrumented here.
+ * The REF_DELTA count served per shape is the proof the delta path was actually
+ * on: a shape that serves 0 deltas proves nothing about deltified serving. It is
+ * read through `{ instrument: true }` + `collectedRuns()` (which is why the app is
+ * built instrumented here) and asserted as a floor on every shape built so the
+ * delta wins; shapes that legitimately serve none (`tags`, `blob-edges`) simply
+ * omit `minDeltasServed`, so the exception is stated rather than assumed.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -68,6 +68,11 @@ type Shape = {
 	 * rewind a ref; the only orphan generator over the wire is a DENIED push,
 	 * which `orphan-anchor-tree-reuse` uses. */
 	force?: boolean
+	/** Floor on the REF_DELTA entries the post-repack clone must be served. Set on
+	 * every shape built so "the delta actually wins"; omitted where a shape
+	 * legitimately serves none (`tags`, `blob-edges`), so that exception is stated
+	 * rather than inferred from silence. */
+	minDeltasServed?: number
 }
 
 const shapes = new Map<string, Shape>()
@@ -563,6 +568,7 @@ shape("growing-plain", {
 		}
 		await fastImport(dir, out.join(""))
 	},
+	minDeltasServed: 1,
 })
 
 // B. growing dir made of GITLINKS — mode 160000 entries the repack's diff filters out.
@@ -577,6 +583,7 @@ shape("growing-gitlinks", {
 			`M 160000 ${createHash("sha1").update(`churn-${i}`).digest("hex")} deep/a/b/c/mod`,
 		],
 	}),
+	minDeltasServed: 1,
 })
 
 // C. growing dir whose subdirectory names are exotic-but-VALID UTF-8: NFC "é"
@@ -611,6 +618,7 @@ shape("growing-utf8-exotic", {
 		}
 		await fastImport(dir, out.join(""))
 	},
+	minDeltasServed: 1,
 })
 
 // D. growing dir + a single path cycling file → exec → symlink → directory.
@@ -627,6 +635,7 @@ shape("growing-modeswap", {
 			return [`D p`, `M 100644 :${m} p/inner`]
 		},
 	}),
+	minDeltasServed: 1,
 })
 
 // E. deep nesting AND growth: a 120-level chain with a growing dir at the bottom.
@@ -636,6 +645,7 @@ shape("deep-growing", {
 		entry: (i, blob) =>
 			`M 100644 :${blob(filler(`d${i}`, 250))} ${Array.from({ length: 120 }, (_, k) => `l${k}`).join("/")}/${uuidish(i)}/rec`,
 	}),
+	minDeltasServed: 1,
 })
 
 // F. a growing dir whose entries alternate between two blob contents forever
@@ -649,6 +659,7 @@ shape("growing-toggle", {
 			`M 100644 :${blob(i % 2 === 0 ? "B".repeat(500) : "A".repeat(500))} toggle/y`,
 		],
 	}),
+	minDeltasServed: 1,
 })
 
 // H. orphan an ANCHOR while a DELTA against it stays reachable (design N3), driven
@@ -660,6 +671,7 @@ shape("orphan-anchor-tree-reuse", {
 		commits: 300,
 		entry: (i, blob) => `M 100644 :${blob(filler(`o${i}`, 260))} runs/${uuidish(i)}/rec`,
 	}),
+	minDeltasServed: 1,
 	async mutate(dir, url, mirror, mk) {
 		// (1) mid-lineage trees get their own root commits on their own refs, so many
 		//     DELTA trees are reachable through a path that is not main.
@@ -784,6 +796,7 @@ shape("monster", {
 		}
 		await fastImport(dir, out.join(""))
 	},
+	minDeltasServed: 1,
 })
 
 // J. a long linear history — 10k commits, one file changing (scale + timing).
@@ -792,6 +805,7 @@ shape("linear-10k", {
 		commits: LINEAR,
 		entry: (i, blob) => `M 100644 :${blob(filler(`l${i}`, 400))} src/main.txt`,
 	}),
+	minDeltasServed: 1,
 })
 
 // K. mergetag / gpgsig-style multi-line commit headers — repack parses parent
@@ -882,6 +896,7 @@ shape("growing-repetitive-names", {
 		}
 		await fastImport(dir, out.join(""))
 	},
+	minDeltasServed: 1,
 })
 
 /** The sweep list: every shape EXCEPT the one confirmed defect, which has its own
@@ -967,13 +982,20 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 			resetCollected()
 			await spawnGit(["clone", "-q", "--bare", url, post])
 			const fr = collectedRuns().find((r) => r.label === "fetch")
-			// The proof the delta path was actually ON for this shape. Recorded, not
-			// asserted: some shapes (tags, blob-edges) legitimately serve zero deltas,
-			// and the source script printed this same line rather than gating on it.
+			const deltasServed = fr?.counters.get("deltasServed") ?? 0
 			console.log(
-				`shape ${name} — served: ${fr?.counters.get("deltasServed") ?? 0} REF_DELTA entries, ` +
+				`shape ${name} — served: ${deltasServed} REF_DELTA entries, ` +
 					`pack ${fr?.counters.get("packBytes") ?? 0} B`,
 			)
+			// The proof the delta path was actually ON for this shape. Every shape
+			// carrying a floor is built so the delta wins; without this the whole sweep
+			// stays green with deltified serving deleted.
+			if (s.minDeltasServed !== undefined) {
+				expect(
+					deltasServed,
+					`${name}: the delta serve path was not exercised`,
+				).toBeGreaterThanOrEqual(s.minDeltasServed)
+			}
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: post })
 			const postObjs = await objectList(post)
 			expect(postObjs.length).toBe(ctlObjs.length)
@@ -986,12 +1008,25 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 				const cf = join(mk(`${name}-cf`), "c.git")
 				await spawnGit(["clone", "-q", "--bare", `--filter=${f}`, `file://${mirror}`, cf])
 				await spawnGit(["clone", "-q", "--bare", `--filter=${f}`, url, pf])
-				const a = (await objectList(pf)).join("\n")
-				const b = (await objectList(cf)).join("\n")
-				// tree:0 is a KNOWN pre-existing gap (pggit ignores it and ships a
-				// superset — src/e2e/transport-filter-tree0.test.ts); only judge
-				// blob:none against the control, but require both to be usable.
-				if (f !== "tree:0") expect(a).toBe(b)
+				// "usable" asserted, not assumed — every other clone in this function
+				// is fsck'd and these were not.
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: pf })
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: cf })
+				const pgSet = new Set(await objectList(pf))
+				const ctlSet = new Set(await objectList(cf))
+				if (f === "tree:0") {
+					// tree:0 is a KNOWN pre-existing gap (pggit ignores it and ships a
+					// superset — src/e2e/transport-filter-tree0.test.ts). Pin the
+					// documented behaviour rather than nothing: the served set must
+					// CONTAIN the control's, so a change in the shape of the gap fails
+					// loudly instead of passing unnoticed.
+					expect(
+						[...ctlSet].filter((o) => !pgSet.has(o)),
+						`${name}: pggit's tree:0 clone is MISSING objects the control served`,
+					).toEqual([])
+				} else {
+					expect([...pgSet].sort().join("\n")).toBe([...ctlSet].sort().join("\n"))
+				}
 			}
 
 			const postRefs = await refList(post)

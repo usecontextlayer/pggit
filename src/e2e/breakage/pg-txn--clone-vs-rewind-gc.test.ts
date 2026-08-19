@@ -214,6 +214,13 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 	it("ran every race and reclaimed something on the way", () => {
 		expect(outcomes).toHaveLength(ITERS)
 		expect(outcomes.some((o) => o.gc.deletedObjects > 0)).toBe(true)
+		// The clone side needs the same floor the GC side already has: every verdict
+		// below fails only on corruption, so a server that refused all 12 raced
+		// clones passes them all while serving nothing.
+		expect(
+			outcomes.filter((o) => o.verdict === "complete").length,
+			outcomes.map(describeOf).join("\n"),
+		).toBeGreaterThan(0)
 	})
 
 	it("never serves a pack git calls corrupt", () => {

@@ -2,18 +2,18 @@
  * Property-based GC STRESS differential (`docs/2026-06-24-force-commit-gc-design.md`
  * §4, §8). The existing PBT-1/2/3 (`gc.spec.test.ts`) sample MANY SMALL repos
  * (~25 commands). This file is the complement: FEW fast-check runs, each candidate
- * a DEEP + WIDE repo with a LARGE orphan set, so GC's batched DELETE + anti-join,
- * the `git_edge` recursion, and the blob-from-tree enumeration are all exercised at
- * scale. It does NOT replace the small-candidate properties — it stresses the axes
- * they cannot reach.
+ * a DEEP + WIDE repo with a LARGE orphan set, so GC's batched DELETE + anti-join, the
+ * commit-parent recursion, the tree→subtree walk, and the blob-from-tree enumeration
+ * are all exercised at scale. It does NOT replace the small-candidate properties — it
+ * stresses the axes they cannot reach.
  *
  *   DEEP — a long commit CHAIN (tens of commits) seeded as one history, so the
- *          reachable closure walks a deep kind-2 (commit-parent) edge chain.
+ *          reachable closure walks a deep commit-parent chain.
  *   WIDE — large NESTED trees: tens-to-low-hundreds of files across a deep
  *          directory nesting (`a/b/c/d/e/file.txt`), so each snapshot fans into a
- *          long kind-3 (tree→subtree) edge chain and a wide blob set; PLUS many
- *          refs/branches, so the reachable closure and the live-set materialization
- *          are wide.
+ *          long tree→subtree walk and a wide blob set; PLUS many refs/branches, each
+ *          with a commit and a file of its OWN, so the reachable closure genuinely
+ *          spans many tips and the live-set materialization is wide.
  *   ORPHANS — many INDEPENDENT deep/wide histories are seeded into Postgres WITHOUT
  *          a ref (and, for the force-commit half, prior force-committed snapshots),
  *          so GC has a large genuinely-unreachable set to reclaim in MANY batches.
@@ -44,19 +44,19 @@
  * PERFORMANCE: each candidate is a full PG round-trip seeding tens of thousands of
  * rows, so the run counts are deliberately TINY (`NUM_RUNS`) and the seed is pinned
  * (424_242) for determinism, matching the sibling specs. The deep/wide builder uses
- * `git fast-import` (one process per history) + a single `cat-file --batch` loader
+ * `git fast-import` (one process per history) + a bespoke `cat-file --batch` loader
  * (one process for ALL object contents) — empirically ~0.5s to build+load a
- * 90-commit/120-file history vs ~128s for a per-object `cat-file` spawn loop, which
- * is why a bespoke builder exists rather than `buildRepoFromCommands` /
- * `loadAllObjects`. Each property logs the REALIZED scale (chain depth, files,
- * nesting, refs, orphan-set size) after `fc.assert` so the deep/wide reach is
- * VISIBLE.
+ * 90-commit/120-file history vs ~128s for `loadAllObjects`' per-object `cat-file`
+ * spawn loop, which is why the bespoke loader exists. Both run through `spawnGit`,
+ * so they inherit the pinned identity/clock and the GIT_* env scrub like every other
+ * oracle call — the batching is the only difference. Each property logs the REALIZED
+ * scale (chain depth, files, nesting, refs, orphan-set size) after `fc.assert` so the
+ * deep/wide reach is VISIBLE.
  *
- * RED until GC is implemented: the LARGE setup (build + seed) COMPLETES, then the
- * first `gc()` call throws the TDD stub's "pggit gc: not implemented (TDD stub)".
- * Each property goes green once GC honours the §4 contract. No assertion is weakened.
+ * Originated as the TDD spec for GC at scale (§4/§8) and ran RED against a throwing
+ * stub — the LARGE setup completed and the first `gc()` threw; it now pins the shipped
+ * contract.
  */
-import { spawn } from "node:child_process"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -95,10 +95,14 @@ type HistorySpec = {
 	files: number
 	nesting: number
 	salt: number
+	/** Extra branch tips forked off the chain — the WIDE-ref axis. Each gets a commit
+	 * and a file of its OWN, so its closure is NOT a subset of `main`'s. `main` is
+	 * always the chain tip and is never named here. */
+	branches?: readonly string[]
 }
 
 /** `a/b/c/d/e/file<i>.txt` — a deep nested path so each snapshot tree fans into a
- * long kind-3 (tree→subtree) edge chain (the WIDE+nested axis). `salt` rotates the
+ * long tree→subtree walk (the WIDE+nested axis). `salt` rotates the
  * directory letters so different histories occupy different subtree OIDs. */
 function nestedPath(fileIdx: number, nesting: number, salt: number): string {
 	const parts: string[] = []
@@ -113,8 +117,9 @@ function nestedPath(fileIdx: number, nesting: number, salt: number): string {
  * A `git fast-import` stream for one deep/wide history on `refs/heads/main`: a
  * `chainDepth`-long commit chain whose first commit writes every file and each
  * later commit mutates ~a third of them (so blobs/trees churn down the chain, the
- * DEEP axis). The pinned committer identity/clock keeps OIDs reproducible across a
- * rebuild (STRESS-3). Returns the stream text.
+ * DEEP axis), followed by one commit per extra branch (the WIDE-ref axis). The pinned
+ * committer identity/clock keeps OIDs reproducible across a rebuild (STRESS-3).
+ * Returns the stream text.
  */
 function fastImportStream(spec: HistorySpec): string {
 	const out: string[] = ["reset refs/heads/main"]
@@ -134,24 +139,32 @@ function fastImportStream(spec: HistorySpec): string {
 			}
 		}
 	}
+	// WIDE-ref axis. Each extra branch forks off the chain at a DIFFERENT depth and
+	// adds one commit carrying a uniquely-named file, so its tip reaches a blob, a
+	// subtree, a root tree and a commit that NO other tip reaches. Branches that were
+	// merely `main~k` would each sit wholly inside main's closure, and then dropping
+	// every ref but `main` would not change one assertion in this file — the multi-tip
+	// live-set materialization would go unexercised while the header advertised it.
+	const branches = spec.branches ?? []
+	for (let i = 0; i < branches.length; i++) {
+		const branch = branches[i]
+		if (branch === undefined) continue
+		out.push(`commit refs/heads/${branch}`, `committer ${FI_COMMITTER}`)
+		const msg = `branch ${branch} salt ${spec.salt}`
+		out.push(`data ${Buffer.byteLength(msg)}`, msg)
+		// Fork point: mark `chainDepth - (i+1)` is commit index `chainDepth-i-2`, so
+		// each branch hangs off the chain a little further back than the last.
+		out.push(`from :${Math.max(1, spec.chainDepth - (i + 1))}`)
+		const content = `branch ${branch} salt ${spec.salt}\n`
+		out.push(`M 100644 inline branches/${branch}.txt`)
+		out.push(`data ${Buffer.byteLength(content)}`, content)
+	}
 	return `${out.join("\n")}\n`
 }
 
 /** Feed a fast-import stream into a fresh repo `dir` (one process per history). */
-function fastImport(dir: string, stream: string): Promise<void> {
-	return new Promise<void>((resolve, reject) => {
-		const child = spawn("git", ["fast-import", "--quiet"], { cwd: dir })
-		const err: Buffer[] = []
-		child.stderr.on("data", (d: Buffer) => err.push(d))
-		child.on("error", reject)
-		child.on("close", (code) =>
-			code === 0
-				? resolve()
-				: reject(new Error(`fast-import exited ${code}: ${Buffer.concat(err)}`)),
-		)
-		child.stdin.write(stream)
-		child.stdin.end()
-	})
+async function fastImport(dir: string, stream: string): Promise<void> {
+	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: stream })
 }
 
 /**
@@ -159,49 +172,53 @@ function fastImport(dir: string, stream: string): Promise<void> {
  * process — the scale-critical alternative to `loadAllObjects` (which spawns one
  * `git` per object: ~128s for 6.5k objects vs ~120ms here). The `--batch` stream is
  * `<oid> <type> <size>\n<raw bytes>\n` per object; binary-safe (sizes drive the
- * cut, never newlines). Idempotent re-seeds in pggit dedupe by OID, so loading the
- * full object set (reachable + churned) is exactly the orphan-bearing seed GC must
- * reclaim down to the reachable closure.
+ * cut, never newlines), which is why it reads `stdoutBytes` and never `stdout`.
+ * Idempotent re-seeds in pggit dedupe by OID, so loading the full object set
+ * (reachable + churned) is exactly the orphan-bearing seed GC must reclaim down to
+ * the reachable closure.
+ *
+ * The parse is LOUD in both directions — a short or malformed record throws instead
+ * of resolving a truncated list. A silently-truncated ORPHAN load is invisible
+ * downstream (fewer orphans just means less for GC to reclaim, and every assertion
+ * still passes), so the parser is the only place that failure can be caught.
  */
-function loadAllObjectsBatched(dir: string): Promise<PackInputObject[]> {
-	return new Promise<PackInputObject[]>((resolve, reject) => {
-		const list = spawn("git", [
-			"-C",
-			dir,
-			"cat-file",
-			"--batch-all-objects",
-			"--batch-check=%(objectname)",
-		])
-		const idChunks: Buffer[] = []
-		list.stdout.on("data", (d: Buffer) => idChunks.push(d))
-		list.on("error", reject)
-		list.on("close", () => {
-			const oids = Buffer.concat(idChunks).toString("utf8").trim().split("\n")
-			const cat = spawn("git", ["-C", dir, "cat-file", "--batch"])
-			const chunks: Buffer[] = []
-			cat.stdout.on("data", (d: Buffer) => chunks.push(d))
-			cat.on("error", reject)
-			cat.on("close", () => {
-				const buf = Buffer.concat(chunks)
-				const objs: PackInputObject[] = []
-				let pos = 0
-				while (pos < buf.length) {
-					const nl = buf.indexOf(0x0a, pos)
-					const [, type, sizeStr] = buf.toString("utf8", pos, nl).split(" ")
-					const size = Number.parseInt(sizeStr ?? "", 10)
-					const start = nl + 1
-					objs.push({
-						content: buf.subarray(start, start + size),
-						type: type as GitObjectType,
-					})
-					pos = start + size + 1 // skip the record's trailing LF
-				}
-				resolve(objs)
-			})
-			for (const oid of oids) cat.stdin.write(`${oid}\n`)
-			cat.stdin.end()
-		})
+async function loadAllObjectsBatched(dir: string): Promise<PackInputObject[]> {
+	const listed = await spawnGit(
+		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+		{ cwd: dir },
+	)
+	const oids = listed.stdout.trim().split("\n").filter(Boolean)
+	if (oids.length === 0) return []
+
+	const batch = await spawnGit(["cat-file", "--batch"], {
+		cwd: dir,
+		input: `${oids.join("\n")}\n`,
 	})
+	const buf = batch.stdoutBytes
+	const objs: PackInputObject[] = []
+	let pos = 0
+	while (pos < buf.length) {
+		const nl = buf.indexOf(0x0a, pos)
+		if (nl === -1) throw new Error(`cat-file --batch: no record header at byte ${pos}`)
+		const header = buf.toString("utf8", pos, nl)
+		const [, type, sizeStr] = header.split(" ")
+		const size = Number.parseInt(sizeStr ?? "", 10)
+		if (type === undefined || !Number.isSafeInteger(size)) {
+			throw new Error(`cat-file --batch: unparseable header ${JSON.stringify(header)}`)
+		}
+		const start = nl + 1
+		objs.push({ content: buf.subarray(start, start + size), type: type as GitObjectType })
+		pos = start + size + 1 // skip the record's trailing LF
+	}
+	if (pos !== buf.length) {
+		throw new Error(`cat-file --batch: stream ended mid-record (${pos} vs ${buf.length})`)
+	}
+	if (objs.length !== oids.length) {
+		throw new Error(
+			`cat-file --batch: read ${objs.length} objects, asked for ${oids.length}`,
+		)
+	}
+	return objs
 }
 
 /** Build one deep/wide history on disk (fast-import), load all its objects, capture
@@ -221,9 +238,9 @@ async function buildHistory(
 	}
 }
 
-/** The deep/wide branch names — the WIDE-ref axis. One live history is published
- * under several of these (each branch a window onto the same chain at a different
- * depth), so the reachable closure spans many ref tips. */
+/** The deep/wide branch names — the WIDE-ref axis. `main` is the chain tip; every
+ * other name gets its own fork commit and its own file in the same fast-import
+ * stream, so each tip contributes objects no other tip reaches. */
 const BRANCHES = [
 	"main",
 	"feature",
@@ -239,11 +256,15 @@ const BRANCHES = [
 
 /**
  * Build ONE on-disk live repo with a deep chain + wide nested trees + MANY branch
- * refs (each branch points at a distinct commit along the chain so the closure
+ * refs (each branch forks off the chain and adds a commit of its own, so the closure
  * genuinely spans them), seed its full object set + every branch ref into Postgres
  * under `repo`, then seed several INDEPENDENT (salted) deep/wide histories WITHOUT a
  * ref — the large orphan set GC must reclaim. Returns the on-disk live source dir
  * (the survivor oracle; CALLER cleans it) and the realized scale of the seed.
+ *
+ * Both stressor axes are ESTABLISHED here rather than advertised: the multi-tip
+ * closure must be strictly larger than `main`'s alone, and the orphan seed must be
+ * non-empty. Neither has a downstream assertion that would notice its absence.
  */
 async function seedDeepWideRepo(
 	fx: GcFixture,
@@ -256,39 +277,43 @@ async function seedDeepWideRepo(
 		orphanChains: number
 	},
 ): Promise<{ liveDir: string; orphanObjects: number }> {
+	// BRANCHES[0] is `main` (the chain tip itself); the rest fork off it in-stream.
+	const refCount = Math.min(params.refCount, BRANCHES.length)
+	const extraBranches = BRANCHES.slice(1, refCount)
+
 	const liveDir = mkdtempSync(join(tmpdir(), "pggit-stress-live-"))
 	await spawnGit(["init", "-q", "-b", "main"], { cwd: liveDir })
 	await fastImport(
 		liveDir,
 		fastImportStream({
+			branches: extraBranches,
 			chainDepth: params.chainDepth,
 			files: params.files,
 			nesting: params.nesting,
 			salt: 0,
 		}),
 	)
-	// WIDE-ref axis: branch `refCount` names off commits spread along the chain, so
-	// the live closure spans many tips (not all reaching the same single tip).
-	const refCount = Math.min(params.refCount, BRANCHES.length)
+	// fast-import wrote every ref, so the tips are read back rather than constructed.
 	const liveRefs: { name: string; oid: string }[] = []
-	for (let i = 0; i < refCount; i++) {
-		const branch = BRANCHES[i] ?? "main"
-		// Commit `chainDepth - 1 - i` (clamped): `main` = tip, later branches sit a
-		// few commits back, so dropping none still spans distinct closures per tip.
-		const depthBack = Math.min(i, params.chainDepth - 1)
+	for (const branch of ["main", ...extraBranches]) {
 		const oid = (
-			await spawnGit(["rev-parse", `main~${depthBack}`], { cwd: liveDir })
+			await spawnGit(["rev-parse", `refs/heads/${branch}`], { cwd: liveDir })
 		).stdout.trim()
 		liveRefs.push({ name: `refs/heads/${branch}`, oid })
 	}
-	// Materialize every branch on disk too, so the on-disk oracle's `--all` closure
-	// matches exactly what Postgres holds as live (the STRESS-1 differential).
-	for (const ref of liveRefs) {
-		const branch = ref.name.replace("refs/heads/", "")
-		if (branch !== "main") {
-			await spawnGit(["branch", branch, ref.oid], { cwd: liveDir })
-		}
-	}
+	// The WIDE-ref axis, established: the all-refs closure must reach objects `main`
+	// alone does not, or "the live closure spans many tips" is a claim no assertion
+	// in this file can feel.
+	const mainClosure = (
+		await spawnGit(["rev-list", "--objects", "main"], { cwd: liveDir })
+	).stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean).length
+	expect(
+		(await gitReachableOids(liveDir)).length,
+		"the branch tips reach nothing main does not — the WIDE-ref axis is not exercised",
+	).toBeGreaterThan(mainClosure)
 
 	await fx.objects.putPack(repo, await loadAllObjectsBatched(liveDir))
 	for (const ref of liveRefs) await fx.refs.setRef(repo, ref.name, ref.oid)
@@ -306,6 +331,10 @@ async function seedDeepWideRepo(
 		await fx.objects.putPack(repo, orphan.objects)
 		orphanObjects += orphan.objects.length
 	}
+	expect(
+		orphanObjects,
+		"no orphan objects seeded — the multi-batch DELETE stressor never happens",
+	).toBeGreaterThan(0)
 	return { liveDir, orphanObjects }
 }
 
@@ -451,9 +480,20 @@ describe("§4 PBT stress — deep + wide GC differential at scale", () => {
 
 						await fx.gc.gc(repo, { graceSeconds: 0 })
 
+						// GC reclaimed a LARGE set: the seed carried whole orphan histories, so
+						// strictly fewer objects must survive than went in. Without this the
+						// equality below is equally satisfied by a candidate whose orphan seed
+						// silently never landed — which is exactly what a truncated load looks
+						// like from here.
+						const survivors = await objectOids(fx.db, repo)
+						expect(
+							survivors.length,
+							"nothing was reclaimed — the orphan set never reached the store",
+						).toBeLessThan(seeded)
+
 						// Survivors in Postgres == real-git reachable closure over the on-disk live
 						// source (all branch tips + peeled tags). Neither over- nor under-deletes.
-						expect(await objectOids(fx.db, repo)).toEqual(await gitReachableOids(liveDir))
+						expect(survivors).toEqual(await gitReachableOids(liveDir))
 						// And a live ref still fetches fsck-clean end-to-end.
 						await fetchAndFsck(fx, repo)
 					} finally {

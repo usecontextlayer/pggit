@@ -1,14 +1,20 @@
 /**
- * Lifecycle breakage — incremental push/repack chain + repack idempotence.
+ * Repack is idempotent across an incremental push chain: a 200-commit
+ * append-only history delivered in five widening slices (40, 80, 120, 160, 201
+ * commits), each followed by two repack passes and a mirror clone compared
+ * against a plain `file://` bare remote carrying the same visible history.
  *
- * Converted from `breakage/lifecycle--incremental-repack-idempotence.ts`
- * (exploration 1), mechanically and at full scale: a 200-commit append-only
- * history delivered in five widening slices (40, 80, 120, 160, 201 commits),
- * each followed by two repack passes and a mirror clone compared against a
- * plain `file://` bare remote carrying the same visible history. The second
- * repack of a round must be a strict no-op — the tier is derived, so a pass over
- * an already-covered repo has nothing to write. The source exits 1 when that
- * fails; the assertions here state the correct outcome, so a reproduction is RED.
+ * THE CONTRACT, per round: the FIRST repack does real work — each slice adds at
+ * least 40 commits of genuinely new objects, and without that floor a repack
+ * that permanently encoded nothing would satisfy every assertion here while the
+ * clones quietly came off the undeltified raw path — and the SECOND is a strict
+ * no-op, because the tier is derived and a pass over an already-covered repo has
+ * nothing to write. Every round's clone must then be fsck-clean and carry exactly
+ * the oracle's object set and refs.
+ *
+ * Originated as exploration-1 probe
+ * `lifecycle--incremental-repack-idempotence.ts` (exit 1 when the second pass
+ * wrote anything), which reproduced non-idempotent repack; fixed.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -140,6 +146,7 @@ function at<T>(xs: T[], i: number): T {
 
 type RoundResult = {
 	commits: number
+	first: RepackResult
 	second: RepackResult
 	objectsOnlyPg: number
 	objectsOnlyRef: number
@@ -174,7 +181,7 @@ describe("lifecycle breakage — incremental repack idempotence", () => {
 			const tip = at(commits, upto - 1)
 			await spawnGit(["push", "-q", url, `${tip}:refs/heads/main`], { cwd: src })
 			await spawnGit(["push", "-q", ref, `${tip}:refs/heads/main`], { cwd: src })
-			await repack.repack(REPO)
+			const first = await repack.repack(REPO)
 			const second = await repack.repack(REPO)
 
 			const a = dir(`pg-${round}`)
@@ -184,6 +191,7 @@ describe("lifecycle breakage — incremental repack idempotence", () => {
 			const objDiff = diffLists(pgc.objects, refc.objects)
 			rounds.push({
 				commits: upto,
+				first,
 				fsck: pgc.fsck,
 				objectsOnlyPg: objDiff.onlyA.length,
 				objectsOnlyRef: objDiff.onlyB.length,
@@ -200,6 +208,18 @@ describe("lifecycle breakage — incremental repack idempotence", () => {
 		await server?.close()
 		await db?.drop()
 		if (root) rmSync(root, { force: true, recursive: true })
+	})
+
+	it("does real encoding work in every incremental round", () => {
+		// The floor under the no-op claim below: every slice adds at least 40 commits
+		// of new objects, so a first pass that encoded nothing is a broken repack —
+		// and one that permanently encodes nothing passes every other test in this
+		// file, serving every clone off the raw path.
+		expect(
+			rounds
+				.filter((r) => r.first.wholes + r.first.deltas === 0)
+				.map((r) => `${r.commits} commits`),
+		).toEqual([])
 	})
 
 	it("makes the second repack of every incremental round a strict no-op", () => {

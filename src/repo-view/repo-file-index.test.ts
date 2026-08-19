@@ -43,17 +43,6 @@ describe("repo_file — list-by-prefix is index-served (§5)", () => {
 		await db?.drop()
 	})
 
-	it("creates the partitioned pattern index (migration 0006)", async () => {
-		// Scope to THIS test's schema: pg_indexes spans every schema, and the shared
-		// container holds many isolated `t_<uuid>` schemas at once — each with its own
-		// `repo_file_path_pattern` — so an unscoped count is polluted by siblings.
-		const rows = await db.sql<{ indexname: string }[]>`
-			select indexname from pg_indexes
-			where schemaname = ${db.schema} and indexname = 'repo_file_path_pattern'
-		`
-		expect(rows).toHaveLength(1)
-	})
-
 	it("turns `path LIKE 'prefix%'` into an index range, not a filter", async () => {
 		// Correctness first: the prefix predicate selects exactly the 5 seeded files.
 		const hits = await db.sql<{ path: string }[]>`

@@ -11,7 +11,9 @@
  *
  * Both suites are kept as their own top-level describe blocks (the safe combine):
  * their `postUploadPack` helpers have different signatures, so each lives in its
- * own block scope to avoid a top-level redeclaration.
+ * own block scope to avoid a top-level redeclaration. The git-oracle helpers come
+ * from `@/testing/git-fixtures` — a local copy would miss every guarantee added at
+ * that seam.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -19,38 +21,14 @@ import { join } from "node:path"
 import { gzipSync } from "node:zlib"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import type { GitObjectType } from "@/object/object"
-import type { PackInputObject } from "@/pack/write-pack"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { allObjectOids, loadAllObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-
-async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-		{ cwd: dir },
-	)
-	const objs: PackInputObject[] = []
-	for (const line of list.stdout.trim().split("\n")) {
-		const [oid, type] = line.split(" ")
-		if (!oid || !type) continue
-		const raw = await spawnGit(["cat-file", type, oid], { cwd: dir })
-		objs.push({ content: raw.stdoutBytes, type: type as GitObjectType })
-	}
-	return objs
-}
-
-async function allObjectOids(dir: string): Promise<string[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-		{ cwd: dir },
-	)
-	return list.stdout.trim().split("\n").sort()
-}
 
 // A minimal, valid v2 `ls-refs` request (command + delim + flush, no args → list
 // every ref). Built from our own pkt-line encoders so the gzip cases test the
@@ -173,26 +151,17 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 })
 
 /**
- * pro02 protocol-http-boundary — a POST that declares `Content-Encoding: gzip`
- * but carries a body that is NOT valid gzip is a CLIENT-side wire fault, and it
- * MUST surface as a clean HTTP 400, exactly like every other malformed/unsupported
- * encoding already does (`deflate` → 400, `br` → 400, `unknownfoo` → 400 — all via
- * `GitProtocolError`).
+ * pro02 protocol-http-boundary — a POST that declares `Content-Encoding: gzip` but
+ * carries a body that is NOT valid gzip is a CLIENT-side wire fault, and it comes
+ * back as a clean HTTP 400 — exactly like every other malformed or unsupported
+ * encoding (`deflate`, `br`, `unknownfoo`, all via `GitProtocolError`), and like
+ * `git http-backend`, which never 500s on a malformed request body.
  *
- * THE BUG: `readRequestBody` (src/index.ts:53) calls `gunzipSync(raw)` UNGUARDED.
- * On a body that fails to inflate, Node throws a `ZlibError` ("incorrect header
- * check"), which is NOT a `GitProtocolError`, so `createGitApp`'s onError maps it
- * to HTTP 500 "internal server error" — a server fault for a client mistake, and
- * an INCONSISTENCY with the sibling encodings that all return a clean 400.
- *
- * ORACLE EXPECTATION: a declared-gzip body that fails to inflate is a bad request
- * body → clean 400 (like the sibling encodings, and like `git http-backend`, which
- * never 500s on a malformed request body). The fix is trivial: wrap `gunzipSync`
- * and rethrow as a `GitProtocolError`, sharing the existing 400 path.
- *
- * This test is EXPECTED-RED on current code: it asserts the oracle 400 while the
- * server still returns 500. The RED IS the reproduction. It flips to GREEN once
- * pggit wraps the gunzip failure as a GitProtocolError.
+ * ORIGINATED as the breakage probe for an UNGUARDED `gunzipSync` in the request-body
+ * reader: a body that failed to inflate threw a zlib error, which — not being a
+ * `GitProtocolError` — fell through to onError as HTTP 500, a server fault reported
+ * for a client mistake and an inconsistency with every sibling encoding. Fixed by
+ * rethrowing the inflate failure as a GitProtocolError onto the shared 400 path.
  *
  * Observed against the wire (the in-process Hono app over a real listening port),
  * asserting only the HTTP status the client sees — not any internal zlib detail.

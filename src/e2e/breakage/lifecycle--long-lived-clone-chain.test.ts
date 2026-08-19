@@ -4,14 +4,14 @@
  * clone must stay fsck-clean and object-identical to a file:// reference remote
  * subjected to the same sequence. Mixed encoded/unencoded serving throughout.
  *
- * Converted from `breakage/lifecycle--long-lived-clone-chain.ts` (exploration 6),
- * mechanically and at full scale — 160 seed commits, 50 incremental rounds, then
- * 8 rewind rounds where a force-move + gc(0) + repack precedes a forced fetch and
- * a FRESH mirror clone (the real oracle for the SERVED state). Repack runs on 2
- * of every 3 rounds and gc every 7th, exactly as the source did, so the served
- * pack mixes encoded and unencoded objects. The source exits 1 when a round
- * diverges; the assertions here state the correct outcome, so a live divergence
- * is RED.
+ * Full scale — 160 seed commits, 50 incremental rounds, then 8 rewind rounds
+ * where a force-move + gc(0) + repack precedes a forced fetch and a FRESH mirror
+ * clone (the real oracle for the SERVED state). Repack runs on 2 of every 3
+ * rounds and gc every 7th, so the served pack mixes encoded and unencoded
+ * objects.
+ *
+ * Originated as exploration-6 probe `lifecycle--long-lived-clone-chain.ts` (exit
+ * 1 when a round diverged from the reference remote); fixed.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"

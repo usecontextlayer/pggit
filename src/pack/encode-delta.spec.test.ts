@@ -18,8 +18,11 @@
  *      tree.
  *
  *   3. ADVERSARIAL VECTORS. The specific encodings with teeth — a COPY of exactly
- *      0x10000, an offset whose low bytes are zero, a run past the 3-byte size field.
- *      Fuzzing reaches these only by luck, so they are pinned by hand.
+ *      0x10000, an offset whose low bytes are zero, a run past the encoder's 0xFFFF
+ *      COPY-size split. Fuzzing reaches these only by luck, so they are pinned by
+ *      hand. The reader's WIDER forms (a 3-byte COPY size, a 4-byte COPY offset) are
+ *      unreachable from this encoder by construction and belong to the reader's own
+ *      hand vectors in `delta.test.ts`.
  *
  * The oracle is `applyDelta`, and it is NOT self-referential: `applyDelta` is already
  * pinned against GIT-PRODUCED deltas in `read-pack.test.ts`, so it is an independently
@@ -292,11 +295,12 @@ describe("encodeDelta — adversarial encodings", () => {
 		expectRoundTrip(base, Buffer.concat([marker, filler]))
 	})
 
-	it("handles a run longer than the 3-byte COPY size field", () => {
-		// A single COPY size maxes out at 0xFFFFFF (16 MiB). A longer run must be split
-		// into consecutive COPYs with a correctly ADVANCED offset — getting the advance
-		// wrong yields a plausible-looking delta of the right length and wrong content.
-		const base = Buffer.alloc(0x100_0004)
+	it("handles a run longer than the encoder's 0xFFFF COPY-size split", () => {
+		// `pushCopies` caps every COPY at 0xFFFF bytes, so a longer run becomes
+		// consecutive COPYs with a correctly ADVANCED offset — getting the advance
+		// wrong yields a plausible-looking delta of the right length and wrong
+		// content. 200 KiB crosses that boundary three times.
+		const base = Buffer.alloc(200 * 1024)
 		for (let i = 0; i < base.length; i++) base[i] = (i * 31) & 0xff
 		expectRoundTrip(base, base)
 	})

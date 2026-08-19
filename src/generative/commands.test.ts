@@ -9,8 +9,34 @@ import { spawnGit } from "@/testing/spawn-git"
 // must yield a valid (fsck-clean) repo and never run an invalid command (which
 // would make `git` exit non-zero and `spawnGit` throw). This guards that core
 // directly; the differentials in `*.spec.test.ts` consume it. All run on one gate.
+//
+// It must ALSO produce a corpus with real graph shape. Every invalid-op guard in
+// `step` is a silent `return`, so a regression that makes a command kind unreachable
+// reduces every candidate — in this file and in all six consuming differentials — to
+// a linear single-branch repo, and nothing goes red: agreement between the model and
+// git holds perfectly when both say "one branch, no tags, no merges". The corpus
+// floors below are the one place that failure mode is observable.
+
+/** The realized shape of the sampled corpus, folded in per candidate from the
+ * real-git oracle plus the model. Floored after `fc.assert` — the seed is pinned, so
+ * the counts are deterministic and a floor is a gate, not a flake. */
+type CorpusShape = {
+	candidates: number
+	withMerge: number
+	withTagObject: number
+	withSecondBranch: number
+	withTag: number
+}
+
 describe("repoCommands generator + buildRepoFromCommands replay", () => {
 	it("replays ANY generated command list into an fsck-clean repo whose model matches git", async () => {
+		const shape: CorpusShape = {
+			candidates: 0,
+			withMerge: 0,
+			withSecondBranch: 0,
+			withTag: 0,
+			withTagObject: 0,
+		}
 		await fc.assert(
 			fc.asyncProperty(repoCommands({ maxCommands: 25 }), async (commands) => {
 				const { dir, model } = await buildRepoFromCommands(commands)
@@ -48,6 +74,22 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 						.filter(Boolean)
 						.sort()
 					expect(tags).toEqual([...model.tags].sort())
+
+					// 5. Fold this candidate's realized shape in (git oracle + model) for the
+					// corpus floors below. `--merges` lists merge commits over ALL refs; a
+					// `tag`-typed ref is an annotated tag OBJECT (a lightweight tag is a
+					// commit-typed ref, counted by `withTag` from the model instead).
+					const merges = (
+						await spawnGit(["rev-list", "--all", "--merges"], { cwd: dir })
+					).stdout.trim()
+					const refTypes = (
+						await spawnGit(["for-each-ref", "--format=%(objecttype)"], { cwd: dir })
+					).stdout
+					shape.candidates++
+					if (merges !== "") shape.withMerge++
+					if (refTypes.split("\n").some((t) => t.trim() === "tag")) shape.withTagObject++
+					if (model.existingBranches.size >= 2) shape.withSecondBranch++
+					if (model.tags.size > 0) shape.withTag++
 				} finally {
 					rmSync(dir, { force: true, recursive: true })
 				}
@@ -56,23 +98,63 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 			// Broad seed exploration of the generator happens during development.
 			{ numRuns: 30, seed: 424_242 },
 		)
+
+		// The corpus floors: the counts the pinned seed realizes today. Each one falling
+		// means the corresponding command kind stopped landing and every consuming
+		// differential quietly lost that dimension. Raising a floor is fine (a richer
+		// corpus); dropping one is the regression these exist to red.
+		//
+		// MERGE IS DELIBERATELY NOT FLOORED HERE: at seed 424_242 / 30 runs the corpus
+		// realizes ZERO merge commits (logged below), so a positive floor would be a
+		// false claim and a zero floor would assert nothing. Merge reachability is
+		// instead pinned by the hand-picked case below — the only place in the corpus
+		// where a multi-parent commit is guaranteed. Making the RANDOM corpus reach
+		// merges needs a generator change, which is not this pass.
+		console.log(
+			`[repoCommands corpus] candidates=${shape.candidates} merge=${shape.withMerge} ` +
+				`tag-object=${shape.withTagObject} second-branch=${shape.withSecondBranch} ` +
+				`tag=${shape.withTag}`,
+		)
+		expect(shape.candidates, "the property sampled nothing").toBe(30)
+		expect(
+			shape.withTagObject,
+			"no candidate produced an annotated-tag object",
+		).toBeGreaterThanOrEqual(1)
+		expect(
+			shape.withSecondBranch,
+			"no candidate produced a second branch",
+		).toBeGreaterThanOrEqual(4)
+		expect(shape.withTag, "no candidate produced a tag").toBeGreaterThanOrEqual(2)
 	}, 180_000)
 
-	it("can generate a repo with commits, a branch, and a tag (coverage smoke)", async () => {
+	it("can generate a repo with commits, a branch, a MERGE, and a tag (coverage smoke)", async () => {
 		// A hand-picked sequence proving the vocabulary actually produces graph shape.
+		// The merge half is load-bearing: the random corpus above realizes zero merge
+		// commits at the pinned seed, so this is the ONLY place a multi-parent commit
+		// is guaranteed — if `step`'s merge guard ever starts skipping unconditionally,
+		// this is what goes red. The two branches must DIVERGE (each gets its own
+		// commit) or git fast-forwards and records no merge commit at all.
 		const { dir, model } = await buildRepoFromCommands([
 			{ content: { kind: "text", value: "alpha\n" }, kind: "writeFile", path: "a.txt" },
 			{ kind: "commit" },
-			{ idx: 0, kind: "branch" },
-			{ idx: 0, kind: "checkout" },
+			{ idx: 0, kind: "branch" }, // "feature" at the first commit
+			{ idx: 1, kind: "checkout" }, // onto "feature"
 			{ content: { kind: "text", value: "beta\n" }, kind: "writeFile", path: "b.txt" },
 			{ kind: "commit" },
+			{ idx: 0, kind: "checkout" }, // back onto "main"
+			{ content: { kind: "text", value: "gamma\n" }, kind: "writeFile", path: "g.txt" },
+			{ kind: "commit" }, // main now diverges from feature
+			{ idx: 0, kind: "merge" }, // merge "feature" into "main"
 			{ annotated: true, idx: 1, kind: "tag" },
 		])
 		try {
 			expect(model.commitCount).toBeGreaterThanOrEqual(2)
 			expect(model.existingBranches.size).toBeGreaterThanOrEqual(2)
 			expect(model.tags.size).toBe(1)
+			const merges = (
+				await spawnGit(["rev-list", "--all", "--merges"], { cwd: dir })
+			).stdout.trim()
+			expect(merges, "the merge command produced no multi-parent commit").not.toBe("")
 			await spawnGit(["fsck", "--full"], { cwd: dir })
 		} finally {
 			rmSync(dir, { force: true, recursive: true })

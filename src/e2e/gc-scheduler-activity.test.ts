@@ -27,9 +27,9 @@ import { spawnGit } from "@/testing/spawn-git"
  * pushes themselves (each push is a distinct round-trip, so `clock_timestamp()`
  * advances between them — no wall-clock sleep, no `ageObjects`).
  *
- * RED now because the store does NOT yet stamp `repos.last_pushed_at` (it stays
- * NULL after a push), so `expect(...).not.toBeNull()` rejects. GREEN once the
- * store writes the bump per §3.
+ * ORIGINATED as the TDD suite for the activity stamp, written while the store did
+ * not yet write `repos.last_pushed_at` at all (it stayed NULL after a push). The
+ * stamp landed per §3; these cases are its regression gate.
  */
 describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 	let fx: GcFixture

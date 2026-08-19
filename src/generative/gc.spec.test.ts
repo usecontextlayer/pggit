@@ -19,21 +19,24 @@
  *           byte-identical. Generalises GC-6.
  *
  * OBSERVABLE-ONLY: assertions read only the real-`git` oracle (rev-list / fetch /
- * fsck), Postgres rows (`git_object` / `git_edge` via the helpers), and the `gc()`
- * return value. Nothing probes GC internals. Grace is made deterministic by
- * `ageObjects` + `graceSeconds: 0`, never a wall-clock sleep.
+ * fsck), Postgres rows (`git_object` via the helpers), and the `gc()` return value.
+ * Nothing probes GC internals. Grace is made deterministic by `ageObjects` +
+ * `graceSeconds: 0`, never a wall-clock sleep.
  *
  * SAMPLING (`NUM_RUNS` / `NUM_RUNS_REWIND`): the fast-check seed is pinned (424_242)
  * so every run is reproducible, but the run count is CI-aware — a small count
  * locally (each candidate is a full PG round-trip) and a broad count under `CI` so
  * the thin annotated-tag / nested-tree / dropped-ref corners actually get sampled.
- * Each property folds every candidate's shape into a `ShapeCoverage` tally and logs
- * the fractions once after `fc.assert`, so thin coverage is VISIBLE (surfaced, not
- * yet enforced — no assertion depends on it).
+ * Each property folds every candidate's shape into a `ShapeCoverage` tally and FLOORS
+ * it after `fc.assert`: the floors are the counts the pinned seed realizes locally,
+ * and a broader CI run only ever exceeds them (same seed ⇒ the local corpus is a
+ * prefix of the CI one). Without those floors a generator regression that degenerated
+ * every candidate — no dropped ref, hence nothing unreachable to reclaim — would leave
+ * "GC deleted nothing" indistinguishable from "GC is correct", with every property green.
  *
- * RED until GC is implemented: every `gc()` call throws the TDD stub's
- * "not implemented" today; each property goes green once GC honours the §4
- * contract. (`buildRepoFromCommands` builds in `/tmp`; the caller cleans it.)
+ * Originated as the TDD spec for GC (§4) and ran RED against a throwing stub until GC
+ * landed; it now pins the shipped contract. (`buildRepoFromCommands` builds in `/tmp`;
+ * the caller cleans it.)
  */
 import { rmSync } from "node:fs"
 import fc from "fast-check"
@@ -125,8 +128,8 @@ async function seedSubset(
 /**
  * The shape-coverage classification of one seeded candidate (GAP-3). These are the
  * three corners the reviewer flagged as thinly sampled; tallying them (see
- * `ShapeCoverage`) makes coverage VISIBLE (it surfaces, does not yet enforce, that
- * the property actually exercised them). All three are derived purely from the
+ * `ShapeCoverage`) and flooring the tally is what makes "the property actually
+ * exercised them" a claim the suite can fail. All three are derived purely from the
  * real-`git` oracle over the on-disk source + the kept/dropped ref split — no GC
  * internals are touched.
  *
@@ -197,8 +200,8 @@ async function shapeOfCandidate(
  * is the lightweight, deterministic alternative to `fc.statistics` (whose own
  * standalone sampling pass would re-build repos and break the one-seed PG-round-trip
  * budget): the property folds each candidate's shape into the same counter, and the
- * test logs the fractions ONCE after `fc.assert`. Thin sampling is then VISIBLE — a
- * 0/N corner in the output is the reviewer's "barely sampled" signal made concrete.
+ * test logs the fractions ONCE after `fc.assert` and then FLOORS them
+ * (`expectShapeFloors`). A 0/N corner is a failure, not a number in the output.
  */
 type ShapeCoverage = {
 	total: number
@@ -224,8 +227,7 @@ function frac(n: number, total: number): string {
 	return `${n}/${total} (${pct}%)`
 }
 
-/** Print the shape-coverage tally for one property (the GAP-3 visibility surface).
- * Logged, never asserted — it surfaces the corner coverage, it does not enforce it. */
+/** Print the shape-coverage tally for one property (the GAP-3 visibility surface). */
 function logCoverage(label: string, cov: ShapeCoverage): void {
 	console.log(
 		`[gc-pbt shape coverage] ${label}: ` +
@@ -236,13 +238,50 @@ function logCoverage(label: string, cov: ShapeCoverage): void {
 }
 
 /**
- * Run counts: keep the PG-round-trip cost low LOCALLY (the historical thin counts),
- * but let CI sample BROADLY so the annotated-tag / nested-tree / dropped-ref corners
- * are actually hit (GAP-3). The seed stays pinned (424_242) so every run — local or
- * CI — is reproducible. `process.env.CI` is read defensively (it may be undefined).
+ * The corner floors: what the pinned seed (424_242) realizes at the LOCAL run count.
+ * `droppedUnreachable` is the load-bearing one — a corpus in which no candidate drops
+ * a ref has an empty unreachable set everywhere, and "GC deleted nothing" then passes
+ * PBT-1 and PBT-3 identically to "GC is correct". The other two guard the annotated-tag
+ * and nested-subtree corners the generator is meant to reach. A broader CI run draws
+ * the same candidate sequence and simply exceeds these.
+ */
+const SHAPE_FLOORS = {
+	annotatedTag: 5,
+	droppedUnreachable: 2,
+	nestedTree: 16,
+} as const
+
+function expectShapeFloors(label: string, cov: ShapeCoverage): void {
+	logCoverage(label, cov)
+	expect(cov.total, `${label}: the property sampled nothing`).toBeGreaterThan(0)
+	expect(
+		cov.droppedUnreachable,
+		`${label}: no candidate had an unreachable set — GC deleting nothing would pass`,
+	).toBeGreaterThanOrEqual(SHAPE_FLOORS.droppedUnreachable)
+	expect(
+		cov.annotatedTag,
+		`${label}: no candidate kept an annotated-tag ref tip`,
+	).toBeGreaterThanOrEqual(SHAPE_FLOORS.annotatedTag)
+	expect(
+		cov.nestedTree,
+		`${label}: no candidate kept a nested subtree`,
+	).toBeGreaterThanOrEqual(SHAPE_FLOORS.nestedTree)
+}
+
+/**
+ * Run counts: keep the PG-round-trip cost low LOCALLY, but let CI sample BROADLY so
+ * the annotated-tag / nested-tree / dropped-ref corners are actually hit (GAP-3). The
+ * seed stays pinned (424_242) so every run — local or CI — is reproducible.
+ * `process.env.CI` is read defensively (it may be undefined).
+ *
+ * The local count is 30 because MEASUREMENT set it, not taste: at the historical 12 the
+ * corpus realizes ZERO candidates with a dropped-ref unreachable set, so PBT-1 and
+ * PBT-3 had nothing for GC to reclaim and a GC that deleted nothing passed both. 30 is
+ * the smallest round count at this seed that reaches that corner (see `SHAPE_FLOORS`,
+ * which is what now holds it there); it costs a few seconds per property.
  */
 const IS_CI = process.env.CI !== undefined && process.env.CI !== ""
-const NUM_RUNS = IS_CI ? 200 : 12
+const NUM_RUNS = IS_CI ? 200 : 30
 // PBT-2 drives a per-cycle push+GC loop (heavier per candidate), so it scales lower.
 const NUM_RUNS_REWIND = IS_CI ? 120 : 8
 
@@ -299,7 +338,7 @@ describe("§4 PBT — property-based GC differential", () => {
 			),
 			{ numRuns: NUM_RUNS, seed: 424_242 },
 		)
-		logCoverage("PBT-1", cov)
+		expectShapeFloors("PBT-1", cov)
 	})
 
 	it("PBT-2 — repeated GC pins git_object to the current reachable closure (no growth with K)", async () => {
@@ -352,6 +391,13 @@ describe("§4 PBT — property-based GC differential", () => {
 			`[gc-pbt shape coverage] PBT-2: rewind-orphan-cycles=${rewindCycles} ` +
 				`max-amend-chain-K=${maxChainK}`,
 		)
+		// The storage bound only means something once a cycle ORPHANED a prior snapshot:
+		// with zero rewinds every candidate is a single push and "no growth with K" is
+		// trivially true. Floored at what the pinned seed realizes locally.
+		expect(
+			rewindCycles,
+			"too few rewinds — the storage-bound corner is under-exercised",
+		).toBeGreaterThanOrEqual(27)
 	})
 
 	it("PBT-3 — GC∘GC == GC: a second pass deletes nothing and leaves rows + clone unchanged", async () => {
@@ -369,11 +415,22 @@ describe("§4 PBT — property-based GC differential", () => {
 						const { kept, dropped } = await seedSubset(fx, repo, src, keepMask)
 						// Same shape tally as PBT-1: idempotence is only a real test when the
 						// first pass had a non-empty (annotated-tag / nested / dropped) set to act on.
-						recordShape(cov, await shapeOfCandidate(src, kept, dropped))
+						const shape = await shapeOfCandidate(src, kept, dropped)
+						recordShape(cov, shape)
 						// Age so the FIRST pass actually reclaims the unreachable set — idempotence
 						// is only meaningful once the first run has done its deletions.
 						await ageObjects(fx.db, repo, "1 hour")
-						await fx.gc.gc(repo, { graceSeconds: 0 })
+						const first = await fx.gc.gc(repo, { graceSeconds: 0 })
+						// ESTABLISH that precondition rather than assume it: when a dropped ref
+						// carried objects the kept tips do not reach, the first pass MUST have
+						// reclaimed something. Otherwise "GC∘GC == GC" below is just "nothing
+						// happened twice".
+						if (shape.droppedUnreachable) {
+							expect(
+								first.deletedObjects,
+								"the dropped refs' exclusive objects survived the first pass",
+							).toBeGreaterThan(0)
+						}
 
 						const afterFirst = await objectOids(fx.db, repo)
 						const second = await fx.gc.gc(repo, { graceSeconds: 0 })
@@ -394,6 +451,6 @@ describe("§4 PBT — property-based GC differential", () => {
 			),
 			{ numRuns: NUM_RUNS, seed: 424_242 },
 		)
-		logCoverage("PBT-3", cov)
+		expectShapeFloors("PBT-3", cov)
 	})
 })

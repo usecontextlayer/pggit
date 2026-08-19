@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { diffFileLists } from "@/object/tree-diff"
+import { diffFileLists, type FileDiff } from "@/object/tree-diff"
 import { spawnGit } from "@/testing/spawn-git"
 
 /**
@@ -105,8 +105,9 @@ describe("diffFileLists — file-level tree diff vs `git diff-tree -r`", () => {
 		if (dir) rmSync(dir, { force: true, recursive: true })
 	})
 
-	/** Compare diffFileLists against git for the commit pair (i → j). */
-	async function assertMatchesGit(i: number, j: number): Promise<void> {
+	/** Compare diffFileLists against git for the commit pair (i → j), and return the
+	 * diff so a caller can additionally pin the change its own name promises. */
+	async function assertMatchesGit(i: number, j: number): Promise<FileDiff> {
 		const read = repoReader(dir)
 		const before = await treeOf(dir, commits[i] as string)
 		const after = await treeOf(dir, commits[j] as string)
@@ -122,10 +123,16 @@ describe("diffFileLists — file-level tree diff vs `git diff-tree -r`", () => {
 			.map((c) => `${c.path} ${c.mode} ${c.oid}`)
 			.sort()
 
+		// The oracle must have SEEN a change: a fixture step that silently became a
+		// no-op leaves both sides empty and turns every equality below into
+		// `[] === []` — green having exercised nothing.
+		expect(expected.length).toBeGreaterThan(0)
+
 		expect([...got.removed].sort()).toEqual(expectedRemoved)
 		expect(got.upserts.map((u) => `${u.path} ${u.mode} ${u.blobOid}`).sort()).toEqual(
 			expectedUpserts,
 		)
+		return got
 	}
 
 	it("adds + changes + removals across levels, untouched subtrees pruned", async () => {
@@ -133,7 +140,11 @@ describe("diffFileLists — file-level tree diff vs `git diff-tree -r`", () => {
 	})
 
 	it("a mode-only change (chmod) is reported as changed", async () => {
-		await assertMatchesGit(1, 2)
+		const got = await assertMatchesGit(1, 2)
+		// The named precondition, established rather than assumed: c2's ONLY change is
+		// b.txt gaining the exec bit, with its blob untouched.
+		expect(got.upserts.map((u) => `${u.path} ${u.mode}`)).toEqual(["b.txt 100755"])
+		expect(got.removed).toEqual([])
 	})
 
 	it("a file↔directory swap at one path", async () => {

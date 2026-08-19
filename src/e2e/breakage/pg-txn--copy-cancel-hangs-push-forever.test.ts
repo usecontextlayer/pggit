@@ -53,6 +53,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { buildGitEnv } from "@/testing/spawn-git"
 
 const RUNS = 700
 const WAIT_S = 25
@@ -68,19 +69,7 @@ function gitBounded(args: string[], cwd: string, limitMs: number): Promise<Bound
 		const t0 = Date.now()
 		const child = spawn("git", ["-c", "gc.auto=0", ...args], {
 			cwd,
-			env: {
-				...Object.fromEntries(
-					Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")),
-				),
-				GIT_AUTHOR_DATE: "@1700000000 +0000",
-				GIT_AUTHOR_EMAIL: "oracle@pggit.test",
-				GIT_AUTHOR_NAME: "pggit oracle",
-				GIT_COMMITTER_DATE: "@1700000000 +0000",
-				GIT_COMMITTER_EMAIL: "oracle@pggit.test",
-				GIT_COMMITTER_NAME: "pggit oracle",
-				GIT_CONFIG_GLOBAL: "/dev/null",
-				GIT_CONFIG_NOSYSTEM: "1",
-			},
+			env: buildGitEnv(),
 		})
 		let out = ""
 		child.stdout.on("data", (d) => {

@@ -41,7 +41,7 @@ const PINNED_CONFIG_ARGS = [
 // leak GIT_DIR/GIT_CONFIG/etc.), then set our pinned identity, clock, and the
 // config-isolation switches (no system/global gitconfig → no gpgsign, autocrlf,
 // defaultBranch surprises). PATH/HOME are kept so `git` is found.
-function buildGitEnv(): NodeJS.ProcessEnv {
+export function buildGitEnv(): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {}
 	for (const [key, value] of Object.entries(process.env)) {
 		if (!key.startsWith("GIT_")) env[key] = value

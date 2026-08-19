@@ -1,39 +1,25 @@
 /**
- * neg02 incremental-negotiation — `buildPack` over-serves an explicit `want` that
- * the client already owns through its `have`-closure, producing a NON-MINIMAL pack
- * where the oracle ships nothing.
+ * neg02 incremental-negotiation — a `want` the client already owns through its
+ * `have`-closure is served as NOTHING. The pack pggit builds for that shape carries
+ * exactly the objects canonical `git upload-pack --stateless-rpc` builds for the
+ * same request bytes: zero.
  *
- * THE BUG (EXPECTED-RED until pggit is fixed):
- *   `object-store.ts` buildPack (lines 109-111) computes the served set as:
- *       for (const o of want.present) if (!have.present.has(o)) set.add(o)   // subtract
- *       for (const w of wants)        if (want.present.has(w)) set.add(w)     // re-add EVERY want
- *   The first loop correctly subtracts the have-closure. The second loop then
- *   unconditionally re-adds every explicit want. That re-add is justified ONLY for
- *   partial-clone promisor roots (a wanted blob reachable from a tree the client
- *   already has, which omitBlobs subtracted) — but on a normal, non-filtered fetch
- *   it re-inserts a want the subtraction already (correctly) dropped.
- *
- *   Concretely: linear history c1..c6, a fetch with `want c3` (old) and `have c6`
- *   (new tip; c3 is an ANCESTOR of c6, so the client already has c3 and its whole
- *   closure). The subtraction empties the set, then loop 2 re-adds the c3 commit —
- *   and ONLY the commit; its tree/blob stay subtracted. The result is a 1-object
- *   pack carrying a commit whose tree the pack omits — a thin/incomplete standalone
- *   pack (`git index-pack --strict` on it in isolation fails connectivity). The
- *   real-git fetch still completes (git tolerates a duplicate it already owns), so
- *   no corruption — but it diverges from the oracle's minimal pack.
- *
- * THE ORACLE (real `git upload-pack --stateless-rpc`, same bytes — verified):
- *   c3 is fully contained in the have-closure, so there is NOTHING to send: a
- *   ZERO-object pack. pggit must match.
+ * The shape: linear history c1..c6, a v2 fetch with `want c3` (old) and `have c6`
+ * (the tip). c3 is an ANCESTOR of c6, so the client already holds c3 and its whole
+ * closure and there is nothing left to send.
  *
  * WHY A RAW-WIRE REQUEST: a real git HTTP client never issues `want c3 / have c6`
  * when c3 is an ancestor of its local c6 — it short-circuits because it already has
- * the ref target. So the divergence is only reachable by putting the exact
- * negotiation bytes on the wire ourselves; this test POSTs them to the real server
- * and reads the served pack's object count from the response.
+ * the ref target. The shape is only reachable by putting the exact negotiation bytes
+ * on the wire, so this test builds them once and feeds the SAME bytes to pggit and
+ * to a real `git upload-pack` over the source repo — the oracle is a dependency of
+ * the run, not a remembered value.
  *
- * RED on current code (served pack count == 1); GREEN once buildPack stops
- * re-adding a want that the have-closure already contains (the count drops to 0).
+ * ORIGINATED as the breakage probe for a serve set that subtracted the have-closure
+ * and then re-added EVERY explicit want — a re-add justified only for partial-clone
+ * promisor roots, which on a plain fetch shipped a 1-object pack carrying a commit
+ * whose tree the same pack omitted (connectivity-incomplete in isolation). Fixed:
+ * the served set is routed and that re-add is scoped to the promisor case.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -47,6 +33,7 @@ import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { packObjectCount } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { spawnUploadPack } from "@/testing/upload-pack-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
 
 describe("neg02 — buildPack must not re-add a want already in the have-closure (minimal pack)", () => {
@@ -88,21 +75,27 @@ describe("neg02 — buildPack must not re-add a want already in the have-closure
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 
-	it("want fully contained in the have-closure serves a ZERO-object pack (oracle), not 1", async () => {
+	it("serves a want fully contained in the have-closure exactly as canonical git does: a ZERO-object pack", async () => {
+		const request = fetchRequest({
+			done: true,
+			haves: [c6],
+			objectFormat: "sha1",
+			wants: [c3],
+		})
 		const res = await app.request("/neg02/git-upload-pack", {
-			body: fetchRequest({ done: true, haves: [c6], objectFormat: "sha1", wants: [c3] }),
+			body: request,
 			headers: { "Git-Protocol": "version=2" },
 			method: "POST",
 		})
 		expect(res.status).toBe(200)
-		const body = Buffer.from(await res.arrayBuffer())
-		const objCount = packObjectCount(body)
+		const ours = Buffer.from(await res.arrayBuffer())
 
-		// ORACLE: real `git upload-pack` ships a 0-object pack here — c3 is wholly
-		// inside the c6 have-closure, so there is nothing to send. pggit currently
-		// re-adds the lone c3 commit (object-store.ts:111), serving a 1-object,
-		// connectivity-incomplete pack. This assertion is RED on current code and
-		// GREEN once buildPack stops re-adding a want the have-closure already has.
-		expect(objCount).toBe(0)
+		// THE ORACLE: the identical request bytes through real `git upload-pack
+		// --stateless-rpc` over the source repo. Asserting the oracle's own count
+		// first keeps the differential honest — a helper that silently found no PACK
+		// would otherwise let `null === null` pass for agreement.
+		const oracle = await spawnUploadPack(src, request)
+		expect(packObjectCount(oracle)).toBe(0)
+		expect(packObjectCount(ours)).toBe(packObjectCount(oracle))
 	}, 60_000)
 })

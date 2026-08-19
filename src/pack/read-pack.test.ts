@@ -51,44 +51,72 @@ describe("readPack", () => {
 		}
 	})
 
-	it("reads a real git pack containing OFS deltas, recovering all objects", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-rp-delta-"))
-		try {
-			await spawnGit(["init", "-q"], { cwd: dir })
-			const big = "lorem ipsum dolor sit amet\n".repeat(400)
-			writeFileSync(join(dir, "big.txt"), big)
-			await spawnGit(["add", "."], { cwd: dir })
-			await spawnGit(["commit", "-q", "-m", "v1"], { cwd: dir })
-			// A near-identical large blob ⇒ git will deltify one against the other.
-			writeFileSync(join(dir, "big.txt"), `${big}one more line\n`)
-			await spawnGit(["add", "."], { cwd: dir })
-			await spawnGit(["commit", "-q", "-m", "v2"], { cwd: dir })
-			await spawnGit(["repack", "-adq"], { cwd: dir }) // default ⇒ deltas ON
+	// Both delta wire forms, each read from a REAL git pack. The form is PINNED by
+	// config rather than inherited from git's default: `git repack` always passes
+	// `--delta-base-offset` to pack-objects according to `repack.useDeltaBaseOffset`
+	// (which is why `pack.useOfsDelta` is inert on this path — verified on git
+	// 2.55), so a future default flip cannot silently drop a form from the suite.
+	// And the form is MEASURED, not assumed: a REF_DELTA entry carries its base
+	// object id as 20 raw bytes inside the pack body, an OFS_DELTA carries a
+	// back-offset varint instead — `verify-pack -v` renders both identically, so
+	// the presence of those bytes is the only observable that tells them apart.
+	for (const form of [
+		{ embedsBaseOid: false, name: "OFS", useDeltaBaseOffset: true },
+		{ embedsBaseOid: true, name: "REF", useDeltaBaseOffset: false },
+	]) {
+		it(`reads a real git pack containing ${form.name} deltas, recovering all objects`, async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pggit-rp-delta-"))
+			try {
+				await spawnGit(["init", "-q"], { cwd: dir })
+				const big = "lorem ipsum dolor sit amet\n".repeat(400)
+				writeFileSync(join(dir, "big.txt"), big)
+				await spawnGit(["add", "."], { cwd: dir })
+				await spawnGit(["commit", "-q", "-m", "v1"], { cwd: dir })
+				// A near-identical large blob ⇒ git will deltify one against the other.
+				writeFileSync(join(dir, "big.txt"), `${big}one more line\n`)
+				await spawnGit(["add", "."], { cwd: dir })
+				await spawnGit(["commit", "-q", "-m", "v2"], { cwd: dir })
+				await spawnGit(
+					[
+						"-c",
+						`repack.useDeltaBaseOffset=${form.useDeltaBaseOffset}`,
+						"repack",
+						"-adq",
+					],
+					{ cwd: dir },
+				)
 
-			const packDir = join(dir, ".git/objects/pack")
-			const packName = readdirSync(packDir).find((f) => f.endsWith(".pack"))
-			if (!packName) throw new Error("no pack produced")
-			const idxName = packName.replace(/\.pack$/, ".idx")
+				const packDir = join(dir, ".git/objects/pack")
+				const packName = readdirSync(packDir).find((f) => f.endsWith(".pack"))
+				if (!packName) throw new Error("no pack produced")
+				const packBytes = readFileSync(join(packDir, packName))
+				const idxName = packName.replace(/\.pack$/, ".idx")
 
-			// Guard against a vacuous test: confirm the pack actually has ≥1 delta.
-			// verify-pack delta lines carry a trailing base-OID; base objects don't.
-			const verify = await spawnGit(["verify-pack", "-v", join(packDir, idxName)], {
-				cwd: dir,
-			})
-			const deltaCount = verify.stdout
-				.split("\n")
-				.filter((l) => /^[0-9a-f]{40} \S.* [0-9a-f]{40}$/.test(l)).length
-			expect(deltaCount).toBeGreaterThan(0)
+				// The pack really is deltified: verify-pack delta lines carry a trailing
+				// base OID; base objects don't.
+				const verify = await spawnGit(["verify-pack", "-v", join(packDir, idxName)], {
+					cwd: dir,
+				})
+				const baseOids = verify.stdout
+					.split("\n")
+					.map((l) => /^[0-9a-f]{40} \S.* ([0-9a-f]{40})$/.exec(l)?.[1])
+					.filter((oid): oid is string => oid !== undefined)
+				expect(baseOids.length).toBeGreaterThan(0)
+				// …and every delta in it is THIS test's wire form.
+				for (const base of baseOids) {
+					expect(packBytes.includes(Buffer.from(base, "hex"))).toBe(form.embedsBaseOid)
+				}
 
-			const parsed = await readPack(readFileSync(join(packDir, packName)))
-			const list = await spawnGit(
-				["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-				{ cwd: dir },
-			)
-			const expected = list.stdout.trim().split("\n").sort()
-			expect(parsed.map((p) => p.oid).sort()).toEqual(expected)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
-	})
+				const parsed = await readPack(packBytes)
+				const list = await spawnGit(
+					["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+					{ cwd: dir },
+				)
+				const expected = list.stdout.trim().split("\n").sort()
+				expect(parsed.map((p) => p.oid).sort()).toEqual(expected)
+			} finally {
+				rmSync(dir, { force: true, recursive: true })
+			}
+		})
+	}
 })

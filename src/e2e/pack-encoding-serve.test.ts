@@ -15,9 +15,8 @@
  *   4. A repack committing DURING a clone changes nothing: the derived model's
  *      central safety claim (D1), asserted as a raw race rather than trusted.
  *
- * Everything here is red until chunks 2 (repack) and 3 (serve-from-tier) land; the
- * first and third assertions also pass against today's raw path by design — they
- * pin that the tier never regresses what already works.
+ * The first and third contracts hold for the raw path too, by design: they pin that
+ * the encoding tier never regresses what already worked.
  */
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -148,17 +147,31 @@ describe("serve — a repacked repo over the real wire", () => {
 	})
 
 	it("stays valid when a repack commits mid-clone (the derived model's safety claim)", async () => {
+		// The repo GROWS first: the test above left the tier complete, and a repack
+		// with nothing to encode cannot interleave with anything — the "race" would be
+		// a no-op running beside a clone.
+		for (let i = RUNS + 6; i < RUNS + 12; i++) {
+			const run = join(src, RUNS_DIR, runDirName(i))
+			mkdirSync(run, { recursive: true })
+			writeFileSync(join(run, "record.json"), `{"n":${i}}\n`)
+			await spawnGit(["add", "-A"], { cwd: src })
+			await spawnGit(["commit", "-q", "-m", `run ${i}`], { cwd: src })
+		}
+		await seedRepoIntoStore(REPO, src, { objects, refs })
+
 		// A raw race, not a scripted interleaving: the clone and a concurrent repack
 		// run together. Under the derived model the served OID set comes from the
 		// inventory, so WHATEVER the interleaving, the pack must arrive complete and
-		// fsck-clean. (Before chunk 2 lands the repack rejects — the Promise.all still
-		// surfaces it loudly rather than masking the failure.)
+		// fsck-clean.
 		const dest = join(mkdtempSync(join(tmpdir(), "enc-serve-race-")), "c")
 		try {
-			await Promise.all([
+			const [, encoded] = await Promise.all([
 				spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest]),
 				repack.repack(REPO),
 			])
+			// The concurrent participant really wrote rows — without this the race is
+			// a clone running beside a no-op, which proves nothing about interleaving.
+			expect(encoded.wholes + encoded.deltas).toBeGreaterThan(0)
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 			expect(await allObjectOids(dest)).toEqual(await allObjectOids(src))
 		} finally {

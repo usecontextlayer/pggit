@@ -19,7 +19,6 @@ import { type Epoch, loadEpoch, oidsOfUnion, splitOids } from "@/store/reach-epo
 import { fullClosure } from "@/store/reachability"
 import {
 	type GcFixture,
-	pushFile,
 	repoUrl,
 	setupGcFixture,
 	teardownGcFixture,
@@ -85,6 +84,7 @@ describe("reach-epoch producer (chunk 5b)", () => {
 	}
 
 	async function expectExactBitmaps(): Promise<void> {
+		let anchored = 0
 		const epoch = await expectReadyEpoch()
 		const refs = await fx.db.sql<{ oid: Buffer }[]>`
 			select oid from git_ref where repo_id = ${id} and oid is not null`
@@ -104,6 +104,7 @@ describe("reach-epoch producer (chunk 5b)", () => {
 				() => null,
 			)
 			if (inSrc?.stdout.trim() === "commit") {
+				anchored++
 				const expected = (
 					await spawnGit(["rev-list", "--objects", tip], { cwd: src })
 				).stdout
@@ -115,6 +116,14 @@ describe("reach-epoch producer (chunk 5b)", () => {
 				expect(named, `git oracle for tip ${tip}`).toEqual(expected)
 			}
 		}
+		// Without a git-anchored tip this call degrades to pggit-vs-pggit — the epoch's
+		// bitmaps against our own `fullClosure` walk, a shared defect self-confirming.
+		// Every stage must keep at least one commit tip the source repo can still
+		// resolve, or the oracle silently opted out.
+		expect(
+			anchored,
+			"no tip was anchored against canonical git — the stage lost its oracle",
+		).toBeGreaterThan(0)
 		expect(splitOids(epoch.oids)).toEqual([...all].sort())
 	}
 
@@ -158,9 +167,36 @@ describe("reach-epoch producer (chunk 5b)", () => {
 	})
 
 	it("a rewind falls back LOUDLY to a rebuild that reclaims the rewound history", async () => {
-		// Force-push an UNRELATED single-commit history onto main: the old main
-		// line becomes garbage, and its epoch tip is no longer covered.
-		await pushFile(fx, REPO, { content: "rewound\n", path: "a.txt", rewind: true })
+		// An UNRELATED single-commit history replaces main: the old main line becomes
+		// garbage and its epoch tip is no longer covered. The new root is built INSIDE
+		// `src` (rather than in a throwaway repo) so this stage keeps a tip canonical
+		// git can still resolve — expectExactBitmaps refuses to run without one.
+		await spawnGit(["checkout", "-q", "--orphan", "rewound"], { cwd: src })
+		await spawnGit(["rm", "-rf", "--cached", "."], { cwd: src })
+		writeFileSync(join(src, "a.txt"), "rewound\n")
+		await spawnGit(["add", "a.txt"], { cwd: src })
+		await spawnGit(["commit", "-q", "-m", "rewound"], { cwd: src })
+		const rewound = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+		// The wire denies non-fast-forward moves, so the objects land through a
+		// throwaway CREATE and `main` is CAS-moved through the store — the store-level
+		// rewind the GC workload models (gc-helpers' `rewind` mechanic, inlined here).
+		const tmpRef = `refs/heads/rewind-${rewound.slice(0, 12)}`
+		await spawnGit(["push", "-q", repoUrl(fx, REPO), `HEAD:${tmpRef}`], { cwd: src })
+		const current = (await fx.refs.listRefs(REPO)).find(
+			(r) => r.name === "refs/heads/main",
+		)
+		if (!current) throw new Error("refs/heads/main missing — nothing to rewind")
+		const moved = await fx.refs.applyRefUpdates(
+			REPO,
+			[
+				{ newOid: rewound, oldOid: current.oid, ref: "refs/heads/main" },
+				{ newOid: "0".repeat(40), oldOid: rewound, ref: tmpRef },
+			],
+			false,
+		)
+		if (moved.some((ok) => !ok)) {
+			throw new Error(`store ref updates failed (${moved})`)
+		}
 		const result = await fx.gc.gc(REPO, { graceSeconds: 0 })
 		expect(result.epoch).toBe("rebuilt")
 		expect(result.deletedObjects).toBeGreaterThan(0)

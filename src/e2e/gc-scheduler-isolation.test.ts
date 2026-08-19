@@ -15,11 +15,9 @@
  * deterministic with `graceSeconds: 0` + `ageObjects`, never a wall-clock sleep;
  * concurrency is exercised (`concurrency: 4`) but only its OUTCOME is asserted.
  *
- * RED now because `createGcScheduler(...).drainOnce()` is a throwing TDD stub
- * ("pggit gc-scheduler: not implemented (TDD stub)") AND the store does not yet
- * stamp `repos.last_pushed_at`, so today no repo is even judged eligible and no
- * object is reclaimed. GREEN once the store stamps `last_pushed_at` on each push
- * and `drainOnce()` GCs exactly the eligible set per §6.
+ * ORIGINATED as the TDD suite written against a throwing `createGcScheduler` stub
+ * and a store that did not yet stamp `repos.last_pushed_at` — so no repo was even
+ * judged eligible. Both landed per §6; this is their regression gate.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createGcScheduler } from "@/gc-scheduler"

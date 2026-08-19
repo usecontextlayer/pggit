@@ -3,6 +3,7 @@ import { sql } from "kysely"
 import TinyQueue from "tinyqueue"
 import type { Database } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
+import { count } from "@/instrument"
 import { GITLINK_MODE, isTreeEntryMode, treeEntries } from "@/object/object"
 import { type IndexedTree, indexTreeEntries } from "@/object/tree-diff"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
@@ -1031,8 +1032,12 @@ export async function routeServeSet(
 		// cannot answer EXACTLY returns `fallback` and falls through to the walk.
 		if (!omitBlobs) {
 			const fast = await epochServe(db, id, wants)
-			if (fast.state === "served") return fast.result
+			if (fast.state === "served") {
+				count("epochServed")
+				return fast.result
+			}
 		}
+		count("walkServed")
 		const { present, missing } = await fullClosure(db, id, wants, omitBlobs)
 		return {
 			boundaryExact: true,

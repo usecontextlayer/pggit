@@ -6,7 +6,14 @@ import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { allObjectOids, objectsByType, seedRepoIntoStore } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	objectsByType,
+	packFiles,
+	packObjectOids,
+	parseLsTree,
+	seedRepoIntoStore,
+} from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
@@ -95,6 +102,37 @@ describe("M1 — blobless partial clone (real git)", () => {
 			expect(readFileSync(join(dest, "a.txt"), "utf8")).toBe("alpha2\n")
 			expect(readFileSync(join(dest, "sub", "b.txt"), "utf8")).toBe("beta\n")
 			await spawnGit(["fsck"], { cwd: dest })
+
+			// Correct file contents alone do NOT prove a lazy fault: a server that
+			// ignored the filter would ship every blob up front and read identically.
+			// The pack layout is the observable — the INITIAL fetch's pack (the one
+			// carrying the tip commit) must hold no blob at all, and HEAD's blobs must
+			// nevertheless be present, i.e. they arrived afterwards on demand.
+			const srcBlobs = (await objectsByType(src))
+				.filter((o) => o.type === "blob")
+				.map((o) => o.oid)
+			expect(srcBlobs.length).toBeGreaterThan(0)
+			const tip = (await spawnGit(["rev-parse", "HEAD"], { cwd: dest })).stdout.trim()
+			const packs = await Promise.all(
+				packFiles(dest).map(async (pack) => ({
+					oids: await packObjectOids(dest, pack),
+					pack,
+				})),
+			)
+			const initial = packs.find((p) => p.oids.includes(tip))
+			expect(initial, "no pack in the clone carries the tip commit").toBeDefined()
+			expect(
+				srcBlobs.filter((oid) => initial?.oids.includes(oid)),
+				"the initial fetch shipped blobs — `blob:none` was not honored",
+			).toEqual([])
+			const headBlobs = parseLsTree(
+				(await spawnGit(["ls-tree", "-r", "HEAD"], { cwd: src })).stdout,
+			).map((e) => e.oid)
+			const have = new Set(await allObjectOids(dest))
+			expect(
+				headBlobs.filter((oid) => !have.has(oid)),
+				"the checkout never faulted HEAD's blobs back from the promisor remote",
+			).toEqual([])
 		} finally {
 			rmSync(dest, { force: true, recursive: true })
 		}

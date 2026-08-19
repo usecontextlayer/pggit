@@ -47,9 +47,13 @@ describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () =
 			).stdoutBytes
 
 			// Self-verifying: without c1's objects the external base is unresolvable,
-			// so ingest MUST fail. (A non-thin pack would succeed here — this asserts
-			// the pack really does carry external deltas.)
-			await expect(objects.ingestPack("repo-empty", thinPack)).rejects.toThrow()
+			// so ingest MUST fail with exactly that code. (A non-thin pack would
+			// succeed here — this is what establishes that the pack really does carry
+			// external deltas; a bare `toThrow()` would also accept a schema fault or
+			// a regression that rejected valid packs, leaving the precondition unproven.)
+			await expect(objects.ingestPack("repo-empty", thinPack)).rejects.toMatchObject({
+				code: "unresolved-base",
+			})
 
 			// With c1's objects stored, the same thin pack resolves and re-stores c2
 			// self-contained.
