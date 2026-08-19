@@ -28,6 +28,11 @@ import {
 const A = "a".repeat(40)
 const B = "b".repeat(40)
 
+// A rejected command cannot exist without the reason report-status must emit.
+// @ts-expect-error CommandResult's failure arm requires reason
+const FAILURE_WITHOUT_REASON: CommandResult = { ok: false, ref: "refs/heads/x" }
+void FAILURE_WITHOUT_REASON
+
 // The push caps we expect to be advertised, in canonical order (authored here,
 // independent of the handler). AGENT is an external input → imported.
 const EXPECTED_RECEIVE_CAPS = [
@@ -95,14 +100,6 @@ describe("§8.1 receive-pack wire — surface 7: report-status", () => {
 				framedLine("ng refs/heads/dev stale ref (compare-and-swap failed)") +
 				"0000",
 		)
-	})
-
-	it("a rejected command with no reason defaults to `failed`", () => {
-		expect(
-			framedPktLines(
-				encodeReportStatus("ok", [{ ok: false, ref: "refs/heads/x" }], false),
-			),
-		).toBe(`${framedLine("unpack ok") + framedLine("ng refs/heads/x failed")}0000`)
 	})
 
 	it("unpack failure → `unpack <error>` then every command `ng`", () => {

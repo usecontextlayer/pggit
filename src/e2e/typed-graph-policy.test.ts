@@ -128,6 +128,9 @@ describe("typed-graph policy", () => {
 		await expect(deps.objects.isConnected(repo, childOid)).rejects.toThrow(
 			/no derived row/,
 		)
+		await expect(deps.objects.isAncestor(repo, parentOid, childOid)).rejects.toThrow(
+			/no derived row/,
+		)
 		await expect(createGc(db.sql).gc(repo, { graceSeconds: 0 })).rejects.toThrow(
 			/no derived row/,
 		)
@@ -136,6 +139,38 @@ describe("typed-graph policy", () => {
 			select count(*)::text as n from git_object
 			where oid = ${Buffer.from(parentOid, "hex")}`
 		expect(row?.n).toBe("1")
+	})
+
+	it("a tag whose derived row is missing crashes peeling and include-tag augmentation", async () => {
+		const repo = "policy/corrupt-tag"
+		const blob = Buffer.from("hello\n")
+		const tree = Buffer.concat([
+			Buffer.from("100644 f.txt\0"),
+			Buffer.from(computeOid("blob", blob), "hex"),
+		])
+		const commit = Buffer.from(
+			`tree ${computeOid("tree", tree)}\ncommitter t <t@t> 1700000000 +0000\n\nc\n`,
+		)
+		const commitOid = computeOid("commit", commit)
+		const tag = Buffer.from(
+			`object ${commitOid}\ntype commit\ntag broken\ntagger t <t@t> 1700000001 +0000\n\nbroken\n`,
+		)
+		const tagOid = computeOid("tag", tag)
+		await deps.objects.putPack(repo, [
+			{ content: blob, type: "blob" },
+			{ content: tree, type: "tree" },
+			{ content: commit, type: "commit" },
+			{ content: tag, type: "tag" },
+		])
+		await deps.refs.setRef(repo, "refs/tags/original", tagOid)
+		await db.sql`delete from git_tag where oid = ${Buffer.from(tagOid, "hex")}`
+
+		await expect(deps.refs.setRef(repo, "refs/tags/copy", tagOid)).rejects.toThrow(
+			/no derived row/,
+		)
+		await expect(
+			deps.objects.buildPack(repo, [commitOid], [], false, true),
+		).rejects.toThrow(/no derived row/)
 	})
 
 	it("a blob-mode tree entry naming a TREE fails connectivity for its commit", async () => {

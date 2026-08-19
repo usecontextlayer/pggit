@@ -57,7 +57,11 @@ export function computeGenerations(
 		}
 		generations.set(oid, generation)
 		for (const child of dependents.get(oid) ?? []) {
-			const n = (indegree.get(child) ?? 1) - 1
+			const childIndegree = indegree.get(child)
+			if (childIndegree === undefined) {
+				throw new Error(`computeGenerations: no indegree for batch commit ${child}`)
+			}
+			const n = childIndegree - 1
 			indegree.set(child, n)
 			if (n === 0) ready.push(child)
 		}
@@ -71,4 +75,16 @@ export function computeGenerations(
 		)
 	}
 	return generations
+}
+
+/** Read the total result of `computeGenerations` without collapsing a valid NULL
+ * generation and an impossible missing key into the same value. */
+export function requireGeneration(
+	generations: ReadonlyMap<string, number | null>,
+	oid: string,
+): number | null {
+	if (!generations.has(oid)) {
+		throw new Error(`computeGenerations: no result for batch commit ${oid}`)
+	}
+	return generations.get(oid) as number | null
 }

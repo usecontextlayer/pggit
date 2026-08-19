@@ -52,6 +52,30 @@ export type GcScheduler = ReturnType<typeof createGcScheduler>
  * and written back as `last_gc_at`. */
 type Candidate = { id: string; name: string }
 
+const MAX_TIMER_MS = 2_147_483_647
+
+function assertSchedulerOptions(opts: GcSchedulerOptions): void {
+	if (!Number.isFinite(opts.graceSeconds) || opts.graceSeconds < 0) {
+		throw new Error(
+			`pggit gc-scheduler: graceSeconds must be finite and nonnegative, got ${String(opts.graceSeconds)}`,
+		)
+	}
+	if (
+		!Number.isInteger(opts.intervalMs) ||
+		opts.intervalMs <= 0 ||
+		opts.intervalMs > MAX_TIMER_MS
+	) {
+		throw new Error(
+			`pggit gc-scheduler: intervalMs must be an integer from 1 to ${MAX_TIMER_MS}, got ${String(opts.intervalMs)}`,
+		)
+	}
+	if (!Number.isInteger(opts.concurrency) || opts.concurrency <= 0) {
+		throw new Error(
+			`pggit gc-scheduler: concurrency must be a positive integer, got ${String(opts.concurrency)}`,
+		)
+	}
+}
+
 /**
  * Build the GC scheduler over a porsager client (the same wire→DB boundary the
  * stores take). `drainOnce()` runs one poll+sweep pass; `start()`/`stop()` drive
@@ -59,6 +83,7 @@ type Candidate = { id: string; name: string }
  * per-repo GC primitive, which is reachability-safe.
  */
 export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
+	assertSchedulerOptions(opts)
 	const gc = createGc(pg)
 	let timer: ReturnType<typeof setInterval> | undefined
 	// The in-flight pass (if any). Doubles as the overlap guard (a tick skips while a
@@ -123,7 +148,7 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 	 * whose GC threw is skipped (not in the summary) and retried next pass. */
 	async function drainOnce(): Promise<DrainSummary> {
 		const candidates = await selectCandidates()
-		const results = await mapPool(candidates, Math.max(1, opts.concurrency), drainRepo)
+		const results = await mapPool(candidates, opts.concurrency, drainRepo)
 		return results.filter((e): e is DrainEntry => e !== null)
 	}
 

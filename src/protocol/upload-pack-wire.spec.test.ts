@@ -87,19 +87,17 @@ describe("§8.1 upload-pack wire — surface 2: ls-refs response", () => {
 
 describe("§8.1 upload-pack wire — surface 3: fetch acknowledgments (no pack)", () => {
 	it("no common objects, not ready → `acknowledgments` + `NAK` + flush", () => {
-		expect(pktLineUnpack(encodeAcknowledgments([], false))).toBe(
-			"acknowledgments\nNAK\n0000\n",
-		)
+		expect(pktLineUnpack(encodeAcknowledgments([]))).toBe("acknowledgments\nNAK\n0000\n")
 	})
 
 	it("one common object → bare `ACK <oid>` (no v0-style suffix)", () => {
-		expect(pktLineUnpack(encodeAcknowledgments([A], false))).toBe(
+		expect(pktLineUnpack(encodeAcknowledgments([A]))).toBe(
 			`acknowledgments\nACK ${A}\n0000\n`,
 		)
 	})
 
 	it("multiple common objects → one `ACK` line each, in order", () => {
-		expect(pktLineUnpack(encodeAcknowledgments([A, B], false))).toBe(
+		expect(pktLineUnpack(encodeAcknowledgments([A, B]))).toBe(
 			`acknowledgments\nACK ${A}\nACK ${B}\n0000\n`,
 		)
 	})

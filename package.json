@@ -81,7 +81,7 @@
 		"build": "npx tsdown",
 		"check": "pnpm run format.fix && pnpm run tsc && pnpm run test",
 		"clean": "rm -rf dist dist-types *.tsbuildinfo coverage .vitest-attachments node_modules",
-		"db.manage": "npx tsx ./manage.ts --sub=database",
+		"db.manage": "npx tsx ./manage.ts",
 		"dev": "npx tsx src/main.ts",
 		"format.fix": "npx @biomejs/biome check --fix --error-on-warnings .",
 		"format.verify": "npx @biomejs/biome check --error-on-warnings .",

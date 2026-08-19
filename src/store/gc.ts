@@ -111,13 +111,27 @@ export function createGc(pg: Sql) {
 
 	return {
 		async gc(repo: string, opts: InternalGcOptions): Promise<GcResult> {
+			const batchLimit = opts.batchLimit ?? DEFAULT_BATCH_LIMIT
+			if (!Number.isFinite(opts.graceSeconds) || opts.graceSeconds < 0) {
+				throw new Error(
+					`pggit gc: graceSeconds must be finite and nonnegative, got ${String(opts.graceSeconds)}`,
+				)
+			}
+			if (!Number.isInteger(batchLimit) || batchLimit <= 0) {
+				throw new Error(
+					`pggit gc: batchLimit must be a positive integer, got ${String(batchLimit)}`,
+				)
+			}
+			if (opts.maintain !== undefined && typeof opts.maintain !== "boolean") {
+				throw new Error(
+					`pggit gc: maintain must be boolean, got ${String(opts.maintain)}`,
+				)
+			}
 			// 1. Resolve the repo. A name never written has nothing to reclaim. Resolved
 			// fresh every pass — a long-lived Gc outlives repo delete/re-create cycles
 			// (lookupRepoId).
 			const id = await lookupRepoId(db, repo)
 			if (id === null) return { deletedObjects: 0, epoch: "unchanged" }
-
-			const batchLimit = opts.batchLimit ?? DEFAULT_BATCH_LIMIT
 
 			// 2 + 3. Materialize the live set under a consistent snapshot.
 			//

@@ -1,4 +1,5 @@
 import type { ISql, TransactionSql } from "postgres"
+import { assertNever } from "@/assert-never"
 
 /**
  * Bulk binary insert via `COPY … FROM STDIN (FORMAT binary)` into a staging temp
@@ -67,6 +68,7 @@ function encodeValue(field: CopyValue): Buffer | null {
 		case "text":
 			return Buffer.from(field.v, "utf8")
 	}
+	return assertNever(field)
 }
 
 /** Encode rows as one PGCOPY binary payload: header, then per row a field count

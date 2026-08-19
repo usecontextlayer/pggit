@@ -1,9 +1,12 @@
 import { type Kysely, sql } from "kysely"
 import type { Sql } from "postgres"
+import { assertNever } from "@/assert-never"
 import { type Database, initKysely } from "@/database"
 import type { GitRefName } from "@/database/models/public/GitRef"
 import type { ReposId } from "@/database/models/public/Repos"
+import { isOid, ZERO_OID } from "@/oid"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
+import { throwMissingDerivedRow } from "@/store/derived-row"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 export type RefRow = { name: string; oid: string; peeled?: string }
@@ -13,13 +16,13 @@ export type RefUpdate = { oldOid: string; newOid: string; ref: string }
 
 export type RefStore = ReturnType<typeof createRefStore>
 
-const isZero = (oid: string): boolean => /^0{40}$/.test(oid)
+const isZero = (oid: string): boolean => oid === ZERO_OID
 
-const toOid = (hex: string): Buffer => {
+const toOidBuffer = (hex: string): Buffer => {
 	// `Buffer.from("gg", "hex")` silently yields a SHORT buffer; a persisted
 	// short/empty ref oid poisons every later advertisement. The wire paths
 	// validate upstream — this guards the platform-facing setRef/seeding calls.
-	if (!/^[0-9a-f]{40}$/.test(hex)) {
+	if (!isOid(hex)) {
 		throw new Error(`pggit refs: malformed object id ${JSON.stringify(hex)}`)
 	}
 	return Buffer.from(hex, "hex")
@@ -47,9 +50,13 @@ function classifyRefUpdate(cmd: RefUpdate): RefOp {
 	// zero old-oid here means "delete unconditionally" (oldOid null), never a
 	// malformed command. The all-zeros sentinel is classified away here and never
 	// coerced into a real all-zero bytea.
-	if (del) return { kind: "delete", oldOid: create ? null : toOid(cmd.oldOid) }
-	if (create) return { kind: "create", newOid: toOid(cmd.newOid) }
-	return { kind: "update", newOid: toOid(cmd.newOid), oldOid: toOid(cmd.oldOid) }
+	if (del) return { kind: "delete", oldOid: create ? null : toOidBuffer(cmd.oldOid) }
+	if (create) return { kind: "create", newOid: toOidBuffer(cmd.newOid) }
+	return {
+		kind: "update",
+		newOid: toOidBuffer(cmd.newOid),
+		oldOid: toOidBuffer(cmd.oldOid),
+	}
 }
 
 /**
@@ -68,24 +75,38 @@ async function peelRef(
 	repoId: ReposId,
 	oid: Buffer,
 ): Promise<Buffer | null> {
-	const result = await sql<{ peeled: Buffer }>`
-		with recursive chain(oid, is_tag, depth) as (
-			select o.oid, o.type = ${PACK_OBJ_TYPE.TAG}, 0
+	const result = await sql<{ corrupt_oid: Buffer | null; peeled: Buffer | null }>`
+		with recursive chain(oid, is_tag, has_derived, depth) as (
+			select o.oid, o.type = ${PACK_OBJ_TYPE.TAG}, t.oid is not null, 0
 				from git_object o
+				left join git_tag t
+					on t.repo_id = o.repo_id and t.oid = o.oid
 				where o.repo_id = ${repoId}::bigint and o.oid = ${oid}::bytea
 			union all
-			select t.target_oid, co.type = ${PACK_OBJ_TYPE.TAG}, c.depth + 1
+			select target.oid, target.type = ${PACK_OBJ_TYPE.TAG}, next_tag.oid is not null,
+				c.depth + 1
 				from chain c
-				join git_tag t
-					on t.repo_id = ${repoId}::bigint and t.oid = c.oid
-				left join git_object co
-					on co.repo_id = ${repoId}::bigint and co.oid = t.target_oid
+				join git_tag current_tag
+					on current_tag.repo_id = ${repoId}::bigint and current_tag.oid = c.oid
+				join git_object target
+					on target.repo_id = ${repoId}::bigint
+					and target.oid = current_tag.target_oid
+				left join git_tag next_tag
+					on next_tag.repo_id = target.repo_id and next_tag.oid = target.oid
 				where c.is_tag
 		)
-		select oid as peeled from chain where not is_tag and depth > 0
-			order by depth desc limit 1
+		select
+			(select oid from chain where not is_tag and depth > 0
+				order by depth desc limit 1) as peeled,
+			(select oid from chain where is_tag and not has_derived
+				order by depth limit 1) as corrupt_oid
 	`.execute(exec)
-	return result.rows[0]?.peeled ?? null
+	const [row] = result.rows
+	if (!row) throw new Error("pggit refs: peel query returned no row")
+	if (row.corrupt_oid !== null) {
+		throwMissingDerivedRow(row.corrupt_oid.toString("hex"), PACK_OBJ_TYPE.TAG)
+	}
+	return row.peeled
 }
 
 /** Sentinel thrown inside a transaction to roll an atomic batch all the way back. */
@@ -198,6 +219,7 @@ async function casRefUpdate(
 			return { mutated, ok: mutated }
 		}
 	}
+	return assertNever(op)
 }
 
 /**
@@ -341,7 +363,7 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 
 		async setRef(repoId: string, name: string, oid: string): Promise<void> {
 			const id = await repos.ensureRepoId(repoId)
-			const value = toOid(oid)
+			const value = toOidBuffer(oid)
 			const peeled = await peelRef(db, id, value)
 			await db
 				.insertInto("git_ref")

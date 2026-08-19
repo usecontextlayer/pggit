@@ -62,6 +62,12 @@ describe("ls-refs handler — ref-prefix filtering", () => {
 			`${DEV} refs/heads/dev\n${MAIN} refs/heads/main\n0000\n`,
 		)
 	})
+
+	it("rejects an unknown argument instead of silently ignoring it", async () => {
+		await expect(lsRefs(POPULATED, ["frobnicate"])).rejects.toThrow(
+			/ls-refs: unsupported argument "frobnicate"/,
+		)
+	})
 })
 
 describe("ls-refs handler — unborn HEAD (empty repo)", () => {

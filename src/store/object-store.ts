@@ -7,14 +7,16 @@ import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
 import { OBJECT_TYPE_CODE, objectTypeFromCode } from "@/database/object-type-codes"
 import { count, withPhase } from "@/instrument"
-import { computeGenerations } from "@/object/commit-graph"
+import { computeGenerations, requireGeneration } from "@/object/commit-graph"
 import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/derive"
 import { computeOid, type GitObjectType } from "@/object/object"
+import { isOid } from "@/oid"
 import { encodeDelta } from "@/pack/delta"
 import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, packHeader, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
+import { throwMissingDerivedRow } from "@/store/derived-row"
 import { ancestry, originClosure, routeServeSet } from "@/store/reachability"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
@@ -37,6 +39,19 @@ function batches<T>(items: T[], size: number): T[][] {
 	const out: T[][] = []
 	for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
 	return out
+}
+
+function assertObjectIds(oids: readonly string[]): void {
+	for (const oid of oids) {
+		if (!isOid(oid)) {
+			throw new Error(`pggit objects: malformed object id ${JSON.stringify(oid)}`)
+		}
+	}
+}
+
+function toOidBuffer(oid: string): Buffer {
+	assertObjectIds([oid])
+	return Buffer.from(oid, "hex")
 }
 
 export type StoredObject = {
@@ -78,8 +93,11 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			includeTag = false,
 			thinPack = false,
 		): Promise<Buffer> {
+			assertObjectIds(wants)
+			assertObjectIds(haves)
+			if (wants.length === 0) return writePack([])
 			const id = await repos.resolveRepoId(repoId)
-			if (id === null || wants.length === 0) return writePack([])
+			if (id === null) throw new WantNotFoundError(wants)
 
 			const route = await withPhase("closure", async () => {
 				// The one routed entry (spine chunk 2/R4): the router type-dispatches
@@ -137,16 +155,18 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 				}
 				// Warm-delta base bodies: boundary trees, NOT in the served set — read
 				// once per serve (they are the same handful the frontier just diffed).
-				const warmBaseCache = new Map<string, Buffer | null>()
-				const readWarmBase = async (oid: string): Promise<Buffer | null> => {
+				const warmBaseCache = new Map<string, Buffer>()
+				const readWarmBase = async (oid: string): Promise<Buffer> => {
 					const hit = warmBaseCache.get(oid)
 					if (hit !== undefined) return hit
 					const [row] = await pg<{ content: Buffer }[]>`
 						select content from git_object
 						where repo_id = ${id}::bigint and oid = ${Buffer.from(oid, "hex")}`
-					const content = row?.content ?? null
-					warmBaseCache.set(oid, content)
-					return content
+					if (!row) {
+						throw new Error(`pggit: warm-delta base ${oid} vanished while packing`)
+					}
+					warmBaseCache.set(oid, row.content)
+					return row.content
 				}
 				const emitOrder = [
 					...served.filter((o) => !deltaOids.has(o)),
@@ -310,10 +330,11 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		/** The subset of `haves` this repo actually has — the negotiation common set,
 		 * in one indexed lookup rather than a per-have probe. */
 		async commonHaves(repoId: string, haves: string[]): Promise<string[]> {
+			assertObjectIds(haves)
 			if (haves.length === 0) return []
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return []
-			// Batched: the have list is CLIENT-sized and unvalidated, one bind per oid,
+			// Batched: the have list is CLIENT-sized, one bind per oid,
 			// and the wire caps a statement at 65,534 binds — this was the store's last
 			// unbatched client-sized value list, and it 500'd exactly at the wall
 			// (pg-corrupt--fetch-haves-value-list).
@@ -337,6 +358,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		},
 		async getObject(repoId: string, oid: string): Promise<StoredObject | null> {
 			count("getObjectCalls")
+			const oidBytes = toOidBuffer(oid)
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return null
 
@@ -350,26 +372,26 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 					),
 				)
 				.where("repo_id", "=", id)
-				.where("oid", "=", Buffer.from(oid, "hex"))
+				.where("oid", "=", oidBytes)
 				.executeTakeFirst()
 			if (!row) return null
 
 			// A >256MiB object comes back with content NULL (the CASE guard); read it chunked
 			// so its bytes never transit the porsager driver as one over-cap hex string.
-			const content =
-				row.content ?? (await readContentChunked(id, Buffer.from(oid, "hex"), row.size))
+			const content = row.content ?? (await readContentChunked(id, oidBytes, row.size))
 			count("objectBytesRead", content.length)
 			return { content, type: objectTypeFromCode(row.type) }
 		},
 
 		async hasObject(repoId: string, oid: string): Promise<boolean> {
+			const oidBytes = toOidBuffer(oid)
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
 			const row = await db
 				.selectFrom("git_object")
 				.select("oid")
 				.where("repo_id", "=", id)
-				.where("oid", "=", Buffer.from(oid, "hex"))
+				.where("oid", "=", oidBytes)
 				.executeTakeFirst()
 			return row !== undefined
 		},
@@ -403,6 +425,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			ancestor: string,
 			descendant: string,
 		): Promise<boolean> {
+			assertObjectIds([ancestor, descendant])
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
 			return await ancestry(db, id, descendant, [Buffer.from(ancestor, "hex")])
@@ -427,6 +450,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			oid: string,
 			boundary: string[] = [],
 		): Promise<boolean> {
+			assertObjectIds([oid, ...boundary])
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
 			// The boundary is a STOP-SET, not a have-set: connectivity needs "every
@@ -444,13 +468,14 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		 * policy's branch-tip check (refs/heads tips must be commits, git's
 		 * rule) needs the TYPE without pulling a possibly-huge content. */
 		async objectType(repoId: string, oid: string): Promise<GitObjectType | null> {
+			const oidBytes = toOidBuffer(oid)
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return null
 			const row = await db
 				.selectFrom("git_object")
 				.select("type")
 				.where("repo_id", "=", id)
-				.where("oid", "=", Buffer.from(oid, "hex"))
+				.where("oid", "=", oidBytes)
 				.executeTakeFirst()
 			return row === undefined ? null : objectTypeFromCode(row.type)
 		},
@@ -485,6 +510,8 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			wants: string[],
 			common: string[],
 		): Promise<boolean> {
+			assertObjectIds(wants)
+			assertObjectIds(common)
 			if (common.length === 0) return false
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
@@ -599,7 +626,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 						${chunk.map(([, c]) => c.treeOid)}::text[],
 						${chunk.map(([, c]) => c.parents.join(" "))}::text[],
 						${chunk.map(([, c]) => c.commitTime)}::bigint[],
-						${chunk.map(([hex]) => generations.get(hex) ?? null)}::int[]
+						${chunk.map(([hex]) => requireGeneration(generations, hex))}::int[]
 					) as u(oid, tree, parents, commit_time, generation)
 					on conflict do nothing`
 			}
@@ -678,7 +705,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		if (qualifying.length === 0) return
 
 		const seed = sql.join(qualifying.map((r) => sql`(${Buffer.from(r, "hex")}::bytea)`))
-		const chain = await sql<{ oid: Buffer }>`
+		const chain = await sql<{ oid: Buffer; type: number | null; has_tag_row: boolean }>`
 			with recursive tags(oid) as (
 				select oid from (values ${seed}) as roots(oid)
 				union
@@ -686,8 +713,18 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 					join tags g on t.oid = g.oid
 					where t.repo_id = ${id}::bigint
 			)
-			select oid from tags
+			select g.oid, o.type, t.oid is not null as has_tag_row
+			from tags g
+				left join git_object o
+					on o.repo_id = ${id}::bigint and o.oid = g.oid
+				left join git_tag t
+					on t.repo_id = ${id}::bigint and t.oid = g.oid
 		`.execute(db)
+		for (const r of chain.rows) {
+			if (r.type === PACK_OBJ_TYPE.TAG && !r.has_tag_row) {
+				throwMissingDerivedRow(r.oid.toString("hex"), r.type)
+			}
+		}
 		for (const r of chain.rows) served.add(r.oid.toString("hex"))
 	}
 

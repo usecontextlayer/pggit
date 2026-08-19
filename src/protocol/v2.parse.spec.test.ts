@@ -38,8 +38,8 @@ const stubBackend: RepoBackend = {
 	readyToGiveUp: async () => false,
 }
 
-describe("parseFetch — keeps valid args, ignores unknown ones", () => {
-	it("ignores an unknown arg but keeps wants/haves/done", () => {
+describe("parseFetch — argument dispatch", () => {
+	it("rejects an unknown argument instead of running a plausible subset", () => {
 		const body = Buffer.concat([
 			encodePktLine(Buffer.from("command=fetch\n")),
 			encodePkt({ type: "delim" }),
@@ -49,10 +49,18 @@ describe("parseFetch — keeps valid args, ignores unknown ones", () => {
 			encodePktLine(Buffer.from("done\n")),
 			encodePkt({ type: "flush" }),
 		])
-		const fetch = parseFetch(parseV2Request(body))
-		expect(fetch.wants).toEqual([A])
-		expect(fetch.haves).toEqual([B])
-		expect(fetch.done).toBe(true)
+		expect(() => parseFetch(parseV2Request(body))).toThrow(
+			/fetch: unsupported argument "frobnicate the widget"/,
+		)
+	})
+
+	it("accepts the no-state ofs-delta and no-progress arguments", () => {
+		const fetch = parseFetch({
+			args: [`want ${A}`, "ofs-delta", "no-progress", "done"],
+			capabilities: [],
+			command: "fetch",
+		})
+		expect(fetch).toMatchObject({ done: true, wants: [A] })
 	})
 })
 

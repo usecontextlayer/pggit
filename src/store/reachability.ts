@@ -3,9 +3,9 @@ import { sql } from "kysely"
 import TinyQueue from "tinyqueue"
 import type { Database } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
-import { objectTypeFromCode } from "@/database/object-type-codes"
 import { GITLINK_MODE, isTreeEntryMode, treeEntries } from "@/object/object"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
+import { throwMissingDerivedRow } from "@/store/derived-row"
 import { loadEpoch, oidsOfUnion, remapPositions } from "@/store/reach-epoch"
 
 /** Oids looked up per round-trip. Kysely's `in`-expansion spends one bind per
@@ -145,13 +145,6 @@ function boundarySatisfies(expects: ReadonlySet<EdgeExpectation>, type: number):
 	if (type === PACK_OBJ_TYPE.TREE) return expects.has("tree")
 	if (type === PACK_OBJ_TYPE.BLOB) return expects.has("blob")
 	return false // a TAG satisfies no edge expectation (edges never declare tags)
-}
-
-/** The chunk-1 corruption crash — loud, never a sweepable "missing". */
-function throwMissingDerivedRow(oid: string, type: number): never {
-	throw new Error(
-		`pggit reachability: stored ${objectTypeFromCode(type)} ${oid} has no derived row — the chunk-1 invariant is broken (backfill missed, or a write path skipped derivation)`,
-	)
 }
 
 /** The router's `git_object` probe: stored type by oid, no invariant judgment
@@ -522,7 +515,11 @@ export async function ancestry(
 ): Promise<boolean> {
 	if (commonBufs.length === 0) return false
 	const commons = sql.join(commonBufs.map((b) => sql`(${b}::bytea)`))
-	const result = await sql<{ reached: boolean }>`
+	const result = await sql<{
+		reached: boolean
+		corrupt_oid: string | null
+		corrupt_type: number | null
+	}>`
 		with recursive anc(oid) as (
 			select ${Buffer.from(want, "hex")}::bytea
 			union
@@ -534,12 +531,28 @@ export async function ancestry(
 					select t.target_oid from git_tag t
 						where t.repo_id = ${id}::bigint and t.oid = a.oid
 				) as step
+		), corrupt as (
+			select a.oid, o.type from anc a
+				join git_object o on o.repo_id = ${id}::bigint and o.oid = a.oid
+				left join git_commit c on c.repo_id = o.repo_id and c.oid = o.oid
+				left join git_tag t on t.repo_id = o.repo_id and t.oid = o.oid
+			where (o.type = ${PACK_OBJ_TYPE.COMMIT} and c.oid is null)
+				or (o.type = ${PACK_OBJ_TYPE.TAG} and t.oid is null)
+			order by a.oid
+			limit 1
 		)
 		select exists (
-			select 1 from anc join (values ${commons}) as c(oid) on c.oid = anc.oid
-		) as reached
+			select 1 from anc join (values ${commons}) as common(oid) on common.oid = anc.oid
+		) as reached,
+		(select encode(oid, 'hex') from corrupt) as corrupt_oid,
+		(select type from corrupt) as corrupt_type
 	`.execute(db)
-	return result.rows[0]?.reached ?? false
+	const [row] = result.rows
+	if (!row) throw new Error("pggit reachability: ancestry query returned no row")
+	if (row.corrupt_oid !== null && row.corrupt_type !== null) {
+		throwMissingDerivedRow(row.corrupt_oid, row.corrupt_type)
+	}
+	return row.reached
 }
 
 // ─────────────────────────── the frontier (chunk 2, S4) ───────────────────────────
@@ -921,7 +934,7 @@ async function epochServe(
 				`.execute(db)
 			).rows
 			if (!row) {
-				throw new Error(`pggit reachability: tag ${current} has no git_tag row`)
+				throwMissingDerivedRow(current, PACK_OBJ_TYPE.TAG)
 			}
 			if (typed.get(row.target) === undefined) {
 				const [t] = (
@@ -1029,9 +1042,8 @@ export async function routeServeSet(
 				`.execute(db)
 			).rows
 			if (!row) {
-				// A stored tag object always has its row (chunk 1); no row means the
-				// walk was handed a non-tag, which the type dispatch prevents.
-				throw new Error(`pggit reachability: tag ${current} has no git_tag row`)
+				// A stored tag object always has its row (chunk 1).
+				throwMissingDerivedRow(current, PACK_OBJ_TYPE.TAG)
 			}
 			const targetType = typed.get(row.target)
 			if (targetType === undefined) {

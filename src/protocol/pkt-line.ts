@@ -5,6 +5,7 @@
  * `0002`. See gitprotocol-common + design spec §5.
  */
 
+import { assertNever } from "@/assert-never"
 import { GitProtocolError } from "@/protocol/errors"
 
 export type Pkt =
@@ -46,6 +47,7 @@ export function encodePkt(pkt: Pkt): Buffer {
 		case "response-end":
 			return RESPONSE_END_PKT
 	}
+	return assertNever(pkt)
 }
 
 function parseLen(buf: Buffer, offset: number): number {

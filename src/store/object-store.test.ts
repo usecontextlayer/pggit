@@ -1,6 +1,7 @@
 import { describe, expect, inject, it } from "vitest"
 import { computeOid } from "@/object/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
+import { WantNotFoundError } from "@/protocol/errors"
 import { createObjectStore } from "@/store/object-store"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
@@ -41,6 +42,21 @@ describe("object store", () => {
 			expect(await store.getObject("repo1", "0".repeat(40))).toBeNull()
 			// repo isolation: repo2 cannot see repo1's objects
 			expect(await store.hasObject("repo2", someOid)).toBe(false)
+			await expect(store.getObject("repo1", "not-an-oid")).rejects.toThrow(
+				/malformed object id "not-an-oid"/,
+			)
+		} finally {
+			await db.drop()
+		}
+	})
+
+	it("rejects an exact want against an unknown repo instead of returning an empty pack", async () => {
+		const db = await createIsolatedSchema(inject("pgBaseUrl"))
+		try {
+			const store = createObjectStore(db.sql)
+			await expect(
+				store.buildPack("unknown", ["a".repeat(40)], [], false),
+			).rejects.toThrow(WantNotFoundError)
 		} finally {
 			await db.drop()
 		}

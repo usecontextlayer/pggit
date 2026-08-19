@@ -92,7 +92,6 @@ function biome(): void {
 async function run(): Promise<void> {
 	const program = new Command()
 		.argument("<action>")
-		.option("--sub <string>")
 		.option("--no-auto-codegen")
 		.option("--no-auto-biome")
 		.option("--ci")

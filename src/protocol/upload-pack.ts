@@ -44,6 +44,16 @@ export type RepoBackend = {
 async function handleLsRefs(req: V2Request, backend: RepoBackend): Promise<Buffer> {
 	label("ls-refs")
 	return withPhase("ref-advertise", async () => {
+		for (const arg of req.args) {
+			if (
+				arg !== "peel" &&
+				arg !== "symrefs" &&
+				arg !== "unborn" &&
+				!arg.startsWith("ref-prefix ")
+			) {
+				throw new GitProtocolError(`ls-refs: unsupported argument ${JSON.stringify(arg)}`)
+			}
+		}
 		const wantPeel = req.args.includes("peel")
 		const wantSymrefs = req.args.includes("symrefs")
 		const prefixes = req.args
@@ -115,7 +125,7 @@ async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer
 			// ACK/NAK and flush, no pack — the client sends more haves. Once ready, git
 			// requires the pack in this same response, after the `ready` line.
 			if (!(await backend.readyToGiveUp(wants, common))) {
-				return encodeAcknowledgments(common, false)
+				return encodeAcknowledgments(common)
 			}
 			return encodeReadyWithPack(
 				common,

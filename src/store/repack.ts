@@ -349,11 +349,9 @@ export function createRepack(pg: Sql) {
 				(select coalesce(array_agg(encode(p.h, 'hex') order by p.ord), '{}')
 					from unnest(c.parents) with ordinality as p(h, ord)) as parents
 			from git_commit c where c.repo_id = ${id}::bigint`
-		const byOid = new Map(commits.map((c) => [c.oid, c]))
-		const parsed = new Map<string, { tree: string; parents: string[] }>()
-		for (const c of commits) {
-			parsed.set(c.oid, { parents: c.parents, tree: c.tree })
-		}
+		const parsed = new Map(
+			commits.map((c) => [c.oid, { parents: c.parents, tree: c.tree }] as const),
+		)
 
 		// Kahn over the parent relation, restricted to parents that still exist (a
 		// force-push + GC can leave a reachable commit whose parent is gone — that
@@ -361,7 +359,7 @@ export function createRepack(pg: Sql) {
 		const indegree = new Map<string, number>()
 		const children = new Map<string, string[]>()
 		for (const [oid, p] of parsed) {
-			const present = p.parents.filter((parent) => byOid.has(parent))
+			const present = p.parents.filter((parent) => parsed.has(parent))
 			indegree.set(oid, present.length)
 			for (const parent of present) {
 				const slot = children.get(parent)
@@ -377,15 +375,23 @@ export function createRepack(pg: Sql) {
 		while (ready.length > 0) {
 			const oid = ready.shift() as string
 			const p = parsed.get(oid)
-			if (!p) continue
-			const firstParent = p.parents.find((parent) => byOid.has(parent))
+			if (!p) throw new Error(`pggit repack: no commit row for queued oid ${oid}`)
+			const firstParent = p.parents.find((parent) => parsed.has(parent))
+			const parent = firstParent === undefined ? undefined : parsed.get(firstParent)
+			if (firstParent !== undefined && parent === undefined) {
+				throw new Error(`pggit repack: no commit row for parent ${firstParent}`)
+			}
 			order.push({
-				parentTreeOid: firstParent ? (parsed.get(firstParent)?.tree ?? null) : null,
+				parentTreeOid: parent === undefined ? null : parent.tree,
 				treeOid: p.tree,
 			})
 			const next: string[] = []
 			for (const child of children.get(oid) ?? []) {
-				const n = (indegree.get(child) ?? 1) - 1
+				const childIndegree = indegree.get(child)
+				if (childIndegree === undefined) {
+					throw new Error(`pggit repack: no indegree for child ${child}`)
+				}
+				const n = childIndegree - 1
 				indegree.set(child, n)
 				if (n === 0) next.push(child)
 			}
@@ -394,6 +400,11 @@ export function createRepack(pg: Sql) {
 				ready.push(...next)
 				ready.sort()
 			}
+		}
+		if (order.length !== parsed.size) {
+			throw new Error(
+				`pggit repack: ${parsed.size - order.length} commits form a parent cycle`,
+			)
 		}
 		return order
 	}

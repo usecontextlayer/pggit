@@ -2,7 +2,7 @@ import { isOid } from "@/oid"
 import { AGENT } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"
-import { encodeSideband, SIDEBAND_DATA } from "@/protocol/sideband"
+import { encodeSidebandData } from "@/protocol/sideband"
 
 /**
  * The v2 capability advertisement (GET info/refs body, minus HTTP framing).
@@ -124,7 +124,11 @@ export function parseFetch(req: V2Request): FetchRequest {
 		else if (arg === "include-tag") includeTag = true
 		else if (arg === "thin-pack") thinPack = true
 		else if (arg === "done") done = true
-		// `ofs-delta` stays parsed-and-ignored: REF_DELTA-only is legal in any pack.
+		// REF_DELTA-only remains legal without `ofs-delta`; pggit never emits
+		// progress, so `no-progress` also needs no state of its own.
+		else if (arg !== "ofs-delta" && arg !== "no-progress") {
+			throw new GitProtocolError(`fetch: unsupported argument ${JSON.stringify(arg)}`)
+		}
 	}
 	return { done, filter, haves, includeTag, thinPack, wants }
 }
@@ -166,8 +170,8 @@ function acknowledgmentLines(common: string[], ready: boolean): Buffer {
  * (no `done`): the section + flush, no pack. The client sends more haves or
  * `done` (spec §4 shape b).
  */
-export function encodeAcknowledgments(common: string[], ready: boolean): Buffer {
-	return Buffer.concat([acknowledgmentLines(common, ready), encodePkt({ type: "flush" })])
+export function encodeAcknowledgments(common: string[]): Buffer {
+	return Buffer.concat([acknowledgmentLines(common, false), encodePkt({ type: "flush" })])
 }
 
 /**
@@ -200,7 +204,7 @@ export function encodeErr(message: string): Buffer {
 export function encodePackfileResponse(pack: Buffer): Buffer {
 	return Buffer.concat([
 		encodePktLine(Buffer.from("packfile\n")),
-		encodeSideband(SIDEBAND_DATA, pack),
+		encodeSidebandData(pack),
 		encodePkt({ type: "flush" }),
 	])
 }

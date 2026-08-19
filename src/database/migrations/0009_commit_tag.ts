@@ -1,6 +1,6 @@
 import { type Kysely, sql } from "kysely"
 import { OBJECT_TYPE_CODE } from "@/database/object-type-codes"
-import { computeGenerations } from "@/object/commit-graph"
+import { computeGenerations, requireGeneration } from "@/object/commit-graph"
 import { deriveCommitRow, deriveTagRow } from "@/object/derive"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 
@@ -144,7 +144,7 @@ async function backfill(db: Kysely<unknown>): Promise<void> {
 					${chunk.map((d) => d.row.treeOid)}::text[],
 					${chunk.map((d) => d.row.parents.join(" "))}::text[],
 					${chunk.map((d) => d.row.commitTime)}::bigint[],
-					${chunk.map((d) => generations.get(d.oid) ?? null)}::int[]
+					${chunk.map((d) => requireGeneration(generations, d.oid))}::int[]
 				) as u(oid, tree, parents, commit_time, generation)
 				on conflict do nothing
 			`.execute(db)

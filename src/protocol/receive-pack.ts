@@ -2,7 +2,7 @@ import { isOid, type Oid, ZERO_OID } from "@/oid"
 import { AGENT, assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"
-import { encodeSideband, SIDEBAND_DATA } from "@/protocol/sideband"
+import { encodeSidebandData } from "@/protocol/sideband"
 
 /** A ref name longer than this (bytes) is rejected at the boundary: `git_ref`'s PK is
  * a btree on (repo_id, name) whose index entry overflows past ~2704 bytes, which
@@ -36,7 +36,9 @@ const UTF8_STRICT = new TextDecoder("utf8", { fatal: true })
 
 export type RefCommand = { oldOid: Oid; newOid: Oid; ref: string }
 export type ReceiveRequest = { commands: RefCommand[]; caps: string[]; pack: Buffer }
-export type CommandResult = { ref: string; ok: boolean; reason?: string }
+export type CommandResult =
+	| { ref: string; ok: true }
+	| { ref: string; ok: false; reason: string }
 
 /**
  * v0 ref advertisement for receive-pack (push). An empty repo — the dominant
@@ -133,16 +135,13 @@ export function encodeReportStatus(
 ): Buffer {
 	const lines: Buffer[] = [encodePktLine(Buffer.from(`unpack ${unpack}\n`))]
 	for (const r of results) {
-		const line = r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason ?? "failed"}\n`
+		const line = r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`
 		lines.push(encodePktLine(Buffer.from(line)))
 	}
 	lines.push(encodePkt({ type: "flush" }))
 	const report = Buffer.concat(lines)
 	if (!useSideband) return report
-	return Buffer.concat([
-		encodeSideband(SIDEBAND_DATA, report),
-		encodePkt({ type: "flush" }),
-	])
+	return Buffer.concat([encodeSidebandData(report), encodePkt({ type: "flush" })])
 }
 
 /**
@@ -330,10 +329,17 @@ export async function handleReceivePack(
 							? null
 							: "non-fast-forward (refs only advance)",
 	)
+	const reasonFor = (i: number): string | null => {
+		const reason = reasons[i]
+		if (reason === undefined) {
+			throw new Error(`receive-pack: no decision produced for command ${i}`)
+		}
+		return reason
+	}
 	if (atomic && reasons.some((r) => r !== null)) {
 		const failed = commands.map((c, i) => ({
 			ok: false,
-			reason: reasons[i] ?? "atomic transaction failed",
+			reason: reasonFor(i) ?? "atomic transaction failed",
 			ref: c.ref,
 		}))
 		return encodeReportStatus(unpackStatus, failed, useSideband)
@@ -346,7 +352,7 @@ export async function handleReceivePack(
 	)
 	let applied = 0
 	const results: CommandResult[] = commands.map((c, i) => {
-		const reason = reasons[i]
+		const reason = reasonFor(i)
 		if (reason !== null) return { ok: false, reason, ref: c.ref }
 		return oks[applied++]
 			? { ok: true, ref: c.ref }
@@ -363,7 +369,11 @@ export async function handleReceivePack(
 	// view layer decides branch-filtering and build-vs-drop. Sequential — same-repo
 	// rebuilds must not race the shared-blob reaper.
 	for (const [i, c] of commands.entries()) {
-		if (!results[i]?.ok) continue
+		const result = results[i]
+		if (result === undefined) {
+			throw new Error(`receive-pack: no result produced for ${JSON.stringify(c.ref)}`)
+		}
+		if (!result.ok) continue
 		// rc2: the queryable view is a DERIVED projection — a rebuild failure (e.g. a
 		// tip that is not a commit, which buildFileList cannot walk) must NEVER roll
 		// back or 500 an already-applied push (rebuild.ts's standing contract). Absorb

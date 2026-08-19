@@ -69,8 +69,10 @@ export async function migrateToLatest<T>(db: Kysely<T>): Promise<void> {
  */
 export async function applyMigrations<T>(db: Kysely<T>): Promise<void> {
 	const migrations = await migrationProvider().getMigrations()
-	for (const name of Object.keys(migrations).sort()) {
-		const migration: Migration | undefined = migrations[name]
-		await migration?.up(db)
+	const ordered = Object.entries(migrations).sort(([a], [b]) =>
+		a < b ? -1 : a > b ? 1 : 0,
+	)
+	for (const [, migration] of ordered) {
+		await migration.up(db)
 	}
 }

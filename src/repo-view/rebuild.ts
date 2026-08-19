@@ -1,7 +1,6 @@
 import { commitTreeOid } from "@/object/object"
 import { diffFileLists, type TreeReader } from "@/object/tree-diff"
 import { buildFileList } from "@/repo-view/build-file-list"
-import { SNAPSHOT_REFS } from "@/repo-view/config"
 import type { RepoFileProjection } from "@/repo-view/repo-file-projection"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
@@ -15,7 +14,7 @@ export type SnapshotDeps = {
 
 /**
  * Refresh `refName`'s file snapshot after a push applied it. Non-branch refs are
- * ignored (§ SNAPSHOT_REFS); a delete (zero oid) drops the snapshot; otherwise
+ * ignored; a delete (zero oid) drops the snapshot; otherwise
  * the projection advances to the new tip — incrementally from its recorded basis
  * when the tip descends from it, by full rebuild when no basis exists, and NOT AT
  * ALL when a newer push already projected past this oid (the monotonic guard,
@@ -31,7 +30,9 @@ export async function syncRefSnapshot(
 	refName: string,
 	newOid: string,
 ): Promise<void> {
-	if (!SNAPSHOT_REFS(refName)) return
+	// The queryable projection is branch-only: tags, notes, and pull refs do not
+	// describe a workspace file tree.
+	if (!refName.startsWith("refs/heads/")) return
 	if (newOid === ZERO_OID) {
 		await deps.snapshots.dropRefSnapshot(repoId, refName)
 		return
