@@ -1,5 +1,7 @@
 # Conversion mapping — lens `txn` (crash integrity)
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts and mechanism names below (`sweepEncodings`, `gc_live_<id>`, `deletedEncodings`, …) describe the code AS CONVERTED; the 2026-08-16 defect-fix pass redesigned several of them (delta-pack doc D11–D16). This file is deliberately NOT updated — read it as the frozen record of what each harness asserted at conversion time.
+
 Seven source scripts assigned, seven converted. One source script → exactly one destination artifact; no script split, none dropped. Routing is by each script's PRIMARY exit verdict: a measured threshold (bytes / ms) goes to a perf harness, a correctness or convergence property goes to a vitest e2e test. Secondary checks stay inside the one destination they belong to.
 
 `pg-txn--*` scripts are a DIFFERENT lens and are untouched by this conversion.

@@ -1,5 +1,7 @@
 # Breakage conversion mapping — lens `perf`
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts and mechanism names below (`sweepEncodings`, `gc_live_<id>`, `deletedEncodings`, …) describe the code AS CONVERTED; the 2026-08-16 defect-fix pass redesigned several of them (delta-pack doc D11–D16). This file is deliberately NOT updated — read it as the frozen record of what each harness asserted at conversion time.
+
 11 source scripts assigned, 11 converted (10 perf harnesses + 1 e2e test), plus the lens's shared helper. One source script → exactly one destination artifact; no script was split, dropped, or shrunk.
 
 Routing followed the spec's rule — a MEASURED THRESHOLD exits perf, a CORRECTNESS property on a hermetic fixture exits e2e — decided per script by its PRIMARY exit verdict.

@@ -1,5 +1,7 @@
 # Conversion mapping — lens `pgres` (Postgres resource economics of the derived encoding tier)
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts and mechanism names below (`sweepEncodings`, `gc_live_<id>`, `deletedEncodings`, …) describe the code AS CONVERTED; the 2026-08-16 defect-fix pass redesigned several of them (delta-pack doc D11–D16). This file is deliberately NOT updated — read it as the frozen record of what each harness asserted at conversion time.
+
 6 source scripts assigned, 6 converted. One source script → exactly one destination artifact; every check the source carried lives in that one destination.
 
 | source (`breakage/…`) | destination | kind | property it asserts / measures | expected current state |
