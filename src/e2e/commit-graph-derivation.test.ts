@@ -1,0 +1,289 @@
+/**
+ * Spine chunk 1 (S1 gates): every stored commit/tag object gets its
+ * `git_commit`/`git_tag` row, derived transactionally at ingest — and
+ * `generation` behaves EXACTLY as designed in both directions:
+ *
+ *   - a first push of a linear history yields FINITE generations 1..N even
+ *     though a git pack lists commits newest-first (the in-pack topological
+ *     pass; all-NULL here is the bug the design calls out by name), and
+ *   - a commit ingested while its parent is ABSENT derives NULL — and STAYS
+ *     NULL when the parent arrives later (absorbing, never recomputed), and
+ *     NULL propagates to descendants.
+ *
+ * Plus: `parents` preserves CONTENT order (the kind-2 edge set threw it away —
+ * this column is the fix), `commit_time` is the committer epoch, tag rows carry
+ * target + type, and the 0009 backfill derives for pre-0009 data exactly what
+ * ingest derives — including absorbing NULL for denied-push residue.
+ */
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { Migration } from "kysely/migration"
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import { createGitApp, createGitDeps } from "@/index"
+import { computeOid } from "@/object/object"
+import { type GitServer, serveOnPort } from "@/server"
+import { createObjectStore } from "@/store/object-store"
+import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { spawnGit } from "@/testing/spawn-git"
+
+const EPOCH = 1_700_000_000
+
+/** A well-formed synthetic commit. The tree does not need to exist for row
+ * derivation (putPack runs no connectivity check), which keeps these fixtures
+ * on the exact seam under test: content → row. */
+function commitBytes(
+	tree: string,
+	parents: string[],
+	msg: string,
+	epoch = EPOCH,
+): Buffer {
+	return Buffer.from(
+		`tree ${tree}\n${parents.map((p) => `parent ${p}\n`).join("")}author a <a@a.test> ${epoch} +0000\ncommitter c <c@c.test> ${epoch} +0000\n\n${msg}\n`,
+		"latin1",
+	)
+}
+
+function tagBytes(target: string, type: string, name: string): Buffer {
+	return Buffer.from(
+		`object ${target}\ntype ${type}\ntag ${name}\ntagger t <t@t.test> ${EPOCH} +0000\n\n${name}\n`,
+		"latin1",
+	)
+}
+
+const FAKE_TREE = "ab".repeat(20)
+
+type CommitRow = {
+	oid: string
+	tree: string
+	parents: string[]
+	commit_time: string
+	generation: number | null
+}
+
+describe("spine S1 — git_commit/git_tag derivation", () => {
+	let db: IsolatedDb
+
+	beforeAll(async () => {
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
+	}, 600_000)
+
+	afterAll(async () => {
+		await db?.drop()
+	})
+
+	async function commitRows(repo: string): Promise<Map<string, CommitRow>> {
+		const rows = await db.sql<CommitRow[]>`
+			select encode(c.oid, 'hex') as oid, encode(c.tree_oid, 'hex') as tree,
+				(select coalesce(array_agg(encode(p.h, 'hex') order by p.ord), '{}')
+					from unnest(c.parents) with ordinality as p(h, ord)) as parents,
+				c.commit_time, c.generation
+			from git_commit c join repos r on r.id = c.repo_id
+			where r.name = ${repo}`
+		return new Map(rows.map((r) => [r.oid, r]))
+	}
+
+	it("a first push of a linear history yields FINITE generations (in-pack topo pass)", async () => {
+		const store = createObjectStore(db.sql)
+		const commits: { oid: string; content: Buffer }[] = []
+		let parent: string | null = null
+		for (let i = 0; i < 5; i++) {
+			const content = commitBytes(FAKE_TREE, parent ? [parent] : [], `c${i}`, EPOCH + i)
+			const oid = computeOid("commit", content)
+			commits.push({ content, oid })
+			parent = oid
+		}
+		// NEWEST-FIRST, exactly as a real pack lists them: per-row computation in
+		// this order would derive NULL for every commit (the named bug).
+		await store.putPack(
+			"linear",
+			[...commits]
+				.reverse()
+				.map((c) => ({ content: c.content, type: "commit" as const })),
+		)
+
+		const rows = await commitRows("linear")
+		expect(rows.size).toBe(5)
+		for (const [i, c] of commits.entries()) {
+			const row = rows.get(c.oid)
+			expect(row?.generation).toBe(i + 1)
+			expect(row?.tree).toBe(FAKE_TREE)
+			expect(BigInt(row?.commit_time ?? 0n)).toBe(BigInt(EPOCH + i))
+			expect(row?.parents).toEqual(i === 0 ? [] : [commits[i - 1]?.oid])
+		}
+	})
+
+	it("a merge commit's parents preserve CONTENT order; generation is 1+max", async () => {
+		const store = createObjectStore(db.sql)
+		const a = commitBytes(FAKE_TREE, [], "a")
+		const aOid = computeOid("commit", a)
+		const b = commitBytes(FAKE_TREE, [aOid], "b")
+		const bOid = computeOid("commit", b)
+		// Parents deliberately [bOid, aOid] — descending-generation order, so a
+		// sorted or set-shaped store would betray itself here.
+		const m = commitBytes(FAKE_TREE, [bOid, aOid], "m")
+		const mOid = computeOid("commit", m)
+		await store.putPack("merge", [
+			{ content: m, type: "commit" },
+			{ content: b, type: "commit" },
+			{ content: a, type: "commit" },
+		])
+
+		const rows = await commitRows("merge")
+		expect(rows.get(mOid)?.parents).toEqual([bOid, aOid])
+		expect(rows.get(aOid)?.generation).toBe(1)
+		expect(rows.get(bOid)?.generation).toBe(2)
+		expect(rows.get(mOid)?.generation).toBe(3)
+	})
+
+	it("an absent parent derives NULL, absorbing — the parent arriving later changes NOTHING", async () => {
+		const store = createObjectStore(db.sql)
+		const orphanParent = commitBytes(FAKE_TREE, [], "never-pushed-first")
+		const orphanParentOid = computeOid("commit", orphanParent)
+		const child = commitBytes(FAKE_TREE, [orphanParentOid], "child")
+		const childOid = computeOid("commit", child)
+
+		// 1. Child arrives WITHOUT its parent (denied-push residue shape).
+		await store.putPack("orphan", [{ content: child, type: "commit" }])
+		expect((await commitRows("orphan")).get(childOid)?.generation).toBeNull()
+
+		// 2. The parent arrives later: it gets its own finite generation, but the
+		// child is NEVER recomputed (absorbing NULL, ingest atomicity).
+		await store.putPack("orphan", [{ content: orphanParent, type: "commit" }])
+		const after = await commitRows("orphan")
+		expect(after.get(orphanParentOid)?.generation).toBe(1)
+		expect(after.get(childOid)?.generation).toBeNull()
+
+		// 3. Re-sending the child is idempotent — still NULL.
+		await store.putPack("orphan", [{ content: child, type: "commit" }])
+		expect((await commitRows("orphan")).get(childOid)?.generation).toBeNull()
+
+		// 4. NULL propagates: a NEW descendant of the NULL child is NULL too, even
+		// beside a finite-generation parent (max over a NULL region is unknowable).
+		const grandchild = commitBytes(FAKE_TREE, [childOid, orphanParentOid], "grandchild")
+		await store.putPack("orphan", [{ content: grandchild, type: "commit" }])
+		expect(
+			(await commitRows("orphan")).get(computeOid("commit", grandchild))?.generation,
+		).toBeNull()
+	})
+
+	it("tag rows: target + stored type code, chains included", async () => {
+		const store = createObjectStore(db.sql)
+		const c = commitBytes(FAKE_TREE, [], "tagged")
+		const cOid = computeOid("commit", c)
+		const t1 = tagBytes(cOid, "commit", "v1")
+		const t1Oid = computeOid("tag", t1)
+		const t2 = tagBytes(t1Oid, "tag", "v1-signed")
+		const t2Oid = computeOid("tag", t2)
+		await store.putPack("tags", [
+			{ content: c, type: "commit" },
+			{ content: t1, type: "tag" },
+			{ content: t2, type: "tag" },
+		])
+
+		const rows = await db.sql<{ oid: string; target: string; target_type: number }[]>`
+			select encode(t.oid, 'hex') as oid, encode(t.target_oid, 'hex') as target, t.target_type
+			from git_tag t join repos r on r.id = t.repo_id where r.name = ${"tags"}`
+		const byOid = new Map(rows.map((r) => [r.oid, r]))
+		expect(byOid.get(t1Oid)).toMatchObject({ target: cOid, target_type: 1 })
+		expect(byOid.get(t2Oid)).toMatchObject({ target: t1Oid, target_type: 4 })
+	})
+
+	it("a real `git push` over the wire derives rows for every commit and tag", async () => {
+		const server: GitServer = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+		const dir = mkdtempSync(join(tmpdir(), "pggit-s1-wire-"))
+		try {
+			await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
+			writeFileSync(join(dir, "f.txt"), "one\n")
+			await spawnGit(["add", "."], { cwd: dir })
+			await spawnGit(["commit", "-q", "-m", "c1"], { cwd: dir })
+			writeFileSync(join(dir, "f.txt"), "two\n")
+			await spawnGit(["commit", "-q", "-am", "c2"], { cwd: dir })
+			await spawnGit(["tag", "-a", "-m", "v1", "v1"], { cwd: dir })
+			const url = `http://127.0.0.1:${server.port}/wire`
+			await spawnGit(
+				["push", "-q", url, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"],
+				{ cwd: dir },
+			)
+
+			const rows = await commitRows("wire")
+			expect(rows.size).toBe(2)
+			expect([...rows.values()].map((r) => r.generation).sort()).toEqual([1, 2])
+			const tags = await db.sql<{ n: string }[]>`
+				select count(*) as n from git_tag t join repos r on r.id = t.repo_id
+				where r.name = ${"wire"}`
+			expect(Number(tags[0]?.n)).toBe(1)
+		} finally {
+			rmSync(dir, { force: true, recursive: true })
+			await server.close()
+		}
+	})
+})
+
+describe("spine S1 — 0009 backfill derives rows for pre-0009 data", () => {
+	let db: IsolatedDb
+
+	beforeAll(async () => {
+		db = await createIsolatedSchema(inject("pgBaseUrl"))
+	}, 600_000)
+
+	afterAll(async () => {
+		await db?.drop()
+	})
+
+	it("backfills commit generations, ordered parents, and tag rows; absent parents stay NULL", async () => {
+		// The pre-0009 world, made with the migration's own inverse: down() drops
+		// the derived tables, rows land straight in git_object, up() re-creates and
+		// backfills — one test covers both directions of the real migration. Typed
+		// through kysely's own Migration interface, exactly as the migrator calls it.
+		const m0009: Migration = await import("@/database/migrations/0009_commit_tag")
+		await m0009.down?.(db.db)
+
+		const a = commitBytes(FAKE_TREE, [], "a")
+		const aOid = computeOid("commit", a)
+		const b = commitBytes(FAKE_TREE, [aOid], "b")
+		const bOid = computeOid("commit", b)
+		const ghost = "cd".repeat(20) // parent object the repo never held
+		const c = commitBytes(FAKE_TREE, [ghost, bOid], "c")
+		const cOid = computeOid("commit", c)
+		const tag = tagBytes(bOid, "commit", "v1")
+		const tagOid = computeOid("tag", tag)
+
+		await db.sql`insert into repos (name) values ('prebackfill')`
+		const [{ id }] = await db.sql<[{ id: string }]>`
+			select id from repos where name = 'prebackfill'`
+		for (const [oid, type, content] of [
+			[aOid, 1, a],
+			[bOid, 1, b],
+			[cOid, 1, c],
+			[tagOid, 4, tag],
+		] as const) {
+			await db.sql`insert into git_object (repo_id, oid, type, size, content)
+				values (${id}::bigint, ${Buffer.from(oid, "hex")}, ${type}, ${content.length}, ${content})`
+		}
+
+		await m0009.up(db.db)
+
+		const rows = await db.sql<
+			{ oid: string; parents: string[]; generation: number | null }[]
+		>`
+			select encode(c.oid, 'hex') as oid,
+				(select coalesce(array_agg(encode(p.h, 'hex') order by p.ord), '{}')
+					from unnest(c.parents) with ordinality as p(h, ord)) as parents,
+				c.generation
+			from git_commit c where c.repo_id = ${id}::bigint`
+		const byOid = new Map(rows.map((r) => [r.oid, r]))
+		expect(byOid.get(aOid)?.generation).toBe(1)
+		expect(byOid.get(bOid)?.generation).toBe(2)
+		// c's first parent never existed in the repo: absorbing NULL, exactly what
+		// ingest would have derived — and its CONTENT parent order is preserved.
+		expect(byOid.get(cOid)?.generation).toBeNull()
+		expect(byOid.get(cOid)?.parents).toEqual([ghost, bOid])
+
+		const tags = await db.sql<{ target: string; target_type: number }[]>`
+			select encode(target_oid, 'hex') as target, target_type
+			from git_tag where repo_id = ${id}::bigint`
+		expect(tags).toHaveLength(1)
+		expect(tags[0]).toMatchObject({ target: bOid, target_type: 1 })
+	})
+})

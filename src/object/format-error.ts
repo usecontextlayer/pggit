@@ -26,12 +26,17 @@ export type GitFormatErrorCode =
 	| "delta-target-size-mismatch"
 	// git object content
 	| "malformed-tree"
+	| "malformed-tree-mode"
 	| "non-utf8-path"
 	| "malformed-oid"
 	| "missing-tree-header"
 	| "multiple-tree-headers"
 	| "missing-tag-object"
 	| "multiple-tag-objects"
+	| "missing-committer-header"
+	| "malformed-committer-time"
+	| "missing-tag-type"
+	| "unknown-tag-type"
 
 export class GitFormatError extends Error {
 	readonly code: GitFormatErrorCode

@@ -61,6 +61,10 @@ export function isTreeEntryMode(mode: string): boolean {
 	return mode === "40000"
 }
 
+/** A tree entry pointing at a commit in *another* repo — nothing stored behind
+ * it in THIS repo, so walks and projections skip it. */
+export const GITLINK_MODE = "160000"
+
 /** OIDs of a tree's entries (all kinds), in tree order. */
 function treeEntryOids(content: Buffer): string[] {
 	return treeEntries(content).map((e) => e.oid)
@@ -81,6 +85,50 @@ export function commitTreeOid(content: Buffer): string {
 		)
 	}
 	return tree
+}
+
+/**
+ * The committer's epoch seconds — `git_commit.commit_time`, the frontier's
+ * tiebreak within and without generation regions (spine chunk 1). Headers end at
+ * the first blank line; continuation lines (a `mergetag` payload) start with a
+ * space and can never match. Loud on absence or a non-numeric epoch: the row
+ * derivation IS the ingest-side validation of this header.
+ */
+export function commitCommitterTime(content: Buffer): number {
+	for (const line of content.toString("latin1").split("\n")) {
+		if (line === "") break
+		if (!line.startsWith("committer ")) continue
+		// `committer Name <email> <epoch> <tz>` — the epoch is the second-to-last token.
+		const tokens = line.split(" ")
+		const epoch = tokens[tokens.length - 2]
+		if (epoch === undefined || !/^-?\d+$/.test(epoch)) {
+			throw new GitFormatError(
+				"malformed-committer-time",
+				`commit committer header carries no epoch: ${line.slice(0, 80)}`,
+			)
+		}
+		return Number.parseInt(epoch, 10)
+	}
+	throw new GitFormatError("missing-committer-header", "commit has no committer header")
+}
+
+/** The annotated tag's `type` header — its target's object type
+ * (`git_tag.target_type`). Loud on absence or an unknown name, like the epoch
+ * parse above: deriving the tag row is what validates the header. */
+export function tagTargetType(content: Buffer): GitObjectType {
+	for (const line of content.toString("latin1").split("\n")) {
+		if (line === "") break
+		if (!line.startsWith("type ")) continue
+		const name = line.slice(5)
+		if (name === "blob" || name === "commit" || name === "tag" || name === "tree") {
+			return name
+		}
+		throw new GitFormatError(
+			"unknown-tag-type",
+			`tag type header names no git object type: ${name.slice(0, 40)}`,
+		)
+	}
+	throw new GitFormatError("missing-tag-type", "annotated tag has no type header")
 }
 
 /**
