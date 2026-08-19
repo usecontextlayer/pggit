@@ -19,6 +19,7 @@ describe("git_commit/git_tag derivation at seed", () => {
 	let src = ""
 	let c1 = ""
 	let c2 = ""
+	let t1 = ""
 	let t2 = ""
 	let tag = ""
 	let c1Time = 0
@@ -59,6 +60,7 @@ describe("git_commit/git_tag derivation at seed", () => {
 			(await spawnGit(["rev-parse", rev], { cwd: src })).stdout.trim()
 		c2 = await rp("HEAD")
 		c1 = await rp("HEAD~1")
+		t1 = await rp("HEAD~1^{tree}")
 		t2 = await rp("HEAD^{tree}")
 		tag = await rp("refs/tags/v1")
 		const ct = async (rev: string): Promise<number> =>
@@ -94,20 +96,23 @@ describe("git_commit/git_tag derivation at seed", () => {
 	})
 
 	it("each commit row matches git's own readings: tree, parents, committer time", () => {
-		expect(commitRows.get(c1)).toMatchObject({
+		expect(commitRows.get(c1)).toEqual({
 			commit_time: String(c1Time),
 			generation: 1,
+			oid: c1,
 			parents: [],
+			tree: t1,
 		})
-		expect(commitRows.get(c2)).toMatchObject({
+		expect(commitRows.get(c2)).toEqual({
 			commit_time: String(c2Time),
 			generation: 2,
+			oid: c2,
 			parents: [c1],
 			tree: t2,
 		})
 	})
 
 	it("the annotated tag's row carries target + stored type code", () => {
-		expect(tagRows[0]).toMatchObject({ oid: tag, target: c2, target_type: 1 })
+		expect(tagRows).toEqual([{ oid: tag, target: c2, target_type: 1 }])
 	})
 })

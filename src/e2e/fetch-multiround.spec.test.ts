@@ -3,19 +3,19 @@
  * real store. The incremental-fetch differentials assert the resulting object SET;
  * this asserts the negotiation SEQUENCE, exercising `readyToGiveUp`'s ancestry cut
  * (over-eager ⇒ a wrong delta sent too early; under-eager ⇒ a loop). A non-cutting
- * `have` (off a sibling branch) must yield acknowledgments+flush and NO pack;
+ * `have` from an unrelated root must yield acknowledgments+flush and NO pack;
  * adding a cutting `have` must flip to `ready`+delim+pack in one response (git's
  * t5702 ready-delim lock). Each transcript is compared against real
  * `git upload-pack --stateless-rpc` fed the IDENTICAL request bytes, so ACK order,
  * `ready` timing and the ready-delim lock are a differential against canonical git
- * rather than a transcription of one. The negotiation logic lives in the store now
- * (ancestry CTE over the edge table), so this drives a store-backed backend rather
- * than an in-memory map.
+ * rather than a transcription of one. The negotiation logic lives in the store now,
+ * so this drives a store-backed backend rather than an in-memory map.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import { createGitApp } from "@/index"
 import { decodePktStream } from "@/protocol/pkt-line"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
@@ -30,6 +30,7 @@ import { fetchRequest } from "@/testing/wire-fetch"
 describe("M1 multi-round negotiation", () => {
 	let db: IsolatedDb
 	let dir: string
+	let app: ReturnType<typeof createGitApp>
 	let backend: RepoBackend
 	let c3 = ""
 	let c2 = ""
@@ -40,6 +41,7 @@ describe("M1 multi-round negotiation", () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
+		app = createGitApp({ objects, refs })
 
 		// main: c1 ← c2 ← c3.  feature (off c1): f1 — a sibling, NOT an ancestor of c3.
 		dir = mkdtempSync(join(tmpdir(), "pggit-mr-"))
@@ -126,13 +128,27 @@ describe("M1 multi-round negotiation", () => {
 		// `ERR upload-pack: not our ref <oid>` (an HTTP-200 protocol error the client
 		// reads), not a transport-level rejection/500 — and never ships a short/partial
 		// pack. (Earlier this rejected; that diverged from the oracle — see smoke/mal01.)
-		const out = await handleUploadPack(
-			fetchRequest({ done: true, haves: [], wants: ["a".repeat(40)] }),
-			backend,
-		)
-		const text = out.toString("utf8")
-		expect(text).toMatch(/ERR .*not our ref/)
-		expect(text).toContain("a".repeat(40))
-		expect(text).not.toContain("packfile")
+		const request = fetchRequest({
+			done: true,
+			haves: [],
+			wants: ["a".repeat(40)],
+		})
+		const response = await app.request("/repo/git-upload-pack", {
+			body: request,
+			headers: {
+				"Content-Type": "application/x-git-upload-pack-request",
+				"Git-Protocol": "version=2",
+			},
+			method: "POST",
+		})
+		expect(response.status).toBe(200)
+		const out = Buffer.from(await response.arrayBuffer())
+		const oracle = await spawnUploadPack(dir, request, { expectInBandError: true })
+		expect(oracle.code).toBe(128)
+		expect(out).toEqual(oracle.out)
+		const expectedError = `ERR upload-pack: not our ref ${"a".repeat(40)}`
+		expect(out.toString("utf8")).toContain(expectedError)
+		expect(oracle.out.toString("utf8")).toContain(expectedError)
+		expect(out.toString("utf8")).not.toContain("packfile")
 	})
 })

@@ -148,7 +148,7 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 			{ annotated: true, idx: 1, kind: "tag" },
 		])
 		try {
-			expect(model.commitCount).toBeGreaterThanOrEqual(2)
+			expect(model.commitCount).toBe(4)
 			expect(model.existingBranches.size).toBeGreaterThanOrEqual(2)
 			expect(model.tags.size).toBe(1)
 			const merges = (

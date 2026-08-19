@@ -6,6 +6,23 @@ import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { spawnGit } from "@/testing/spawn-git"
 
+const OBJECT_TYPES = new Set<GitObjectType>(["blob", "commit", "tag", "tree"])
+
+function objectType(value: string, line: string): GitObjectType {
+	if (!OBJECT_TYPES.has(value as GitObjectType)) {
+		throw new Error(`unexpected git object-list line: ${line}`)
+	}
+	return value as GitObjectType
+}
+
+/** Validate one SHA-1 oid emitted by canonical git before it enters an oracle set. */
+export function requireGitOid(value: string, context: string): string {
+	if (!/^[0-9a-f]{40}$/.test(value)) {
+		throw new Error(`unexpected git oid ${JSON.stringify(value)} in ${context}`)
+	}
+	return value
+}
+
 /** Every object in a real repo, as pack inputs (content read binary-safe). */
 export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
 	const list = await spawnGit(
@@ -13,11 +30,15 @@ export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
 		{ cwd: dir },
 	)
 	const objs: PackInputObject[] = []
-	for (const line of list.stdout.trim().split("\n")) {
+	for (const line of list.stdout.trim().split("\n").filter(Boolean)) {
 		const [oid, type] = line.split(" ")
-		if (!oid || !type) continue
-		const raw = await spawnGit(["cat-file", type, oid], { cwd: dir })
-		objs.push({ content: raw.stdoutBytes, type: type as GitObjectType })
+		if (oid === undefined || type === undefined || line.split(" ").length !== 2) {
+			throw new Error(`unexpected git object-list line: ${line}`)
+		}
+		const parsedOid = requireGitOid(oid, `object-list line ${JSON.stringify(line)}`)
+		const parsedType = objectType(type, line)
+		const raw = await spawnGit(["cat-file", parsedType, parsedOid], { cwd: dir })
+		objs.push({ content: raw.stdoutBytes, type: parsedType })
 	}
 	return objs
 }
@@ -34,11 +55,20 @@ export function parseLsTree(
 			const tab = line.indexOf("\t")
 			if (tab < 0) throw new Error(`unexpected ls-tree line: ${line}`)
 			const path = line.slice(tab + 1)
-			const [mode, , oid] = line.slice(0, tab).split(" ")
-			if (mode === undefined || oid === undefined) {
+			const meta = line.slice(0, tab).split(" ")
+			if (meta.length !== 3 || path.length === 0) {
 				throw new Error(`unexpected ls-tree meta: ${line}`)
 			}
-			return { mode, oid, path }
+			const [mode, type, oid] = meta as [string, string, string]
+			if (!/^[0-7]{6}$/.test(mode)) {
+				throw new Error(`unexpected ls-tree mode: ${line}`)
+			}
+			objectType(type, line)
+			return {
+				mode,
+				oid: requireGitOid(oid, `ls-tree line ${JSON.stringify(line)}`),
+				path,
+			}
 		})
 }
 
@@ -48,7 +78,12 @@ export async function allObjectOids(dir: string): Promise<string[]> {
 		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
 		{ cwd: dir },
 	)
-	return list.stdout.trim().split("\n").filter(Boolean).sort()
+	return list.stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => requireGitOid(line, `object-list line ${JSON.stringify(line)}`))
+		.sort()
 }
 
 /**
@@ -66,9 +101,17 @@ export async function refsOf(dir: string): Promise<{ name: string; oid: string }
 		.split("\n")
 		.filter(Boolean)
 		.map((line) => {
-			const [oid, name] = line.split(" ")
-			if (!oid || !name) throw new Error(`bad for-each-ref line: ${line}`)
-			return { name, oid }
+			const split = line.indexOf(" ")
+			if (split < 0 || split === line.length - 1) {
+				throw new Error(`unexpected for-each-ref line: ${line}`)
+			}
+			return {
+				name: line.slice(split + 1),
+				oid: requireGitOid(
+					line.slice(0, split),
+					`for-each-ref line ${JSON.stringify(line)}`,
+				),
+			}
 		})
 		.sort((a, b) => a.name.localeCompare(b.name))
 }
@@ -85,9 +128,16 @@ export async function seedRepoIntoStore(
 ): Promise<void> {
 	await stores.objects.putPack(repoId, await loadAllObjects(srcDir))
 	const showRef = await spawnGit(["show-ref"], { cwd: srcDir })
-	for (const line of showRef.stdout.trim().split("\n")) {
-		const [oid, name] = line.split(" ")
-		if (oid && name) await stores.refs.setRef(repoId, name, oid)
+	for (const line of showRef.stdout.trim().split("\n").filter(Boolean)) {
+		const split = line.indexOf(" ")
+		if (split < 0 || split === line.length - 1) {
+			throw new Error(`unexpected show-ref line: ${line}`)
+		}
+		await stores.refs.setRef(
+			repoId,
+			line.slice(split + 1),
+			requireGitOid(line.slice(0, split), `show-ref line ${JSON.stringify(line)}`),
+		)
 	}
 	const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: srcDir })).stdout.trim()
 	await stores.refs.setSymref(repoId, "HEAD", head)
@@ -100,21 +150,49 @@ export function packFiles(dir: string): string[] {
 	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
 }
 
+export type VerifyPackObject = { oid: string; delta: boolean }
+
+/** Every object row inside one `git verify-pack -v` report, including whether it
+ * is deltified. Summary rows are validated and omitted from the result. */
+export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
+	const objects: VerifyPackObject[] = []
+	for (const line of stdout.trim().split("\n").filter(Boolean)) {
+		const object = line.match(
+			/^([0-9a-f]{40})\s+(commit|tree|blob|tag)\s+\d+\s+\d+\s+\d+(?:\s+(\d+)\s+([0-9a-f]{40}))?$/,
+		)
+		if (object?.[1]) {
+			objects.push({ delta: object[3] !== undefined, oid: object[1] })
+			continue
+		}
+		if (
+			/^non delta: \d+ objects?$/.test(line) ||
+			/^chain length = \d+: \d+ objects?$/.test(line) ||
+			/\.pack: ok$/.test(line)
+		) {
+			continue
+		}
+		throw new Error(`unexpected verify-pack line: ${line}`)
+	}
+	// git never writes an empty pack, so zero parsed rows means verify-pack's
+	// output format moved and the scrape above went blind — fail, don't return [].
+	if (objects.length === 0) {
+		throw new Error("parsed zero objects from git verify-pack -v")
+	}
+	return objects
+}
+
+/** The sorted OIDs inside one pack, per `git verify-pack -v`. */
+export function parseVerifyPackObjectOids(stdout: string): string[] {
+	return parseVerifyPackObjects(stdout)
+		.map((object) => object.oid)
+		.sort()
+}
+
 /** The OIDs inside one pack, per `git verify-pack -v` (the bytes git received). */
 export async function packObjectOids(dir: string, packFile: string): Promise<string[]> {
 	const idx = join(dir, PACK_DIR, packFile.replace(/\.pack$/, ".idx"))
 	const out = await spawnGit(["verify-pack", "-v", idx], { cwd: dir })
-	const oids: string[] = []
-	for (const line of out.stdout.split("\n")) {
-		const m = line.match(/^([0-9a-f]{40}) (commit|tree|blob|tag) /)
-		if (m?.[1]) oids.push(m[1])
-	}
-	// git never writes an empty pack, so zero parsed rows means verify-pack's
-	// output format moved and the scrape above went blind — fail, don't return [].
-	if (oids.length === 0) {
-		throw new Error(`packObjectOids: parsed zero objects from verify-pack -v ${idx}`)
-	}
-	return oids.sort()
+	return parseVerifyPackObjectOids(out.stdout)
 }
 
 /** Every object in a real repo as `{oid, type}` (one `cat-file --batch-all-objects`
@@ -127,9 +205,15 @@ export async function objectsByType(
 		{ cwd: dir },
 	)
 	const out: { oid: string; type: GitObjectType }[] = []
-	for (const line of list.stdout.trim().split("\n")) {
+	for (const line of list.stdout.trim().split("\n").filter(Boolean)) {
 		const [oid, type] = line.split(" ")
-		if (oid && type) out.push({ oid, type: type as GitObjectType })
+		if (oid === undefined || type === undefined || line.split(" ").length !== 2) {
+			throw new Error(`unexpected git object-list line: ${line}`)
+		}
+		out.push({
+			oid: requireGitOid(oid, `object-list line ${JSON.stringify(line)}`),
+			type: objectType(type, line),
+		})
 	}
 	return out
 }

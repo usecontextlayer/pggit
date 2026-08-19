@@ -15,6 +15,7 @@ import { createHash } from "node:crypto"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { requireGitOid } from "@/testing/git-fixtures"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
 /** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
@@ -97,13 +98,17 @@ export async function createAppendOnlyRepo(opts: AppendOnlyRepoOptions): Promise
  * successive versions the delta encoder must collapse. */
 export async function runsTreeAt(dir: string, rev: string): Promise<string> {
 	const out = await spawnGit(["rev-parse", `${rev}:${RUNS_DIR}`], { cwd: dir })
-	return out.stdout.trim()
+	return requireGitOid(out.stdout.trim(), `rev-parse ${rev}:${RUNS_DIR}`)
 }
 
 /** Commit OIDs oldest-first. */
 export async function commitsOldestFirst(dir: string): Promise<string[]> {
 	const out = await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: dir })
-	return out.stdout.trim().split("\n").filter(Boolean)
+	return out.stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((oid) => requireGitOid(oid, "rev-list --reverse HEAD"))
 }
 
 /** One object's raw bytes, binary-safe. */

@@ -1,6 +1,6 @@
 /**
  * §5.3 peeled_oid computed at ref-write, replacing the per-ls-refs tag walk. The
- * peel follows the kind=5 (tag→target) chain to the terminal non-tag: an annotated
+ * peel follows the annotated-tag target chain to the terminal non-tag: an annotated
  * tag peels to its commit, a tag-of-tag peels through the chain, a lightweight tag
  * and a branch do not peel (no `peeled` line). Asserted both at the store
  * (`listRefs`) and on the ls-refs wire.

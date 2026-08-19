@@ -87,6 +87,29 @@ describe("reach-epoch position math", () => {
 		])
 	})
 
+	it("remapPositions preserves every retained member under arbitrary insertions", () => {
+		fc.assert(
+			fc.property(
+				fc.uniqueArray(hexOid, { maxLength: 100, minLength: 1 }),
+				fc.array(hexOid, { maxLength: 100 }),
+				(oldHexes, additions) => {
+					const oldBuf = concatSortedOids(oldHexes)
+					const oldSorted = splitOids(oldBuf)
+					const newBuf = concatSortedOids([...oldSorted, ...additions])
+					const selected = oldSorted.filter((_, i) => i % 2 === 0)
+					const dropped = new Set(oldSorted.filter((_, i) => i % 3 === 0))
+					const bits = bitmapFromPositions(selected.map((h) => positionOf(oldBuf, h)))
+					const expected = selected
+						.filter((h) => !dropped.has(h))
+						.map((h) => positionOf(newBuf, h))
+
+					expect(remapPositions(bits, oldBuf, newBuf, dropped)).toEqual(expected)
+				},
+			),
+			{ seed: 424_242 },
+		)
+	})
+
 	it("remapPositions throws LOUDLY when an old member is absent from the new array", () => {
 		const oldBuf = concatSortedOids(["02".repeat(20), "05".repeat(20)])
 		const newBuf = concatSortedOids(["02".repeat(20)])

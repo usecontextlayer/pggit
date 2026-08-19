@@ -7,7 +7,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { allObjectOids, requireGitOid } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -255,8 +255,9 @@ export async function gitReachableOids(dir: string): Promise<string[]> {
 	for (const line of revList.stdout.trim().split("\n")) {
 		if (!line) continue
 		// `--objects` lines are `<oid>` or `<oid> <path>` — take the leading oid.
-		const oid = line.split(" ", 1)[0]
-		if (oid) oids.add(oid)
+		const split = line.indexOf(" ")
+		const oid = split < 0 ? line : line.slice(0, split)
+		oids.add(requireGitOid(oid, `rev-list line ${JSON.stringify(line)}`))
 	}
 	// Annotated-tag OBJECTS: `rev-list --objects --all` lists a tag ref's peeled
 	// target, not the tag object, so add every ref oid that is itself a tag object.
@@ -264,9 +265,14 @@ export async function gitReachableOids(dir: string): Promise<string[]> {
 		["for-each-ref", "--format=%(objecttype) %(objectname)"],
 		{ cwd: dir },
 	)
-	for (const line of refLines.stdout.trim().split("\n")) {
-		const [type, oid] = line.split(" ")
-		if (type === "tag" && oid) oids.add(oid)
+	for (const line of refLines.stdout.trim().split("\n").filter(Boolean)) {
+		const fields = line.split(" ")
+		if (fields.length !== 2) {
+			throw new Error(`unexpected for-each-ref line: ${line}`)
+		}
+		const [type, oid] = fields as [string, string]
+		const parsedOid = requireGitOid(oid, `for-each-ref line ${JSON.stringify(line)}`)
+		if (type === "tag") oids.add(parsedOid)
 	}
 	return [...oids].sort()
 }

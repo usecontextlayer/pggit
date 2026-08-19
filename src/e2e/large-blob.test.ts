@@ -10,12 +10,14 @@
  * to ~1GB and canonical git stores blobs this size happily, so anything smaller
  * than this is pggit refusing what git accepts.
  *
- * THE CONTRACT: a push carrying such a blob reports `unpack ok` and lands its ref,
- * and a subsequent v2 fetch of that blob answers HTTP 200 with a pack of exactly
- * ONE object whose oid is the blob's — the bytes that went in came back.
+ * THE CONTRACT: canonical git creates and pushes the blob, the ref lands, then a
+ * fresh canonical-git repository fetches the tag and is fsck-clean with exactly
+ * that one object, of type blob and the original byte length. This observes both
+ * wire directions from the client side without asking pggit's own pack encoder or
+ * parser to certify pggit's result.
  *
  * The ref is a TAG: tags legally hold ANY object type (canonical git accepts a
- * blob-tipped tag, probed live), which isolates the string-cap subject from the
+ * blob-tipped tag), which isolates the string-cap subject from the
  * branch-tips-must-be-commits policy without faking a commit wrapper.
  *
  * ORIGINATED as two breakage probes over the same shape — a07 (INGEST: the push
@@ -24,19 +26,18 @@
  * fixed; merged into one describe because two byte-identical 270MB fixtures were
  * paying twice for one shape.
  */
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { computeOid } from "@/object/object"
-import { readPack } from "@/pack/read-pack"
-import { writePack } from "@/pack/write-pack"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
+import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
+import { allObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { packObjectCount, pktLineUnpack, sidebandDemux } from "@/testing/pkt-oracle"
-import { fetchRequest } from "@/testing/wire-fetch"
+import { spawnGit } from "@/testing/spawn-git"
 
-const ZERO = "0".repeat(40)
 const TAG = "huge"
 /** 270_000_000 bytes > 0x1fffffe8 / 2 ≈ 268_435_443, so this value's hex text form
  * — in EITHER direction — exceeds V8's max string length. */
@@ -44,64 +45,74 @@ const SIZE = 270_000_000
 
 describe("large blob past the V8 string cap — pushed, then fetched back", () => {
 	let db: IsolatedDb
-	let app: ReturnType<typeof createGitApp>
+	let server: GitServer
 	let objects: ObjectStore
 	let refs: RefStore
+	let src = ""
+	let url = ""
 	let blobOid = ""
-	let report = ""
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
-		app = createGitApp({ objects, refs })
+		server = await serveOnPort(createGitApp({ objects, refs }), 0)
+		url = `http://127.0.0.1:${server.port}/r`
 
-		// Deterministic fill, no randomness: the size is what matters, and the same
-		// bytes must be reproducible for the served-oid comparison below.
+		src = mkdtempSync(join(tmpdir(), "pggit-large-blob-src-"))
+		await spawnGit(["init", "-q"], { cwd: src })
+
+		// Deterministic fill, no randomness: the size is what matters. Canonical git
+		// owns the object encoding and hashes the exact bytes it is about to push.
 		const content = Buffer.alloc(SIZE)
 		for (let i = 0; i < SIZE; i += 4096) content.writeUInt32LE((i * 2654435761) >>> 0, i)
-		blobOid = computeOid("blob", content)
-
-		const body = Buffer.concat([
-			encodePktLine(Buffer.from(`${ZERO} ${blobOid} refs/tags/${TAG}\0report-status`)),
-			encodePkt({ type: "flush" }),
-			writePack([{ content, type: "blob" }]),
-		])
-		const res = await app.request("/r/git-receive-pack", {
-			body: new Uint8Array(body),
-			method: "POST",
+		blobOid = (
+			await spawnGit(["hash-object", "-w", "--stdin"], { cwd: src, input: content })
+		).stdout.trim()
+		await spawnGit(["update-ref", `refs/tags/${TAG}`, blobOid], { cwd: src })
+		await spawnGit(["push", "-q", url, `refs/tags/${TAG}:refs/tags/${TAG}`], {
+			cwd: src,
 		})
-		expect(res.status).toBe(200)
-		report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
 	}, 300_000)
 
 	afterAll(async () => {
+		await server?.close()
 		await db?.drop()
+		if (src) rmSync(src, { force: true, recursive: true })
 	})
 
 	it("ingests a ~257MB blob and lands the ref", async () => {
-		expect(report).toContain("unpack ok")
-		expect(report).toContain(`ok refs/tags/${TAG}`)
-		const stored = (await refs.listRefs("r")).find((r) => r.name === `refs/tags/${TAG}`)
-		expect(stored?.oid).toBe(blobOid)
+		expect(await refs.listRefs("r")).toEqual([{ name: `refs/tags/${TAG}`, oid: blobOid }])
 		expect(await objects.hasObject("r", blobOid)).toBe(true)
 	})
 
-	it("serves it back — one object in the pack, and it is the blob that went in", async () => {
-		const res = await app.request("/r/git-upload-pack", {
-			body: new Uint8Array(
-				fetchRequest({ done: true, objectFormat: "sha1", wants: [blobOid] }),
-			),
-			method: "POST",
-		})
-		expect(res.status).toBe(200)
-		const body = Buffer.from(await res.arrayBuffer())
-		// A `PACK` substring proves nothing — every upload-pack response carries that
-		// header, an EMPTY pack included. The count and the parsed object are the
-		// observables that tell "blob served" from "200 with nothing in it".
-		expect(packObjectCount(body)).toBe(1)
-		const served = await readPack(sidebandDemux(body).band1)
-		// readPack hashes what it parsed, so a matching oid IS byte identity.
-		expect(served.map((o) => `${o.type} ${o.oid}`)).toEqual([`blob ${blobOid}`])
-	}, 180_000)
+	it("serves the exact blob to a fresh canonical-git repository", async () => {
+		const dest = mkdtempSync(join(tmpdir(), "pggit-large-blob-dest-"))
+		try {
+			await spawnGit(["init", "-q"], { cwd: dest })
+			await spawnGit(
+				[
+					"-c",
+					"protocol.version=2",
+					"fetch",
+					"-q",
+					url,
+					`refs/tags/${TAG}:refs/tags/${TAG}`,
+				],
+				{ cwd: dest },
+			)
+			await spawnGit(["fsck", "--full", "--no-dangling"], { cwd: dest })
+			expect(await allObjectOids(dest)).toEqual([blobOid])
+			expect(
+				(await spawnGit(["cat-file", "-t", blobOid], { cwd: dest })).stdout.trim(),
+			).toBe("blob")
+			expect(
+				Number(
+					(await spawnGit(["cat-file", "-s", blobOid], { cwd: dest })).stdout.trim(),
+				),
+			).toBe(SIZE)
+		} finally {
+			rmSync(dest, { force: true, recursive: true })
+		}
+	}, 300_000)
 })

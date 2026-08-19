@@ -58,6 +58,12 @@ type EncodingAudit = {
 	content: Buffer
 }
 
+type CloneAudit = {
+	bytes: number
+	inventory: string[]
+	refs: string[]
+}
+
 const mb = (n: number): string => `${(n / 1_000_000).toFixed(2)} MB`
 
 const nameFor = (salt: string, i: number): string =>
@@ -72,7 +78,9 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 	let baseUrl = ""
 	let src = ""
 	let rows: EncodingAudit[] = []
-	let baselineBytes = 0
+	let baseline: CloneAudit = { bytes: 0, inventory: [], refs: [] }
+	let sourceInventory: string[] = []
+	let sourceRefs: string[] = []
 	/** Delta rows the repack actually stored — zero makes three tests below vacuous. */
 	let deltaRowCount = 0
 	/** Inflated length of the largest stored delta PROGRAM, in bytes. */
@@ -129,13 +137,30 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 		await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: out.join("") })
 	}
 
-	/** Mirror-clone, fsck it, and return the received pack's byte size. */
-	async function cloneBytes(from: string, dest: string): Promise<number> {
+	/** Mirror-clone, fsck it, and return its exact client-visible state and pack size. */
+	async function cloneAudit(from: string, dest: string): Promise<CloneAudit> {
 		await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", from, dest])
 		await spawnGit(["fsck", "--full", "--strict", "--no-dangling"], { cwd: dest })
 		const out = await spawnGit(["count-objects", "-v"], { cwd: dest })
 		const line = out.stdout.split("\n").find((l) => l.startsWith("size-pack:"))
-		return Number(line?.split(":")[1]?.trim() ?? 0) * 1024
+		if (line === undefined) throw new Error("git count-objects -v omitted size-pack")
+		const kibibytes = Number(line.slice("size-pack:".length).trim())
+		if (!Number.isSafeInteger(kibibytes) || kibibytes < 0) {
+			throw new Error(`git count-objects -v returned an invalid size-pack line: ${line}`)
+		}
+		const inventory = (
+			await spawnGit(["cat-file", "--batch-check", "--batch-all-objects"], { cwd: dest })
+		).stdout
+			.split("\n")
+			.filter(Boolean)
+			.sort()
+		const refs = (
+			await spawnGit(["for-each-ref", "--format=%(objectname) %(refname)"], { cwd: dest })
+		).stdout
+			.split("\n")
+			.filter(Boolean)
+			.sort()
+		return { bytes: kibibytes * 1024, inventory, refs }
 	}
 
 	beforeAll(async () => {
@@ -145,6 +170,18 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 				`${WIDE_VERSIONS} × ${WIDE_ENTRIES}-entry trees…`,
 		)
 		await buildSource(src)
+		sourceInventory = (
+			await spawnGit(["cat-file", "--batch-check", "--batch-all-objects"], { cwd: src })
+		).stdout
+			.split("\n")
+			.filter(Boolean)
+			.sort()
+		sourceRefs = (
+			await spawnGit(["for-each-ref", "--format=%(objectname) %(refname)"], { cwd: src })
+		).stdout
+			.split("\n")
+			.filter(Boolean)
+			.sort()
 		const treeSize = Number(
 			(await spawnGit(["cat-file", "-s", "HEAD:wide"], { cwd: src })).stdout.trim(),
 		)
@@ -163,8 +200,8 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 			cwd: src,
 		})
 		await spawnGit(["push", "-q", url, "refs/heads/main:refs/heads/main"], { cwd: src })
-		baselineBytes = await cloneBytes(baseUrl, join(mk("base"), "c.git"))
-		console.log(`baseline clone (no encoding tier): ${mb(baselineBytes)}`)
+		baseline = await cloneAudit(baseUrl, join(mk("base"), "c.git"))
+		console.log(`baseline clone (no encoding tier): ${mb(baseline.bytes)}`)
 
 		const t = Date.now()
 		const r = await createRepack(db.sql).repack(REPO)
@@ -256,10 +293,14 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 	}, 600_000)
 
 	it("the encoding tier never makes the served pack bigger than the raw path", async () => {
-		const subjectBytes = await cloneBytes(url, join(mk("subj"), "c.git"))
+		const subject = await cloneAudit(url, join(mk("subj"), "c.git"))
 		console.log(
-			`clone WITH encoding tier: ${mb(subjectBytes)} (baseline ${mb(baselineBytes)})`,
+			`clone WITH encoding tier: ${mb(subject.bytes)} (baseline ${mb(baseline.bytes)})`,
 		)
-		expect(subjectBytes).toBeLessThanOrEqual(baselineBytes)
+		expect(baseline.inventory).toEqual(sourceInventory)
+		expect(baseline.refs).toEqual(sourceRefs)
+		expect(subject.inventory).toEqual(sourceInventory)
+		expect(subject.refs).toEqual(sourceRefs)
+		expect(subject.bytes).toBeLessThanOrEqual(baseline.bytes)
 	}, 900_000)
 })

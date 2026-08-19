@@ -6,8 +6,8 @@
  * quiet drain (unchanged — the write-cost guard), refs-only advance (the
  * steady-state delta), a force-push rewind (LOUD fallback to a rebuild that
  * actually reclaims), a ref deletion (same), and finally an emptied repo
- * (cleared). Exactness is asserted against `fullClosure` — the engine clone
- * and connectivity already trust — at every stage.
+ * (cleared). Exactness is asserted against `fullClosure` at every stage, with each
+ * source-resolvable commit tip also anchored to canonical `git rev-list`.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

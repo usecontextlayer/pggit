@@ -11,7 +11,7 @@ import { GitProtocolError } from "@/protocol/errors"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { handleReceivePack, type ReceiveBackend } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
-import { sidebandDemux } from "@/testing/pkt-oracle"
+import { packObjectCount } from "@/testing/pkt-oracle"
 
 const A = "a".repeat(40)
 const Z = "0".repeat(40)
@@ -99,7 +99,8 @@ describe("fetch with zero wants is a no-op (matches git's oracle)", () => {
 			encodePkt({ type: "flush" }),
 		])
 		const out = await handleUploadPack(body, backend)
-		// An empty but valid pack rides band 1 (PACK magic, zero objects).
-		expect(sidebandDemux(out).band1.subarray(0, 4).toString("latin1")).toBe("PACK")
+		// An empty but valid pack rides band 1. Checking only its PACK magic would
+		// also accept an arbitrary non-empty response and would not pin the no-op.
+		expect(packObjectCount(out)).toBe(0)
 	})
 })

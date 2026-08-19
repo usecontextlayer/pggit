@@ -207,20 +207,33 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			const others = [...model.existingBranches].filter((b) => b !== model.currentBranch)
 			if (others.length === 0) return
 			const target = pick(others, cmd.idx)
+			const before = (
+				await spawnGit(["rev-parse", "HEAD"], { cwd: model.dir })
+			).stdout.trim()
+			const targetTip = (
+				await spawnGit(["rev-parse", target], { cwd: model.dir })
+			).stdout.trim()
 			try {
 				await spawnGit(["merge", "--no-edit", "-m", `merge ${model.commitSeq}`, target], {
 					cwd: model.dir,
 				})
-				model.commitSeq++ // a merge that advanced HEAD consumes a sequence number
+				const after = (
+					await spawnGit(["rev-parse", "HEAD"], { cwd: model.dir })
+				).stdout.trim()
+				if (after !== before) model.commitSeq++
+				// A fast-forward moves HEAD to the target's already-counted commit; a
+				// distinct result is a newly-created merge commit and must count as such.
+				if (after !== before && after !== targetTip) model.commitCount++
 			} catch (e) {
 				// A content conflict is expected with random divergent branches: abort
 				// cleanly and skip. Anything else is real — rethrow after aborting.
 				// Every nonzero git exit is a GitCommandError, so the conflict must be
 				// PROVEN (unmerged index entries), not inferred from the error type —
 				// else broken config, corruption, and command regressions all skip.
+				if (!(e instanceof GitCommandError)) throw e
 				const unmerged = await spawnGit(["ls-files", "-u"], { cwd: model.dir })
-				await spawnGit(["merge", "--abort"], { cwd: model.dir }).catch(() => {})
-				if (!(e instanceof GitCommandError) || unmerged.stdout.trim() === "") throw e
+				if (unmerged.stdout.trim() === "") throw e
+				await spawnGit(["merge", "--abort"], { cwd: model.dir })
 			}
 			return
 		}

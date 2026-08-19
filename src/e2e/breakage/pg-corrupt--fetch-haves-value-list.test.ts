@@ -1,47 +1,41 @@
 /**
- * PG BIND-PARAMETER PROBE — the fetch `have` list is an UNBATCHED value list.
+ * PG BIND-PARAMETER REGRESSION — client-sized fetch `have` lists are validated at
+ * the wire boundary and batched before Postgres, so even a request larger than the
+ * extended-query parameter ceiling returns the exact canonical pack.
  *
- * Every other multi-OID lookup in the store chunks itself: the serve closure uses
- * `PACK_BATCH = 1000`, reachability uses `LOOKUP_BATCH = 1000`, GC loads in
- * `LIVE_LOAD_BATCH = 10000`, ingest goes through binary COPY (no binds at all).
+ * The original `commonHaves` query expanded the CLIENT'S entire have list into one
+ * bind parameter per oid. PostgreSQL's Bind message caps a statement at 65,535
+ * parameters (one was already spent on the repo id), so 65,534+ haves produced an
+ * internal 500. `commonHaves` now uses the same bounded lookup batches as the rest
+ * of the store, and `parseFetch` validates haves like wants.
  *
- * Two sites take the CLIENT'S have-list whole, with no chunk:
- *
- *   object-store.ts commonHaves →  .where("oid", "in", haves.map(Buffer.from))
- *   reachability.ts reachableClosure → `values ${sql.join(roots.map(…))}`
- *
- * Both turn one client-controlled list into one bind parameter each. The Postgres
- * extended-query Bind message counts parameters in an INT16, so the wall is 65535 —
- * and `parseFetch` does not even shape-check a `have` (only `want` gets `isOid`),
- * so the list is unfiltered client input.
- *
- * Part A pins the exact wall and its failure MODE (in-band ERR? clean 400? 500?).
- * Part B measures how many haves a REAL `git fetch` puts in one request, so the
- * wall's reachability is a measurement rather than a guess.
+ * Part A drives well-formed raw requests on both sides of the old wall and parses
+ * the returned pack, requiring the exact closure canonical Git derives from the
+ * source. Part B measures how many haves a REAL `git fetch` puts in each HTTP body,
+ * observed at the HTTP boundary rather than through a store-method spy.
  *
  * MEASURED (2026-08-15, git 2.55.0, 4000 mutually-unreachable tips): the per-request
  * have counts were 16, 48, 112, 240, 496 — CUMULATIVE, confirming that
  * protocol-v2-over-HTTP being stateless makes git re-send the whole accumulated list
  * each round. But git then gave up (MAX_IN_VAIN) at 496, and a LINEAR history
  * collapses in one round because a single ACK marks the whole ancestor chain common.
- * So stock `git fetch` does not reach 65534 in these shapes: the wall is a
- * hostile-input / exotic-client crash, not an everyday one. It is still the only
- * unbatched, unvalidated, client-sized value list in the store, and it 500s.
+ * So stock `git fetch` does not reach 65534 in these shapes: the old wall was a
+ * hostile-input / exotic-client crash, not an everyday one.
  *
- * Converted from `breakage/pg-corrupt--fetch-haves-value-list.ts`, whose verdict was:
- * exit 0 = every request is answered (or refused in-band); non-zero = a fetch
- * crashes the server.
+ * Originated as breakage probe `pg-corrupt--fetch-haves-value-list.ts`, whose
+ * non-zero verdict reproduced the server fault; fixed by bounded lookups.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { gunzipSync } from "node:zlib"
+import { Hono } from "hono"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
-import { createObjectStore } from "@/store/object-store"
-import { createRefStore } from "@/store/refs-store"
+import { allObjectOids, requireGitOid } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 
@@ -60,7 +54,8 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 	let server: GitServer
 	let url = ""
 	let tip = ""
-	/** Have-list lengths the store saw, one entry per `commonHaves` call. */
+	let expectedOids: string[] = []
+	/** Have-list lengths real Git put on the HTTP wire, one entry per request. */
 	const seen: number[] = []
 	const dirs: string[] = []
 	const mk = (tag: string): string => {
@@ -110,23 +105,26 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 		await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: lines.join("") })
 	}
 
+	/** Let canonical Git accept and index the returned pack, then enumerate its exact set. */
+	async function indexPackOids(pack: Buffer, tag: string): Promise<string[]> {
+		const dir = mk(tag)
+		await spawnGit(["init", "-q"], { cwd: dir })
+		await spawnGit(["index-pack", "--stdin"], { cwd: dir, input: pack })
+		return allObjectOids(dir)
+	}
+
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		// Wrap the store so the test can SEE what the wire actually delivered per request.
-		const objects = createObjectStore(db.sql)
-		const spy = new Proxy(objects, {
-			get(target, prop, receiver) {
-				if (prop !== "commonHaves") return Reflect.get(target, prop, receiver)
-				return async (repoId: string, haves: string[]) => {
-					seen.push(haves.length)
-					return target.commonHaves(repoId, haves)
-				}
-			},
-		})
-		const app = createGitApp({
-			objects: spy,
-			refs: createRefStore(db.sql),
-			snapshots: createRepoFileProjection(db.sql),
+		const backed = createGitApp(createGitDeps(db.sql))
+		const app = new Hono()
+		app.mount("/", async (request) => {
+			if (request.method === "POST" && request.url.endsWith("/git-upload-pack")) {
+				const raw = Buffer.from(await request.clone().arrayBuffer())
+				const encoding = request.headers.get("content-encoding")?.toLowerCase()
+				const body = encoding === "gzip" || encoding === "x-gzip" ? gunzipSync(raw) : raw
+				seen.push(body.toString("latin1").match(/have [0-9a-f]{40}\n/g)?.length ?? 0)
+			}
+			return backed.fetch(request)
 		})
 		server = await serveOnPort(app, 0)
 		url = `http://127.0.0.1:${server.port}/${REPO}`
@@ -135,6 +133,15 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 		console.log(`building a ${DEPTH}-commit history…`)
 		await buildHistory(src, DEPTH)
 		tip = (await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })).stdout.trim()
+		expectedOids = (await spawnGit(["rev-list", "--objects", tip], { cwd: src })).stdout
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => {
+				const split = line.indexOf(" ")
+				const oid = split < 0 ? line : line.slice(0, split)
+				return requireGitOid(oid, `rev-list line ${JSON.stringify(line)}`)
+			})
+			.sort()
 		await spawnGit(["push", "-q", url, "refs/heads/main:refs/heads/main"], { cwd: src })
 		console.log(`pushed ${DEPTH} commits; tip ${tip}`)
 	}, 900_000)
@@ -157,7 +164,8 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 				headers: { "content-type": "application/x-git-upload-pack-request" },
 				method: "POST",
 			})
-			const text = Buffer.from(await res.arrayBuffer()).toString("latin1")
+			const response = Buffer.from(await res.arrayBuffer())
+			const text = response.toString("latin1")
 			const verdict =
 				res.status === 200
 					? text.includes("PACK")
@@ -165,10 +173,19 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 						: `200 + ${JSON.stringify(text.slice(0, 120))}`
 					: `${res.status} ${JSON.stringify(text.slice(0, 200))}`
 			console.log(`  haves=${String(n).padStart(6)} → ${verdict}`)
-			if (res.status >= 500) {
-				faults.push(
-					`a fetch with ${n} haves returned HTTP ${res.status} (server fault, not in-band)`,
-				)
+			if (res.status !== 200) {
+				faults.push(`a valid fetch with ${n} haves returned HTTP ${res.status}`)
+				continue
+			}
+			try {
+				const served = await indexPackOids(sidebandDemux(response).band1, `raw-${n}`)
+				if (served.join("\n") !== expectedOids.join("\n")) {
+					faults.push(
+						`a fetch with ${n} haves served ${served.length} objects; canonical git requires ${expectedOids.length}`,
+					)
+				}
+			} catch (error) {
+				faults.push(`a fetch with ${n} haves returned an invalid pack: ${String(error)}`)
 			}
 		}
 		expect(faults).toEqual([])

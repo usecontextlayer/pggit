@@ -182,12 +182,13 @@ export function renderRefAdvertV0(buf: Buffer): RefAdvertV0 {
 }
 
 /**
- * Object count from a smart-HTTP fetch response (the PACK header is `PACK` + a
- * 4-byte version + a 4-byte big-endian object count), or null if no PACK is present.
- * `PACK` rides band-1 literally, so a raw search locates it.
+ * Object count from a complete v2 smart-HTTP fetch response (the PACK header is
+ * `PACK` + a 4-byte version + a 4-byte big-endian object count), or null if its
+ * band-1 stream carries no pack. Searching the raw response is not sufficient:
+ * ordinary protocol text, progress, and errors may all contain the bytes `PACK`.
  */
 export function packObjectCount(body: Buffer): number | null {
-	const i = body.indexOf(Buffer.from("PACK", "ascii"))
-	if (i < 0 || i + 12 > body.length) return null
-	return body.readUInt32BE(i + 8)
+	const pack = sidebandDemux(body).band1
+	if (pack.length < 12 || pack.subarray(0, 4).toString("ascii") !== "PACK") return null
+	return pack.readUInt32BE(8)
 }

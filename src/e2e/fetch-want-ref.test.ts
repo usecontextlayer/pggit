@@ -83,7 +83,9 @@ describe("mal04 — ref-in-want (want-ref, unadvertised) must fail loudly, not c
 			method: "POST",
 		})
 		const body = Buffer.from(await res.arrayBuffer())
-		const objCount = packObjectCount(body)
+		// A non-200 is the loud refusal this test demands; its body is a plain-text
+		// error, not pkt-framed, so the strict pack parser only runs on a 200.
+		const objCount = res.status === 200 ? packObjectCount(body) : null
 
 		// ORACLE: an unadvertised ref-in-want request must NOT succeed as a clone with
 		// an empty pack. Either it fails loudly (status >= 400, no pack) OR — if some

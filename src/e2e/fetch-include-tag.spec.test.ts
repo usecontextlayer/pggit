@@ -2,23 +2,23 @@
  * §6.5 include-tag: when the client sends the `include-tag` capability, the server
  * augments the served pack with annotated tags whose peeled target is in the served
  * set — and ONLY those. A tag pointing at a commit outside the fetched set is not
- * sent, and without `include-tag` no tag is auto-included. Driven with a hand-built
- * fetch so the wants are controlled (real git auto-adds tag wants, which would mask
- * the capability).
+ * sent, and without `include-tag` no tag is auto-included. Driven with identical
+ * raw requests through pggit and canonical `git upload-pack` so the wants stay
+ * controlled (a real porcelain fetch auto-adds tag wants and would mask the
+ * capability) while the complete served set remains oracle-anchored.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { computeOid } from "@/object/object"
-import { readPack } from "@/pack/read-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { seedRepoIntoStore } from "@/testing/git-fixtures"
+import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { spawnUploadPack } from "@/testing/upload-pack-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
 
 describe("include-tag augmentation", () => {
@@ -65,29 +65,34 @@ describe("include-tag augmentation", () => {
 	})
 
 	async function servedOids(out: Buffer): Promise<Set<string>> {
-		const objs = await readPack(sidebandDemux(out).band1)
-		return new Set(objs.map((o) => computeOid(o.type, o.content)))
+		const scratch = mkdtempSync(join(tmpdir(), "pggit-inctag-pack-"))
+		try {
+			await spawnGit(["init", "-q"], { cwd: scratch })
+			await spawnGit(["index-pack", "--stdin"], {
+				cwd: scratch,
+				input: sidebandDemux(out).band1,
+			})
+			return new Set(await allObjectOids(scratch))
+		} finally {
+			rmSync(scratch, { force: true, recursive: true })
+		}
 	}
 
 	it("includes an annotated tag whose peeled target is served, but not one pointing outside it", async () => {
-		const oids = await servedOids(
-			await handleUploadPack(
-				fetchRequest({ done: true, includeTag: true, wants: [c1] }),
-				backend,
-			),
-		)
+		const request = fetchRequest({ done: true, includeTag: true, wants: [c1] })
+		const oids = await servedOids(await handleUploadPack(request, backend))
+		const oracleOids = await servedOids(await spawnUploadPack(dir, request))
+		expect([...oids].sort()).toEqual([...oracleOids].sort())
 		expect(oids.has(c1)).toBe(true)
 		expect(oids.has(av)).toBe(true) // av → c1 (served) ⇒ included
 		expect(oids.has(av2)).toBe(false) // av2 → c2 (not served) ⇒ excluded
 	})
 
 	it("includes no tag when the client did not request include-tag", async () => {
-		const oids = await servedOids(
-			await handleUploadPack(
-				fetchRequest({ done: true, includeTag: false, wants: [c1] }),
-				backend,
-			),
-		)
+		const request = fetchRequest({ done: true, includeTag: false, wants: [c1] })
+		const oids = await servedOids(await handleUploadPack(request, backend))
+		const oracleOids = await servedOids(await spawnUploadPack(dir, request))
+		expect([...oids].sort()).toEqual([...oracleOids].sort())
 		expect(oids.has(c1)).toBe(true)
 		expect(oids.has(av)).toBe(false)
 		expect(oids.has(av2)).toBe(false)

@@ -21,25 +21,24 @@
  * `file://` bare remote driven through the identical dance. Partial-clone filters
  * (`blob:none`, `tree:0`) are exercised against the repacked repo too.
  *
- * The REF_DELTA count served per shape is the proof the delta path was actually
- * on: a shape that serves 0 deltas proves nothing about deltified serving. It is
- * read through `{ instrument: true }` + `collectedRuns()` (which is why the app is
- * built instrumented here) and asserted as a floor on every shape built so the
- * delta wins; shapes that legitimately serve none (`tags`, `blob-edges`) simply
- * omit `minDeltasServed`, so the exception is stated rather than assumed.
+ * The delta count in the real clone's pack is the proof the delta path was
+ * actually on. `git verify-pack -v` reads it on the client side, and every shape
+ * built so the delta wins carries an asserted floor. Shapes that legitimately
+ * serve none (`tags`, `blob-edges`) omit `minDeltasServed`, so the exception is
+ * stated rather than assumed.
  */
 import { createHash } from "node:crypto"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
-import { collectedRuns, resetCollected } from "@/instrument"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import { createRepack, type Repack } from "@/store/repack"
+import { parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 /** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
 const WHEN = "1700000000 +0000"
@@ -93,8 +92,26 @@ async function objectList(dir: string): Promise<string[]> {
 async function refList(dir: string): Promise<string[]> {
 	// `show-ref` exits 1 on a repo with no refs at all (the `blob-edges` control
 	// before its first push) — that is "no refs", not a fault.
-	const r = await spawnGit(["show-ref"], { cwd: dir }).catch(() => ({ stdout: "" }))
-	return r.stdout.trim().split("\n").filter(Boolean).sort()
+	try {
+		const r = await spawnGit(["show-ref"], { cwd: dir })
+		return r.stdout.trim().split("\n").filter(Boolean).sort()
+	} catch (error) {
+		if (error instanceof GitCommandError && error.code === 1) return []
+		throw error
+	}
+}
+
+/** Delta entries in the packs a bare clone actually retained, per canonical git. */
+async function servedDeltaCount(dir: string): Promise<number> {
+	const packDir = join(dir, "objects", "pack")
+	const indexes = readdirSync(packDir).filter((name) => name.endsWith(".idx"))
+	if (indexes.length === 0) throw new Error("the client clone retained no pack index")
+	let deltas = 0
+	for (const file of indexes) {
+		const out = await spawnGit(["verify-pack", "-v", join(packDir, file)], { cwd: dir })
+		deltas += parseVerifyPackObjects(out.stdout).filter((object) => object.delta).length
+	}
+	return deltas
 }
 
 // ───────────────────────── helpers for building shapes ─────────────────────────
@@ -913,12 +930,7 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		repack = createRepack(db.sql)
 		gc = createGc(db.sql)
-		// `instrument: true` is load-bearing: the per-shape REF_DELTA readout below is
-		// only collected when the app wraps each request in a collector.
-		server = await serveOnPort(
-			createGitApp(createGitDeps(db.sql), { instrument: true }),
-			0,
-		)
+		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 	}, 600_000)
 
 	afterAll(async () => {
@@ -979,14 +991,9 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 			)
 
 			const post = join(mk(`${name}-post`), "c.git")
-			resetCollected()
 			await spawnGit(["clone", "-q", "--bare", url, post])
-			const fr = collectedRuns().find((r) => r.label === "fetch")
-			const deltasServed = fr?.counters.get("deltasServed") ?? 0
-			console.log(
-				`shape ${name} — served: ${deltasServed} REF_DELTA entries, ` +
-					`pack ${fr?.counters.get("packBytes") ?? 0} B`,
-			)
+			const deltasServed = await servedDeltaCount(post)
+			console.log(`shape ${name} — client retained ${deltasServed} delta entries`)
 			// The proof the delta path was actually ON for this shape. Every shape
 			// carrying a floor is built so the delta wins; without this the whole sweep
 			// stays green with deltified serving deleted.

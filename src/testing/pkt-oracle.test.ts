@@ -5,6 +5,7 @@ import {
 	EMPTY_BLOB,
 	EMPTY_TREE,
 	framedPktLines,
+	packObjectCount,
 	pktLineUnpack,
 	renderRefAdvertV0,
 	sidebandDemux,
@@ -96,6 +97,36 @@ describe("sidebandDemux — mirror of `test-tool pkt-line unpack-sideband`", () 
 			FLUSH,
 		])
 		expect(sidebandDemux(stream).band1).toEqual(pack)
+	})
+})
+
+describe("packObjectCount", () => {
+	it("reads the object count from the band-1 PACK header", () => {
+		const pack = Buffer.alloc(12)
+		pack.write("PACK", 0, "ascii")
+		pack.writeUInt32BE(2, 4)
+		pack.writeUInt32BE(37, 8)
+		const response = Buffer.concat([
+			pkt("packfile\n"),
+			encodePktLine(Buffer.concat([Buffer.from([1]), pack])),
+			FLUSH,
+		])
+
+		expect(packObjectCount(response)).toBe(37)
+	})
+
+	it("does not mistake PACK bytes in protocol text or progress for a pack", () => {
+		const fakeHeader = Buffer.alloc(12)
+		fakeHeader.write("PACK", 0, "ascii")
+		fakeHeader.writeUInt32BE(2, 4)
+		fakeHeader.writeUInt32BE(37, 8)
+		const response = Buffer.concat([
+			encodePktLine(fakeHeader),
+			encodePktLine(Buffer.concat([Buffer.from([2]), fakeHeader])),
+			FLUSH,
+		])
+
+		expect(packObjectCount(response)).toBeNull()
 	})
 })
 

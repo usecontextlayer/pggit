@@ -116,7 +116,7 @@ describe("wire — incremental fetch against the deltified serve path", () => {
 
 		// ---- seed pggit over the real wire (v0 push) --------------------------
 		await spawnGit(["push", "-q", pggitUrl, "--all"], { cwd: src })
-		await spawnGit(["push", "-q", pggitUrl, "--tags"], { cwd: src }).catch(() => {})
+		await spawnGit(["push", "-q", pggitUrl, "--tags"], { cwd: src })
 		await createRepack(db.sql).repack(REPO)
 
 		// ---- round 1: full clone from both --------------------------------------

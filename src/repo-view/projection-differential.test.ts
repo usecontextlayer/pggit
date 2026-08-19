@@ -78,6 +78,13 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 		return row?.oid ?? null
 	}
 
+	/** Canonical git's file rows at one revision, in the projection's text form. */
+	async function gitFileRows(dir: string, rev: string): Promise<string[]> {
+		return parseLsTree((await spawnGit(["ls-tree", "-r", rev], { cwd: dir })).stdout)
+			.map((e) => `${e.path} ${e.mode} ${e.oid}`)
+			.sort()
+	}
+
 	/** Apply ops in a workdir; commit; return the new tip (null if nothing changed). */
 	async function applyAndCommit(
 		dir: string,
@@ -121,7 +128,11 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 			// commit failure must fail the property, not silently drop every
 			// generated transition.
 			const status = await spawnGit(["status", "--porcelain"], { cwd: dir })
-			if (status.stdout.trim() !== "") throw e
+			const nothingToCommit =
+				e instanceof GitCommandError &&
+				(e.stdout + e.stderr).includes("nothing to commit") &&
+				status.stdout.trim() === ""
+			if (!nothingToCommit) throw e
 			return null
 		}
 		return (await spawnGit(["rev-parse", "HEAD"], { cwd: dir })).stdout.trim()
@@ -158,6 +169,7 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 						await pushAndProject(repo, dir, tip)
 						// The seed projection is asserted too, so no candidate is ever
 						// vacuous even when every generated push has nothing to commit.
+						expect(await projectedRows(repo)).toEqual(await gitFileRows(dir, tip))
 						expect(await projectedHead(repo)).toBe(tip)
 
 						for (const [n, ops] of pushes.entries()) {
@@ -170,11 +182,7 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 							// row set to `git ls-tree -r` (rather than to a second pggit walk)
 							// is what makes a decoder defect SHARED by both projection paths
 							// visible here.
-							const lsTree = parseLsTree(
-								(await spawnGit(["ls-tree", "-r", tip], { cwd: dir })).stdout,
-							)
-								.map((e) => `${e.path} ${e.mode} ${e.oid}`)
-								.sort()
+							const lsTree = await gitFileRows(dir, tip)
 							const rows = await projectedRows(repo)
 							expect(rows).toEqual(lsTree)
 

@@ -1,8 +1,8 @@
 /**
  * neg01 — `readyToGiveUp` must ready a SIBLING common have, like git's
- * `ok_to_give_up`. An ACKed have marks its WHOLE ancestry common, and a want is
- * satisfiable once its own ancestry reaches that common region — so a have that
- * shares a base with the want but is not on its ancestor chain still readies.
+ * `ok_to_give_up`. An ACKed have marks itself and its direct parents common, and a
+ * want is satisfiable once its own ancestry reaches that common region — so a have
+ * that shares a base with the want but is not on its ancestor chain still readies.
  *
  * Scenario (the crisp wire form): main = c1←c2←c3, feature = c1←f1 (a sibling
  * off c1). want=c3, have=f1, NO `done`. f1 and c3 share c1.

@@ -285,11 +285,14 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 			}),
 		)
 
-		// Whatever the client observed, read the SERVER's durable state and a fresh
-		// clone — the two must not contradict each other.
+		// Whatever the pushing client observed, read the server's durable state and
+		// ask a fresh canonical client what the remote advertises. None may contradict.
 		const refs = createRefStore(db.sql)
 		const stored = new Set((await refs.listRefs("nam02")).map((r) => r.name))
 		const okAppliedServerSide = stored.has("refs/heads/ok")
+		const longRefAppliedServerSide = stored.has(longRef)
+		const sourceOid = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
+		const advertised = (await spawnGit(["ls-remote", url])).stdout
 
 		// The bug surfaces as an HTTP 500 with no in-band report-status: git can't
 		// read a per-ref result, so it reports the whole push as failed even though
@@ -300,11 +303,10 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 			"client must not see an HTTP 500 / RPC failure — push must report per-ref status in-band",
 		).not.toMatch(/HTTP 500|RPC failed|hung up/)
 
-		// And the core divergence: the client must not believe the push failed
-		// wholesale while the server durably kept one of the refs. If `ok` landed
-		// server-side, the client's push must have SUCCEEDED (exit 0) and reported it.
 		// The valid half MUST land: a non-atomic push applies each command on its own,
 		// so the over-long ref's rejection cannot take `refs/heads/ok` down with it.
+		// The command exits non-zero for the rejected half, but its per-ref status must
+		// still tell the client that `ok` succeeded.
 		expect(
 			okAppliedServerSide,
 			`refs/heads/ok never landed — stored: ${[...stored].join(", ")}`,
@@ -319,5 +321,18 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 			outcome.stderr,
 			"refs/heads/ok landed server-side, so the client must have been told in-band ([new branch]), not seen a wholesale failure",
 		).toMatch(/\[new branch]/)
+		expect(outcome.failed, "one rejected command must make git push exit non-zero").toBe(
+			true,
+		)
+		expect(
+			outcome.stderr,
+			"the client must receive the over-long ref's per-ref rejection",
+		).toMatch(/\[remote rejected].*funny refname \(too long to store\)/)
+		expect(
+			longRefAppliedServerSide,
+			"the ref reported rejected must not exist in durable server state",
+		).toBe(false)
+		expect(advertised).toContain(`${sourceOid}\trefs/heads/ok\n`)
+		expect(advertised).not.toContain(`\t${longRef}\n`)
 	})
 })

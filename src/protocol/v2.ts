@@ -201,7 +201,9 @@ export function encodeReadyWithPack(common: string[], pack: Buffer): Buffer {
  * does not have): an HTTP-200 protocol error the client can read, NOT a transport 500.
  */
 export function encodeErr(message: string): Buffer {
-	return encodePktLine(Buffer.from(`ERR ${message}\n`))
+	// Bare message, no trailing newline — canonical git's packet_writer_error
+	// framing, byte-for-byte (probed: `0049ERR upload-pack: not our ref <oid>`).
+	return encodePktLine(Buffer.from(`ERR ${message}`))
 }
 
 /**

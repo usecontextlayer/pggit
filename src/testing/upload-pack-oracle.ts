@@ -15,13 +15,27 @@ import { spawn } from "node:child_process"
 import { decodePktStream } from "@/protocol/pkt-line"
 import { buildGitEnv } from "@/testing/spawn-git"
 
+export type ExpectedUploadPackError = { code: number; out: Buffer }
+
+type SpawnUploadPackOptions = { expectInBandError: true }
+
 /**
  * Feed `request` (a v2 upload-pack POST body, e.g. from `fetchRequest`) to real
  * `git upload-pack --stateless-rpc <dir>` and return its raw response bytes —
  * the same byte stream a smart-HTTP client would read from git-http-backend.
  */
-export async function spawnUploadPack(dir: string, request: Buffer): Promise<Buffer> {
-	return new Promise((resolve, reject) => {
+export function spawnUploadPack(dir: string, request: Buffer): Promise<Buffer>
+export function spawnUploadPack(
+	dir: string,
+	request: Buffer,
+	opts: SpawnUploadPackOptions,
+): Promise<ExpectedUploadPackError>
+export async function spawnUploadPack(
+	dir: string,
+	request: Buffer,
+	opts?: SpawnUploadPackOptions,
+): Promise<Buffer | ExpectedUploadPackError> {
+	return new Promise<Buffer | ExpectedUploadPackError>((resolve, reject) => {
 		const child = spawn("git", ["upload-pack", "--stateless-rpc", dir], {
 			env: { ...buildGitEnv(), GIT_PROTOCOL: "version=2" },
 		})
@@ -40,9 +54,49 @@ export async function spawnUploadPack(dir: string, request: Buffer): Promise<Buf
 		child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
 		child.on("error", reject)
 		child.on("close", (code, signal) => {
+			const out = Buffer.concat(stdout)
 			const err = Buffer.concat(stderr).toString("utf8")
-			// A signal death or non-zero exit means the oracle never spoke: resolving
-			// its truncated output would launder a broken oracle into a green diff.
+			if (opts?.expectInBandError) {
+				// Missing wants are canonical Git's exception to the usual subprocess
+				// contract: upload-pack writes a complete in-band ERR pkt to stdout and
+				// exits 128. Accept only that fully framed shape; every other nonzero
+				// result remains an oracle failure.
+				if (code === null || code === 0) {
+					reject(
+						new Error(
+							`git upload-pack --stateless-rpc ${dir} expected an in-band error but exited ${code ?? `by ${signal}`}`,
+						),
+					)
+					return
+				}
+				try {
+					const decoded = decodePktStream(out)
+					const lastData = decoded.packets
+						.filter((packet) => packet.type === "data")
+						.at(-1)
+					// Probed (git 2.55): the ERR payload carries NO trailing newline —
+					// packet_writer_error frames the bare message.
+					if (
+						decoded.rest.length > 0 ||
+						lastData?.type !== "data" ||
+						!/^ERR .+\n?$/.test(lastData.payload.toString("utf8"))
+					) {
+						throw new Error("stdout was not a complete in-band ERR response")
+					}
+				} catch (error) {
+					reject(
+						new Error(
+							`git upload-pack --stateless-rpc ${dir} exited ${code} without a valid in-band ERR: ${String(error)}; stderr: ${err.trim()}`,
+						),
+					)
+					return
+				}
+				resolve({ code, out })
+				return
+			}
+			// By default, a signal death or non-zero exit means the oracle never
+			// spoke: resolving partial output would launder a broken oracle into a
+			// green differential.
 			if (code !== 0) {
 				reject(
 					new Error(
@@ -51,7 +105,7 @@ export async function spawnUploadPack(dir: string, request: Buffer): Promise<Buf
 				)
 				return
 			}
-			resolve(Buffer.concat(stdout))
+			resolve(out)
 		})
 	})
 }
@@ -63,7 +117,10 @@ export async function spawnUploadPack(dir: string, request: Buffer): Promise<Buf
  * what both git and pggit answer to a request that already said `done`.
  */
 export function ackSection(out: Buffer): string {
-	const { packets } = decodePktStream(out)
+	const { packets, rest } = decodePktStream(out)
+	if (rest.length > 0) {
+		throw new Error(`truncated upload-pack response (${rest.length} undecoded bytes)`)
+	}
 	const delim = packets.findIndex((p) => p.type === "delim")
 	const end = delim < 0 ? packets.length : delim
 	return packets

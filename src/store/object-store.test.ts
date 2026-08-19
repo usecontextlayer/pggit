@@ -88,8 +88,15 @@ describe("object store", () => {
 			const second = await store.putPack("repo", objects) // same objects again
 			expect(first.oids.sort()).toEqual([...expected].sort())
 			expect(second.oids.sort()).toEqual([...expected].sort())
-			for (const oid of expected) {
-				expect(await store.hasObject("repo", oid)).toBe(true)
+			const rows = await db.sql<{ n: number }[]>`
+				select count(*)::int as n
+				from git_object o
+				join repos r on r.id = o.repo_id
+				where r.name = 'repo'
+			`
+			expect(rows).toEqual([{ n: objects.length }])
+			for (const [i, oid] of expected.entries()) {
+				expect(await store.getObject("repo", oid)).toEqual(objects[i])
 			}
 		} finally {
 			await db.drop()

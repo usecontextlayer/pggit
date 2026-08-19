@@ -23,7 +23,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/solo"
 const NEVER_REPO = "workspace/probe/never"
@@ -89,9 +89,14 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 		)
 		if (neverCloneError === null) {
 			// `show-ref` exits 1 on a repo with no refs — that is the empty case, not a fault.
-			unknownCloneRefs = (
-				await spawnGit(["show-ref"], { cwd: neverDest }).catch(() => ({ stdout: "" }))
-			).stdout.trim()
+			try {
+				unknownCloneRefs = (
+					await spawnGit(["show-ref"], { cwd: neverDest })
+				).stdout.trim()
+			} catch (error) {
+				if (!(error instanceof GitCommandError) || error.code !== 1) throw error
+				unknownCloneRefs = ""
+			}
 		}
 
 		// 2/3 + 5 (first half). A single orphan commit; repack BEFORE the push has
