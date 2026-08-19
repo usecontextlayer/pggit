@@ -4,7 +4,7 @@
  *
  * The object-store ingest path chunks its INSERTs (INSERT_BATCH=1000) so a large
  * push lands under the 65534-parameter wire cap. But the post-commit `repo_file`
- * snapshot rebuild (`repo-file-projection.rebuildRefSnapshot`) does ONE un-chunked
+ * snapshot rebuild (`repo-file-projection.applyRefAdvance`'s full-rebuild path) does ONE un-chunked
  * multi-row INSERT of every file at the tip. `repo_file` has 5 bound columns, so a
  * single commit whose tree holds >= 13107 files binds >= 65535 parameters and the
  * driver throws MAX_PARAMETERS_EXCEEDED. The exception escapes the receive-pack
