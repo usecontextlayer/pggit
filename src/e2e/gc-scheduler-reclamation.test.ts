@@ -88,6 +88,51 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 	// that never judged the repo eligible (no `last_pushed_at` stamp) would leave the
 	// orphans in place and the survivor-equality / flat-count assertions would fail;
 	// an over-deleting drain would drop a live object and break the clone.
+	// A pass INSIDE the grace window must not settle the repo: young garbage the
+	// cutoff protects would otherwise be orphaned FOREVER once it ages (nothing
+	// re-qualifies a caught-up repo). The repo stays eligible until a pass runs
+	// past the grace horizon — simulated deterministically by backdating
+	// last_pushed_at and ageing the orphans, never by sleeping on the wall clock.
+	it("a pass inside the grace window leaves the repo ELIGIBLE until its garbage can age out", async () => {
+		const repo = "sch/young-garbage"
+		await pushFile(fx, repo, { content: "v1\n" })
+		await pushFile(fx, repo, { content: "v2\n", rewind: true }) // v1 is now garbage
+		const scheduler = createGcScheduler(fx.db.sql, {
+			concurrency: 1,
+			graceSeconds: 3600,
+			intervalMs: 60_000,
+		})
+
+		const first = await scheduler.drainOnce()
+		const mine = first.find((e) => e.repo === repo)
+		expect(mine).toBeDefined()
+		expect(mine?.deletedObjects).toBe(0) // everything is younger than grace
+		expect(mine?.settled).toBe(false)
+
+		// Still eligible: the young garbage exists and MUST get a post-grace pass.
+		const eligible = await fx.db.sql<{ name: string }[]>`
+			select name from repos
+			where last_pushed_at is not null
+				and (last_gc_at is null or last_pushed_at > last_gc_at)`
+		expect(eligible.map((r) => r.name)).toContain(repo)
+
+		// Two hours pass: the push recedes past grace and the orphans age out.
+		await fx.db.sql`
+			update repos set last_pushed_at = last_pushed_at - interval '2 hours'
+			where name = ${repo}`
+		await ageObjects(fx.db, repo, "2 hours")
+
+		const second = await scheduler.drainOnce()
+		const settled = second.find((e) => e.repo === repo)
+		expect(settled?.deletedObjects).toBeGreaterThan(0) // v1's orphans reclaimed
+		expect(settled?.settled).toBe(true)
+		const after = await fx.db.sql<{ name: string }[]>`
+			select name from repos
+			where last_pushed_at is not null
+				and (last_gc_at is null or last_pushed_at > last_gc_at)`
+		expect(after.map((r) => r.name)).not.toContain(repo)
+	})
+
 	it("SCH-6 — drainOnce reduces git_object to the live closure and stays flat over K rewind cycles", async () => {
 		const repo = "sch6-loop-reclaim"
 		const scheduler = createGcScheduler(fx.db.sql, {

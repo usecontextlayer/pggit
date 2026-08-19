@@ -22,7 +22,15 @@ import type { EpochOutcome } from "@/store/reach-epoch"
 /** One repo's outcome in a drain pass: the repo and what its GC reclaimed.
  * Emitted for EVERY repo the pass judged eligible (including zero-reclaim), so the
  * eligible set itself is observable (SCH-3). */
-export type DrainEntry = { repo: string; deletedObjects: number; epoch: EpochOutcome }
+export type DrainEntry = {
+	repo: string
+	deletedObjects: number
+	epoch: EpochOutcome
+	/** False while garbage YOUNGER than grace may still exist (the pass ran
+	 * inside the grace window): the repo deliberately stays eligible and is
+	 * re-drained next tick, so post-grace residue is never orphaned forever. */
+	settled: boolean
+}
 
 /** What one `drainOnce()` reclaimed, one entry per eligible repo. */
 export type DrainSummary = DrainEntry[]
@@ -86,8 +94,21 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 				graceSeconds: opts.graceSeconds,
 				maintain: false,
 			})
-			await pg`update repos set last_gc_at = ${t.t0}::timestamptz where id = ${c.id}::bigint`
-			return { deletedObjects, epoch, repo: c.name }
+			// Settle ONLY when this pass ran past the grace horizon of the repo's
+			// last push: a pass inside the window sees young garbage the grace
+			// cutoff protects, and stamping it caught-up would orphan that
+			// garbage FOREVER once it ages (nothing re-qualifies the repo). Not
+			// stamping keeps it eligible — a bounded number of cheap re-passes
+			// (unchanged tips skip the walk) until one runs post-grace. The WHERE
+			// also fails when a push landed mid-pass (last_pushed_at > t0), the
+			// standing no-lost-garbage rule.
+			const settledRows = await pg<{ id: string }[]>`
+				update repos set last_gc_at = ${t.t0}::timestamptz
+				where id = ${c.id}::bigint
+					and last_pushed_at + make_interval(secs => ${opts.graceSeconds}::float8)
+						<= ${t.t0}::timestamptz
+				returning id::text as id`
+			return { deletedObjects, epoch, repo: c.name, settled: settledRows.length > 0 }
 		} catch (err) {
 			console.error(
 				`pggit gc-scheduler: GC of repo ${JSON.stringify(c.name)} failed (retried next pass):`,
