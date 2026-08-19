@@ -61,12 +61,12 @@ See `docs/2026-06-26-npm-publishing-design.md` for the full design + rationale.
 
 ## This repo is harness/oracle-first
 
-Per the design spec at
-`/Users/alizain/ContextLayer/internal/in-progress/2026-06-20-git-remote-postgres-design.md`,
 `pggit` is a generic git remote that speaks the git smart-HTTP wire protocol
 (v2 fetch, v0 push) and stores all git objects + refs in Postgres. The protocol
 is fully specified and **verifiable against a perfect oracle** (real `git` +
 generative property tests via `fast-check`). Write the harness/oracle FIRST and
 let it drive the implementation: every server behavior is checked by round-
-tripping against canonical `git`. Hot path is zero-filesystem / zero-git-binary;
-the only `git` shell-out is the offline M3 repack worker.
+tripping against canonical `git`. Production paths are zero-filesystem and
+zero-git-binary — the `git` binary appears only in tests, oracles, and perf
+harnesses. The living design record is `docs/` in this repo (the derived-state
+spine and delta-pack docs carry the current architecture and its decisions).
