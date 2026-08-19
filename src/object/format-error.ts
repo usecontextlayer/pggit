@@ -22,6 +22,8 @@ export type GitFormatErrorCode =
 	| "inflate-failed"
 	// delta application
 	| "delta-base-size-mismatch"
+	| "delta-copy-out-of-range"
+	| "delta-insert-truncated"
 	| "delta-reserved-opcode"
 	| "delta-target-size-mismatch"
 	// git object content

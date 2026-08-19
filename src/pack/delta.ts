@@ -197,10 +197,38 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 			if (op & 0x20) copySize |= delta.readUInt8(pos++) << 8
 			if (op & 0x40) copySize |= delta.readUInt8(pos++) << 16
 			if (copySize === 0) copySize = 0x10000
+			// Every range is validated BEFORE the copy: `Buffer.copy` silently
+			// CLAMPS an out-of-range read/write while `outPos` advances by the
+			// declared size, which would synthesize zero bytes into the target —
+			// a malformed delta canonical `index-pack` rejects would pass here.
+			if (copyOffset + copySize > base.length) {
+				throw new GitFormatError(
+					"delta-copy-out-of-range",
+					`delta: copy [${copyOffset}, ${copyOffset + copySize}) exceeds base size ${base.length}`,
+				)
+			}
+			if (outPos + copySize > targetSize) {
+				throw new GitFormatError(
+					"delta-copy-out-of-range",
+					`delta: copy overflows declared target size ${targetSize} at ${outPos}`,
+				)
+			}
 			base.copy(out, outPos, copyOffset, copyOffset + copySize)
 			outPos += copySize
 		} else if (op !== 0) {
-			// INSERT: `op` literal bytes follow.
+			// INSERT: `op` literal bytes follow — all of them, or the delta lies.
+			if (pos + op > delta.length) {
+				throw new GitFormatError(
+					"delta-insert-truncated",
+					`delta: insert declares ${op} bytes, ${delta.length - pos} remain`,
+				)
+			}
+			if (outPos + op > targetSize) {
+				throw new GitFormatError(
+					"delta-insert-truncated",
+					`delta: insert overflows declared target size ${targetSize} at ${outPos}`,
+				)
+			}
 			delta.copy(out, outPos, pos, pos + op)
 			outPos += op
 			pos += op

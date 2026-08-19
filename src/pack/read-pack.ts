@@ -120,6 +120,14 @@ export async function readPack(
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
 			count("bytesInflated", data.length)
 			offset += compressedLength
+			// The header size of a delta entry declares the DELTA PROGRAM's
+			// inflated length — a mismatch is corruption index-pack rejects.
+			if (data.length !== size) {
+				throw new GitFormatError(
+					"size-mismatch",
+					`pack: delta program at ${start} inflated to ${data.length} bytes, header declared ${size}`,
+				)
+			}
 			entries.set(start, { baseOffset: start - negOffset, delta: data, kind: "ofs" })
 		} else if (type === PACK_OBJ_TYPE.REF_DELTA) {
 			const baseOid = pack.subarray(offset, offset + 20).toString("hex")
@@ -127,6 +135,12 @@ export async function readPack(
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
 			count("bytesInflated", data.length)
 			offset += compressedLength
+			if (data.length !== size) {
+				throw new GitFormatError(
+					"size-mismatch",
+					`pack: delta program at ${start} inflated to ${data.length} bytes, header declared ${size}`,
+				)
+			}
 			entries.set(start, { baseOid, delta: data, kind: "ref" })
 		} else {
 			const typeName = CODE_TO_TYPE[type]
