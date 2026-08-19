@@ -16,7 +16,7 @@ export function encodeAdvertisement(): Buffer {
 		"version 2",
 		`agent=${AGENT}`,
 		"ls-refs=unborn",
-		"fetch=filter include-tag",
+		"fetch=filter include-tag thin-pack",
 		"object-format=sha1",
 	]
 	return Buffer.concat([
@@ -70,6 +70,10 @@ export type FetchRequest = {
 	/** Client asked the server to auto-include annotated tags pointing into the
 	 * fetched set (the `include-tag` capability). */
 	includeTag: boolean
+	/** Client can fix thin packs (`thin-pack`): a served delta's base may live on
+	 * the CLIENT side — provably, via the frontier's `clientHas` — instead of in
+	 * the pack (D8′). Without it, every delta base must be in-pack, as before. */
+	thinPack: boolean
 }
 
 /** Fetch features pggit deliberately does NOT advertise (encodeAdvertisement): a
@@ -84,6 +88,7 @@ export function parseFetch(req: V2Request): FetchRequest {
 	let done = false
 	let filter: string | undefined
 	let includeTag = false
+	let thinPack = false
 	for (const arg of req.args) {
 		// Reject an unadvertised feature request loudly before parsing wants — else a
 		// `want-ref` line falls through every branch below and silently leaves wants=[]
@@ -104,12 +109,24 @@ export function parseFetch(req: V2Request): FetchRequest {
 				)
 			}
 			wants.push(oid)
-		} else if (arg.startsWith("have ")) haves.push(arg.slice(5))
-		else if (arg.startsWith("filter ")) filter = arg.slice("filter ".length)
+		} else if (arg.startsWith("have ")) {
+			const oid = arg.slice(5)
+			// Same boundary rule as wants: a non-hex have would coerce to a
+			// short/empty bytea downstream and silently weaken the subtraction —
+			// git's upload-pack dies on a malformed have line, and so do we.
+			if (!isOid(oid)) {
+				throw new GitProtocolError(
+					`fetch: malformed have object id ${JSON.stringify(oid)}`,
+				)
+			}
+			haves.push(oid)
+		} else if (arg.startsWith("filter ")) filter = arg.slice("filter ".length)
 		else if (arg === "include-tag") includeTag = true
+		else if (arg === "thin-pack") thinPack = true
 		else if (arg === "done") done = true
+		// `ofs-delta` stays parsed-and-ignored: REF_DELTA-only is legal in any pack.
 	}
-	return { done, filter, haves, includeTag, wants }
+	return { done, filter, haves, includeTag, thinPack, wants }
 }
 
 /**

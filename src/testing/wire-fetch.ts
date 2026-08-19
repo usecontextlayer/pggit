@@ -17,6 +17,7 @@ export function fetchRequest(parts: {
 	wantRefs?: string[]
 	haves?: string[]
 	includeTag?: boolean
+	thinPack?: boolean
 	done?: boolean
 }): Buffer {
 	const {
@@ -25,6 +26,7 @@ export function fetchRequest(parts: {
 		wantRefs = [],
 		haves = [],
 		includeTag = false,
+		thinPack = false,
 		done = false,
 	} = parts
 	return Buffer.concat([
@@ -37,6 +39,7 @@ export function fetchRequest(parts: {
 		...wantRefs.map((r) => encodePktLine(Buffer.from(`want-ref ${r}\n`))),
 		...haves.map((h) => encodePktLine(Buffer.from(`have ${h}\n`))),
 		...(includeTag ? [encodePktLine(Buffer.from("include-tag\n"))] : []),
+		...(thinPack ? [encodePktLine(Buffer.from("thin-pack\n"))] : []),
 		...(done ? [encodePktLine(Buffer.from("done\n"))] : []),
 		encodePkt({ type: "flush" }),
 	])

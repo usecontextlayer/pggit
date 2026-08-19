@@ -122,8 +122,8 @@ function parseGitPath(path: string): { repoId: string; service: GitService } | n
 
 function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	return {
-		buildPack: (wants, haves, omitBlobs, includeTag) =>
-			deps.objects.buildPack(repoId, wants, haves, omitBlobs, includeTag),
+		buildPack: (wants, haves, omitBlobs, includeTag, thinPack) =>
+			deps.objects.buildPack(repoId, wants, haves, omitBlobs, includeTag, thinPack),
 		commonHaves: (haves) => deps.objects.commonHaves(repoId, haves),
 		getSymref: (name) => deps.refs.getSymref(repoId, name),
 		listRefs: () => deps.refs.listRefs(repoId),
@@ -140,7 +140,13 @@ function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 		},
 		isAncestor: (ancestor, descendant) =>
 			deps.objects.isAncestor(repoId, ancestor, descendant),
-		isConnected: (oid) => deps.objects.isConnected(repoId, oid),
+		// Connectivity walks only the NEW region: boundary = the PRE-PUSH ref tips
+		// (read here, before any CAS applies — R5). Everything under a tip is live
+		// and grace-protected; anything above it is verified, not trusted.
+		isConnected: async (oid) => {
+			const tips = (await deps.refs.listRefs(repoId)).map((r) => r.oid)
+			return deps.objects.isConnected(repoId, oid, tips)
+		},
 	}
 	if (deps.snapshots) {
 		const sdeps = { objects: deps.objects, snapshots: deps.snapshots }

@@ -21,9 +21,9 @@ export function createRepoAdmin(pg: Sql, repos: RepoResolver) {
 	const db = initKysely<Database>(pg)
 	return {
 		/**
-		 * Delete a repo row; the child FKs (git_object / git_edge / git_ref /
-		 * repo_file, ON DELETE CASCADE since 0007) take every dependent row with it
-		 * in the same statement. An unknown name is a no-op returning false — repos
+		 * Delete a repo row; the child FKs (git_object / git_ref / repo_file and the
+		 * derived git_pack_encoding / git_commit / git_tag, ON DELETE CASCADE since
+		 * 0007) take every dependent row with it in the same statement. An unknown name is a no-op returning false — repos
 		 * are lazily created on first push, so "never existed" and "already deleted"
 		 * are the same observable state, and a caller can re-run a partially-failed
 		 * teardown blindly.

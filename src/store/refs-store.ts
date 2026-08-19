@@ -3,7 +3,6 @@ import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
 import type { GitRefName } from "@/database/models/public/GitRef"
 import type { ReposId } from "@/database/models/public/Repos"
-import { EDGE_KIND } from "@/object/edges"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
@@ -16,7 +15,15 @@ export type RefStore = ReturnType<typeof createRefStore>
 
 const isZero = (oid: string): boolean => /^0{40}$/.test(oid)
 
-const toOid = (hex: string): Buffer => Buffer.from(hex, "hex")
+const toOid = (hex: string): Buffer => {
+	// `Buffer.from("gg", "hex")` silently yields a SHORT buffer; a persisted
+	// short/empty ref oid poisons every later advertisement. The wire paths
+	// validate upstream — this guards the platform-facing setRef/seeding calls.
+	if (!/^[0-9a-f]{40}$/.test(hex)) {
+		throw new Error(`pggit refs: malformed object id ${JSON.stringify(hex)}`)
+	}
+	return Buffer.from(hex, "hex")
+}
 
 /**
  * A ref CAS discriminated on the wire hex strings — BEFORE any `bytea` coercion.
@@ -46,15 +53,15 @@ function classifyRefUpdate(cmd: RefUpdate): RefOp {
 }
 
 /**
- * The peeled target of a ref oid: if it is an annotated tag, follow the `kind=5`
+ * The peeled target of a ref oid: if it is an annotated tag, follow the `git_tag`
  * (tag→target) chain — while the current node is a tag — to its terminal non-tag
  * object. A branch or a lightweight tag (the oid is not a tag object) peels to
  * `null` → `ls-refs` emits no `peeled` line. git imposes NO depth bound on ref
  * peeling, so neither do we: the `is_tag` predicate terminates the recursion at the
  * first non-tag, and a content-addressed tag chain is acyclic (an oid cannot embed
- * its own hash) hence finite. Computed at ref-write, so the tag's edges + target
- * are already present (connectivity proved the chain on push). Replaces the
- * per-`ls-refs` app-side tag walk.
+ * its own hash) hence finite. Computed at ref-write, so the chain's `git_tag` rows
+ * and targets are already present (connectivity proved the chain on push).
+ * Replaces the per-`ls-refs` app-side tag walk.
  */
 async function peelRef(
 	exec: Kysely<Database>,
@@ -67,14 +74,12 @@ async function peelRef(
 				from git_object o
 				where o.repo_id = ${repoId}::bigint and o.oid = ${oid}::bytea
 			union all
-			select e.child, co.type = ${PACK_OBJ_TYPE.TAG}, c.depth + 1
+			select t.target_oid, co.type = ${PACK_OBJ_TYPE.TAG}, c.depth + 1
 				from chain c
-				join git_edge e
-					on e.repo_id = ${repoId}::bigint
-					and e.parent = c.oid
-					and e.kind = ${EDGE_KIND.TAG_TARGET}
+				join git_tag t
+					on t.repo_id = ${repoId}::bigint and t.oid = c.oid
 				left join git_object co
-					on co.repo_id = ${repoId}::bigint and co.oid = e.child
+					on co.repo_id = ${repoId}::bigint and co.oid = t.target_oid
 				where c.is_tag
 		)
 		select oid as peeled from chain where not is_tag and depth > 0
@@ -106,6 +111,16 @@ async function ensureHeadDefault(exec: Kysely<Database>, repoId: ReposId): Promi
 		})
 		.onConflict((oc) => oc.columns(["repo_id", "name"]).doNothing())
 		.execute()
+}
+
+/** The loud absorb for a failed post-CAS activity stamp (see the call sites). */
+function logStampFailure(repo: string): (err: unknown) => void {
+	return (err) => {
+		console.error(
+			`pggit: last_pushed_at stamp failed for ${JSON.stringify(repo)} (the ref updates are already applied; GC sees this repo on its next successful push):`,
+			err,
+		)
+	}
 }
 
 /**
@@ -216,13 +231,31 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 				const results: boolean[] = []
 				let mutated = false
 				for (const cmd of commands) {
-					const r = await casRefUpdate(db, id, cmd)
-					results.push(r.ok)
-					if (r.mutated) mutated = true
+					// Per-ref independence IS non-atomic semantics (git's `ng` line): a
+					// storage failure on one command — a lock timeout from a concurrent
+					// writer of that ref's row — fails THAT command and never the batch.
+					// Letting it throw here would 500 a push whose earlier commands are
+					// already applied: refs moved, no report, no projection, no stamp —
+					// the three-way tear pg-txn--post-cas-failure-tears-push pins.
+					try {
+						const r = await casRefUpdate(db, id, cmd)
+						results.push(r.ok)
+						if (r.mutated) mutated = true
+					} catch (err) {
+						console.error(
+							`pggit: ref update failed for ${JSON.stringify(cmd.ref)} (reported ng; the rest of the batch continues):`,
+							err,
+						)
+						results.push(false)
+					}
 				}
 				// One activity stamp per push, only when a ref actually changed — a batch
 				// of pure no-ops leaves the watermark untouched (so GC is not re-triggered).
-				if (mutated) await stampPushed(db, id)
+				// Best-effort: the refs are already MOVED, so a stamp failure must never
+				// fail the push (the client would see failure for an applied update — a
+				// torn report). The cost is the documented delayed-GC trade: this repo's
+				// garbage waits until some later push stamps it.
+				if (mutated) await stampPushed(db, id).catch(logStampFailure(repoId))
 				return results
 			}
 			// Atomic batch: take the per-ref row locks in a deterministic by-name order
@@ -253,8 +286,9 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 			// lose that garbage forever (the GC primitive's snapshot still protects
 			// liveness, so this is leak-not-corruption — but a leak the durable signal is
 			// meant to prevent). Mirrors the non-atomic path, which already stamps after
-			// its CAS commits.
-			if (anyMutated) await stampPushed(db, id)
+			// its CAS commits — and is best-effort for the same reason (the batch is
+			// already applied; a stamp failure must not turn success into a torn report).
+			if (anyMutated) await stampPushed(db, id).catch(logStampFailure(repoId))
 			return commands.map(() => true)
 		},
 

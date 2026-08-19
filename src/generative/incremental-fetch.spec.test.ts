@@ -77,7 +77,9 @@ describe("§8.4 generative — incremental fetch (M1) differential", () => {
 							await seedRepoIntoStore("repo", src, { objects, refs })
 
 							// Keep the received objects as a pack (unpackLimit=1) so we can read
-							// exactly what crossed the wire.
+							// what crossed the wire. The server advertises thin-pack, so git's
+							// index-pack --fix-thin APPENDS each client-held delta base into
+							// the kept pack: wire-exact = pack contents minus what we had.
 							await spawnGit(
 								[
 									"-c",
@@ -92,9 +94,9 @@ describe("§8.4 generative — incremental fetch (M1) differential", () => {
 
 							const newPacks = packFiles(dest).filter((p) => !packsAfterClone.has(p))
 							expect(newPacks.length).toBe(1)
-							expect(await packObjectOids(dest, newPacks[0] as string)).toEqual(
-								[...delta].sort(),
-							)
+							const transferred = await packObjectOids(dest, newPacks[0] as string)
+							const wireNew = transferred.filter((o) => !haveAfterClone.includes(o))
+							expect(wireNew).toEqual([...delta].sort())
 							await spawnGit(["fsck", "--full"], { cwd: dest })
 						} finally {
 							await server?.close()

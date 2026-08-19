@@ -3,9 +3,8 @@ import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
 import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
-import { commitParents, commitTreeOid, treeEntries } from "@/object/object"
+import { treeEntries } from "@/object/object"
 import { encodeDelta } from "@/pack/delta"
-import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { lookupRepoId } from "@/store/repo-resolver"
 
 /**
@@ -246,6 +245,33 @@ export function createRepack(pg: Sql) {
 				if (!repair && !pendingByOid.has(treeOid)) return
 				const raw = await content(treeOid)
 
+				// Recurse into changed subtrees FIRST, pairing by entry NAME (git's
+				// structural unit): same directory name on both sides, different oid.
+				// POST-ORDER — children's rows land before their root's — so any crash
+				// prefix is subtree-closed and the covered-tree prune above stays safe
+				// across an interrupted pass: a covered tree really does imply covered
+				// descendants, whatever flush boundary a crash landed on. (Emitting the
+				// root first made the opposite briefly true on disk, and a resumed pass
+				// would prune at the covered root and orphan its pending children to
+				// phase-2 whole encodings, permanently — D15's stamp cannot see a
+				// crashed pass, which never stamped.) Anchor choices are unaffected:
+				// a delta's anchor comes from its PREDECESSOR's stored row (an earlier
+				// commit's walk), never from this commit's own emit order.
+				if (parentTreeOid !== null) {
+					const before = new Map(
+						treeEntries(await content(parentTreeOid))
+							.filter((e) => e.mode === "40000")
+							.map((e) => [e.name, e.oid]),
+					)
+					for (const entry of treeEntries(raw)) {
+						if (entry.mode !== "40000") continue
+						const prior = before.get(entry.name)
+						if (prior !== undefined && prior !== entry.oid) {
+							await encodeTreePair(entry.oid, prior)
+						}
+					}
+				}
+
 				if (pendingByOid.has(treeOid)) {
 					const predecessor = parentTreeOid ? encoded.get(parentTreeOid) : undefined
 					if (predecessor !== undefined && parentTreeOid !== null) {
@@ -265,22 +291,6 @@ export function createRepack(pg: Sql) {
 						}
 					} else {
 						await emitWhole(treeOid, raw) // no predecessor — first version anchors
-					}
-				}
-
-				// Recurse into changed subtrees, pairing by entry NAME (git's structural
-				// unit): same directory name on both sides, different oid.
-				if (parentTreeOid === null) return
-				const before = new Map(
-					treeEntries(await content(parentTreeOid))
-						.filter((e) => e.mode === "40000")
-						.map((e) => [e.name, e.oid]),
-				)
-				for (const entry of treeEntries(raw)) {
-					if (entry.mode !== "40000") continue
-					const prior = before.get(entry.name)
-					if (prior !== undefined && prior !== entry.oid) {
-						await encodeTreePair(entry.oid, prior)
 					}
 				}
 			}
@@ -323,22 +333,22 @@ export function createRepack(pg: Sql) {
 	 * The commit walk, precomputed: every commit's root tree beside its FIRST
 	 * parent's root tree (null for a root commit or a parent GC has removed), in
 	 * deterministic oldest-first topological order (Kahn; ties broken by oid).
-	 * Parent ORDER lives only in commit content — `git_edge` kind-2 rows are a
-	 * set — so the walk parses the commits themselves (small, header-only reads).
+	 * Parent ORDER is first-class in `git_commit.parents` (spine chunk 1), so the
+	 * walk reads rows — the per-commit body re-parse this function used to do is
+	 * deleted with the edge-set's orderlessness that forced it.
 	 */
 	async function commitDiffOrder(
 		id: ReposId,
 	): Promise<{ treeOid: string; parentTreeOid: string | null }[]> {
-		const commits = await pg<{ oid: string; content: Buffer }[]>`
-			select encode(oid, 'hex') as oid, content from git_object
-			where repo_id = ${id}::bigint and type = ${PACK_OBJ_TYPE.COMMIT}`
+		const commits = await pg<{ oid: string; tree: string; parents: string[] }[]>`
+			select encode(c.oid, 'hex') as oid, encode(c.tree_oid, 'hex') as tree,
+				(select coalesce(array_agg(encode(p.h, 'hex') order by p.ord), '{}')
+					from unnest(c.parents) with ordinality as p(h, ord)) as parents
+			from git_commit c where c.repo_id = ${id}::bigint`
 		const byOid = new Map(commits.map((c) => [c.oid, c]))
 		const parsed = new Map<string, { tree: string; parents: string[] }>()
 		for (const c of commits) {
-			parsed.set(c.oid, {
-				parents: commitParents(c.content),
-				tree: commitTreeOid(c.content),
-			})
+			parsed.set(c.oid, { parents: c.parents, tree: c.tree })
 		}
 
 		// Kahn over the parent relation, restricted to parents that still exist (a

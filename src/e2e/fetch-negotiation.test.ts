@@ -70,7 +70,10 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 			await seedRepoIntoStore("repo1", src, { objects, refs })
 
 			// Incremental fetch; keep the received objects as a pack so we can read
-			// exactly what crossed the wire (unpackLimit=1 defeats loose-unpacking).
+			// what crossed the wire (unpackLimit=1 defeats loose-unpacking). The server
+			// advertises thin-pack, so a served delta's base may be an object the clone
+			// already has — git's index-pack --fix-thin APPENDS each such base into the
+			// kept pack. Wire-exact is therefore the pack's contents MINUS what we had.
 			await spawnGit(
 				["-c", "protocol.version=2", "-c", "fetch.unpackLimit=1", "fetch", "origin"],
 				{ cwd: dest },
@@ -83,7 +86,8 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 			// The delta = everything reachable from c3 that the clone did not have.
 			const delta = (await allObjectOids(src)).filter((o) => !haveAfterClone.includes(o))
 			expect(delta.length).toBe(3) // c3 commit + new root tree + new a.txt blob
-			expect(transferred).toEqual(delta)
+			const wireNew = transferred.filter((o) => !haveAfterClone.includes(o))
+			expect(wireNew).toEqual(delta)
 
 			await spawnGit(["fsck", "--full"], { cwd: dest })
 		} finally {

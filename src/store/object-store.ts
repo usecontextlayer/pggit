@@ -1,22 +1,21 @@
 import { createHash } from "node:crypto"
+import { deflateSync } from "node:zlib"
 import { sql } from "kysely"
 import type { Sql } from "postgres"
 import { type Database, initKysely } from "@/database"
 import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
+import { OBJECT_TYPE_CODE, objectTypeFromCode } from "@/database/object-type-codes"
 import { count, withPhase } from "@/instrument"
-import { deriveEdges, EDGE_KIND, validateObject } from "@/object/edges"
+import { computeGenerations } from "@/object/commit-graph"
+import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/derive"
 import { computeOid, type GitObjectType } from "@/object/object"
+import { encodeDelta } from "@/pack/delta"
 import { encodeObjectHeader, PACK_OBJ_TYPE, type PackObjType } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
-import {
-	type PackInputObject,
-	packHeader,
-	packObject,
-	writePack,
-} from "@/pack/write-pack"
+import { type PackInputObject, packHeader, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
-import { ancestryReachesCommon, reachableClosure } from "@/store/reachability"
+import { ancestry, originClosure, routeServeSet } from "@/store/reachability"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */
@@ -46,30 +45,6 @@ export type StoredObject = {
 }
 
 export type ObjectStore = ReturnType<typeof createObjectStore>
-
-// `git_object.type` stores the pack object-type code (1 commit, 2 tree, 3 blob,
-// 4 tag) — so it maps straight to the pack header on serve. Mirrors the codec's
-// own private map (write-pack.ts), referencing the same constants; the codec
-// stays storage-independent and untouched.
-const TYPE_TO_CODE: Record<GitObjectType, number> = {
-	blob: PACK_OBJ_TYPE.BLOB,
-	commit: PACK_OBJ_TYPE.COMMIT,
-	tag: PACK_OBJ_TYPE.TAG,
-	tree: PACK_OBJ_TYPE.TREE,
-}
-
-const CODE_TO_TYPE = new Map<number, GitObjectType>([
-	[PACK_OBJ_TYPE.BLOB, "blob"],
-	[PACK_OBJ_TYPE.COMMIT, "commit"],
-	[PACK_OBJ_TYPE.TAG, "tag"],
-	[PACK_OBJ_TYPE.TREE, "tree"],
-])
-
-function typeFromCode(code: number): GitObjectType {
-	const type = CODE_TO_TYPE.get(code)
-	if (!type) throw new Error(`object-store: unknown git object type code ${code}`)
-	return type
-}
 
 /**
  * Postgres-backed git object store. Each immutable object is one row in the
@@ -101,39 +76,32 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			haves: string[],
 			omitBlobs: boolean,
 			includeTag = false,
+			thinPack = false,
 		): Promise<Buffer> {
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null || wants.length === 0) return writePack([])
 
-			const served = await withPhase("closure", async () => {
-				const want = await reachableClosure(db, id, wants, omitBlobs)
+			const route = await withPhase("closure", async () => {
+				// The one routed entry (spine chunk 2/R4): the router type-dispatches
+				// wants, peels tag chains, sends have-ful commit fetches through the
+				// frontier, and keeps have-less requests on the full closure. An exact
+				// blob want is served even under a blob filter — the promisor rule —
+				// because the router adds it unconditionally, never by subtraction.
+				const routed = await routeServeSet(db, id, wants, haves, omitBlobs)
 				// A want whose closure is incomplete cannot be served (git rejects it
-				// too) — fail loud rather than ship a short pack. The have side may be
-				// incomplete (we just don't subtract what we lack), so only wants matter.
-				// Missing WANTS lead the list (the error's capped message shows the head,
-				// and git's own ERR names the want); the rest sorted, so the message is
-				// deterministic — the closure iterates in planner order.
-				if (want.missing.size > 0) {
-					const missingWants = wants.filter((w) => want.missing.has(w))
+				// too) — fail loud rather than ship a short pack. Missing WANTS lead the
+				// list (the error's capped message shows the head, and git's own ERR
+				// names the want); the rest sorted, so the message is deterministic.
+				if (routed.missing.size > 0) {
+					const missingWants = wants.filter((w) => routed.missing.has(w))
 					const lead = new Set(missingWants)
-					const rest = [...want.missing].filter((o) => !lead.has(o)).sort()
+					const rest = [...routed.missing].filter((o) => !lead.has(o)).sort()
 					throw new WantNotFoundError([...missingWants, ...rest])
 				}
-				const have =
-					haves.length > 0
-						? await reachableClosure(db, id, haves, omitBlobs)
-						: { missing: new Set<string>(), present: new Set<string>() }
-				const set = new Set<string>()
-				for (const o of want.present) if (!have.present.has(o)) set.add(o)
-				// Under a blobless/partial filter the client may explicitly want an object
-				// reachable from a `have` whose closure it does NOT fully possess (a promisor
-				// root the omitBlobs subtraction drops), so re-add those wants. On an unfiltered
-				// fetch a `have` implies its whole closure — a want already in it is genuinely
-				// owned, so re-adding would re-send what the client has (a non-minimal pack).
-				if (omitBlobs) for (const w of wants) if (want.present.has(w)) set.add(w)
-				if (includeTag) await augmentWithTags(id, set)
-				return [...set]
+				if (includeTag) await augmentWithTags(id, routed.served)
+				return routed
 			})
+			const served = [...route.served]
 
 			return withPhase("pack-encode", async () => {
 				const hash = createHash("sha1")
@@ -143,13 +111,49 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 					parts.push(chunk)
 				}
 				push(packHeader(served.length))
-				// Which deltas may ship AS deltas: only those whose base is itself in this
-				// pack (delta-pack design D8). An external base would need the client's
-				// thin-pack request, which the v2 parser does not yet carry — so until it
-				// does, an out-of-set base means the object falls back to its whole form.
-				const servedSet = new Set(served)
-				let emitted = 0
+				// Which deltas may ship AS deltas (D8′): base in this pack, or — under a
+				// negotiated thin-pack — provably client-held (`clientHas`). Otherwise
+				// the object falls back to its whole form.
+				const servedSet = route.served
+				const { clientHas, warmBases } = route
+				// Emit non-deltas FIRST: a delta's base is always a whole encoding
+				// (depth ≤ 1, D2), so this ordering guarantees every REF_DELTA's base
+				// precedes it in the stream — legal either way in a self-contained pack,
+				// but a stream whose deltas all dangle until the end forces worst-case
+				// client buffering (the closure's discovery order is newest-first, which
+				// is exactly that pathological order).
+				const deltaOids = new Set<string>()
 				for (const batch of batches(served, PACK_BATCH)) {
+					const rows = await pg<{ oid: string }[]>`
+						select encode(oid, 'hex') as oid from git_pack_encoding
+						where repo_id = ${id}::bigint and base_oid is not null
+							and oid in ${pg(batch.map((h) => Buffer.from(h, "hex")))}`
+					for (const r of rows) deltaOids.add(r.oid)
+				}
+				// Warm-delta candidates (R9) sit in the delta segment too — ordering
+				// only; whether each actually ships as a delta is decided at emit.
+				if (thinPack) {
+					for (const t of warmBases.keys()) if (servedSet.has(t)) deltaOids.add(t)
+				}
+				// Warm-delta base bodies: boundary trees, NOT in the served set — read
+				// once per serve (they are the same handful the frontier just diffed).
+				const warmBaseCache = new Map<string, Buffer | null>()
+				const readWarmBase = async (oid: string): Promise<Buffer | null> => {
+					const hit = warmBaseCache.get(oid)
+					if (hit !== undefined) return hit
+					const [row] = await pg<{ content: Buffer }[]>`
+						select content from git_object
+						where repo_id = ${id}::bigint and oid = ${Buffer.from(oid, "hex")}`
+					const content = row?.content ?? null
+					warmBaseCache.set(oid, content)
+					return content
+				}
+				const emitOrder = [
+					...served.filter((o) => !deltaOids.has(o)),
+					...served.filter((o) => deltaOids.has(o)),
+				]
+				let emitted = 0
+				for (const batch of batches(emitOrder, PACK_BATCH)) {
 					// The derived encoding beside the object's type (delta-pack design D1):
 					// a stored encoding is served as a verbatim byte copy — no deflate, no
 					// delta resolution; an object without one takes the raw path below.
@@ -170,16 +174,34 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 							and o.oid in ${pg(batch.map((h) => Buffer.from(h, "hex")))}`
 					const byOid = new Map(rows.map((r) => [r.oid, r]))
 
-					const usable = (r: ServeRow): boolean =>
+					// D8′: a delta's base must be PROVABLY resolvable by the client — in
+					// this pack, or (under negotiated thin-pack) in `clientHas`, whose
+					// membership is proof by construction: a boundary tree reachable from
+					// a stated have named it.
+					const storedDeltaUsable = (r: ServeRow): boolean =>
 						r.data !== null &&
 						r.data_size !== null &&
-						(r.base_oid === null || servedSet.has(r.base_oid))
+						r.base_oid !== null &&
+						(servedSet.has(r.base_oid) || (thinPack && clientHas.has(r.base_oid)))
+					const storedWholeUsable = (r: ServeRow): boolean =>
+						r.data !== null && r.data_size !== null && r.base_oid === null
+					// Emission priority per object: stored delta (byte copy, zero compute)
+					// → warm delta (R9: computed now against the client-held boundary tree
+					// — this OUTRANKS a stored whole, because a freshly-pushed tree's
+					// stored form IS a whole and shipping it whole is exactly the 3–11×
+					// warm-fetch gap this slice closes) → stored whole (byte copy) →
+					// computed whole.
+					const wantsContent = (h: string, r: ServeRow): boolean => {
+						if (storedDeltaUsable(r)) return false
+						if (thinPack && warmBases.has(h)) return true
+						return !storedWholeUsable(r)
+					}
 
 					// Raw-path subset, read through the existing size-guarded query (CASE →
 					// NULL keeps a >256MiB blob off the driver's hex path; chunked below).
 					const fallback = batch.filter((h) => {
 						const r = byOid.get(h)
-						return r !== undefined && !usable(r)
+						return r !== undefined && wantsContent(h, r)
 					})
 					const contentByOid = new Map<string, Buffer>()
 					if (fallback.length > 0) {
@@ -216,19 +238,53 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 							// hard fault (a mid-clone repo deletion), never a short pack.
 							throw new Error(`pggit: object ${h} vanished while packing`)
 						}
-						if (usable(r) && r.data !== null && r.data_size !== null) {
-							if (r.base_oid === null) {
-								push(encodeObjectHeader(r.type as PackObjType, r.data_size))
-							} else {
-								push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, r.data_size))
-								push(Buffer.from(r.base_oid, "hex"))
-								count("deltasServed")
-							}
+						if (storedDeltaUsable(r) && r.data !== null && r.data_size !== null) {
+							push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, r.data_size))
+							push(Buffer.from(r.base_oid as string, "hex"))
+							push(r.data)
+							count("deltasServed")
+						} else if (!wantsContent(h, r) && r.data !== null && r.data_size !== null) {
+							// Stored whole, no better option: verbatim byte copy.
+							push(encodeObjectHeader(r.type as PackObjType, r.data_size))
 							push(r.data)
 						} else {
 							const content = contentByOid.get(h)
 							if (!content) throw new Error(`pggit: no content read for ${h}`)
-							push(packObject(typeFromCode(r.type), content))
+							// The serve-time warm delta (R9): a tree the tier cannot cover
+							// FOR THIS CLIENT — freshly pushed (stored whole), or its stored
+							// anchor unprovable — deltas against its same-path boundary
+							// predecessor, client-held by construction, using the SAME
+							// oracle-tested encoder repack uses. Kept only when it beats the
+							// whole form (git's rule).
+							const warmBase = thinPack ? warmBases.get(h) : undefined
+							const baseContent =
+								warmBase === undefined ? null : await readWarmBase(warmBase)
+							const wholeDeflated = deflateSync(content)
+							const delta =
+								baseContent === null ? null : encodeDelta(baseContent, content)
+							const deltaDeflated = delta === null ? null : deflateSync(delta)
+							if (
+								delta !== null &&
+								deltaDeflated !== null &&
+								warmBase !== undefined &&
+								deltaDeflated.length < wholeDeflated.length
+							) {
+								push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, delta.length))
+								push(Buffer.from(warmBase, "hex"))
+								push(deltaDeflated)
+								count("deltasServed")
+								count("warmDeltasServed")
+							} else if (
+								storedWholeUsable(r) &&
+								r.data !== null &&
+								r.data_size !== null
+							) {
+								push(encodeObjectHeader(r.type as PackObjType, r.data_size))
+								push(r.data)
+							} else {
+								push(encodeObjectHeader(r.type as PackObjType, content.length))
+								push(wholeDeflated)
+							}
 						}
 						emitted++
 					}
@@ -253,19 +309,26 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			if (haves.length === 0) return []
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return []
-			const rows = await db
-				.selectFrom("git_object")
-				.select("oid")
-				.where("repo_id", "=", id)
-				.where(
-					"oid",
-					"in",
-					haves.map((h) => Buffer.from(h, "hex")),
-				)
-				.execute()
+			// Batched: the have list is CLIENT-sized and unvalidated, one bind per oid,
+			// and the wire caps a statement at 65,534 binds — this was the store's last
+			// unbatched client-sized value list, and it 500'd exactly at the wall
+			// (pg-corrupt--fetch-haves-value-list).
+			const present = new Set<string>()
+			for (const batch of batches(haves, PACK_BATCH)) {
+				const rows = await db
+					.selectFrom("git_object")
+					.select("oid")
+					.where("repo_id", "=", id)
+					.where(
+						"oid",
+						"in",
+						batch.map((h) => Buffer.from(h, "hex")),
+					)
+					.execute()
+				for (const r of rows) present.add(r.oid.toString("hex"))
+			}
 			// Preserve the client's `have` order (the ACK lines echo it) — the `in`
 			// query returns rows in arbitrary order.
-			const present = new Set(rows.map((r) => r.oid.toString("hex")))
 			return haves.filter((h) => present.has(h))
 		},
 		async getObject(repoId: string, oid: string): Promise<StoredObject | null> {
@@ -292,7 +355,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			const content =
 				row.content ?? (await readContentChunked(id, Buffer.from(oid, "hex"), row.size))
 			count("objectBytesRead", content.length)
-			return { content, type: typeFromCode(row.type) }
+			return { content, type: objectTypeFromCode(row.type) }
 		},
 
 		async hasObject(repoId: string, oid: string): Promise<boolean> {
@@ -326,10 +389,10 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		 * Is `ancestor` in `descendant`'s history (or equal to it)? The
 		 * fast-forward policy check for receive-pack's deny-non-FF (a ref update
 		 * may only ADVANCE — see handleReceivePack): delegates to the same
-		 * ancestry CTE that powers negotiation (`ancestryReachesCommon`, edge
-		 * kinds 2,5 — the tag kind is harmless for branch tips), seeded at the
-		 * descendant and self-inclusive, so a no-op update (old == new) counts as
-		 * an ancestor.
+		 * ancestry walk that powers negotiation (`ancestry` over `git_commit`
+		 * parents + `git_tag` targets — the tag step is harmless for branch
+		 * tips), seeded at the descendant and self-inclusive, so a no-op update
+		 * (old == new) counts as an ancestor.
 		 */
 		async isAncestor(
 			repoId: string,
@@ -338,25 +401,39 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		): Promise<boolean> {
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
-			return await ancestryReachesCommon(db, id, descendant, [
-				Buffer.from(ancestor, "hex"),
-			])
+			return await ancestry(db, id, descendant, [Buffer.from(ancestor, "hex")])
 		},
 
 		/**
 		 * Connectivity check (spec §5.2): is every object reachable from `oid` present?
 		 * A push whose new tip fails this references an object the pack neither carried
 		 * nor delta-resolved, and must be rejected. Delegates to the one reachability
-		 * engine (`reachableClosure`) shared with clone/fetch, so connectivity and
-		 * serving can never disagree on what is reachable. Full-closure (matching the
-		 * old walk's scope); the bounded "new objects only" form is a deferred
-		 * optimization (OQ-14).
+		 * engine shared with clone/fetch, so connectivity and serving can never
+		 * disagree on what is reachable. With a `boundary` (the PRE-PUSH ref tips,
+		 * R5) the walk is `originClosure` with the tips as its STOP-SET — only the
+		 * NEW region is verified: objects under a tip GC's pinned snapshot saw are
+		 * live and cannot vanish mid-check, and a tip advanced after that snapshot
+		 * is covered by the grace window (D13), the same defense it has today.
+		 * Anything NOT under a tip (a denied push's stored-but-unverified orphans)
+		 * is walked, not trusted. Without a boundary (first push, operator calls)
+		 * the stop-set is empty and the walk is the full closure.
 		 */
-		async isConnected(repoId: string, oid: string): Promise<boolean> {
+		async isConnected(
+			repoId: string,
+			oid: string,
+			boundary: string[] = [],
+		): Promise<boolean> {
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return false
-			const { missing } = await reachableClosure(db, id, [oid], false)
-			return missing.size === 0
+			// The boundary is a STOP-SET, not a have-set: connectivity needs "every
+			// object in the NEW region above the pre-push tips is present", so the
+			// walk stops AT a boundary tip and never descends below it. Routing
+			// this through the serve frontier instead would mark_uninteresting the
+			// boundary's whole history — one round-trip per commit per command,
+			// measured at ~4000 × 3000 sequential queries on a many-branch push of
+			// a deep repo (the fetch-haves probe's 900 s wall).
+			const walk = await originClosure(db, id, [oid], new Set(boundary))
+			return walk.missing.size === 0
 		},
 
 		/** Seed objects directly (the differential harness + perf bench path): insert
@@ -373,8 +450,9 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		/**
 		 * git's `ok_to_give_up`: ready once every want reaches a common have by commit/
 		 * tag ancestry (the haves form a cut below all wants, so the delta is well-
-		 * defined). One ancestry CTE (edge kinds 2,5) per want replaces `reachesCommon`'s
-		 * per-object BFS. Generation-number pruning is a deferred §6.4 lever.
+		 * defined). One ancestry CTE (commit parents + tag targets) per want replaces
+		 * `reachesCommon`'s per-object BFS. Generation-number pruning is a deferred
+		 * §6.4 lever.
 		 */
 		async readyToGiveUp(
 			repoId: string,
@@ -386,16 +464,18 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			if (id === null) return false
 			const commonBufs = common.map((h) => Buffer.from(h, "hex"))
 			for (const want of wants) {
-				if (!(await ancestryReachesCommon(db, id, want, commonBufs))) return false
+				if (!(await ancestry(db, id, want, commonBufs))) return false
 			}
 			return true
 		},
 	}
 
-	/** Insert objects as rows + their derived edges, idempotent (re-sent objects are
-	 * skipped). Each object row and its complete edge set go in ONE transaction from
-	 * ONE derivation (§10.1) — so no object ever exists without its edges. Edge
-	 * derivation validates at the boundary and throws on malformed content (§5.1),
+	/** Insert objects as rows + their derived commit/tag rows, idempotent
+	 * (re-sent objects are skipped). Each object row and its complete derived set go
+	 * in ONE transaction from ONE derivation (§10.1) — so no commit/tag object ever
+	 * exists without its `git_commit`/`git_tag` row (spine chunk 1: "every stored
+	 * commit has a row" is an invariant, not a hope).
+	 * Derivation validates at the boundary and throws on malformed content (§5.1),
 	 * aborting the ingest before any row lands. Returns every object's hex OID, in
 	 * input order. */
 	async function insertObjects(
@@ -407,23 +487,47 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			const hex = computeOid(obj.type, obj.content)
 			const oid = Buffer.from(hex, "hex")
 			return {
-				edges: deriveEdges(obj.type, obj.content).map((e) => ({
-					child: Buffer.from(e.child, "hex"),
-					kind: e.kind,
-					parent: oid,
-					repo_id: id,
-				})),
+				commit: obj.type === "commit" ? deriveCommitRow(obj.content) : null,
 				hex,
 				row: {
 					content: obj.content,
 					oid,
 					repo_id: id,
 					size: obj.content.length,
-					type: TYPE_TO_CODE[obj.type],
+					type: OBJECT_TYPE_CODE[obj.type],
 				},
+				tag: obj.type === "tag" ? deriveTagRow(obj.content) : null,
 			}
 		})
 		if (entries.length === 0) return []
+
+		// Generations resolve in ONE topological pass over the ingest batch: a git
+		// pack lists commits newest-first, so per-row computation in pack order would
+		// derive NULL for every commit of a first push — and absorbing-NULL would
+		// freeze that forever. In-pack parents resolve locally; parents already in
+		// `git_commit` resolve by read; anything else is absent (denied-push residue)
+		// and derives absorbing NULL (spine chunk 1).
+		const commitByHex = new Map(
+			entries.flatMap((e) => (e.commit ? [[e.hex, e.commit] as const] : [])),
+		)
+		const batchParents = new Map(
+			[...commitByHex].map(([hex, c]) => [hex, c.parents] as const),
+		)
+		const externalParents = [
+			...new Set([...commitByHex.values()].flatMap((c) => c.parents)),
+		].filter((p) => !batchParents.has(p))
+		const priorGenerations = new Map<string, number | null>()
+		for (const batch of batches(externalParents, PACK_BATCH)) {
+			const rows = await pg<{ oid: string; generation: number | null }[]>`
+				select encode(oid, 'hex') as oid, generation from git_commit
+				where repo_id = ${id}::bigint
+					and oid in ${pg(batch.map((h) => Buffer.from(h, "hex")))}`
+			for (const r of rows) priorGenerations.set(r.oid, r.generation)
+		}
+		const generations = computeGenerations(batchParents, priorGenerations)
+		const tagByHex = new Map(
+			entries.flatMap((e) => (e.tag ? [[e.hex, e.tag] as const] : [])),
+		)
 
 		const objectRows: CopyValue[][] = entries.map((e) => [
 			{ t: "int8", v: e.row.repo_id },
@@ -432,18 +536,14 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			{ t: "int4", v: e.row.size },
 			{ t: "bytea", v: e.row.content },
 		])
-		const edgeRows: CopyValue[][] = entries.flatMap((e) =>
-			e.edges.map((edge): CopyValue[] => [
-				{ t: "int8", v: edge.repo_id },
-				{ t: "bytea", v: edge.parent },
-				{ t: "bytea", v: edge.child },
-				{ t: "int2", v: edge.kind },
-			]),
-		)
-		// One transaction (the object⟺edges invariant, §10.1) via COPY into staging:
-		// no bind-parameter ceiling and content streams as raw bytes (see copyInsert),
-		// so neither object count nor blob size has a hard wall. Empty edgeRows (an
-		// all-blob push) is a no-op, never an empty insert.
+		// One transaction (the object⟺derived-rows invariant, §10.1) via COPY into
+		// staging: no bind-parameter ceiling and content streams as raw bytes (see
+		// copyInsert), so neither object count nor blob size has a hard wall.
+		// Commit/tag rows go AFTER the object rows (their FK needs them) —
+		// value-list INSERTs, not COPY: `parents bytea[]` has no binary-COPY encoder
+		// and a push carries few of either. A `bytea[]` cannot be bound directly
+		// (the driver serializes Buffer[] as one bytea), so parents travel as hex
+		// text and decode server-side, order pinned by WITH ORDINALITY.
 		await pg.begin(async (tx) => {
 			await copyInsert(
 				tx,
@@ -451,7 +551,33 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 				["repo_id", "oid", "type", "size", "content"],
 				objectRows,
 			)
-			await copyInsert(tx, "git_edge", ["repo_id", "parent", "child", "kind"], edgeRows)
+			for (const chunk of batches([...commitByHex], PACK_BATCH)) {
+				await tx`
+					insert into git_commit (repo_id, oid, tree_oid, parents, commit_time, generation)
+					select ${id}::bigint, decode(u.oid, 'hex'), decode(u.tree, 'hex'),
+						(select coalesce(array_agg(decode(p.h, 'hex') order by p.ord), '{}'::bytea[])
+							from unnest(string_to_array(nullif(u.parents, ''), ' ')) with ordinality as p(h, ord)),
+						u.commit_time, u.generation
+					from unnest(
+						${chunk.map(([hex]) => hex)}::text[],
+						${chunk.map(([, c]) => c.treeOid)}::text[],
+						${chunk.map(([, c]) => c.parents.join(" "))}::text[],
+						${chunk.map(([, c]) => c.commitTime)}::bigint[],
+						${chunk.map(([hex]) => generations.get(hex) ?? null)}::int[]
+					) as u(oid, tree, parents, commit_time, generation)
+					on conflict do nothing`
+			}
+			for (const chunk of batches([...tagByHex], PACK_BATCH)) {
+				await tx`
+					insert into git_tag (repo_id, oid, target_oid, target_type)
+					select ${id}::bigint, decode(u.oid, 'hex'), decode(u.target, 'hex'), u.target_type
+					from unnest(
+						${chunk.map(([hex]) => hex)}::text[],
+						${chunk.map(([, t]) => t.targetOid)}::text[],
+						${chunk.map(([, t]) => OBJECT_TYPE_CODE[t.targetType])}::int[]
+					) as u(oid, target, target_type)
+					on conflict do nothing`
+			}
 		})
 		// Stamp the repo's GC-activity watermark AFTER the ingest commits — never inside
 		// the txn, where `clock_timestamp()` would be read BEFORE the commit. These objects
@@ -495,7 +621,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 
 	/**
 	 * include-tag augmentation (§6.5): annotated tags whose peeled target is in the
-	 * served set get their tag OBJECTS added — transitively over `kind=5`, so a
+	 * served set get their tag OBJECTS added — transitively over `git_tag`, so a
 	 * tag-of-tag chain ships every tag object in it (each must be present for the
 	 * client's fsck). Annotated tags are few, so we fetch them all and filter by
 	 * served membership app-side rather than feeding the whole served set into SQL.
@@ -520,9 +646,9 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			with recursive tags(oid) as (
 				select oid from (values ${seed}) as roots(oid)
 				union
-				select e.child from git_edge e
-					join tags t on e.parent = t.oid
-					where e.repo_id = ${id}::bigint and e.kind = ${EDGE_KIND.TAG_TARGET}
+				select t.target_oid from git_tag t
+					join tags g on t.oid = g.oid
+					where t.repo_id = ${id}::bigint
 			)
 			select oid from tags
 		`.execute(db)

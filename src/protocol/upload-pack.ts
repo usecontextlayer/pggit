@@ -37,6 +37,7 @@ export type RepoBackend = {
 		haves: string[],
 		omitBlobs: boolean,
 		includeTag: boolean,
+		thinPack: boolean,
 	) => Promise<Buffer>
 }
 
@@ -101,7 +102,7 @@ async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer
 	label("fetch")
 	// parseFetch validates wire shape (malformed/unsupported args → GitProtocolError
 	// → 400) BEFORE the serve attempt — kept outside the try so it stays a 400.
-	const { wants, haves, done, filter, includeTag } = parseFetch(req)
+	const { wants, haves, done, filter, includeTag, thinPack } = parseFetch(req)
 	// A zero-want fetch is NOT an error: git's upload-pack treats it as a no-op
 	// (upload-pack.c) and returns an empty pack — buildPack produces one, so we let
 	// it fall through rather than rejecting.
@@ -118,14 +119,14 @@ async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer
 			}
 			return encodeReadyWithPack(
 				common,
-				await backend.buildPack(wants, common, omitBlobs, includeTag),
+				await backend.buildPack(wants, common, omitBlobs, includeTag, thinPack),
 			)
 		}
 
 		// `done` (spec §4 shapes a/c): pack the delta directly. A clone has no haves, so
 		// the subtrahend is empty and we pack the whole want-closure.
 		return encodePackfileResponse(
-			await backend.buildPack(wants, common, omitBlobs, includeTag),
+			await backend.buildPack(wants, common, omitBlobs, includeTag, thinPack),
 		)
 	} catch (err) {
 		// A `want` the repo does not have is a client condition, not a server fault:

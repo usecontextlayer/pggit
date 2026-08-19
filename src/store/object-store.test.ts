@@ -3,6 +3,7 @@ import { computeOid } from "@/object/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createIsolatedSchema } from "@/testing/pg"
+import { spawnGit } from "@/testing/spawn-git"
 
 describe("object store", () => {
 	it("round-trips objects through Postgres (put pack, get by oid)", async () => {
@@ -56,10 +57,22 @@ describe("object store", () => {
 				{ content: Buffer.from("dup-a\n"), type: "blob" },
 				{ content: Buffer.from("dup-b\n"), type: "blob" },
 			]
+			// The expected oids come from GIT, not from the store's own receipt —
+			// two identically wrong receipts must not confirm each other.
+			const expected = await Promise.all(
+				objects.map(async (o) =>
+					(
+						await spawnGit(["hash-object", "-t", "blob", "--stdin"], {
+							input: o.content,
+						})
+					).stdout.trim(),
+				),
+			)
 			const first = await store.putPack("repo", objects)
 			const second = await store.putPack("repo", objects) // same objects again
-			expect(second.oids.sort()).toEqual(first.oids.sort())
-			for (const oid of first.oids) {
+			expect(first.oids.sort()).toEqual([...expected].sort())
+			expect(second.oids.sort()).toEqual([...expected].sort())
+			for (const oid of expected) {
 				expect(await store.hasObject("repo", oid)).toBe(true)
 			}
 		} finally {
