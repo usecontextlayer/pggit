@@ -74,7 +74,7 @@ const ZERO: TableStat = {
 }
 
 /**
- * Storage + autovacuum counters for `git_object` / `git_edge` /
+ * Storage + autovacuum counters for `git_object` / `git_commit` / `git_tag` /
  * `git_pack_encoding`, summed across their leaf partitions, in ONE schema.
  * `pg_relation_size` / `pg_indexes_size` are exact (page counts); the
  * `pg_stat_all_tables` counters are the stats collector's, so callers that just
@@ -97,7 +97,8 @@ export async function schemaStats(pg: Sql, schema: string): Promise<SchemaStats>
 		select
 			case
 				when c.relname like 'git_object%' then 'git_object'
-				when c.relname like 'git_edge%' then 'git_edge'
+				when c.relname like 'git_commit%' then 'git_commit'
+				when c.relname like 'git_tag%' then 'git_tag'
 				when c.relname like 'git_pack_encoding%' then 'git_pack_encoding'
 				else c.relname
 			end as tbl,

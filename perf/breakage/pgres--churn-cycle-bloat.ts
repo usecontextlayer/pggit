@@ -225,7 +225,7 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			const s = await schemaStats(pg, iso.schema)
 			const e = stat(s, "git_pack_encoding")
 			const o = stat(s, "git_object")
-			const ed = stat(s, "git_edge")
+			const ed = stat(s, "git_commit")
 			const census = await encodingCensus(pg)
 			rows.push({
 				edgeTotal: total(ed),
@@ -423,7 +423,7 @@ async function main(): Promise<void> {
 				"mode",
 				"schema MB",
 				"git_object MB",
-				"git_edge MB",
+				"git_commit MB",
 				"git_pack_encoding MB",
 				"schema vs control C",
 			],
@@ -458,7 +458,7 @@ async function main(): Promise<void> {
 		),
 	)
 	console.log(
-		"\n`gc.ts maintain()` runs `vacuum (analyze) git_object` and `vacuum (analyze) git_edge`. It never names git_pack_encoding: since 0008 the encoding rows die by FK cascade inside the object DELETEs, and their dead tuples are left to autovacuum (0008 sets aggressive per-partition reloptions for exactly this).",
+		"\n`gc.ts maintain()` runs `vacuum (analyze) git_object` and `vacuum (analyze) git_pack_encoding` — the two tables the sweep's DELETEs churn (encoding rows die by 0008 FK cascade inside the object DELETEs). git_commit/git_tag cascade-churn too but are bytes-tiny; their 0009 leaf reloptions carry the reclaim.",
 	)
 
 	console.log("\n## verdict\n")

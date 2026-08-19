@@ -14,7 +14,7 @@
  *
  * It also states the number the design deliberately accepted (D1: "the canonical
  * ~73 MB does not shrink"): the encoding tier is ADDITIVE, so the storage
- * question is not `encoding vs pack` but `git_object + git_edge + encoding` vs
+ * question is not `encoding vs pack` but `git_object + git_commit + encoding` vs
  * `one packfile`.
  *
  * WHAT IT PRINTS
@@ -225,7 +225,7 @@ async function main(): Promise<void> {
 		// ── the bill ────────────────────────────────────────────────────────
 		const enc = await sizeOf(db.sql, "git_pack_encoding")
 		const obj = await sizeOf(db.sql, "git_object")
-		const edge = await sizeOf(db.sql, "git_edge")
+		const commit = await sizeOf(db.sql, "git_commit")
 		const [payload] = await db.sql<
 			{ n: string; oct: string; col: string; big: string; maxo: string }[]
 		>`
@@ -273,8 +273,8 @@ async function main(): Promise<void> {
 		row("pack pggit serves", servedPack)
 		row("git_pack_encoding (the tier)", enc.total)
 		row("git_object (canonical, unshrunk)", obj.total)
-		row("git_edge (the DAG index)", edge.total)
-		row("all three", enc.total + obj.total + edge.total)
+		row("git_commit (the topology rows)", commit.total)
+		row("all three", enc.total + obj.total + commit.total)
 
 		const ratio = enc.total / Math.max(servedPack, 1)
 		console.log(
@@ -284,8 +284,8 @@ async function main(): Promise<void> {
 		console.log(
 			`the design accepted that git_object does not shrink (D1); the measured consequence is\n` +
 				`that a repo whose packfile is ${mb(sizePack)} MB occupies ` +
-				`${mb(enc.total + obj.total + edge.total)} MB of Postgres — ` +
-				`${((enc.total + obj.total + edge.total) / Math.max(sizePack, 1)).toFixed(1)}× — of which the\n` +
+				`${mb(enc.total + obj.total + commit.total)} MB of Postgres — ` +
+				`${((enc.total + obj.total + commit.total) / Math.max(sizePack, 1)).toFixed(1)}× — of which the\n` +
 				`encoding tier is the smallest term.`,
 		)
 		if (ratio > TIER_LIMIT) process.exitCode = 1

@@ -609,9 +609,23 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				await spawnGit(["init", "-q", "--bare", d])
 				const f = await tryGit(["-c", "protocol.version=2", "fetch", "-q", url, oid], d)
 				if (!f.ok) {
+					// A rejection only counts as legitimate when CANONICAL git rejects
+					// the same fetch — otherwise a broken exact-OID router would merely
+					// inflate a printed counter while the harness stays green.
+					const cd = join(scratch.mk("oidcanon"), "o.git")
+					mkdirSync(cd, { recursive: true })
+					await spawnGit(["init", "-q", "--bare", cd])
+					const canon = await tryGit(["fetch", "-q", `file://${ORACLE}`, oid], cd)
+					if (canon.ok) {
+						fail(
+							"shapes",
+							`exact-OID fetch ${oid.slice(0, 8)} rejected`,
+							`pggit rejected what canonical git serves — ${f.stderr.trim().split("\n").slice(0, 2).join(" / ")}`,
+						)
+					}
 					oidRejected++
 					console.log(
-						`  exact-OID fetch ${oid.slice(0, 8)} rejected: ${f.stderr.trim().split("\n").slice(0, 2).join(" / ")}`,
+						`  exact-OID fetch ${oid.slice(0, 8)} rejected (canonical git rejects it too)`,
 					)
 					continue
 				}
@@ -673,7 +687,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 
 			// (f) GC over the repacked state, then re-clone — the tier's hygiene (D7)
 			const g = await createGc(db.sql).gc(repoId, { graceSeconds: 0 })
-			console.log(`  gc: ${g.deletedObjects} objects, ${g.deletedEdges} edges`)
+			console.log(`  gc: ${g.deletedObjects} objects`)
 			const afterGcDir = join(scratch.mk("aftergc"), "c.git")
 			const ag = await tryGit([
 				"-c",
@@ -823,7 +837,7 @@ async function phaseOrphan(db: IsolatedDb): Promise<void> {
 
 		// 2. GC reclaims them — the FK cascades take their encodings inside the same DELETE.
 		const g = await createGc(db.sql).gc(repoId, { graceSeconds: 0 })
-		console.log(`  gc: ${g.deletedObjects} objects, ${g.deletedEdges} edges reclaimed`)
+		console.log(`  gc: ${g.deletedObjects} objects reclaimed`)
 		if (g.deletedObjects === 0) {
 			fail(
 				"orphan",
@@ -844,9 +858,7 @@ async function phaseOrphan(db: IsolatedDb): Promise<void> {
 		summary.push(
 			`| orphan | clone with orphans | ${okBefore ? "IDENTICAL to git" : "DIVERGED"} |`,
 		)
-		summary.push(
-			`| orphan | gc reclaimed | ${g.deletedObjects} objects / ${g.deletedEdges} edges |`,
-		)
+		summary.push(`| orphan | gc reclaimed | ${g.deletedObjects} objects |`)
 		summary.push(
 			`| orphan | clone after gc | ${okAfterGc ? "IDENTICAL to git" : "DIVERGED"} |`,
 		)

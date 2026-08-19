@@ -3,15 +3,15 @@
  * git, as a function of tree SHAPE.
  *
  * A git push writes, on disk, roughly the deflated bytes of the objects it
- * carries. pggit writes those objects as rows, plus a `git_edge` row per
- * structural reference, plus a full rewrite of the `repo_file` projection for the
- * branch, plus the WAL for all of it, plus (on the next drain) an encoding row
- * per object. This harness measures the ratio on identical pushes, over tree
- * shapes chosen to separate the three cost drivers:
+ * carries. pggit writes those objects as rows, plus one `git_commit` row per
+ * commit (spine chunk 1 — the old per-reference `git_edge` rows are gone), plus
+ * a full rewrite of the `repo_file` projection for the branch, plus the WAL for
+ * all of it, plus (on the next drain) an encoding row per object. This harness
+ * measures the ratio on identical pushes, over tree shapes chosen to separate
+ * the three cost drivers:
  *
  *   - **depth D** — a commit touching one file rewrites D+1 trees.
- *   - **width W** — a rewritten tree costs its whole entry list again, and emits
- *     one `git_edge` kind-3 row per SUBDIRECTORY it holds.
+ *   - **width W** — a rewritten tree costs its whole entry list again.
  *   - **files F** — how many leaves the commit touches.
  *
  * The pathological point is the wide-flat directory: W large, D small. Git pays
@@ -252,17 +252,17 @@ async function main(): Promise<void> {
 					(after[t]?.total ?? 0) - (before[t]?.total ?? 0)
 				const pgBytes = TABLES.reduce((n, t) => n + delta(t), 0)
 				breakdown.push(
-					`${padr(`${s.name} F=${F}`, 20)} ${pad(kb(delta("git_object")), 10)} ${pad(kb(delta("git_edge")), 10)} ` +
+					`${padr(`${s.name} F=${F}`, 20)} ${pad(kb(delta("git_object")), 10)} ${pad(kb(delta("git_commit")), 10)} ` +
 						`${pad(kb(delta("git_pack_encoding")), 10)} ${pad(kb(delta("repo_file")), 10)} ` +
 						`${pad(kb(delta("git_ref") + delta("repos")), 10)} ${pad(kb(pgBytes), 10)}`,
 				)
 				const objRows = (rowsAfter.git_object ?? 0) - (rowsBefore.git_object ?? 0)
-				const edgeRows = (rowsAfter.git_edge ?? 0) - (rowsBefore.git_edge ?? 0)
+				const commitRows = (rowsAfter.git_commit ?? 0) - (rowsBefore.git_commit ?? 0)
 				const encRows = encRes.wholes + encRes.deltas
 
 				table.push(
 					`${padr(s.name, 13)} ${padr(s.depth, 3)} ${pad(s.width, 5)} ${pad(F, 3)} ` +
-						`${pad(kb(touch.bytes), 11)} ${pad(kb(gitBytes), 8)} ${pad(objRows, 9)} ${pad(edgeRows, 10)} ` +
+						`${pad(kb(touch.bytes), 11)} ${pad(kb(gitBytes), 8)} ${pad(objRows, 9)} ${pad(commitRows, 10)} ` +
 						`${pad(fileTouched, 10)} ${pad(encRows, 9)} ${pad(kb(pgBytes), 8)} ${pad(kb(bwal), 9)} ` +
 						`${pad(kb(wal), 9)} ${pad((pgBytes / Math.max(gitBytes, 1)).toFixed(0), 7)} ` +
 						`${pad((bwal / Math.max(gitBytes, 1)).toFixed(0), 8)}`,

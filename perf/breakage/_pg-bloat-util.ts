@@ -29,10 +29,11 @@ export function flag(name: string, fallback: string): string {
 	return hit ? hit.slice(name.length + 3) : fallback
 }
 
-/** The five tables whose economics this hunt is about. */
+/** The tables whose economics this hunt is about. */
 export const TABLES = [
 	"git_object",
-	"git_edge",
+	"git_commit",
+	"git_tag",
 	"git_pack_encoding",
 	"git_ref",
 	"repo_file",
@@ -43,7 +44,8 @@ export type TableName = (typeof TABLES)[number]
 /** Which of those are HASH-partitioned ×16 (sizes must sum over leaves). */
 export const PARTITIONED = new Set<string>([
 	"git_object",
-	"git_edge",
+	"git_commit",
+	"git_tag",
 	"git_pack_encoding",
 	"repo_file",
 ])

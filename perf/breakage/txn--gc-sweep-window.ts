@@ -51,11 +51,9 @@ function timed(pg: Sql, into: Map<string, number>): Sql {
 				return async (sql: string, ...rest: unknown[]) => {
 					const bucket = sql.includes("git_pack_encoding")
 						? "encodings"
-						: sql.includes("git_edge")
-							? "edges"
-							: sql.includes("git_object")
-								? "objects"
-								: "other"
+						: sql.includes("git_object")
+							? "objects"
+							: "other"
 					const t0 = performance.now()
 					try {
 						return await (real as (s: string, ...r: unknown[]) => Promise<unknown>).call(
@@ -94,8 +92,8 @@ async function main(): Promise<void> {
 			maintain: false,
 		})
 		console.log(
-			`reclaimed: ${res.deletedObjects} objects, ${res.deletedEdges} edges ` +
-				`(encodings cascade with the object sweep since 0008)\n`,
+			`reclaimed: ${res.deletedObjects} objects ` +
+				`(encodings + commit/tag rows cascade with the object sweep, 0008/0009)\n`,
 		)
 
 		const total = [...perSweep.values()].reduce((a, b) => a + b, 0)

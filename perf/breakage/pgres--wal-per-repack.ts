@@ -7,7 +7,7 @@
  * of the original push. This measures the multiplier on the same content.
  *
  * Phases measured per trial, on a FRESH schema each time so nothing carries over:
- *   push    — `putPack` of every object + `setRef` (git_object + git_edge + TOAST)
+ *   push    — `putPack` of every object + `setRef` (git_object + git_commit/git_tag + TOAST)
  *   repack  — `createRepack().repack()` (git_pack_encoding only)
  *   gc      — `gc(graceSeconds: 0)` after a rewind (delete WAL for both tiers)
  *   delete  — `admin.deleteRepo()`, a bare `DELETE FROM repos` whose ENTIRE teardown

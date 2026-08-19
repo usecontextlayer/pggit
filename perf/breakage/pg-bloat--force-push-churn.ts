@@ -229,10 +229,10 @@ async function main(): Promise<void> {
 			rounds.push({ autovac, dead, r, sizes })
 			if (r < 3 || (r + 1) % 5 === 0 || r === ROUNDS - 1) {
 				console.log(
-					`${padr(r, 6)} ${pad(mb(sizes.git_object?.total ?? 0), 8)} ${pad(mb(sizes.git_edge?.total ?? 0), 8)} ` +
+					`${padr(r, 6)} ${pad(mb(sizes.git_object?.total ?? 0), 8)} ${pad(mb(sizes.git_commit?.total ?? 0), 8)} ` +
 						`${pad(mb(sizes.git_pack_encoding?.total ?? 0), 8)} ${pad(mb(sizes.repo_file?.total ?? 0), 8)} ` +
 						`${pad((((sizes.git_ref?.total ?? 0) / 1000) | 0).toFixed(0), 7)} ${pad(mb(total), 8)} ${pad(dead, 8)} ` +
-						`${pad(autovac, 8)} ${pad(gcRes.deletedObjects + gcRes.deletedEdges, 8)} ` +
+						`${pad(autovac, 8)} ${pad(gcRes.deletedObjects, 8)} ` +
 						`${pad(mb(wal - wal0), 8)} ${pad(hz.ageXids, 8)}`,
 				)
 			}
@@ -307,7 +307,7 @@ async function main(): Promise<void> {
 			console.log(`  pid ${b.pid} db=${b.db} ${b.seconds.toFixed(0)}s — ${b.query}`)
 		}
 		const occupied = (await stats(db.sql, db.schema))
-			.filter((s) => /^git_edge_p\d+$/.test(s.relname) && s.dead > 0)
+			.filter((s) => /^git_object_p\d+$/.test(s.relname) && s.dead > 0)
 			.sort((a, b) => b.dead - a.dead)[0]
 		if (occupied) {
 			const v = await vacuumVerbose(PG_URL, db.schema, occupied.relname)
@@ -346,7 +346,7 @@ async function main(): Promise<void> {
 		// re-densifies a page. So an index is the component that a plain VACUUM
 		// cannot fix and only REINDEX (or VACUUM FULL) can — the exact maintenance
 		// the drain declines to run.
-		const idxLeft = await rawIndexSizes(db.sql, "git_edge")
+		const idxCommitLeft = await rawIndexSizes(db.sql, "git_commit")
 		const idxObjLeft = await rawIndexSizes(db.sql, "git_object")
 		const idxEncLeft = await rawIndexSizes(db.sql, "git_pack_encoding")
 
@@ -388,11 +388,11 @@ async function main(): Promise<void> {
 		// ── index-only view: what VACUUM cannot fix ──────────────────────────
 		console.log(`\n## index bloat — the component plain VACUUM cannot reclaim\n`)
 		const idxAfter = [
-			...(await rawIndexSizes(db.sql, "git_edge")),
+			...(await rawIndexSizes(db.sql, "git_commit")),
 			...(await rawIndexSizes(db.sql, "git_object")),
 			...(await rawIndexSizes(db.sql, "git_pack_encoding")),
 		]
-		const idxBefore = [...idxLeft, ...idxObjLeft, ...idxEncLeft]
+		const idxBefore = [...idxCommitLeft, ...idxObjLeft, ...idxEncLeft]
 		console.log(
 			`${padr("index", 34)} ${pad("as-left kB", 12)} ${pad("VAC FULL kB", 12)} ${pad("bloat ×", 9)} ${pad("live rows", 10)}`,
 		)
@@ -415,8 +415,8 @@ async function main(): Promise<void> {
 				? `A ratio near 1.00 here is NOT a clean bill: under a pinned horizon VACUUM FULL must\n` +
 						`copy the unremovable dead tuples too, so the "rebuilt" index is not a floor. The\n` +
 						`comparison only means something when the horizon is free.`
-				: `gc.ts's maintain() would have run \`reindex index git_edge_walk\` here — the drain skips\n` +
-						`it, and plain VACUUM never re-densifies a btree page, so only this rebuild recovers it.`,
+				: `the drain runs no REINDEX, and plain VACUUM never re-densifies a btree page, so\n` +
+						`only this rebuild recovers whatever density the churn cost.`,
 		)
 
 		console.log(`\n## component breakdown\n\nbase push (the reference state):\n`)

@@ -341,25 +341,23 @@ async function main(): Promise<void> {
 			`raw content ingested: ${mb(rawTotal)} → stored at **${(total / rawTotal).toFixed(2)}×** of raw`,
 		)
 
-		// `git_edge` is the OTHER table this shape stresses, and it is not delta-
-		// compressible at all: every historical version of a wide directory emits one
-		// tree→subtree row per child, so kind-3 rows grow with the same N²/2 curve as the
-		// tree bytes. Nothing in the delta work touches this.
-		const [edgeSizes] = await db.sql<{ total: string; heap: string; indexes: string }[]>`
-			select
-				sum(pg_total_relation_size(inhrelid))::text as total,
-				sum(pg_relation_size(inhrelid))::text as heap,
-				sum(pg_indexes_size(inhrelid))::text as indexes
-			from pg_inherits where inhparent = 'git_edge'::regclass`
-		const edgeKinds = await db.sql<{ kind: number; n: string }[]>`
-			select kind, count(*)::text as n from git_edge group by kind order by kind`
+		// The topology surface (spine chunk 1): one `git_commit` row per commit,
+		// linear in history — the quadratic `git_edge` table this section once
+		// measured is dropped (S2), which IS the storage headline.
+		const [topoSizes] = await db.sql<{ total: string }[]>`
+			select (
+				(select coalesce(sum(pg_total_relation_size(inhrelid)), 0)
+					from pg_inherits where inhparent = 'git_commit'::regclass)
+				+ (select coalesce(sum(pg_total_relation_size(inhrelid)), 0)
+					from pg_inherits where inhparent = 'git_tag'::regclass)
+			)::text as total`
+		const [topoRows] = await db.sql<{ commits: string; tags: string }[]>`
+			select (select count(*) from git_commit)::text as commits,
+				(select count(*) from git_tag)::text as tags`
 		console.log(
-			`\n\`git_edge\` on disk: **${mb(Number(edgeSizes?.total ?? 0))}** ` +
-				`(heap ${mb(Number(edgeSizes?.heap ?? 0))}, indexes ${mb(Number(edgeSizes?.indexes ?? 0))})`,
-		)
-		console.log(
-			`edge rows by kind: ${edgeKinds.map((r) => `${r.kind}=${r.n}`).join(", ")} ` +
-				`(1=commit→tree, 2=commit→parent, 3=tree→subtree, 5=tag→target)`,
+			`\ntopology rows (\`git_commit\` + \`git_tag\`) on disk: ` +
+				`**${mb(Number(topoSizes?.total ?? 0))}** — ${topoRows?.commits} commit rows, ` +
+				`${topoRows?.tags} tag rows (linear in history; the quadratic git_edge table is gone, S2)`,
 		)
 
 		await db.sql`create table probe_trees (content bytea compression lz4)`

@@ -3,7 +3,7 @@
  * snapshot on every push.
  *
  * `repo_file` is the per-branch-tip `path → (mode, blob_oid)` index that IS
- * pggit's public read surface. `rebuildRefSnapshot` replaces it wholesale:
+ * pggit's public read surface. the full-rebuild path replaces it wholesale:
  * `delete from repo_file where repo_id = … and ref_name = …` followed by a COPY
  * of the ENTIRE new file list. So a push that changes one byte of one file
  * rewrites N rows for an N-file tree — and 0002's leaf reloptions say this is

@@ -10,17 +10,17 @@
  * computed cluster-wide, so ONE long-running statement pins vacuum for every
  * table in every database.
  *
- * `sweepObjects`/`sweepEdges` each run a single un-batched-in-time statement:
+ * Two windows hold snapshots open: the live-set WALK (one REPEATABLE READ
+ * transaction across the whole reachable closure — the surviving half of hunt
+ * finding M5 now that the edge sweep is deleted, spine S2) and each
+ * `sweepObjects` batch:
  *
- *     with victims as (select … from git_edge e where … limit $2)
- *     delete from git_edge e using victims v where …
+ *     with victims as (select … from git_object o where … limit $3)
+ *     delete from git_object o using victims v where …
  *
  * with no explicit transaction, so each batch IS one transaction — and its
- * duration is the anti-join's runtime, which grows with the table. On a bloated
- * `git_edge` that is minutes, not milliseconds. For that whole window nothing
- * anywhere on the instance can be vacuumed, including the previous pass's dead
- * tuples. The design's only defence is switched off exactly while the workload
- * that needs it runs.
+ * duration is the anti-join's runtime. For those windows nothing anywhere on
+ * the instance can be vacuumed, including the previous pass's dead tuples.
  *
  * WHAT IT MEASURES
  *   1. how long one GC pass holds a transaction open, and the horizon lag it
@@ -28,8 +28,8 @@
  *   2. a control table (`horizon_canary`) in the same schema, unrelated to git,
  *      whose dead tuples are proven unreclaimable DURING the pass and
  *      reclaimable after it — the causal link, not a correlation.
- *   3. the per-batch statement duration as `git_edge` grows, so the trend is
- *      visible rather than asserted.
+ *   3. the terminating anti-join scan every pass pays on `git_object`, so the
+ *      trend is visible rather than asserted.
  *
  * EXIT NON-ZERO when a single GC pass holds one transaction open for longer than
  * `PIN_LIMIT_MS`, i.e. longer than `autovacuum_naptime` would like to wait.
@@ -156,10 +156,10 @@ async function main(): Promise<void> {
 		await refs.setRef(REPO_ID, "refs/heads/main", advTip)
 		await refs.setRef(REPO_ID, "refs/heads/main", baseTip) // the force push
 
-		const edgeSize = await sizeOf(db.sql, "git_edge")
-		const [ec] = await db.sql<{ n: string }[]>`select count(*)::text as n from git_edge`
+		const objSize = await sizeOf(db.sql, "git_object")
+		const [oc] = await db.sql<{ n: string }[]>`select count(*)::text as n from git_object`
 		console.log(
-			`\ngit_edge before the sweep: ${ec?.n} rows, ${(edgeSize.total / 1_000_000).toFixed(2)} MB\n`,
+			`\ngit_object before the sweep: ${oc?.n} rows, ${(objSize.total / 1_000_000).toFixed(2)} MB\n`,
 		)
 
 		// ── the canary: dead tuples with nothing to do with git ──────────────
@@ -209,8 +209,7 @@ async function main(): Promise<void> {
 		await sampler
 
 		console.log(
-			`gc() reclaimed ${gcRes.deletedObjects} objects + ${gcRes.deletedEdges} edges ` +
-				`in ${(gcMs / 1000).toFixed(2)}s\n`,
+			`gc() reclaimed ${gcRes.deletedObjects} objects in ${(gcMs / 1000).toFixed(2)}s\n`,
 		)
 		console.log(
 			`${padr("t (ms)", 8)} ${pad("horizon lag (xids)", 20)} ${pad("longest open xact (s)", 22)}  oldest statement`,
@@ -240,13 +239,14 @@ async function main(): Promise<void> {
 		const [deadNow] = await db.sql<{ live: string; dead: string; rel: string }[]>`
 			select relname as rel, n_live_tup::text as live, n_dead_tup::text as dead
 			from pg_stat_user_tables where schemaname = ${db.schema}
-				and relname like 'git\\_edge\\_p%' order by n_dead_tup desc limit 1`
+				and relname like 'git\\_object\\_p%' order by n_dead_tup desc limit 1`
 		const plan = await db.sql.unsafe<{ "QUERY PLAN": string }[]>(
 			`explain (analyze, buffers, format text)
 			 with victims as (
-				select e.parent, e.child from git_edge e
-				where e.repo_id = (select id from repos limit 1)
-					and not exists (select 1 from git_object o where o.repo_id = e.repo_id and o.oid = e.parent)
+				select o.oid from git_object o
+				where o.repo_id = (select id from repos limit 1)
+					and not exists (select 1 from git_ref r where r.repo_id = o.repo_id and r.oid = o.oid)
+					and o.created_at < clock_timestamp()
 				limit 10000
 			 ) select count(*) from victims`,
 		)
@@ -274,7 +274,7 @@ async function main(): Promise<void> {
 		for (const l of pruned) console.log(`  ${l}`)
 		const scanLine = plan
 			.map((l) => l["QUERY PLAN"])
-			.find((t) => /Seq Scan on git_edge_p\d+/.test(t))
+			.find((t) => /Seq Scan on git_object_p\d+/.test(t))
 		console.log(
 			`\n  (15 of 16 partitions pruned and never executed — hash partitioning is by repo_id,\n` +
 				`   so one repo lives entirely in one leaf and the sweep seq-scans that whole leaf.)`,
