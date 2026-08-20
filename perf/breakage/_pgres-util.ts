@@ -17,18 +17,21 @@ import { join } from "node:path"
 import type { Sql } from "postgres"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import {
+	branchAndTagRefsOf,
+	gitReachableOids,
+	loadReachableObjects,
+} from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+
+export { flag } from "../args"
+
+import { flag, positiveIntegerFlag } from "../args"
 
 // ── flags (the house perf shape: standalone tsx, `--name=value`) ─────────────
 
-export function flag(name: string, fallback: string): string {
-	const hit = process.argv.find((a) => a.startsWith(`--${name}=`))
-	return hit ? hit.slice(name.length + 3) : fallback
-}
-
 export function numFlag(name: string, fallback: number): number {
-	const hit = process.argv.find((a) => a.startsWith(`--${name}=`))
-	return hit === undefined ? fallback : Number(hit.slice(name.length + 3))
+	return positiveIntegerFlag(name, fallback)
 }
 
 export const PG_URL = flag("pg", "postgres://postgres:postgres@localhost:6489/postgres")
@@ -61,17 +64,6 @@ export type TableStat = {
 	autoanalyze: number
 }
 export type SchemaStats = Record<string, TableStat>
-
-const ZERO: TableStat = {
-	autoanalyze: 0,
-	autovac: 0,
-	dead: 0,
-	heap: 0,
-	idx: 0,
-	live: 0,
-	toast: 0,
-	vac: 0,
-}
 
 /**
  * Storage + autovacuum counters for `git_object` / `git_commit` / `git_tag` /
@@ -131,7 +123,13 @@ export async function schemaStats(pg: Sql, schema: string): Promise<SchemaStats>
 	return out
 }
 
-export const stat = (s: SchemaStats, t: string): TableStat => s[t] ?? ZERO
+export function stat(s: SchemaStats, table: string): TableStat {
+	const value = s[table]
+	if (value === undefined) {
+		throw new Error(`schema statistics omitted required table ${table}`)
+	}
+	return value
+}
 export const total = (t: TableStat): number => t.heap + t.idx + t.toast
 
 /** Rows currently in the encoding tier, and the deflated bytes they hold. */
@@ -143,17 +141,15 @@ export async function encodingCensus(
 			count(*) filter (where base_oid is not null)::text as deltas,
 			coalesce(sum(octet_length(data)), 0)::text as bytes
 		from git_pack_encoding`
-	return {
-		dataBytes: Number(r?.bytes ?? 0),
-		deltas: Number(r?.deltas ?? 0),
-		rows: Number(r?.rows ?? 0),
-	}
+	if (r === undefined) throw new Error("encoding census returned no row")
+	return { dataBytes: Number(r.bytes), deltas: Number(r.deltas), rows: Number(r.rows) }
 }
 
 /** Instance-wide WAL position. POLLUTED by sibling agents — relative only. */
 export async function walLsn(pg: Sql): Promise<bigint> {
 	const [r] = await pg<{ n: string }[]>`select pg_current_wal_lsn() - '0/0' as n`
-	return BigInt(r?.n ?? 0)
+	if (r === undefined) throw new Error("WAL position query returned no row")
+	return BigInt(r.n)
 }
 
 /** Connections this harness's own pools hold, by state. */
@@ -166,10 +162,11 @@ export async function ownConnections(
 			count(*) filter (where state = 'active')::text as active,
 			count(*) filter (where state like 'idle in transaction%')::text as idle_in_txn
 		from pg_stat_activity where application_name = ${appName}`
+	if (r === undefined) throw new Error("connection census returned no row")
 	return {
-		active: Number(r?.active ?? 0),
-		idleInTxn: Number(r?.idle_in_txn ?? 0),
-		total: Number(r?.total ?? 0),
+		active: Number(r.active),
+		idleInTxn: Number(r.idle_in_txn),
+		total: Number(r.total),
 	}
 }
 
@@ -270,35 +267,7 @@ export async function objectsBetween(
 	tip: string,
 	notTips: string[],
 ): Promise<Obj[]> {
-	const args = ["rev-list", "--objects", tip, ...notTips.map((t) => `^${t}`)]
-	const list = await spawnGit(args, { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	if (oids.length === 0) return []
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const objs: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		objs.push({ content: buf.subarray(start, start + size), oid, type })
-		pos = start + size + 1
-	}
-	return objs
+	return loadReachableObjects(dir, [tip, ...notTips.map((notTip) => `^${notTip}`)])
 }
 
 /** Seed a set of objects through the public store, batched by bytes. */
@@ -343,18 +312,8 @@ export async function cloneAndVerify(
 ): Promise<{ objects: string[]; refs: string[]; fsck: string }> {
 	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-	const refs = (await spawnGit(["show-ref"], { cwd: dest })).stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.sort()
-	const objects = (
-		await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })
-	).stdout
-		.split("\n")
-		.map((l) => l.slice(0, 40))
-		.filter((o) => /^[0-9a-f]{40}$/.test(o))
-		.sort()
+	const refs = (await branchAndTagRefsOf(dest)).map(({ name, oid }) => `${oid} ${name}`)
+	const objects = await gitReachableOids(dest)
 	return { fsck: `${fsck.stdout}${fsck.stderr}`.trim(), objects, refs }
 }
 
@@ -382,9 +341,13 @@ export function raceClone(
 		})
 		child.stdout.on("data", () => {})
 		child.on("error", reject)
-		child.on("close", (code) =>
-			resolve({ code: code ?? 0, ms: Date.now() - t0, stderr: err }),
-		)
+		child.on("close", (code, signal) => {
+			if (code === null) {
+				reject(new Error(`git clone was terminated by signal ${signal ?? "unknown"}`))
+				return
+			}
+			resolve({ code, ms: Date.now() - t0, stderr: err })
+		})
 	})
 }
 
@@ -403,6 +366,7 @@ export function table(headers: string[], rows: (string | number)[][]): string {
 }
 
 export function median(xs: number[]): number {
+	if (xs.length === 0) throw new Error("cannot take median of an empty sample")
 	const s = [...xs].sort((a, b) => a - b)
 	const m = Math.floor(s.length / 2)
 	return s.length % 2 ? (s[m] as number) : ((s[m - 1] as number) + (s[m] as number)) / 2

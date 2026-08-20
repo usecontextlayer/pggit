@@ -36,7 +36,11 @@ import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids, loadReachableObjects, refsOf } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	branchAndTagRefsOf,
+	loadReachableObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -69,7 +73,7 @@ describe("race — concurrent repack passes on one repo", () => {
 		scratch.push(src)
 		objects = await loadReachableObjects(src, ["--all"])
 		srcOids = await allObjectOids(src)
-		sourceRefs = await refsOf(src)
+		sourceRefs = await branchAndTagRefsOf(src)
 		head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
 
 		const fixture = await setupGitServerFixture()

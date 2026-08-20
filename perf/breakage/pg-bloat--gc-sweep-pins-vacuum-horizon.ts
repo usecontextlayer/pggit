@@ -10,12 +10,12 @@
  * computed cluster-wide, so ONE long-running statement pins vacuum for every
  * table in every database.
  *
- * Two windows hold snapshots open: the live-set WALK (one REPEATABLE READ
- * transaction across the whole reachable closure — the surviving half of hunt
- * finding M5 now that the edge sweep is deleted, spine S2) and each
- * `sweepObjects` batch:
+ * Two windows hold snapshots open: the live plan's `originClosure` walk (one
+ * REPEATABLE READ transaction across the reachable closure, spine S2/S6) and each
+ * `sweepObjects` batch against the pass-local `gc_live` TEMP table:
  *
- *     with victims as (select … from git_object o where … limit $3)
+ *     with victims as (select … from git_object o where not exists
+ *       (select 1 from gc_live l where l.oid = o.oid) … limit $3)
  *     delete from git_object o using victims v where …
  *
  * with no explicit transaction, so each batch IS one transaction — and its
@@ -25,11 +25,6 @@
  * WHAT IT MEASURES
  *   1. how long one GC pass holds a transaction open, and the horizon lag it
  *      creates, sampled from an independent connection while the pass runs.
- *   2. a control table (`horizon_canary`) in the same schema, unrelated to git,
- *      whose dead tuples are proven unreclaimable DURING the pass and
- *      reclaimable after it — the causal link, not a correlation.
- *   3. the terminating anti-join scan every pass pays on `git_object`, so the
- *      trend is visible rather than asserted.
  *
  * EXIT NON-ZERO when a single GC pass holds one transaction open for longer than
  * `PIN_LIMIT_MS`, i.e. longer than `autovacuum_naptime` would like to wait.
@@ -52,10 +47,10 @@ import {
 	objectsBetween,
 	pad,
 	padr,
+	positiveIntegerFlag,
 	runDirName,
 	scratchRoot,
 	sizeOf,
-	vacuumVerbose,
 } from "./_pg-bloat-util"
 
 const REPO_ID = "workspace/slate/horizon"
@@ -65,8 +60,8 @@ const GC_APP = "pgbloat-gc-under-test"
 const PIN_LIMIT_MS = 60_000
 
 const PG_URL = flag("pg", DEFAULT_PG_URL)
-const BASE = Number(flag("base", "400"))
-const ADVANCE = Number(flag("advance", "400"))
+const BASE = positiveIntegerFlag("base", 400)
+const ADVANCE = positiveIntegerFlag("advance", 400)
 
 function buildStream(): string {
 	const out: string[] = []
@@ -118,13 +113,9 @@ async function main(): Promise<void> {
 			`horizon before anything: lag ${pre.ageXids} xids, oldest open client xact ${pre.oldestXactSeconds.toFixed(1)}s`,
 		)
 		if (pre.ageXids > 5000) {
-			console.log(
-				`\n!! An unrelated long transaction is already pinning this instance. The causal\n` +
-					`!! demonstration below still runs, but the canary result is not attributable.\n`,
+			throw new Error(
+				`vacuum horizon is already pinned by ${pre.ageXids} xids; this run would not be attributable`,
 			)
-			for (const b of pre.blockers) {
-				console.log(`   pid ${b.pid} db=${b.db} ${b.seconds.toFixed(0)}s — ${b.query}`)
-			}
 		}
 
 		const src = scratch.dir("src")
@@ -139,16 +130,21 @@ async function main(): Promise<void> {
 
 		const store = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
+		const baseObjects = await objectsBetween(src, baseTip)
+		const advanceObjects = await objectsBetween(src, advTip, baseTip)
+		if (baseObjects.length === 0 || advanceObjects.length === 0) {
+			throw new Error("GC fixture did not produce nonempty base and advance object sets")
+		}
 		await store.putPack(
 			REPO_ID,
-			(await objectsBetween(src, baseTip)).map((o) => ({
+			baseObjects.map((o) => ({
 				content: o.content,
 				type: o.type,
 			})),
 		)
 		await store.putPack(
 			REPO_ID,
-			(await objectsBetween(src, advTip, baseTip)).map((o) => ({
+			advanceObjects.map((o) => ({
 				content: o.content,
 				type: o.type,
 			})),
@@ -158,17 +154,28 @@ async function main(): Promise<void> {
 
 		const objSize = await sizeOf(db.sql, "git_object")
 		const [oc] = await db.sql<{ n: string }[]>`select count(*)::text as n from git_object`
+		const expectedBeforeOids = [...baseObjects, ...advanceObjects]
+			.map((object) => object.oid)
+			.sort()
+		const beforeOids = (
+			await db.sql<
+				{ oid: string }[]
+			>`select encode(oid, 'hex') as oid from git_object order by oid`
+		).map((row) => row.oid)
+		if (
+			!oc ||
+			Number(oc.n) !== expectedBeforeOids.length ||
+			objSize.total <= 0 ||
+			beforeOids.length !== expectedBeforeOids.length ||
+			beforeOids.some((oid, i) => oid !== expectedBeforeOids[i])
+		) {
+			throw new Error(
+				`pre-GC fixture census mismatch: rows=${oc?.n ?? "missing"}/${expectedBeforeOids.length}, bytes=${objSize.total}`,
+			)
+		}
 		console.log(
-			`\ngit_object before the sweep: ${oc?.n} rows, ${(objSize.total / 1_000_000).toFixed(2)} MB\n`,
+			`\ngit_object before the sweep: ${oc.n} rows, ${(objSize.total / 1_000_000).toFixed(2)} MB\n`,
 		)
-
-		// ── the canary: dead tuples with nothing to do with git ──────────────
-		await db.sql.unsafe(`create table horizon_canary (id int primary key, pad text)`)
-		await db.sql.unsafe(
-			`insert into horizon_canary select g, repeat('x', 200) from generate_series(1, 20000) g`,
-		)
-		await db.sql.unsafe(`delete from horizon_canary where id % 2 = 0`)
-		const canaryBefore = await sizeOf(db.sql, "horizon_canary")
 
 		// ── run one GC pass while sampling the horizon from outside ──────────
 		// The GC runs on its own tagged pool so the sampler can attribute open
@@ -191,10 +198,24 @@ async function main(): Promise<void> {
 							where application_name = ${GC_APP}) as secs,
 						(select left(query, 46) from pg_stat_activity where application_name = ${GC_APP}
 							and xact_start is not null order by xact_start limit 1) as q`
+				const [sample] = hz
+				if (!sample) throw new Error("GC horizon sampler returned no row")
+				const lag = Number(sample.lag ?? 0)
+				const longest = Number(sample.secs ?? 0)
+				if (
+					!Number.isFinite(lag) ||
+					lag < 0 ||
+					!Number.isFinite(longest) ||
+					longest < 0
+				) {
+					throw new Error(
+						`GC horizon sampler returned invalid ages: ${JSON.stringify(sample)}`,
+					)
+				}
 				samples.push({
-					lag: Number(hz[0]?.lag ?? 0),
-					longest: Number(hz[0]?.secs ?? 0),
-					q: (hz[0]?.q ?? "").replace(/\s+/g, " "),
+					lag,
+					longest,
+					q: (sample.q ?? "").replace(/\s+/g, " "),
 					t: Date.now() - t0,
 				})
 				await sleep(500)
@@ -202,11 +223,46 @@ async function main(): Promise<void> {
 		})()
 
 		const gcStart = Date.now()
-		const gcRes = await createGc(gcSql).gc(REPO_ID, { graceSeconds: 0, maintain: false })
-		const gcMs = Date.now() - gcStart
-		await gcSql.end()
-		running = false
-		await sampler
+		let gcMs = 0
+		let gcRes: Awaited<ReturnType<ReturnType<typeof createGc>["gc"]>>
+		try {
+			gcRes = await createGc(gcSql).gc(REPO_ID, { graceSeconds: 0, maintain: false })
+			gcMs = Date.now() - gcStart
+		} finally {
+			running = false
+			await sampler
+			await gcSql.end()
+		}
+		if (gcRes.deletedObjects !== advanceObjects.length) {
+			throw new Error(
+				`GC deleted ${gcRes.deletedObjects}/${advanceObjects.length} orphaned objects`,
+			)
+		}
+		const [remaining] = await db.sql<{ n: string; tip: string }[]>`
+			select count(*)::text as n,
+				(select encode(oid, 'hex') from git_ref where name = 'refs/heads/main') as tip
+			from git_object`
+		if (
+			!remaining ||
+			Number(remaining.n) !== baseObjects.length ||
+			remaining.tip !== baseTip
+		) {
+			throw new Error(
+				`post-GC state mismatch: ${JSON.stringify(remaining)}, expected ${baseObjects.length}/${baseTip}`,
+			)
+		}
+		const expectedAfterOids = baseObjects.map((object) => object.oid).sort()
+		const afterOids = (
+			await db.sql<
+				{ oid: string }[]
+			>`select encode(oid, 'hex') as oid from git_object order by oid`
+		).map((row) => row.oid)
+		if (
+			afterOids.length !== expectedAfterOids.length ||
+			afterOids.some((oid, i) => oid !== expectedAfterOids[i])
+		) {
+			throw new Error("post-GC Postgres OIDs do not match canonical base history")
+		}
 
 		console.log(
 			`gc() reclaimed ${gcRes.deletedObjects} objects in ${(gcMs / 1000).toFixed(2)}s\n`,
@@ -224,72 +280,19 @@ async function main(): Promise<void> {
 		}
 		const peakLongest = Math.max(...samples.map((s) => s.longest), 0)
 		const peakLag = Math.max(...samples.map((s) => s.lag), 0)
+		const observedGcQuery = samples.some((sample) =>
+			/gc_live|git_(object|ref|commit|tag)/.test(sample.q),
+		)
+		if (samples.length === 0 || gcMs <= 0 || peakLongest <= 0 || !observedGcQuery) {
+			throw new Error(
+				`GC transaction sampler missed the measured work: samples=${samples.length}, wall=${gcMs}, longest=${peakLongest}, observedQuery=${observedGcQuery}`,
+			)
+		}
 		console.log(
 			`\npeak single-transaction duration during the pass: ${peakLongest.toFixed(2)}s; ` +
 				`peak horizon lag: ${peakLag} xids.`,
 		)
 
-		// ── the cost that grows with the dead backlog ────────────────────────
-		// The sweep loop terminates when a batch deletes nothing, so EVERY pass pays
-		// one full anti-join scan of the repo's partition to discover there is nothing
-		// left. That scan visits dead tuples too — and `maintain: false` means the
-		// dead tuples from previous passes are still there. This is the term that
-		// turns a fast sweep into a slow one as a repo ages.
-		console.log(`\n## the terminating scan every pass pays\n`)
-		const [deadNow] = await db.sql<{ live: string; dead: string; rel: string }[]>`
-			select relname as rel, n_live_tup::text as live, n_dead_tup::text as dead
-			from pg_stat_user_tables where schemaname = ${db.schema}
-				and relname like 'git\\_object\\_p%' order by n_dead_tup desc limit 1`
-		const plan = await db.sql.unsafe<{ "QUERY PLAN": string }[]>(
-			`explain (analyze, buffers, format text)
-			 with victims as (
-				select o.oid from git_object o
-				where o.repo_id = (select id from repos limit 1)
-					and not exists (select 1 from git_ref r where r.repo_id = o.repo_id and r.oid = o.oid)
-					and o.created_at < clock_timestamp()
-				limit 10000
-			 ) select count(*) from victims`,
-		)
-		console.log(
-			`${deadNow?.rel}: ${deadNow?.live} live, ${deadNow?.dead} dead (unvacuumed — the drain passes maintain:false)\n`,
-		)
-		// Partition pruning leaves 15 of 16 branches "never executed"; printing them
-		// buries the two lines that matter.
-		const pruned: string[] = []
-		let skipping = false
-		for (const l of plan) {
-			const text = l["QUERY PLAN"]
-			if (text.includes("never executed")) {
-				skipping = true
-				continue
-			}
-			if (
-				skipping &&
-				/^\s+(Recheck Cond|Index Cond|Index Searches|->\s+Bitmap Index)/.test(text)
-			)
-				continue
-			skipping = false
-			pruned.push(text)
-		}
-		for (const l of pruned) console.log(`  ${l}`)
-		const scanLine = plan
-			.map((l) => l["QUERY PLAN"])
-			.find((t) => /Seq Scan on git_object_p\d+/.test(t))
-		console.log(
-			`\n  (15 of 16 partitions pruned and never executed — hash partitioning is by repo_id,\n` +
-				`   so one repo lives entirely in one leaf and the sweep seq-scans that whole leaf.)`,
-		)
-		if (scanLine) console.log(`\n  the scan that grows: ${scanLine.trim()}`)
-
-		// ── the canary, after ────────────────────────────────────────────────
-		console.log(`\n## the canary: could an unrelated table be vacuumed?\n`)
-		const v = await vacuumVerbose(PG_URL, db.schema, "horizon_canary")
-		const canaryAfter = await sizeOf(db.sql, "horizon_canary")
-		console.log(
-			`horizon_canary (10,000 rows deleted, nothing to do with git):\n` +
-				`  before VACUUM ${(canaryBefore.total / 1000).toFixed(0)} kB → after ${(canaryAfter.total / 1000).toFixed(0)} kB\n` +
-				`  VACUUM removed ${v.removed} tuples, ${v.notRemovable} were dead but NOT YET REMOVABLE`,
-		)
 		const post = await horizon(db.sql)
 		console.log(
 			`\nhorizon after the pass: lag ${post.ageXids} xids, oldest open client xact ${post.oldestXactSeconds.toFixed(1)}s`,
@@ -303,11 +306,8 @@ async function main(): Promise<void> {
 				`Anything past autovacuum_naptime (60s) means a naptime can elapse with the horizon\n` +
 				`pinned — autovacuum wakes, runs, and removes nothing, which is exactly what\n` +
 				`\`maintain: false\` is counting on it NOT to do.\n\n` +
-				`The batch duration is not a constant: it is the anti-join scan above, whose cost\n` +
-				`includes every dead tuple no vacuum has removed. Since a pinned horizon is what\n` +
-				`prevents removal, and a long batch is what pins the horizon, the two feed each other.\n` +
-				`This machine showed the far end of that loop while this ran: SIX concurrent sessions\n` +
-				`held this exact statement open for 11-29 minutes each (listed at the top).`,
+				`The measured hold belongs to this harness's tagged GC connection; the run refuses\n` +
+				`to score when an unrelated transaction already pins the horizon.`,
 		)
 		if (peakLongest * 1000 > PIN_LIMIT_MS) process.exitCode = 1
 	} finally {

@@ -14,7 +14,7 @@ import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { gitReachableOids, refsOf } from "@/testing/git-fixtures"
+import { branchAndTagRefsOf, gitReachableOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { withTempDir } from "@/testing/temp-dir"
@@ -70,7 +70,7 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 			const stored = (await createRefStore(db.sql).listRefs(repoId)).sort((a, b) =>
 				a.name.localeCompare(b.name),
 			)
-			expect(stored).toEqual(await refsOf(src))
+			expect(stored).toEqual(await branchAndTagRefsOf(src))
 		})
 	}
 

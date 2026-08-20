@@ -2,11 +2,10 @@
  * PROBE: after the first backfill, what does a repack pass cost when ONE commit
  * has landed?
  *
- * This is the steady-state drain cost — the thing that runs on every cadence for
- * every repo, forever. `repack()` re-reads the whole inventory (`pending`), the
- * whole encoding table (`existing`), and every commit OBJECT'S CONTENT
- * (`commitDiffOrder`) before it can discover that only one tree is new. The
- * question is whether the pass costs O(new work) or O(whole repo).
+ * This is the steady-state repack cost. `repack()` reads the inventory, existing
+ * encoding tier, and derived commit topology before it can discover that only
+ * one tip's objects are new. The question is whether the pass costs O(new work)
+ * or O(whole repo).
  *
  * Black-box: seed everything except the last commit's objects, repack (backfill),
  * then seed the last commit's objects and time a SECOND repack. `git repack -adf`
@@ -20,12 +19,13 @@ import { rmSync } from "node:fs"
 import { createObjectStore } from "@/store/object-store"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	cleanupTmp,
-	flag,
 	gitRepack,
+	increasingIntegerListFlag,
 	type Obj,
 	PG_URL,
 	reachableObjects,
@@ -33,7 +33,7 @@ import {
 	table,
 } from "./_perf-util"
 
-const SIZES = flag("sizes", "250,500,1000,2000").split(",").map(Number)
+const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
 /** Growth exponent of the one-commit pass above which it is O(repo), not O(work). */
 const EXP_LIMIT = 0.5
 
@@ -80,13 +80,17 @@ async function measure(n: number): Promise<Row> {
 	try {
 		const all = await reachableObjects(dir)
 		const prior = new Set(
-			(await spawnGit(["rev-list", "--objects", "HEAD~1"], { cwd: dir })).stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
+			parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "HEAD~1"], { cwd: dir })).stdout,
+			),
 		)
 		const base = all.filter((o) => prior.has(o.oid))
 		const fresh = all.filter((o) => !prior.has(o.oid))
+		if (base.length === 0 || fresh.length === 0) {
+			throw new Error(
+				`fixture split is vacuous: base=${base.length}, fresh=${fresh.length}`,
+			)
+		}
 		const git = await gitRepack(dir, `inc-repack-git-${n}`)
 
 		const db = await createIsolatedSchema(PG_URL)
@@ -94,16 +98,29 @@ async function measure(n: number): Promise<Row> {
 			await seedSubset(db.sql, "probe/incrp", base)
 			const repack = createRepack(db.sql)
 			const t0 = Date.now()
-			await repack.repack("probe/incrp")
+			const backfill = await repack.repack("probe/incrp")
 			const backfillMs = Date.now() - t0
+			if (backfill.wholes + backfill.deltas !== base.length) {
+				throw new Error(
+					`backfill covered ${backfill.wholes + backfill.deltas}/${base.length} base objects`,
+				)
+			}
 			await seedSubset(db.sql, "probe/incrp", fresh)
 			const t1 = Date.now()
 			const r = await repack.repack("probe/incrp")
 			const incrementalMs = Date.now() - t1
+			if (backfillMs <= 0 || incrementalMs <= 0 || git.ms <= 0) {
+				throw new Error("repack timer recorded a nonpositive latency")
+			}
 			if (r.wholes + r.deltas !== fresh.length) {
 				throw new Error(
 					`expected ${fresh.length} new encodings, got ${r.wholes + r.deltas}`,
 				)
+			}
+			const [count] = await db.sql<{ n: string }[]>`
+				select count(*)::text as n from git_pack_encoding`
+			if (!count || Number(count.n) !== all.length) {
+				throw new Error(`encoding tier has ${count?.n ?? "no count"}/${all.length} rows`)
 			}
 			return {
 				backfillMs,
@@ -156,7 +173,7 @@ async function main(): Promise<void> {
 		const k = Math.log2(b.n / a.n)
 		exps.push([
 			`${a.n}→${b.n}`,
-			(Math.log2(b.incrementalMs / Math.max(a.incrementalMs, 1)) / k).toFixed(2),
+			(Math.log2(b.incrementalMs / a.incrementalMs) / k).toFixed(2),
 		])
 	}
 	console.log("\n## growth of the one-commit pass in repo size (0 = O(new work))\n")

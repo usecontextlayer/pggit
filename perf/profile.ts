@@ -1,7 +1,6 @@
 import { writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import pprof from "@datadog/pprof"
-// @platformatic/flame ships no type declarations; perf/ is run via tsx (not tsc).
 import * as flame from "@platformatic/flame"
 
 export type Hotspot = {
@@ -58,11 +57,15 @@ type PprofProfile = {
 
 /** Aggregate self-time (leaf-attributed wall nanos) per function, top-N. */
 async function topHotspots(pbPath: string, topN: number): Promise<Hotspot[]> {
+	if (!Number.isSafeInteger(topN) || topN < 1) {
+		throw new Error(`topN must be a positive safe integer, got ${topN}`)
+	}
 	const p = (await flame.parseProfile(pbPath)) as unknown as PprofProfile
 	const strings = p.stringTable.strings
-	// Prefer the "nanoseconds" wall value over raw sample count.
+	if (p.sampleType.length === 0) throw new Error("profile contains no sample types")
+	// The report promises wall self-time, so a count-only profile is not scoreable.
 	const nanoIdx = p.sampleType.findIndex((t) => strings[Number(t.unit)] === "nanoseconds")
-	const valueIdx = nanoIdx >= 0 ? nanoIdx : p.sampleType.length - 1
+	if (nanoIdx < 0) throw new Error("profile contains no nanoseconds sample type")
 	const funcById = new Map(p.function.map((f) => [Number(f.id), f]))
 	const locById = new Map(p.location.map((l) => [Number(l.id), l]))
 
@@ -72,20 +75,46 @@ async function topHotspots(pbPath: string, topN: number): Promise<Hotspot[]> {
 	>()
 	let total = 0
 	for (const smp of p.sample) {
-		const v = Number(smp.value[valueIdx] ?? 0)
+		const rawValue = smp.value[nanoIdx]
+		if (rawValue === undefined) {
+			throw new Error(`profile sample omitted nanoseconds value index ${nanoIdx}`)
+		}
+		const v = Number(rawValue)
+		if (!Number.isFinite(v) || v < 0) {
+			throw new Error(`profile sample has invalid value ${String(rawValue)}`)
+		}
 		total += v
-		const leaf = locById.get(Number(smp.locationId[0]))
+		const rawLocationId = smp.locationId[0]
+		const leaf =
+			rawLocationId === undefined ? undefined : locById.get(Number(rawLocationId))
 		const ln = leaf?.line[0]
-		if (!ln) continue
-		const fn = funcById.get(Number(ln.functionId))
-		if (!fn) continue
-		const fnName = strings[Number(fn.name)] || "(anonymous)"
-		const file = strings[Number(fn.filename)] || "<native>"
-		const key = `${fnName}|${file}:${ln.line}`
-		const entry = byFn.get(key) ?? { file, fn: fnName, line: Number(ln.line), nanos: 0 }
+		const fn = ln === undefined ? undefined : funcById.get(Number(ln.functionId))
+		let fnName = "(native/unattributed)"
+		let file = "<native>"
+		let line = 0
+		if (rawLocationId !== undefined && leaf === undefined) {
+			fnName = "(unresolved location)"
+		} else if (ln !== undefined && fn === undefined) {
+			fnName = "(unresolved function)"
+		} else if (ln !== undefined && fn !== undefined) {
+			const rawName = strings[Number(fn.name)]
+			const rawFile = strings[Number(fn.filename)]
+			if (rawName === undefined || rawFile === undefined) {
+				throw new Error(`profile function ${fn.id} references a missing string`)
+			}
+			line = Number(ln.line)
+			if (!Number.isSafeInteger(line) || line < 0) {
+				throw new Error(`profile function ${fn.id} has invalid line ${String(ln.line)}`)
+			}
+			fnName = rawName || "(anonymous)"
+			file = rawFile || "<native>"
+		}
+		const key = `${fnName}|${file}:${line}`
+		const entry = byFn.get(key) ?? { file, fn: fnName, line, nanos: 0 }
 		entry.nanos += v
 		byFn.set(key, entry)
 	}
+	if (total <= 0) throw new Error("profile contains no positive samples")
 
 	return [...byFn.values()]
 		.sort((a, b) => b.nanos - a.nanos)
@@ -95,6 +124,6 @@ async function topHotspots(pbPath: string, topN: number): Promise<Hotspot[]> {
 			fn: e.fn,
 			line: e.line,
 			selfMs: e.nanos / 1e6,
-			selfPct: total > 0 ? (e.nanos / total) * 100 : 0,
+			selfPct: (e.nanos / total) * 100,
 		}))
 }

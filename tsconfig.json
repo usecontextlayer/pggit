@@ -25,5 +25,5 @@
 		"types": ["node"]
 	},
 	"exclude": ["node_modules", "dist", "dist-types", "vitest.config.ts"],
-	"include": ["src/**/*.ts"]
+	"include": ["src/**/*.ts", "perf/**/*.ts", "manage.ts"]
 }

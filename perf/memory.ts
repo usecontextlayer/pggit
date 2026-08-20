@@ -103,8 +103,8 @@ function retainedAfterGc(): MemoryBreakdown {
 // posts it back on `stop`. `performance`/`process` are Node globals in a worker.
 const RSS_WORKER_SRC = `
 const { parentPort } = require("node:worker_threads")
-const series = []
 const start = performance.now()
+const series = [[0, process.memoryUsage().rss]]
 const timer = setInterval(() => {
 	series.push([performance.now() - start, process.memoryUsage().rss])
 }, 1)
@@ -114,17 +114,33 @@ parentPort.on("message", () => {
 })
 `
 
-function startRssSampler(): { stop: () => Promise<[number, number][]> } {
+export function startRssSampler(): { stop: () => Promise<[number, number][]> } {
 	const worker = new Worker(RSS_WORKER_SRC, { eval: true })
 	return {
 		stop: async () => {
-			const series = await new Promise<[number, number][]>((resolve, reject) => {
-				worker.once("message", (m: [number, number][]) => resolve(m))
-				worker.once("error", reject)
-				worker.postMessage("stop")
-			})
-			await worker.terminate()
-			return series
+			try {
+				const series = await new Promise<[number, number][]>((resolve, reject) => {
+					worker.once("message", (message: [number, number][]) => resolve(message))
+					worker.once("error", reject)
+					worker.once("exit", (code) => {
+						reject(new Error(`RSS sampler exited ${code} before returning its series`))
+					})
+					worker.postMessage("stop")
+				})
+				if (series.length < 2) {
+					throw new Error(`RSS sampler returned only ${series.length} sample(s)`)
+				}
+				const firstAt = series[0]?.[0]
+				const lastAt = series.at(-1)?.[0]
+				if (firstAt === undefined || lastAt === undefined || lastAt <= firstAt) {
+					throw new Error(
+						`RSS sampler returned no positive sampling span: ${firstAt}..${lastAt}`,
+					)
+				}
+				return series
+			} finally {
+				await worker.terminate()
+			}
 		},
 	}
 }
@@ -152,14 +168,11 @@ export function startMemorySampler(): { stop: () => Promise<MemoryReport> } {
 		stop: async () => {
 			const peakByField = breakdown.stop()
 			const series = await rss.stop()
+			const firstAt = (series[0] as [number, number])[0]
+			const lastAt = (series.at(-1) as [number, number])[0]
 			const retainedAfterGcBytes = retainedAfterGc()
 			const rssValues = series.map(([, bytes]) => bytes)
-			const meanIntervalMs =
-				series.length > 1
-					? ((series.at(-1) as [number, number])[0] -
-							(series[0] as [number, number])[0]) /
-						(series.length - 1)
-					: 0
+			const meanIntervalMs = (lastAt - firstAt) / (series.length - 1)
 			return {
 				peakByField,
 				peakRssBytes: peakOf(rssValues),

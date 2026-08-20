@@ -21,9 +21,9 @@ import { spawnGit } from "@/testing/spawn-git"
 import {
 	COMMITTER,
 	DEFAULT_PG_URL,
-	duBytes,
 	filler,
 	flag,
+	increasingIntegerListFlag,
 	mb,
 	pad,
 	padr,
@@ -37,7 +37,7 @@ import {
 const EXPONENT_LIMIT = 1.35
 
 const PG_URL = flag("pg", DEFAULT_PG_URL)
-const LENGTHS = flag("lengths", "100,200,400,800,1600").split(",").map(Number)
+const LENGTHS = increasingIntegerListFlag("lengths", [100, 200, 400, 800, 1600])
 
 function buildStream(commits: number): string {
 	const out: string[] = []
@@ -93,7 +93,12 @@ async function measure(
 	const gcDir = scratch.dir(`gc-${commits}`)
 	await spawnGit(["clone", "-q", "--mirror", src, gcDir])
 	await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: gcDir })
-	const packBytes = await duBytes(gcDir)
+	const packMatch = (
+		await spawnGit(["count-objects", "-v"], { cwd: gcDir })
+	).stdout.match(/size-pack: (\d+)/)
+	if (!packMatch) throw new Error("git count-objects omitted size-pack")
+	const packBytes = Number(packMatch[1]) * 1024
+	if (packBytes <= 0) throw new Error(`canonical git pack size is ${packBytes}`)
 
 	const objects = await reachableObjects(src)
 	const db = await createIsolatedSchema(PG_URL)
@@ -126,13 +131,25 @@ async function measure(
 		const tagSize = await sizeOf(db.sql, "git_tag")
 		const obj = await sizeOf(db.sql, "git_object")
 		const [c] = await db.sql<{ n: string }[]>`select count(*)::text as n from git_commit`
+		const [o] = await db.sql<{ n: string }[]>`select count(*)::text as n from git_object`
+		const [t] = await db.sql<{ n: string }[]>`select count(*)::text as n from git_tag`
 		const [edge] = await db.sql<{ n: string }[]>`
 			select count(*)::text as n from information_schema.tables
 			where table_schema = ${db.schema} and table_name = 'git_edge'`
+		if (!c || !o || !t || !edge) throw new Error("topology census returned no row")
+		if (
+			Number(c.n) !== commits + 1 ||
+			Number(o.n) !== objects.length ||
+			Number(t.n) !== 0
+		) {
+			throw new Error(
+				`topology prerequisite mismatch: commits=${c.n}/${commits + 1}, objects=${o.n}/${objects.length}, tags=${t.n}/0`,
+			)
+		}
 		return {
-			commitRows: Number(c?.n ?? 0),
+			commitRows: Number(c.n),
 			commits,
-			edgeTableExists: Number(edge?.n ?? 0) > 0,
+			edgeTableExists: Number(edge.n) > 0,
 			objects: objects.length,
 			objTotal: obj.total,
 			packBytes,
@@ -147,7 +164,9 @@ async function measure(
 function exponent(a: Point, b: Point, pick: (p: Point) => number): number {
 	const va = pick(a)
 	const vb = pick(b)
-	if (va <= 0 || vb <= 0 || a.commits <= 0 || b.commits <= 0) return 0
+	if (va <= 0 || vb <= 0 || a.commits <= 0 || b.commits <= a.commits) {
+		throw new Error(`invalid exponent inputs: ${a.commits}/${va} -> ${b.commits}/${vb}`)
+	}
 	return Math.log(vb / va) / Math.log(b.commits / a.commits)
 }
 
@@ -175,7 +194,7 @@ async function main(): Promise<void> {
 				`${padr(p.commits, 9)} ${pad(p.objects, 8)} ${pad(p.commitRows, 12)} ` +
 					`${pad((p.commitRows / p.commits).toFixed(2), 12)} ${pad(mb(p.topoTotal), 9)} ` +
 					`${pad(mb(p.objTotal), 10)} ${pad(mb(p.packBytes), 12)} ` +
-					`${pad((p.topoTotal / Math.max(p.packBytes, 1)).toFixed(2), 10)}`,
+					`${pad((p.topoTotal / p.packBytes).toFixed(2), 10)}`,
 			)
 		}
 

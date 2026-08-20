@@ -1,19 +1,9 @@
 /**
- * PROBE 5 — how do a GC pass's milliseconds divide between its sweeps?
+ * PROBE 5 — how do a GC pass's measured SQL milliseconds divide between the object sweep and the surrounding pass work?
  *
- * HISTORY (2026-08-16): this originally timed the window between the object
- * sweep and the ENCODING sweep — the exposure in which a crash left probe 1's
- * torn tier. D14 deleted the encoding sweep (the 0008 FK cascades take the
- * dependent rows inside the object DELETEs), so that window no longer exists and
- * probe 1 now pins its unrepresentability instead. What remains worth timing:
- * the object-vs-edge sweep split — the edge sweep is the slowest on a real repo
- * (1.1M kind-3 rows per the design doc's W5) — and the object sweep's own
- * duration, which now carries the cascade work the encoding sweep used to do.
+ * HISTORY (2026-08-16): this originally timed separate object, edge, and encoding sweeps. D14 deleted the encoding sweep in favor of the 0008 FK cascade, and spine S2 deleted `git_edge` and its sweep entirely. The only destructive statement left is the object sweep; its transaction now carries the commit/tag/encoding cascades. This probe measures that current shape instead of preserving retired sweep vocabulary.
  *
- * It is a PERF harness, not a vitest test, because its verdict is a TIMING
- * MEASUREMENT — how the pass's milliseconds divide between the sweeps. Like
- * `perf/delta-probe.ts` it is one-shot and diagnostic: not a gate, no threshold,
- * exits non-zero only if the pass itself throws.
+ * It is a PERF harness, not a vitest test, because its verdict is a TIMING MEASUREMENT. Like `perf/delta-probe.ts` it is one-shot and diagnostic: not a performance gate, but it fails loudly if the fixture reclaims no objects or the timing wrapper observes no object-sweep statement.
  *
  *   npx tsx perf/breakage/txn--gc-sweep-window.ts
  *   npx tsx perf/breakage/txn--gc-sweep-window.ts --pg=postgres://…
@@ -25,8 +15,9 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { seedRepoIntoStore } from "@/testing/git-fixtures"
+import { parseRevListObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import { spawnGit } from "@/testing/spawn-git"
 import { PG_URL, table } from "./_txn-util"
 
 const REPO = "r"
@@ -34,10 +25,7 @@ const RUNS = 300
 /** Where main is rewound to before the sweep — leaves ~270 commits of garbage. */
 const REWIND_TO = 30
 
-/** Time every `unsafe()` statement, bucketed by which sweep issued it. */
-/** Times every `unsafe` statement by the table it names. Must wrap `reserve()`
- * too: the reshaped gc (D12) runs its sweeps on a reserved connection's `unsafe`,
- * not the pool's — a pool-only proxy would leave every bucket empty. */
+/** Times every `unsafe` statement by the table it names. Must wrap `reserve()` too: the reshaped GC runs its sweep on a reserved connection's `unsafe`, so a pool-only proxy would leave every bucket empty. */
 function timed(pg: Sql, into: Map<string, number>): Sql {
 	const wrap = <T extends object>(target: T): T =>
 		new Proxy(target, {
@@ -80,7 +68,29 @@ async function main(): Promise<void> {
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		await seedRepoIntoStore(REPO, src, { objects, refs })
-		await createRepack(db.sql).repack(REPO)
+		const repack = await createRepack(db.sql).repack(REPO)
+		if (repack.wholes + repack.deltas === 0 || repack.deltas === 0) {
+			throw new Error(
+				`gc timing fixture did not establish a delta tier (${repack.wholes} wholes, ${repack.deltas} deltas)`,
+			)
+		}
+		const sourceOids = new Set(
+			parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "HEAD"], { cwd: src })).stdout,
+			),
+		)
+		const expectedLiveOids = new Set(
+			parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", rewindTo], { cwd: src })).stdout,
+			),
+		)
+		const [beforeCensus] = await db.sql<{ objects: number }[]>`
+			select count(*)::int as objects from git_object`
+		if (!beforeCensus || beforeCensus.objects !== sourceOids.size) {
+			throw new Error(
+				`pre-GC object census ${beforeCensus?.objects ?? "missing"}/${sourceOids.size}`,
+			)
+		}
 		await refs.setRef(REPO, "refs/heads/main", rewindTo)
 
 		console.log(
@@ -91,12 +101,31 @@ async function main(): Promise<void> {
 			graceSeconds: 0,
 			maintain: false,
 		})
+		const expectedDeleted = sourceOids.size - expectedLiveOids.size
+		const [afterCensus] = await db.sql<{ objects: number }[]>`
+			select count(*)::int as objects from git_object`
+		if (
+			expectedDeleted <= 0 ||
+			res.deletedObjects !== expectedDeleted ||
+			!afterCensus ||
+			afterCensus.objects !== expectedLiveOids.size
+		) {
+			throw new Error(
+				`gc fixture census mismatch: deleted ${res.deletedObjects}/${expectedDeleted}, live ${afterCensus?.objects ?? "missing"}/${expectedLiveOids.size}`,
+			)
+		}
 		console.log(
 			`reclaimed: ${res.deletedObjects} objects ` +
 				`(encodings + commit/tag rows cascade with the object sweep, 0008/0009)\n`,
 		)
 
 		const total = [...perSweep.values()].reduce((a, b) => a + b, 0)
+		const objectMs = perSweep.get("objects") ?? 0
+		if (objectMs === 0 || total === 0) {
+			throw new Error(
+				`gc timing wrapper missed the object sweep (object=${objectMs}ms, total=${total}ms)`,
+			)
+		}
 		console.log(
 			table(
 				["sweep", "ms", "share"],
@@ -108,12 +137,9 @@ async function main(): Promise<void> {
 			),
 		)
 
-		// The old "exposure window before the encoding sweep" no longer exists (D14:
-		// cascades removed the sweep); what remains worth printing is the split.
-		const objectMs = perSweep.get("objects") ?? 0
 		console.log(
 			`\nobject sweep (now carrying the cascade work) = ${objectMs.toFixed(0)} ms ` +
-				`of the ${total.toFixed(0)} ms pass (${total > 0 ? ((objectMs / total) * 100).toFixed(1) : "0"}%)`,
+				`of the ${total.toFixed(0)} ms pass (${((objectMs / total) * 100).toFixed(1)}%)`,
 		)
 	} finally {
 		await db.drop()

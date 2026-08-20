@@ -25,11 +25,12 @@ import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 import {
 	cleanupTmp,
-	flag,
 	gitRepack,
 	importRepo,
+	increasingIntegerListFlag,
 	mb,
 	PG_URL,
+	positiveIntegerFlag,
 	secs,
 	seedRepo,
 	table,
@@ -38,8 +39,8 @@ import {
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const WIDTH = Number(flag("width", "20000"))
-const COMMITS = flag("commits", "100,200,400").split(",").map(Number)
+const WIDTH = positiveIntegerFlag("width", 20_000)
+const COMMITS = increasingIntegerListFlag("commits", [100, 200, 400])
 const REPO_ID = "probe/mem"
 /** Peak RSS above git's at which this is called broken. */
 const RSS_RATIO_LIMIT = 2
@@ -47,6 +48,7 @@ const RSS_RATIO_LIMIT = 2
 // ── child mode: connect to one schema, repack once, print the numbers ────────
 const childSchema = process.argv.find((a) => a.startsWith("--child="))?.slice(8)
 if (childSchema !== undefined) {
+	if (childSchema === "") throw new Error("--child requires a schema name")
 	const sql = postgres(PG_URL, {
 		connection: { search_path: childSchema },
 		max: 4,
@@ -55,6 +57,21 @@ if (childSchema !== undefined) {
 	if (!process.argv.includes("--noop")) {
 		const t0 = Date.now()
 		const r = await createRepack(sql).repack(REPO_ID)
+		const [objects, encodings] = await Promise.all([
+			sql<{ n: string }[]>`select count(*)::text as n from git_object`,
+			sql<{ n: string }[]>`select count(*)::text as n from git_pack_encoding`,
+		])
+		const objectCount = Number(objects[0]?.n)
+		const encodingCount = Number(encodings[0]?.n)
+		if (
+			objectCount <= 0 ||
+			r.wholes + r.deltas !== objectCount ||
+			encodingCount !== objectCount
+		) {
+			throw new Error(
+				`repack coverage: receipt=${r.wholes + r.deltas}, rows=${encodingCount}, objects=${objectCount}`,
+			)
+		}
 		console.log(`child: ${r.wholes}w+${r.deltas}d in ${Date.now() - t0}ms`)
 	}
 	await sql.end()
@@ -98,9 +115,19 @@ async function bytesByType(dir: string): Promise<Map<string, number>> {
 	)
 	const totals = new Map<string, number>()
 	for (const line of out.stdout.split("\n")) {
+		if (line === "") continue
 		const [type, size] = line.split(" ")
-		if (!type || !size) continue
-		totals.set(type, (totals.get(type) ?? 0) + Number(size))
+		const bytes = Number(size)
+		if (
+			!type ||
+			!size ||
+			line.split(" ").length !== 2 ||
+			!/^(blob|commit|tag|tree)$/.test(type) ||
+			!Number.isSafeInteger(bytes) ||
+			bytes < 0
+		)
+			throw new Error(`malformed cat-file size row: ${JSON.stringify(line)}`)
+		totals.set(type, (totals.get(type) ?? 0) + bytes)
 	}
 	return totals
 }
@@ -116,6 +143,8 @@ async function main(): Promise<void> {
 		["tsx", SELF, `--child=${floorDb.schema}`, `--pg=${PG_URL}`, "--noop"],
 		ROOT,
 	)
+	if (floor.peakRss <= 0)
+		throw new Error("interpreter-floor peak RSS measurement missing")
 	await floorDb.drop()
 
 	const rows: (string | number)[][] = []
@@ -126,20 +155,30 @@ async function main(): Promise<void> {
 		const dir = await importRepo(`mem-${commits}`, stream(commits))
 		try {
 			const totals = await bytesByType(dir)
-			const treeBytes = totals.get("tree") ?? 0
+			const treeBytes = totals.get("tree")
+			if (treeBytes === undefined || treeBytes <= 0) {
+				throw new Error("canonical fixture contains no tree bytes")
+			}
 			const git = await gitRepack(dir, `mem-git-${commits}`)
+			if (git.peakRss <= 0) throw new Error("git peak-RSS measurement missing")
 			const db = await createIsolatedSchema(PG_URL)
 			try {
 				const seeded = await seedRepo(db.sql, REPO_ID, dir)
+				if (seeded.objects <= 0) throw new Error("fixture seeded no objects")
 				const child = await timedSpawn(
 					"npx",
 					["tsx", SELF, `--child=${db.schema}`, `--pg=${PG_URL}`],
 					ROOT,
 				)
 				if (child.code !== 0) throw new Error(`child repack exited ${child.code}`)
+				if (child.peakRss <= floor.peakRss) {
+					throw new Error(
+						`repack child peak ${child.peakRss} did not exceed interpreter floor ${floor.peakRss}`,
+					)
+				}
 				const rss = child.peakRss - floor.peakRss
-				const ratio = rss / Math.max(git.peakRss, 1)
-				const share = rss / Math.max(treeBytes, 1)
+				const ratio = rss / git.peakRss
+				const share = rss / treeBytes
 				worst = Math.max(worst, ratio)
 				worstShare = Math.max(worstShare, share)
 				rows.push([

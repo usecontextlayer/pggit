@@ -1,21 +1,9 @@
 /**
- * The conditions the production drain (design W1) will actually create, on REAL
- * repository history — none of which the suite or the design's verification covers:
+ * Race conditions created by directly driving the candidate serialized maintenance sequence on real repository history.
  *
- *   R1 determinism   two clones of one repacked state must be byte-identical packs
- *                    (buildPack claims "deterministic packs" — served order is fixed).
- *   R2 clone ‖ repack  a client cloning WHILE the offline repack writes encodings.
- *                    Serve reads encodings per 1000-object batch, so a racing clone
- *                    necessarily sees a half-encoded repo — every batch boundary is a
- *                    chance to mix representations. The pack must still be valid.
- *   R3 push ‖ repack  new objects arriving mid-pass, then a clone of the result.
- *   R4 repack ‖ repack  two drains overlapping on one repo (the drain serializes per
- *                    repo today — this asks what happens the day it does not). A loud
- *                    failure is fine; a corrupt or short pack is not.
+ * R1 checks that two clients indexing the same unchanged repacked state produce byte-identical stored packs. R2 starts a clone only after observing committed partial encoding coverage while repack is still unsettled. R3 starts a push at that same proven partial-coverage seam, then converges and clones the result. Promise co-start is not evidence of overlap, so both race cases fail as unmet fixture preconditions unless the intermediate state is observed.
  *
- * Black-box: real `git push` / `git clone` over the wire + `createRepack().repack()`.
- * Every verdict is a clone compared byte-for-byte against a plain `file://` remote
- * that received the identical push.
+ * Black-box behavior remains real `git push` / `git clone` over the wire plus direct `createRepack().repack()` calls. Every successful clone must be fsck-clean and match a plain `file://` oracle exactly in refs and objects. Concurrent repack-vs-repack is deliberately absent because this harness models serialized maintenance; the still-deferred production integration is not evidence supplied by this probe.
  *
  * A perf harness rather than a vitest e2e test because its corpus is a REAL local
  * repository handed in at run time (`--repo=`), which no committed fixture can stand
@@ -23,7 +11,7 @@
  *
  *   npx tsx perf/breakage/realrepo--drain-races.ts --repo=/path/to/checkout --slug=<name>
  *
- * Exit 0 = every race produced a pack identical to git's. Non-zero = reproduced.
+ * Exit 0 = every established race produced canonical refs and objects. Non-zero = divergence or an unestablished named precondition.
  */
 import { createHash } from "node:crypto"
 import { mkdirSync, readdirSync, readFileSync } from "node:fs"
@@ -31,12 +19,15 @@ import { join } from "node:path"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
+import { parseRevListObjectOids, typedRefsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	createLedger,
 	createScratch,
 	DEFAULT_PG_URL,
+	type EncodingCoverage,
+	encodingCoverage,
 	flag,
 	oidSet,
 	prepareMirror,
@@ -45,6 +36,7 @@ import {
 
 const SLUG = flag("slug", "repo")
 const PG_URL = flag("pg", DEFAULT_PG_URL)
+if (SLUG.length === 0) throw new Error("--slug must not be empty")
 
 const scratch = createScratch(`races-${SLUG}`)
 const { fail, findings, report } = createLedger(SLUG)
@@ -56,6 +48,7 @@ function packDigest(bareDir: string): string {
 	const packs = readdirSync(dir)
 		.filter((f) => f.endsWith(".pack"))
 		.sort()
+	if (packs.length === 0) throw new Error(`${bareDir}: clone contains no pack`)
 	const h = createHash("sha256")
 	for (const f of packs) h.update(readFileSync(join(dir, f)))
 	return h.digest("hex")
@@ -65,7 +58,7 @@ function packDigest(bareDir: string): string {
 async function verifyClone(
 	label: string,
 	dir: string,
-	expect: Set<string>,
+	expect: { oids: Set<string>; refs: string },
 ): Promise<boolean> {
 	const fsck = await tryGit(["fsck", "--strict"], dir)
 	if (!fsck.ok) {
@@ -73,8 +66,8 @@ async function verifyClone(
 		return false
 	}
 	const got = await oidSet(dir)
-	const missing = [...expect].filter((o) => !got.has(o))
-	const extra = [...got].filter((o) => !expect.has(o))
+	const missing = [...expect.oids].filter((o) => !got.has(o))
+	const extra = [...got].filter((o) => !expect.oids.has(o))
 	if (missing.length > 0 || extra.length > 0) {
 		fail(
 			`${label}: object set diverges from git`,
@@ -82,20 +75,76 @@ async function verifyClone(
 		)
 		return false
 	}
+	const refs = (await typedRefsOf(dir))
+		.map(({ name, oid, type }) => `${name} ${oid} ${type}`)
+		.join("\n")
+	if (refs !== expect.refs) {
+		fail(
+			`${label}: ref set diverges from git`,
+			`${refs || "<none>"} != ${expect.refs || "<none>"}`,
+		)
+		return false
+	}
 	return true
+}
+
+async function oracleState(dir: string): Promise<{ oids: Set<string>; refs: string }> {
+	const oids = await oidSet(dir)
+	if (oids.size === 0) throw new Error(`oracle ${dir} contains zero objects`)
+	const refs = (await typedRefsOf(dir))
+		.map(({ name, oid, type }) => `${name} ${oid} ${type}`)
+		.join("\n")
+	if (!refs) throw new Error(`oracle ${dir} contains zero refs`)
+	return { oids, refs }
+}
+
+async function waitForPartialCoverage(
+	db: Awaited<ReturnType<typeof createIsolatedSchema>>,
+	repo: string,
+	before: EncodingCoverage,
+	isSettled: () => boolean,
+): Promise<void> {
+	const pending = before.eligible - before.encoded
+	if (pending <= 1000) {
+		throw new Error(
+			`${repo}: race fixture has ${pending} pending encodings; need more than one 1000-row flush`,
+		)
+	}
+	const deadline = Date.now() + 30_000
+	while (Date.now() < deadline) {
+		const current = await encodingCoverage(db.sql, repo)
+		if (
+			current.eligible === before.eligible &&
+			current.encoded > before.encoded &&
+			current.encoded < current.eligible &&
+			!isSettled()
+		) {
+			return
+		}
+		if (isSettled()) break
+		await new Promise<void>((resolve) => setImmediate(resolve))
+	}
+	throw new Error(
+		`${repo}: repack never exposed committed partial encoding coverage while unsettled`,
+	)
 }
 
 async function main(): Promise<void> {
 	MIRROR = await prepareMirror(scratch)
 	console.log(`# drain races — ${SLUG}\n  mirror ${MIRROR}`)
-	const chain = (
-		await spawnGit(["rev-list", "--first-parent", "--reverse", "HEAD"], { cwd: MIRROR })
-	).stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
+	const chain = parseRevListObjectOids(
+		(
+			await spawnGit(["rev-list", "--first-parent", "--reverse", "HEAD"], {
+				cwd: MIRROR,
+			})
+		).stdout,
+	)
+	if (chain.length < 3)
+		throw new Error(`drain-race fixture needs at least 3 commits, got ${chain.length}`)
 	const mid = chain[Math.floor(chain.length * 0.6)] as string
 	const head = chain[chain.length - 1] as string
+	if (mid === head)
+		throw new Error("drain-race fixture mid and head revisions are identical")
 
 	const db = await createIsolatedSchema(PG_URL)
 	const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
@@ -112,10 +161,15 @@ async function main(): Promise<void> {
 			cwd: MIRROR,
 		})
 		const seed = await createRepack(db.sql).repack(`races/${SLUG}`)
+		if (seed.wholes + seed.deltas === 0 || seed.deltas === 0) {
+			throw new Error(
+				`seed repack did not exercise deltas (${seed.wholes} wholes, ${seed.deltas} deltas)`,
+			)
+		}
 		console.log(`  seed repack: ${seed.wholes} wholes + ${seed.deltas} deltas`)
 		const midOracle = join(scratch.mk("midoracle"), "m.git")
 		await spawnGit(["clone", "--bare", "-q", `file://${oracle}`, midOracle])
-		const midExpect = await oidSet(midOracle)
+		const midExpect = await oracleState(midOracle)
 
 		// ── R1: determinism — two clones of one state, byte-identical packs ─────
 		const c1 = join(scratch.mk("det1"), "c.git")
@@ -132,7 +186,10 @@ async function main(): Promise<void> {
 		report.push(
 			`| R1 | determinism (2 clones, same state) | ${d1 === d2 ? "byte-identical" : "DIVERGED"} |`,
 		)
-		await verifyClone("R1 clone", c1, midExpect)
+		await Promise.all([
+			verifyClone("R1 clone 1", c1, midExpect),
+			verifyClone("R1 clone 2", c2, midExpect),
+		])
 
 		// ── R2: a clone racing a repack ─────────────────────────────────────────
 		// Wipe the encoding tier's coverage by pushing the REST of the history first
@@ -143,10 +200,21 @@ async function main(): Promise<void> {
 		})
 		const headOracle = join(scratch.mk("headoracle"), "h.git")
 		await spawnGit(["clone", "--bare", "-q", `file://${oracle}`, headOracle])
-		const headExpect = await oidSet(headOracle)
+		const headExpect = await oracleState(headOracle)
 
 		const raceDir = join(scratch.mk("race"), "c.git")
+		const beforeR2 = await encodingCoverage(db.sql, `races/${SLUG}`)
 		const repackP = createRepack(db.sql).repack(`races/${SLUG}`)
+		let repackSettled = false
+		void repackP.then(
+			() => {
+				repackSettled = true
+			},
+			() => {
+				repackSettled = true
+			},
+		)
+		await waitForPartialCoverage(db, `races/${SLUG}`, beforeR2, () => repackSettled)
 		const cloneP = tryGit([
 			"-c",
 			"protocol.version=2",
@@ -157,6 +225,17 @@ async function main(): Promise<void> {
 			raceDir,
 		])
 		const [rp, cl] = await Promise.all([repackP, cloneP])
+		if (rp.wholes + rp.deltas !== beforeR2.eligible - beforeR2.encoded) {
+			throw new Error(
+				`R2 repack covered ${rp.wholes + rp.deltas}/${beforeR2.eligible - beforeR2.encoded} pending objects`,
+			)
+		}
+		const afterR2 = await encodingCoverage(db.sql, `races/${SLUG}`)
+		if (afterR2.encoded !== afterR2.eligible) {
+			throw new Error(
+				`R2 repack left encoding coverage ${afterR2.encoded}/${afterR2.eligible}`,
+			)
+		}
 		console.log(
 			`  R2 concurrent repack: ${rp.wholes} wholes + ${rp.deltas} deltas; clone ${cl.ok ? "ok" : `FAILED exit ${cl.code}`}`,
 		)
@@ -182,9 +261,25 @@ async function main(): Promise<void> {
 		await spawnGit(["push", `file://${oracle2}`, `${mid}:refs/heads/main`], {
 			cwd: MIRROR,
 		})
+		const beforeR3 = await encodingCoverage(db.sql, rid2)
 		const repackP3 = createRepack(db.sql).repack(rid2)
+		let repack3Settled = false
+		void repackP3.then(
+			() => {
+				repack3Settled = true
+			},
+			() => {
+				repack3Settled = true
+			},
+		)
+		await waitForPartialCoverage(db, rid2, beforeR3, () => repack3Settled)
 		const pushP3 = tryGit(["push", url2, `${head}:refs/heads/later`], MIRROR)
 		const [rp3, pu3] = await Promise.all([repackP3, pushP3])
+		if (rp3.wholes + rp3.deltas !== beforeR3.eligible - beforeR3.encoded) {
+			throw new Error(
+				`R3 repack covered ${rp3.wholes + rp3.deltas}/${beforeR3.eligible - beforeR3.encoded} pending objects`,
+			)
+		}
 		await spawnGit(["push", `file://${oracle2}`, `${head}:refs/heads/later`], {
 			cwd: MIRROR,
 		})
@@ -196,11 +291,23 @@ async function main(): Promise<void> {
 				"R3 a push running concurrently with repack FAILED",
 				pu3.stderr.trim().slice(0, 800),
 			)
-		// converge: repack again, then clone and compare
+		// converge: repack every object the racing push added, then clone and compare
+		const beforeConverge = await encodingCoverage(db.sql, rid2)
 		const rp3b = await createRepack(db.sql).repack(rid2)
+		if (rp3b.wholes + rp3b.deltas !== beforeConverge.eligible - beforeConverge.encoded) {
+			throw new Error(
+				`R3 converging repack covered ${rp3b.wholes + rp3b.deltas}/${beforeConverge.eligible - beforeConverge.encoded} pending objects`,
+			)
+		}
+		const afterConverge = await encodingCoverage(db.sql, rid2)
+		if (afterConverge.encoded !== afterConverge.eligible) {
+			throw new Error(
+				`R3 convergence left encoding coverage ${afterConverge.encoded}/${afterConverge.eligible}`,
+			)
+		}
 		const oracle2Clone = join(scratch.mk("oracle2c"), "o.git")
 		await spawnGit(["clone", "--mirror", "-q", `file://${oracle2}`, oracle2Clone])
-		const expect2 = await oidSet(oracle2Clone)
+		const expect2 = await oracleState(oracle2Clone)
 		const after3 = join(scratch.mk("after3"), "c.git")
 		const cl3 = await tryGit([
 			"-c",
@@ -217,47 +324,6 @@ async function main(): Promise<void> {
 		report.push(
 			`| R3 | push ‖ repack (+converging repack ${rp3b.wholes}w+${rp3b.deltas}d) | ${cl3.ok ? "pack valid, matches git" : "CLONE FAILED"} |`,
 		)
-
-		// ── R4: two overlapping repacks on ONE repo ─────────────────────────────
-		const rid4 = `races/${SLUG}-dual`
-		const url4 = `http://127.0.0.1:${server.port}/${rid4}`
-		await spawnGit(["push", url4, `${head}:refs/heads/main`], { cwd: MIRROR })
-		const both = await Promise.allSettled([
-			createRepack(db.sql).repack(rid4),
-			createRepack(db.sql).repack(rid4),
-		])
-		const rejected = both.filter((r) => r.status === "rejected")
-		console.log(
-			`  R4 two concurrent repacks: ${both
-				.map((r) =>
-					r.status === "fulfilled"
-						? `${r.value.wholes}w+${r.value.deltas}d`
-						: `THREW: ${String((r as PromiseRejectedResult).reason).slice(0, 120)}`,
-				)
-				.join(" | ")}`,
-		)
-		// Whatever happened, the repo must still serve a correct pack — and one more
-		// repack must bring it to full coverage without breaking anything.
-		await createRepack(db.sql).repack(rid4)
-		const after4 = join(scratch.mk("after4"), "c.git")
-		const cl4 = await tryGit([
-			"-c",
-			"protocol.version=2",
-			"clone",
-			"--bare",
-			"-q",
-			url4,
-			after4,
-		])
-		if (!cl4.ok)
-			fail(
-				"R4 clone after two overlapping repacks FAILED",
-				cl4.stderr.trim().slice(0, 800),
-			)
-		else await verifyClone("R4 clone after overlapping repacks", after4, headExpect)
-		report.push(
-			`| R4 | repack ‖ repack | ${rejected.length} of 2 threw; clone ${cl4.ok ? "valid, matches git" : "FAILED"} |`,
-		)
 	} finally {
 		await server.close()
 		await db.drop()
@@ -269,7 +335,7 @@ async function main(): Promise<void> {
 	console.log("|---|---|---|")
 	for (const r of report) console.log(r)
 	console.log(
-		`\n${findings.length === 0 ? "VERDICT: clean — every race served a pack identical to git's." : `VERDICT: ${findings.length} FINDING(S)`}`,
+		`\n${findings.length === 0 ? "VERDICT: clean — every established race matched git's refs and objects." : `VERDICT: ${findings.length} FINDING(S)`}`,
 	)
 	for (const f of findings) console.log(`  - ${f}`)
 	if (findings.length > 0) process.exitCode = 1

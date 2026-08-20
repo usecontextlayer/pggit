@@ -28,13 +28,18 @@
  *   npx tsx perf/delta-corpus.ts --repo=../customers/.../komal-96afa2eb --repo=.
  */
 import { createHash } from "node:crypto"
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { deflateSync } from "node:zlib"
 import type { GitObjectType } from "@/object/object"
 import { applyDelta, encodeDelta } from "@/pack/delta"
 import { encodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
+import {
+	gitLogRawBasePairs,
+	gitReachableOids,
+	loadGitObjects,
+} from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 const PACK_TYPE_CODE: Record<GitObjectType, number> = {
@@ -49,6 +54,11 @@ type PackEntry =
 	| { content: Buffer; kind: "base"; type: GitObjectType }
 	| { baseOid: string; delta: Buffer; kind: "ref" }
 
+/** Every reachable object with its bytes, in one strict `cat-file --batch`. */
+async function reachableObjects(dir: string): Promise<Obj[]> {
+	return loadGitObjects(dir, await gitReachableOids(dir))
+}
+
 const mb = (n: number): string => `${(n / 1_000_000).toFixed(2)} MB`
 
 function repoArgs(): string[] {
@@ -61,84 +71,11 @@ function repoArgs(): string[] {
 	return repos
 }
 
-/** Every reachable object with its bytes, in ONE `cat-file --batch`. */
-async function reachableObjects(dir: string): Promise<Obj[]> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const objs: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		objs.push({
-			content: buf.subarray(start, start + size),
-			oid,
-			type: type as GitObjectType,
-		})
-		pos = start + size + 1
-	}
-	return objs
-}
-
 /**
  * (target → base) pairs from ONE `git log --raw` pass: for each commit, every changed
  * path's old and new oid. This IS the same-path-one-commit-earlier heuristic, taken
  * from structure the repository already carries rather than from a similarity search.
  */
-async function basePairs(dir: string): Promise<Map<string, string>> {
-	const out = await spawnGit(
-		[
-			"log",
-			"--reverse",
-			"--raw",
-			"-r",
-			"-t",
-			"--no-renames",
-			"--abbrev=40",
-			"--format=@%H %T %P",
-			"--all",
-		],
-		{ cwd: dir },
-	)
-	const pairs = new Map<string, string>()
-	const commitTree = new Map<string, string>()
-	for (const line of out.stdout.split("\n")) {
-		if (line.startsWith("@")) {
-			const [hash, tree, ...parents] = line.slice(1).split(" ")
-			if (!hash || !tree) continue
-			commitTree.set(hash, tree)
-			const parentTree = parents[0] ? commitTree.get(parents[0]) : undefined
-			if (parentTree && parentTree !== tree && !pairs.has(tree))
-				pairs.set(tree, parentTree)
-			continue
-		}
-		if (!line.startsWith(":")) continue
-		const tab = line.indexOf("\t")
-		if (tab < 0) continue
-		const fields = line.slice(1, tab).split(" ")
-		const [oldOid, newOid] = [fields[2], fields[3]]
-		if (!oldOid || !newOid || /^0+$/.test(oldOid) || oldOid === newOid) continue
-		if (!pairs.has(newOid)) pairs.set(newOid, oldOid)
-	}
-	return pairs
-}
-
 function buildPack(entries: PackEntry[]): Buffer {
 	const header = Buffer.alloc(12)
 	header.write("PACK", 0, "latin1")
@@ -163,9 +100,10 @@ type Verdict = {
 	repo: string
 	objects: number
 	deltified: number
+	eligible: number
 	roundTripFailures: string[]
 	undeltifiedBytes: number
-	ourBytes: number
+	ourPackBytes: number
 	gitGcBytes: number
 	gitRecoveryFailures: string[]
 }
@@ -177,19 +115,23 @@ async function verifyRepo(repo: string, scratch: string[]): Promise<Verdict> {
 	// so pointing this at a dev checkout does not copy its node_modules — and
 	// `--no-hardlinks` keeps the clone's object files physically its own, so the
 	// aggressive gc cannot reach back into the source's store.
-	const work = join(mkdtempSync(join(tmpdir(), "pggit-corpus-")), "repo.git")
-	scratch.push(work)
+	const workRoot = mkdtempSync(join(tmpdir(), "pggit-corpus-"))
+	const work = join(workRoot, "repo.git")
+	scratch.push(workRoot)
 	await spawnGit(["clone", "--mirror", "--no-hardlinks", "-q", repo, work])
 
 	const objects = await reachableObjects(work)
+	if (objects.length === 0) {
+		throw new Error(`delta-corpus: ${repo} has no reachable objects`)
+	}
 	const byOid = new Map(objects.map((o) => [o.oid, o]))
-	const pairs = await basePairs(work)
+	const pairs = await gitLogRawBasePairs(work)
 
 	const roundTripFailures: string[] = []
 	const entries: PackEntry[] = []
 	let undeltifiedBytes = 0
-	let ourBytes = 0
 	let deltified = 0
+	let eligible = 0
 
 	// A real history can pair A→B AND B→A (a file toggling between two contents),
 	// and emitting both as deltas is an unresolvable cycle — observed at 5 pairs on
@@ -216,82 +158,89 @@ async function verifyRepo(repo: string, scratch: string[]): Promise<Verdict> {
 		const base = baseOid ? byOid.get(baseOid) : undefined
 		if (!base || base.type !== o.type || inCycle(o.oid)) {
 			entries.push({ content: o.content, kind: "base", type: o.type })
-			ourBytes += whole.length
 			continue
 		}
 
+		eligible++
 		const delta = encodeDelta(base.content, o.content)
 		// Property 1 — the encoder's own contract, on real content.
 		if (!applyDelta(base.content, delta).equals(o.content)) {
 			roundTripFailures.push(`${o.type} ${o.oid} (base ${base.oid})`)
 			entries.push({ content: o.content, kind: "base", type: o.type })
-			ourBytes += whole.length
 			continue
 		}
 		const encoded = deflateSync(delta)
 		if (encoded.length < whole.length) {
 			entries.push({ baseOid: base.oid, delta, kind: "ref" })
-			ourBytes += encoded.length
 			deltified++
 		} else {
 			entries.push({ content: o.content, kind: "base", type: o.type })
-			ourBytes += whole.length
 		}
+	}
+	if (eligible === 0) {
+		throw new Error(`delta-corpus: ${repo} produced no eligible base/target pairs`)
+	}
+	if (deltified === 0) {
+		throw new Error(`delta-corpus: ${repo} produced no delta worth transmitting`)
 	}
 
 	// Property 2 — canonical git must ingest the pack and recover every object.
 	// A REF_DELTA base must precede nothing in particular, but it MUST be present;
 	// bases here are always other entries of the same pack, so the pack is self-contained.
-	const sink = join(mkdtempSync(join(tmpdir(), "pggit-corpus-sink-")), "repo")
-	scratch.push(sink)
+	const sinkRoot = mkdtempSync(join(tmpdir(), "pggit-corpus-sink-"))
+	const sink = join(sinkRoot, "repo")
+	scratch.push(sinkRoot)
 	mkdirSync(sink) // spawn reports a missing cwd as `spawn git ENOENT`
 	await spawnGit(["init", "-q", "-b", "main"], { cwd: sink })
+	const ourPack = buildPack(entries)
 	await spawnGit(["index-pack", "--stdin", "--fix-thin"], {
 		cwd: sink,
-		input: buildPack(entries),
+		input: ourPack,
 	})
 	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: sink })
 
 	const gitRecoveryFailures: string[] = []
-	const check = await spawnGit(["cat-file", "--batch"], {
-		cwd: sink,
-		input: `${objects.map((o) => o.oid).join("\n")}\n`,
-	})
-	const buf = check.stdoutBytes
-	let pos = 0
-	for (const expected of objects) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) {
-			gitRecoveryFailures.push(`${expected.oid} (truncated)`)
-			break
-		}
-		const [oid, , sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		const size = Number(sizeStr)
-		const start = nl + 1
+	const recovered = await loadGitObjects(
+		sink,
+		objects.map((object) => object.oid),
+	)
+	for (const [index, expected] of objects.entries()) {
+		const actual = recovered[index]
 		if (
-			oid !== expected.oid ||
-			!buf.subarray(start, start + size).equals(expected.content)
+			actual === undefined ||
+			actual.oid !== expected.oid ||
+			actual.type !== expected.type ||
+			!actual.content.equals(expected.content)
 		) {
 			gitRecoveryFailures.push(expected.oid)
 		}
-		pos = start + size + 1
 	}
 
 	// Property 3 — the quality benchmark.
 	await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: work })
-	const gitGcBytes =
-		Number(
-			(await spawnGit(["count-objects", "-v"], { cwd: work })).stdout.match(
-				/size-pack: (\d+)/,
-			)?.[1] ?? 0,
-		) * 1024
+	const packDir = (
+		await spawnGit(
+			["rev-parse", "--path-format=absolute", "--git-path", "objects/pack"],
+			{
+				cwd: work,
+			},
+		)
+	).stdout.trim()
+	const packFiles = readdirSync(packDir).filter((file) => file.endsWith(".pack"))
+	if (packFiles.length === 0) throw new Error(`git gc produced no pack for ${repo}`)
+	const gitGcBytes = packFiles.reduce(
+		(total, file) => total + statSync(join(packDir, file)).size,
+		0,
+	)
+	if (gitGcBytes === 0) throw new Error(`git gc produced a zero-byte pack for ${repo}`)
 
 	return {
 		deltified,
+		eligible,
 		gitGcBytes,
 		gitRecoveryFailures,
 		objects: objects.length,
-		ourBytes,
+		ourPackBytes: ourPack.length,
 		repo,
 		roundTripFailures,
 		undeltifiedBytes,
@@ -306,10 +255,12 @@ async function main(): Promise<void> {
 			console.log(`\n## ${repo}`)
 			const v = await verifyRepo(repo, scratch)
 			verdicts.push(v)
-			console.log(`objects ${v.objects}, deltified ${v.deltified}`)
 			console.log(
-				`undeltified ${mb(v.undeltifiedBytes)} → ours ${mb(v.ourBytes)} ` +
-					`(${(v.undeltifiedBytes / v.ourBytes).toFixed(1)}×) · git gc ${mb(v.gitGcBytes)} ` +
+				`objects ${v.objects}, eligible pairs ${v.eligible}, deltified ${v.deltified}`,
+			)
+			console.log(
+				`undeltified payload ${mb(v.undeltifiedBytes)} → our pack ${mb(v.ourPackBytes)} ` +
+					`(${(v.undeltifiedBytes / v.ourPackBytes).toFixed(1)}×) · git pack ${mb(v.gitGcBytes)} ` +
 					`(${(v.undeltifiedBytes / v.gitGcBytes).toFixed(1)}×)`,
 			)
 			if (v.roundTripFailures.length > 0) {

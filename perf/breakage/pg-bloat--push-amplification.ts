@@ -5,8 +5,8 @@
  * A git push writes, on disk, roughly the deflated bytes of the objects it
  * carries. pggit writes those objects as rows, plus one `git_commit` row per
  * commit (spine chunk 1 — the old per-reference `git_edge` rows are gone), plus
- * a full rewrite of the `repo_file` projection for the branch, plus the WAL for
- * all of it, plus (on the next drain) an encoding row per object. This harness
+ * the incremental `repo_file` changes for the branch, plus the WAL for all of it,
+ * plus (when repack runs) an encoding row per new object. This harness
  * measures the ratio on identical pushes, over tree shapes chosen to separate
  * the three cost drivers:
  *
@@ -19,9 +19,10 @@
  * not that pggit is expensive there, it is the RATIO, which isolates what
  * Postgres adds on top of git's own cost.
  *
- * The `repo_file` projection is the amplifier nobody sees: it is deleted and
- * re-inserted IN FULL for the pushed branch on every push, so a one-file commit
- * to an N-file tree writes N rows and deletes N rows regardless of F.
+ * The derived-state spine replaced the former delete-all/reinsert-all projection
+ * with a persisted basis and tree diff. The gate now proves that a push touching
+ * F files writes O(F) projection tuples; a retired full rewrite cannot return
+ * unnoticed.
  *
  * WHAT IT PRINTS, per shape and per F: rows written per table, bytes on disk per
  * table, WAL bytes, and the same push's cost in a bare git repo (`du` delta),
@@ -38,6 +39,7 @@ import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import { branchAndTagRefsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
@@ -148,12 +150,12 @@ async function main(): Promise<void> {
 	let failures = 0
 	const table: string[] = []
 	const breakdown: string[] = [
-		`${padr("shape / F", 20)} ${pad("object kB", 10)} ${pad("edge kB", 10)} ${pad("encode kB", 10)} ` +
+		`${padr("shape / F", 20)} ${pad("object kB", 10)} ${pad("topology kB", 10)} ${pad("encode kB", 10)} ` +
 			`${pad("file kB", 10)} ${pad("ref+repo kB", 10)} ${pad("total kB", 10)}`,
 	]
 	table.push(
 		`${padr("shape", 13)} ${padr("D", 3)} ${pad("W", 5)} ${pad("F", 3)} ${pad("content kB", 11)} ` +
-			`${pad("git kB", 8)} ${pad("obj rows", 9)} ${pad("edge rows", 10)} ${pad("file rows", 10)} ` +
+			`${pad("git kB", 8)} ${pad("obj rows", 9)} ${pad("commit rows", 11)} ${pad("file writes", 11)} ` +
 			`${pad("enc rows", 9)} ${pad("pg kB", 8)} ${pad("ownWAL kB", 9)} ${pad("clusWAL kB", 9)} ` +
 			`${pad("pg/git", 7)} ${pad("WAL/git", 8)}`,
 	)
@@ -198,30 +200,41 @@ async function main(): Promise<void> {
 				const repoId = `bench/${s.name}/${F}`
 
 				const baseObjs = await objectsBetween(src, baseTip)
+				if (baseObjs.length === 0) throw new Error(`${s.name} F=${F}: empty base fixture`)
 				await store.putPack(
 					repoId,
 					baseObjs.map((o) => ({ content: o.content, type: o.type })),
 				)
 				await refs.setRef(repoId, "refs/heads/main", baseTip)
 				await syncRefSnapshot(deps, repoId, "refs/heads/main", baseTip)
-				await createRepack(app).repack(repoId)
+				const baseRepack = await createRepack(app).repack(repoId)
+				if (baseRepack.wholes + baseRepack.deltas !== baseObjs.length) {
+					throw new Error(`${s.name} F=${F}: incomplete base repack`)
+				}
 
 				const before = await sizesAll(db.sql)
+				for (const t of TABLES) {
+					if (!before[t]) throw new Error(`missing before size for ${t}`)
+				}
 				const rowsBefore: Record<string, number> = {}
 				for (const t of TABLES) {
 					const [c] = await db.sql.unsafe<{ n: string }[]>(
 						`select count(*)::text as n from ${t}`,
 					)
-					rowsBefore[t] = Number(c?.n ?? 0)
+					if (!c) throw new Error(`missing before count for ${t}`)
+					rowsBefore[t] = Number(c.n)
 				}
 				await flushStats(app)
 				const [insBefore] = await db.sql<{ n: string }[]>`
-					select coalesce(sum(n_tup_ins + n_tup_del),0)::text as n
+					select coalesce(sum(n_tup_ins + n_tup_del + n_tup_upd),0)::text as n
 					from pg_stat_user_tables where schemaname = ${db.schema} and relname like 'repo\\_file%'`
 				const wal0 = await walBytes(db.sql)
 				const bwal0 = await backendWal(db.sql, PUSH_APP)
 
 				const pushObjs = await objectsBetween(src, newTip, baseTip)
+				if (pushObjs.length === 0 || gitBytes <= 0) {
+					throw new Error(`${s.name} F=${F}: missing pushed objects/git byte delta`)
+				}
 				await store.putPack(
 					repoId,
 					pushObjs.map((o) => ({ content: o.content, type: o.type })),
@@ -234,38 +247,84 @@ async function main(): Promise<void> {
 				const wal = (await walBytes(db.sql)) - wal0
 				const bwal = (await backendWal(db.sql, PUSH_APP)) - bwal0
 				const after = await sizesAll(db.sql)
+				for (const t of TABLES) {
+					if (!after[t]) throw new Error(`missing after size for ${t}`)
+				}
 				const rowsAfter: Record<string, number> = {}
 				for (const t of TABLES) {
 					const [c] = await db.sql.unsafe<{ n: string }[]>(
 						`select count(*)::text as n from ${t}`,
 					)
-					rowsAfter[t] = Number(c?.n ?? 0)
+					if (!c) throw new Error(`missing after count for ${t}`)
+					rowsAfter[t] = Number(c.n)
 				}
 				// repo_file NET row count barely moves (delete-all + insert-all), so the
 				// honest number is tuples WRITTEN, from the activity counters.
 				const [insAfter] = await db.sql<{ n: string }[]>`
-					select coalesce(sum(n_tup_ins + n_tup_del),0)::text as n
+					select coalesce(sum(n_tup_ins + n_tup_del + n_tup_upd),0)::text as n
 					from pg_stat_user_tables where schemaname = ${db.schema} and relname like 'repo\\_file%'`
-				const fileTouched = Number(insAfter?.n ?? 0) - Number(insBefore?.n ?? 0)
+				if (!insBefore || !insAfter)
+					throw new Error("repo_file activity census returned no row")
+				const fileTouched = Number(insAfter.n) - Number(insBefore.n)
 
 				const delta = (t: string): number =>
-					(after[t]?.total ?? 0) - (before[t]?.total ?? 0)
+					(after[t] as (typeof after)[string]).total -
+					(before[t] as (typeof before)[string]).total
 				const pgBytes = TABLES.reduce((n, t) => n + delta(t), 0)
 				breakdown.push(
 					`${padr(`${s.name} F=${F}`, 20)} ${pad(kb(delta("git_object")), 10)} ${pad(kb(delta("git_commit")), 10)} ` +
 						`${pad(kb(delta("git_pack_encoding")), 10)} ${pad(kb(delta("repo_file")), 10)} ` +
 						`${pad(kb(delta("git_ref") + delta("repos")), 10)} ${pad(kb(pgBytes), 10)}`,
 				)
-				const objRows = (rowsAfter.git_object ?? 0) - (rowsBefore.git_object ?? 0)
-				const commitRows = (rowsAfter.git_commit ?? 0) - (rowsBefore.git_commit ?? 0)
+				const objRows =
+					(rowsAfter.git_object as number) - (rowsBefore.git_object as number)
+				const commitRows =
+					(rowsAfter.git_commit as number) - (rowsBefore.git_commit as number)
 				const encRows = encRes.wholes + encRes.deltas
+				const expectedFinalObjects = await objectsBetween(src, newTip)
+				const expectedFinalOids = expectedFinalObjects.map((object) => object.oid).sort()
+				const actualObjectOids = (
+					await db.sql<
+						{ oid: string }[]
+					>`select encode(oid, 'hex') as oid from git_object order by oid`
+				).map((row) => row.oid)
+				const actualEncodingOids = (
+					await db.sql<
+						{ oid: string }[]
+					>`select encode(oid, 'hex') as oid from git_pack_encoding order by oid`
+				).map((row) => row.oid)
+				const expectedRefs = await branchAndTagRefsOf(src)
+				const actualRefs = await db.sql<{ name: string; oid: string }[]>`
+					select name, encode(oid, 'hex') as oid from git_ref order by name`
+				const exactObjects =
+					actualObjectOids.length === expectedFinalOids.length &&
+					actualObjectOids.every((oid, i) => oid === expectedFinalOids[i])
+				const exactEncodings =
+					actualEncodingOids.length === expectedFinalOids.length &&
+					actualEncodingOids.every((oid, i) => oid === expectedFinalOids[i])
+				const exactRefs = JSON.stringify(actualRefs) === JSON.stringify(expectedRefs)
+				if (
+					wal <= 0 ||
+					bwal <= 0 ||
+					objRows !== pushObjs.length ||
+					commitRows !== 1 ||
+					encRows !== pushObjs.length ||
+					fileTouched !== F ||
+					!exactObjects ||
+					!exactEncodings ||
+					!exactRefs
+				) {
+					throw new Error(
+						`${s.name} F=${F}: objects ${objRows}/${pushObjs.length} exact=${exactObjects}, commits ${commitRows}/1, encodings ${encRows}/${pushObjs.length} exact=${exactEncodings}, projection writes ${fileTouched}/${F}, refs exact=${exactRefs}`,
+					)
+				}
 
 				table.push(
 					`${padr(s.name, 13)} ${padr(s.depth, 3)} ${pad(s.width, 5)} ${pad(F, 3)} ` +
 						`${pad(kb(touch.bytes), 11)} ${pad(kb(gitBytes), 8)} ${pad(objRows, 9)} ${pad(commitRows, 10)} ` +
 						`${pad(fileTouched, 10)} ${pad(encRows, 9)} ${pad(kb(pgBytes), 8)} ${pad(kb(bwal), 9)} ` +
-						`${pad(kb(wal), 9)} ${pad((pgBytes / Math.max(gitBytes, 1)).toFixed(0), 7)} ` +
-						`${pad((bwal / Math.max(gitBytes, 1)).toFixed(0), 8)}`,
+						`${pad(kb(wal), 9)} ${pad((pgBytes / gitBytes).toFixed(0), 7)} ` +
+						`${pad((bwal / gitBytes).toFixed(0), 8)}`,
 				)
 				if (fileTouched > AMP_LIMIT * F) failures++
 			} finally {
@@ -278,7 +337,7 @@ async function main(): Promise<void> {
 	console.log(table.join("\n"))
 	console.log(
 		`\nlegend: content = new blob bytes the commit introduces · git = bare-repo du delta after gc ·\n` +
-			`obj/edge rows = net new rows · file rows = repo_file TUPLES WRITTEN (inserts + deletes) ·\n` +
+			`obj/commit rows = net new rows · file writes = repo_file inserts + deletes + updates ·\n` +
 			`enc rows = encoding rows the repack pass wrote · pg = on-disk delta across all five tables ·\n` +
 			`ownWAL = WAL charged to THESE backends (pg_stat_get_backend_wal) · clusWAL = cluster LSN\n` +
 			`delta over the same window, which includes every other tenant of this instance.\n` +
@@ -287,10 +346,8 @@ async function main(): Promise<void> {
 	console.log(`## where the bytes go — on-disk delta per table, same pushes\n`)
 	console.log(breakdown.join("\n"))
 	console.log(
-		`\nThe \`file rows\` column is the projection contract: a push is O(tree), never O(changed).\n` +
-			`It does not vary with F, and it does not vary with depth — only with total file count.\n` +
-			`The breakdown says the same thing in bytes: the git object tables cost what git costs;\n` +
-			`the projection is where the order of magnitude is spent.`,
+		`\nThe \`file writes\` column is the incremental projection contract: one changed file\n` +
+			`produces one row change. It scales with F, not with the branch's total file count.`,
 	)
 	scratch.cleanup()
 	if (failures > 0) process.exitCode = 1

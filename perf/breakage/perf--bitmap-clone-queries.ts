@@ -24,12 +24,12 @@ import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { allObjectOids, revParse } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { flag, mkTmp, PG_URL, seedRepo, table } from "./_perf-util"
+import { increasingIntegerListFlag, mkTmp, PG_URL, seedRepo, table } from "./_perf-util"
 
-const SIZES = flag("sizes", "250,500,1000,2000").split(",").map(Number)
+const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
 const REPO = "probe/bitmap-clone"
 /** The largest size must cut clone-serve queries by at least this factor. */
 const MIN_QUERY_FACTOR = 5
@@ -62,7 +62,7 @@ type Row = {
 async function cloneCounting(
 	schema: string,
 	label: string,
-): Promise<{ queries: number; ms: number; oids: string[] }> {
+): Promise<{ queries: number; ms: number; oids: string[]; tip: string }> {
 	const { sql, c } = countingClient(schema)
 	try {
 		const server = await serveOnPort(createGitApp(createGitDeps(sql)), 0)
@@ -80,7 +80,12 @@ async function cloneCounting(
 				])
 				const ms = Date.now() - t0
 				await spawnGit(["fsck", "--full", "--no-dangling"], { cwd: dest })
-				return { ms, oids: await allObjectOids(dest), queries: c.n }
+				return {
+					ms,
+					oids: await allObjectOids(dest),
+					queries: c.n,
+					tip: await revParse(dest, "refs/heads/main"),
+				}
 			} finally {
 				rmSync(dest, { force: true, recursive: true })
 			}
@@ -98,6 +103,13 @@ async function measure(n: number): Promise<Row> {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
 			const seeded = await seedRepo(db.sql, REPO, src)
+			const expectedOids = await allObjectOids(src)
+			const expectedTip = await revParse(src, "refs/heads/main")
+			if (seeded.objects !== expectedOids.length) {
+				throw new Error(
+					`seeded ${seeded.objects} objects, canonical git has ${expectedOids.length}`,
+				)
+			}
 
 			const walk = await cloneCounting(db.schema, `walk-${n}`)
 
@@ -110,18 +122,30 @@ async function measure(n: number): Promise<Row> {
 
 			const bitmap = await cloneCounting(db.schema, `bitmap-${n}`)
 
-			// The correctness anchor: both serves ship the identical object set.
-			if (
-				walk.oids.length !== bitmap.oids.length ||
-				walk.oids.some((o, i) => o !== bitmap.oids[i])
-			) {
-				throw new Error("bitmap-served clone diverged from walk-served clone")
+			// Canonical git is the correctness anchor; comparing the two pggit routes
+			// only would let a shared under-walk self-confirm.
+			for (const [label, clone] of [
+				["walk", walk],
+				["bitmap", bitmap],
+			] as const) {
+				if (
+					clone.tip !== expectedTip ||
+					clone.oids.length !== expectedOids.length ||
+					clone.oids.some((oid, i) => oid !== expectedOids[i])
+				) {
+					throw new Error(`${label}-served clone diverged from canonical git`)
+				}
+			}
+			if (walk.queries <= 0 || bitmap.queries <= 0) {
+				throw new Error(
+					`query counter did not observe both serves: walk=${walk.queries}, bitmap=${bitmap.queries}`,
+				)
 			}
 
 			return {
 				bitmapMs: bitmap.ms,
 				bitmapQueries: bitmap.queries,
-				factor: walk.queries / Math.max(1, bitmap.queries),
+				factor: walk.queries / bitmap.queries,
 				n,
 				objects: seeded.objects,
 				walkMs: walk.ms,

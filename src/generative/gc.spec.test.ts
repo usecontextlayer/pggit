@@ -53,7 +53,11 @@ import {
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
-import { loadAllObjects, parseRevListObjectOids, refsOf } from "@/testing/git-fixtures"
+import {
+	branchAndTagRefsOf,
+	loadAllObjects,
+	parseRevListObjectOids,
+} from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 /**
@@ -108,7 +112,7 @@ async function seedSubset(
 	kept: { name: string; oid: string }[]
 	dropped: { name: string; oid: string }[]
 }> {
-	const allRefs = await refsOf(src)
+	const allRefs = await branchAndTagRefsOf(src)
 	// Apply the mask with wraparound; always keep at least one ref (index 0) so the
 	// repo has a live set and something to fetch.
 	const keptSet = new Set(

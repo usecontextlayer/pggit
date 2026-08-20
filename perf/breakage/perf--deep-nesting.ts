@@ -6,7 +6,7 @@
  * repo?
  *
  * A crash here is a correctness finding, not a performance one: the repo becomes
- * permanently un-repackable and the drain fails on every pass.
+ * permanently un-repackable and every explicit repack pass fails.
  *
  * The deepest case also gets a real clone + `git fsck --strict` off the wire, so a
  * silently-wrong pack cannot pass as a fast one.
@@ -22,13 +22,14 @@ import { join } from "node:path"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
+import { allObjectOids, revParse } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 import {
 	cleanupTmp,
-	flag,
 	gitRepack,
 	importRepo,
+	increasingIntegerListFlag,
 	mb,
 	mkTmp,
 	PG_URL,
@@ -40,7 +41,7 @@ import {
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const DEPTHS = flag("depths", "125,250,500,1000,2000").split(",").map(Number)
+const DEPTHS = increasingIntegerListFlag("depths", [125, 250, 500, 1000, 2000])
 const COMMITS = 16
 const RATIO_LIMIT = 20
 
@@ -74,7 +75,11 @@ async function main(): Promise<void> {
 	for (const depth of DEPTHS) {
 		const dir = await importRepo(`deep-${depth}`, stream(depth))
 		try {
+			const expectedOids = await allObjectOids(dir)
+			const expectedTip = await revParse(dir, "refs/heads/main")
 			const git = await gitRepack(dir, `deep-git-${depth}`)
+			if (git.ms <= 0)
+				throw new Error(`depth ${depth}: canonical git timer was nonpositive`)
 			const db = await createIsolatedSchema(PG_URL)
 			try {
 				const seeded = await seedRepo(db.sql, "probe/deep", dir)
@@ -83,10 +88,17 @@ async function main(): Promise<void> {
 				let rss = 0
 				try {
 					const r = await withPeakRss(() => createRepack(db.sql).repack("probe/deep"))
+					if (r.value.wholes + r.value.deltas !== seeded.objects) {
+						throw new Error(
+							`repack covered ${r.value.wholes + r.value.deltas}/${seeded.objects} objects`,
+						)
+					}
 					ms = r.ms
+					if (ms <= 0)
+						throw new Error(`depth ${depth}: pggit repack timer was nonpositive`)
 					rss = r.peakRss - r.baseRss
 					outcome = `${r.value.wholes}w+${r.value.deltas}d`
-					worstRatio = Math.max(worstRatio, ms / Math.max(git.ms, 1))
+					worstRatio = Math.max(worstRatio, ms / git.ms)
 				} catch (e) {
 					outcome = `THREW: ${(e as Error).message.slice(0, 50)}`
 					crashed = true
@@ -98,7 +110,7 @@ async function main(): Promise<void> {
 					secs(ms),
 					mb(rss),
 					secs(git.ms),
-					`${(ms / Math.max(git.ms, 1)).toFixed(1)}×`,
+					crashed ? "—" : `${(ms / git.ms).toFixed(1)}×`,
 					outcome,
 				])
 
@@ -118,6 +130,15 @@ async function main(): Promise<void> {
 							dest,
 						])
 						await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+						const gotOids = await allObjectOids(dest)
+						const gotTip = await revParse(dest, "refs/heads/main")
+						if (
+							gotTip !== expectedTip ||
+							gotOids.length !== expectedOids.length ||
+							gotOids.some((oid, i) => oid !== expectedOids[i])
+						) {
+							throw new Error("deep clone diverged from canonical refs/object set")
+						}
 						fsckNote = "clone + fsck --strict clean"
 					} catch (e) {
 						fsckNote = `CLONE/FSCK FAILED: ${(e as Error).message.slice(0, 120)}`

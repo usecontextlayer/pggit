@@ -1,19 +1,17 @@
 /**
  * Shared plumbing for the `perf/breakage/txn--*.ts` harnesses — the crash-integrity
- * lens (a repack pass is many transactions, a GC pass is three independent sweeps,
- * and neither has a watermark; see docs/2026-08-15-delta-pack-design.md D4/D5/D7).
+ * lens on bounded multi-statement maintenance. The probes price interruption and
+ * recovery against the current cascading object sweep, reachability epoch, and
+ * D15 repack-repair behavior.
  *
  * Matches `perf/delta-probe.ts`: a `--pg=` flag defaulting to the local
  * docker-compose Postgres, and a markdown table printer. Nothing here reaches into
  * pggit internals — every harness drives the public `createRepack` / `createGc` /
  * wire-server surfaces and observes bytes, rows, and wall time.
  */
+export { flag, positiveIntegerFlag } from "../args"
 
-/** `--name=value` from argv, or `fallback`. */
-export function flag(name: string, fallback: string): string {
-	const hit = process.argv.find((a) => a.startsWith(`--${name}=`))
-	return hit ? hit.slice(name.length + 3) : fallback
-}
+import { flag } from "../args"
 
 export const PG_URL = flag("pg", "postgres://postgres:postgres@localhost:6489/postgres")
 

@@ -1,23 +1,24 @@
 /**
  * pgres — WHAT DOES THE DERIVED ENCODING TIER COST UNDER THE FORCE-PUSH CHURN CYCLE?
  *
- * The cycle is pggit's actual production shape (a chat-home / workspace repo whose
- * ref is rewound and re-pushed): per round, push N new commits, move
- * `refs/heads/main` to the new tip (orphaning the previous round), GC with
- * `graceSeconds: 0`, then repack. The LIVE set is CONSTANT round over round — the
- * same base plus one round's worth — so every monotone increase in physical bytes
- * is bloat, not data.
+ * The cycle puts the derived tier through production-shaped force-push churn (a
+ * chat-home / workspace repo whose ref is rewound and re-pushed): per round, push
+ * N new commits, move `refs/heads/main` to the new tip (orphaning the previous
+ * round), GC with `graceSeconds: 0`, then optionally repack. The LIVE set is
+ * CONSTANT round over round — the same base plus one round's worth — so every
+ * monotone increase in physical bytes is bloat, not data. The current production
+ * scheduler invokes GC only; this harness composes repack explicitly in modes A/B.
  *
  * Three modes, each in its own schema, so the tier's cost is isolated by control:
- *   A  repack + gc(maintain: true)     — the manage.ts / direct-call path.
- *   B  repack + gc(maintain: false)    — what the background drain passes, i.e.
- *                                        what production will actually do.
- *   C  NO repack + gc(maintain: false) — the tier absent. The control that says how
- *                                        much of the churn footprint is the tier's.
+ *   A  repack + gc(maintain: true)     — an explicit direct-call maintenance path.
+ *   B  repack + gc(maintain: false)    — a candidate GC-then-repack composition;
+ *                                        it is not wired into the scheduler today.
+ *   C  NO repack + gc(maintain: false) — the current production scheduler's GC
+ *                                        shape, and the tier-absent control.
  *
  * Comparators inside every mode: `git_object` (same schema, same rounds, same
- * reloptions family — but `gc.ts maintain()` DOES vacuum it and never vacuums the
- * encoding tier), and a real local git repo taking the identical force-update with
+ * reloptions family — and `gc.ts maintain()` vacuums both it and the encoding
+ * tier), and a real local git repo taking the identical force-update with
  * `git gc --prune=now` each round.
  *
  * SHARED-INSTANCE CAVEAT, measured per round: sibling agents hold REPEATABLE READ
@@ -49,6 +50,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
+import { branchAndTagRefsOf, parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
@@ -83,19 +85,19 @@ type Mode = { key: string; label: string; maintain: boolean; repack: boolean }
 const MODES: Mode[] = [
 	{
 		key: "A",
-		label: "A  repack + gc(maintain: true)     — manage.ts / direct-call path",
+		label: "A  repack + gc(maintain: true)     — explicit direct-call path",
 		maintain: true,
 		repack: true,
 	},
 	{
 		key: "B",
-		label: "B  repack + gc(maintain: false)    — what the background drain passes",
+		label: "B  repack + gc(maintain: false)    — candidate composition (not wired)",
 		maintain: false,
 		repack: true,
 	},
 	{
 		key: "C",
-		label: "C  NO repack + gc(maintain: false) — control: the tier absent",
+		label: "C  NO repack + gc(maintain: false) — current scheduler; tier absent",
 		maintain: false,
 		repack: false,
 	},
@@ -115,7 +117,7 @@ type Row = {
 	objDead: number
 	objAutovac: number
 	objVac: number
-	edgeTotal: number
+	commitTotal: number
 	schemaTotal: number
 	gitDirBytes: number
 	gcObjects: number
@@ -136,11 +138,14 @@ type ModeResult = {
 /** Mean per-round growth of the encoding tier's physical footprint over the LAST
  * HALF of the run, as a fraction of the live bytes it stores. Flat ⇒ 0. */
 function tailGrowthPerLiveByte(rows: Row[]): number {
-	const half = Math.max(1, Math.floor(rows.length / 2))
+	if (rows.length < 3) throw new Error("growth measurement requires at least 3 rounds")
+	const half = Math.floor(rows.length / 2)
 	const z = rows[rows.length - 1] as Row
 	const m = rows[half] as Row
-	const span = Math.max(1, rows.length - 1 - half)
-	return z.encLogical === 0 ? 0 : (phys(z) - phys(m)) / span / z.encLogical
+	const span = rows.length - 1 - half
+	if (z.encLogical <= 0)
+		throw new Error("growth measurement requires live encoding bytes")
+	return (phys(z) - phys(m)) / span / z.encLogical
 }
 
 const phys = (r: Row): number => r.encHeap + r.encToast + r.encIdx
@@ -163,7 +168,12 @@ async function xminLag(pg: Sql): Promise<number> {
 		select coalesce(max(extract(epoch from (clock_timestamp() - xact_start))), 0)::int::text as lag
 		from pg_stat_activity
 		where backend_type = 'client backend' and backend_xmin is not null`
-	return Number(r?.lag ?? 0)
+	if (!r) throw new Error("xmin-lag query returned no row")
+	const lag = Number(r.lag)
+	if (!Number.isFinite(lag) || lag < 0) {
+		throw new Error(`xmin-lag query returned invalid value ${r.lag}`)
+	}
+	return lag
 }
 
 async function runMode(mode: Mode): Promise<ModeResult> {
@@ -187,10 +197,16 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 		})
 		await fastImport(dir, base.stream)
 		const baseTip = await revParse(dir, "refs/heads/main")
-		await seedObjects(pg, REPO, await objectsBetween(dir, baseTip, []))
+		const baseObjects = await objectsBetween(dir, baseTip, [])
+		await seedObjects(pg, REPO, baseObjects)
 		await setMain(pg, REPO, baseTip)
 		const repack = createRepack(pg)
-		if (mode.repack) await repack.repack(REPO)
+		if (mode.repack) {
+			const seeded = await repack.repack(REPO)
+			if (seeded.wholes + seeded.deltas !== baseObjects.length) {
+				throw new Error(`${mode.key}: base repack covered incomplete object set`)
+			}
+		}
 
 		const gc = createGc(pg)
 		let tip = baseTip
@@ -210,12 +226,46 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			await fastImport(dir, round.stream)
 			tip = await revParse(dir, "refs/heads/main")
 
-			await seedObjects(pg, REPO, await objectsBetween(dir, tip, [baseTip]))
+			const roundObjects = await objectsBetween(dir, tip, [baseTip])
+			if (roundObjects.length === 0)
+				throw new Error(`${mode.key} round ${r}: empty churn set`)
+			await seedObjects(pg, REPO, roundObjects)
 			await setMain(pg, REPO, tip)
+			const [beforeGc] = await pg<
+				{ n: string }[]
+			>`select count(*)::text as n from git_object`
+			if (!beforeGc) throw new Error(`${mode.key} round ${r}: missing pre-GC census`)
 
-			// GC then repack — the drain's order (design D5).
+			// GC then optional repack — explicit harness composition (design D5).
+			// The current production scheduler stops after GC.
 			const g = await gc.gc(REPO, { graceSeconds: 0, maintain: mode.maintain })
 			const p = mode.repack ? await repack.repack(REPO) : { deltas: 0, wholes: 0 }
+			const canonical = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "refs/heads/main"], { cwd: dir }))
+					.stdout,
+			)
+			const [live] = await pg<
+				{ objects: string; commits: string; encodings: string; tip: string }[]
+			>`select
+				(select count(*) from git_object)::text as objects,
+				(select count(*) from git_commit)::text as commits,
+				(select count(*) from git_pack_encoding)::text as encodings,
+				(select encode(oid, 'hex') from git_ref where name = 'refs/heads/main') as tip`
+			const expectedDeleted = Number(beforeGc.n) - canonical.length
+			const expectedEncodings = mode.repack ? canonical.length : 0
+			if (
+				!live ||
+				live.tip !== tip ||
+				Number(live.objects) !== canonical.length ||
+				Number(live.commits) !== BASE_RUNS + PER_ROUND ||
+				Number(live.encodings) !== expectedEncodings ||
+				g.deletedObjects !== expectedDeleted ||
+				(mode.repack && p.wholes + p.deltas !== roundObjects.length)
+			) {
+				throw new Error(
+					`${mode.key} round ${r} prerequisite mismatch: ${JSON.stringify({ beforeGc, deleted: g.deletedObjects, live, repack: p })}`,
+				)
+			}
 
 			// The git comparator takes the same beating.
 			await spawnGit(["reflog", "expire", "--expire=now", "--all"], { cwd: dir })
@@ -227,8 +277,20 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			const o = stat(s, "git_object")
 			const ed = stat(s, "git_commit")
 			const census = await encodingCensus(pg)
+			if (!s.git_pack_encoding || !s.git_object || !s.git_commit) {
+				throw new Error(
+					`${mode.key} round ${r}: storage statistics missing a measured table`,
+				)
+			}
+			if (
+				mode.repack
+					? census.rows !== expectedEncodings || census.rows <= 0 || census.dataBytes <= 0
+					: census.rows !== 0 || census.dataBytes !== 0
+			) {
+				throw new Error(`${mode.key} round ${r}: encoding census is incomplete`)
+			}
 			rows.push({
-				edgeTotal: total(ed),
+				commitTotal: total(ed),
 				encAutovac: e.autovac,
 				encDead: e.dead,
 				encHeap: e.heap,
@@ -258,16 +320,16 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			const url = `http://127.0.0.1:${server.port}/${REPO}`
 			const clone = join(mkTmp(`clone-${mode.key}`), "c.git")
 			const got = await cloneAndVerify(url, clone)
-			const want = (
-				await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-			).stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((x) => /^[0-9a-f]{40}$/.test(x))
-				.sort()
+			const want = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
+			).sort()
+			const wantRefs = (await branchAndTagRefsOf(dir)).map(
+				({ name, oid }) => `${oid} ${name}`,
+			)
 			const same =
 				got.objects.length === want.length &&
 				got.objects.every((x, i) => x === want[i]) &&
+				JSON.stringify(got.refs) === JSON.stringify(wantRefs) &&
 				got.fsck === ""
 			verdict = same
 				? `clone fsck-clean, ${got.objects.length} objects, identical to local git`
@@ -284,9 +346,15 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			})
 			await fastImport(dir, extra.stream)
 			const tip2 = await revParse(dir, "refs/heads/main")
-			await seedObjects(pg, REPO, await objectsBetween(dir, tip2, [tip]))
+			const extraObjects = await objectsBetween(dir, tip2, [tip])
+			await seedObjects(pg, REPO, extraObjects)
 			await setMain(pg, REPO, tip2)
-			if (mode.repack) await repack.repack(REPO)
+			if (mode.repack) {
+				const extraRepack = await repack.repack(REPO)
+				if (extraRepack.wholes + extraRepack.deltas !== extraObjects.length) {
+					throw new Error(`${mode.key}: incremental repack coverage mismatch`)
+				}
+			}
 			await spawnGit(["fetch", "-q", "origin", "+refs/*:refs/*"], { cwd: clone })
 			const after = (
 				await spawnGit(["rev-parse", "refs/heads/main"], { cwd: clone })
@@ -296,6 +364,23 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 				verdict += ` | INCREMENTAL FETCH MISMATCH ${after} != ${tip2}`
 			} else {
 				const f = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: clone })
+				const gotAfter = parseRevListObjectOids(
+					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: clone })).stdout,
+				).sort()
+				const wantAfter = parseRevListObjectOids(
+					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
+				).sort()
+				const [gotRefsAfter, wantRefsAfter] = await Promise.all([
+					branchAndTagRefsOf(clone),
+					branchAndTagRefsOf(dir),
+				])
+				if (
+					gotAfter.length !== wantAfter.length ||
+					gotAfter.some((oid, i) => oid !== wantAfter[i]) ||
+					JSON.stringify(gotRefsAfter) !== JSON.stringify(wantRefsAfter)
+				) {
+					throw new Error(`${mode.key}: incremental clone refs/objects diverged from git`)
+				}
 				verdict += ` | incremental fetch ok (fsck ${`${f.stdout}${f.stderr}`.trim() || "clean"})`
 			}
 			rmSync(clone, { force: true, recursive: true })
@@ -328,6 +413,8 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 
 function report(res: ModeResult): void {
 	const { rows, mode } = res
+	if (rows.length < 3)
+		throw new Error(`${mode.key}: bloat report needs at least 3 rounds`)
 	console.log(`\n### ${mode.label}\n`)
 	console.log(
 		table(
@@ -373,13 +460,25 @@ function report(res: ModeResult): void {
 	)
 	const a = rows[1] as Row
 	const z = rows[rows.length - 1] as Row
-	const half = Math.max(1, Math.floor(rows.length / 2))
-	const span = Math.max(1, rows.length - 1 - half)
+	if (a.objTotal <= 0 || a.schemaTotal <= 0 || a.gitDirBytes <= 0) {
+		throw new Error(`${mode.key}: bloat baseline has an empty denominator`)
+	}
+	if (mode.repack) {
+		if (phys(a) <= 0 || a.encRows <= 0 || a.encLogical <= 0) {
+			throw new Error(`${mode.key}: repacked bloat baseline has an empty denominator`)
+		}
+	} else if (rows.some((r) => r.encRows !== 0 || r.encLogical !== 0)) {
+		throw new Error(`${mode.key}: tier-absent control produced encoding rows or bytes`)
+	}
+	const half = Math.floor(rows.length / 2)
+	const span = rows.length - 1 - half
 	const tailEnc = (phys(z) - phys(rows[half] as Row)) / span
 	const tailObj = (z.objTotal - (rows[half] as Row).objTotal) / span
 	const tailSchema = (z.schemaTotal - (rows[half] as Row).schemaTotal) / span
 	console.log(
-		`\nround 2 → ${rows.length}:  git_pack_encoding ×${(phys(z) / (phys(a) || 1)).toFixed(2)} (${mb(phys(a))} → ${mb(phys(z))} MB) while its LIVE content stayed ×${(z.encLogical / (a.encLogical || 1)).toFixed(2)} (${mb(a.encLogical)} MB)`,
+		mode.repack
+			? `\nround 2 → ${rows.length}:  git_pack_encoding ×${(phys(z) / phys(a)).toFixed(2)} (${mb(phys(a))} → ${mb(phys(z))} MB) while its LIVE content stayed ×${(z.encLogical / a.encLogical).toFixed(2)} (${mb(a.encLogical)} MB)`
+			: `\nround 2 → ${rows.length}:  git_pack_encoding stayed absent (0 rows, 0 live bytes); its empty relation shell measured ${mb(phys(a))} → ${mb(phys(z))} MB`,
 	)
 	console.log(
 		`  comparators: git_object ×${(z.objTotal / a.objTotal).toFixed(2)} (${mb(a.objTotal)} → ${mb(z.objTotal)} MB) · whole schema ×${(z.schemaTotal / a.schemaTotal).toFixed(2)} (${mb(a.schemaTotal)} → ${mb(z.schemaTotal)} MB) · local git .git ×${(z.gitDirBytes / a.gitDirBytes).toFixed(2)} (${mb(z.gitDirBytes)} MB, flat)`,
@@ -396,11 +495,14 @@ function report(res: ModeResult): void {
 }
 
 async function main(): Promise<void> {
+	if (ROUNDS < 3 || PER_ROUND < 1 || BASE_RUNS < 1) {
+		throw new Error(`rounds/base/commits must be positive and rounds >= 3`)
+	}
 	console.log(
 		`# churn cycle: ${ROUNDS} rounds × ${PER_ROUND} commits over a ${BASE_RUNS}-commit base\n`,
 	)
 	console.log(
-		"Each round: push N new commits → move refs/heads/main (orphaning the previous round) → gc(graceSeconds:0) → repack.",
+		"Each round: push N new commits → move refs/heads/main (orphaning the previous round) → gc(graceSeconds:0) → optional explicit repack.",
 	)
 	console.log(
 		"The live set is CONSTANT across rounds; every physical increase is bloat.\n",
@@ -433,7 +535,7 @@ async function main(): Promise<void> {
 					r.mode.key,
 					mb(z.schemaTotal),
 					mb(z.objTotal),
-					mb(z.edgeTotal),
+					mb(z.commitTotal),
 					mb(phys(z)),
 					`×${(z.schemaTotal / ctrl.schemaTotal).toFixed(2)}`,
 				]
@@ -474,9 +576,8 @@ async function main(): Promise<void> {
 			`${bad ? "FAIL" : "ok  "}  still growing +${(g * 100).toFixed(0)}% of live bytes per round in the last half  — ${r.mode.label}`,
 		)
 	}
-	const ctrlGrowth = tailGrowthPerLiveByte((all[2] as ModeResult).rows)
 	console.log(
-		`      control C (tier absent): +${(ctrlGrowth * 100).toFixed(0)}% — the encoding table stays at its empty-partition floor.`,
+		"      control C (tier absent): N/A — there are deliberately no live encoding bytes to denominate a growth ratio.",
 	)
 	cleanupTmp()
 	if (failed) process.exitCode = 1

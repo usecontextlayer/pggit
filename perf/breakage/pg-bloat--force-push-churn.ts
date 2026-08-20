@@ -1,22 +1,22 @@
 /**
- * pg-bloat--force-push-churn — what the GC drain's `maintain: false` actually
- * costs, measured over repeated force-push churn.
+ * pg-bloat--force-push-churn — what the candidate GC→repack maintenance sequence
+ * costs under repeated force-push churn.
  *
  * THE CLAIM UNDER TEST. `gc.ts` skips VACUUM/REINDEX on the drain's hot cadence
  * ("autovacuum reclaims the GC churn instead"), and 0005/0008 tune every leaf
  * partition for that: `autovacuum_vacuum_scale_factor = 0.02` with
  * `autovacuum_vacuum_threshold = 1000`. Those two numbers are the ONLY defence
- * the hot path has. But they are evaluated PER PHYSICAL RELATION, and every one
- * of the three big tables is HASH-partitioned into 16 leaves — so a GC burst of
- * D dead rows is scattered ~D/16 per leaf, and the ABSOLUTE floor of 1000 becomes
- * an effective repo-wide floor of ~16,000 dead rows before any partition is
- * eligible.
+ * the hot path has. They are evaluated PER PHYSICAL RELATION. Hash partitioning
+ * is by `repo_id`, so one repo's churn lands in one occupied leaf; that leaf's
+ * threshold, not a fictitious D/16 spread, is the relevant defense.
  *
  * THE WORKLOAD. Each round is one force-push cycle, the exact shape pggit's
  * motivating tenant produces: advance `refs/heads/main` by ADVANCE commits (real
- * objects ingested through the real store), rewind the ref to the previous tip
- * (the force push), then run the drain's own calls — `gc(graceSeconds: 0,
- * maintain: false)` followed by `repack()`.
+ * objects ingested through the real store), rewrite the ref through the internal
+ * platform API to the previous tip (the smart-HTTP wire denies rewinds), then run
+ * `gc(graceSeconds: 0, maintain: false)` followed by `repack()`. The production GC
+ * drain already chooses `maintain: false`; repack integration remains deferred, so
+ * this harness invokes the intended engine-side sequence directly.
  *
  * WHAT IT PRINTS
  *   - per round: total/heap/toast/index bytes for all five tables, dead tuples,
@@ -26,16 +26,14 @@
  *   - a settle window after the last round (autovacuum naptime is 60 s) so
  *     "autovacuum never fired" cannot be confused with "autovacuum had not run
  *     yet".
- *   - three sizes for every table: as the drain leaves it, after a manual
- *     `VACUUM (ANALYZE)` (what the drain declines to run), and after
+ *   - three sizes for every table: as the sequence leaves it, after a manual
+ *     `VACUUM (ANALYZE)` (what `maintain: false` declines to run), and after
  *     `VACUUM FULL` (the compaction floor — what ONLY a rewrite reclaims).
  *
  * EXIT NON-ZERO when a table whose LIVE ROW COUNT is unchanged from the base push
- * occupies more than `BLOAT_THRESHOLD`× what it occupied then. That criterion is
- * chosen because it survives a pinned horizon: it compares two states holding
- * identical content, so it is a statement about residue and never about whether
- * some vacuum happened to be able to run. (The VACUUM / VACUUM FULL columns are
- * still printed — they are how you tell WHY the residue is there.)
+ * occupies more than `BLOAT_THRESHOLD`× what it occupied then. A pinned vacuum
+ * horizon makes that residue unattributable, so the harness aborts rather than
+ * score any bloat ratio observed while reclamation was blocked.
  *
  *   npx tsx perf/breakage/pg-bloat--force-push-churn.ts --rounds=40 --settle=180
  */
@@ -59,9 +57,12 @@ import {
 	objectsBetween,
 	pad,
 	padr,
+	positiveIntegerFlag,
+	positiveNumberFlag,
 	rawIndexSizes,
 	runDirName,
 	type Sizes,
+	type Stat,
 	scratchRoot,
 	sizesAll,
 	stats,
@@ -75,12 +76,31 @@ import {
 const REPO_ID = "workspace/slate/churn"
 
 const PG_URL = flag("pg", DEFAULT_PG_URL)
-const ROUNDS = Number(flag("rounds", "40"))
-const ADVANCE = Number(flag("advance", "20"))
-const BASE = Number(flag("base", "200"))
-const SETTLE_S = Number(flag("settle", "180"))
+const ROUNDS = positiveIntegerFlag("rounds", 40)
+const ADVANCE = positiveIntegerFlag("advance", 20)
+const BASE = positiveIntegerFlag("base", 200)
+const SETTLE_S = positiveNumberFlag("settle", 180)
 /** Growth over the base push, at identical live content, that counts as bloat. */
 const BLOAT_THRESHOLD = 2.0
+const HASH_LEAVES = 16
+
+function requiredSize(sizes: Record<string, Sizes>, table: string, phase: string): Sizes {
+	const value = sizes[table]
+	if (!value || value.total <= 0) {
+		throw new Error(`${phase}: missing or empty physical size for ${table}`)
+	}
+	return value
+}
+
+function requiredStat(
+	statsByTable: Record<string, Stat>,
+	table: string,
+	phase: string,
+): Stat {
+	const value = statsByTable[table]
+	if (!value) throw new Error(`${phase}: statistics omitted ${table}`)
+	return value
+}
 
 /**
  * One base history plus ROUNDS throwaway branches off its tip. Every branch's
@@ -139,7 +159,7 @@ async function main(): Promise<void> {
 	const scratch = scratchRoot("churn")
 	const db = await createIsolatedSchema(PG_URL)
 	try {
-		console.log(`# Force-push churn economics under the drain's \`maintain: false\`\n`)
+		console.log(`# Force-push churn economics under the candidate GC→repack sequence\n`)
 		console.log(
 			`schema ${db.schema} · base ${BASE} commits · ${ROUNDS} rounds × advance ${ADVANCE} then rewind\n`,
 		)
@@ -148,7 +168,11 @@ async function main(): Promise<void> {
 			`vacuum horizon at start: lag ${hz0.ageXids} xids, oldest open client xact ` +
 				`${hz0.oldestXactSeconds.toFixed(1)}s${hz0.blockers.length > 0 ? ` (${hz0.blockers.length} over 5s)` : ""}\n`,
 		)
-		let horizonPinned = hz0.ageXids > 5000
+		if (hz0.ageXids > 5000) {
+			throw new Error(
+				`vacuum horizon is already pinned by ${hz0.ageXids} xids; bloat would not be attributable`,
+			)
+		}
 
 		const src = scratch.dir("src")
 		await spawnGit(["init", "-q", "-b", "main", src])
@@ -165,8 +189,9 @@ async function main(): Promise<void> {
 		const deps = { objects: store, snapshots }
 
 		// Seed the base history exactly as a first push would, then repack it —
-		// the steady state the drain is supposed to maintain from here on.
+		// the steady state the candidate maintenance sequence is meant to preserve.
 		const baseObjects = await objectsBetween(src, "refs/heads/main")
+		if (baseObjects.length === 0) throw new Error("base fixture produced no objects")
 		await store.putPack(
 			REPO_ID,
 			baseObjects.map((o) => ({ content: o.content, type: o.type })),
@@ -174,13 +199,57 @@ async function main(): Promise<void> {
 		await refs.setRef(REPO_ID, "refs/heads/main", baseTip)
 		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", baseTip)
 		const seedRepack = await repack.repack(REPO_ID)
+		if (seedRepack.wholes + seedRepack.deltas !== baseObjects.length) {
+			throw new Error(
+				`base repack covered ${seedRepack.wholes + seedRepack.deltas}/${baseObjects.length} objects`,
+			)
+		}
 		const seedSizes = await sizesAll(db.sql)
+		for (const t of TABLES) requiredSize(seedSizes, t, "base")
 		const seedCounts: Record<string, number> = {}
 		for (const t of TABLES) {
 			const [c] = await db.sql.unsafe<{ n: string }[]>(
 				`select count(*)::text as n from ${t}`,
 			)
-			seedCounts[t] = Number(c?.n ?? 0)
+			if (!c) throw new Error(`missing base row count for ${t}`)
+			seedCounts[t] = Number(c.n)
+		}
+		const expectedCounts: Record<(typeof TABLES)[number], number> = {
+			git_commit: baseObjects.filter((object) => object.type === "commit").length,
+			git_object: baseObjects.length,
+			git_pack_encoding: baseObjects.length,
+			git_ref: 1,
+			git_tag: baseObjects.filter((object) => object.type === "tag").length,
+			repo_file: (
+				await spawnGit(["ls-tree", "-r", "--name-only", baseTip], { cwd: src })
+			).stdout
+				.trim()
+				.split("\n")
+				.filter(Boolean).length,
+			repos: 1,
+		}
+		for (const table of TABLES) {
+			if (seedCounts[table] !== expectedCounts[table]) {
+				throw new Error(
+					`base ${table} census ${seedCounts[table]}/${expectedCounts[table]} does not match canonical fixture`,
+				)
+			}
+		}
+		const expectedOids = baseObjects.map((object) => object.oid).sort()
+		const actualOids = (
+			await db.sql<
+				{ oid: string }[]
+			>`select encode(oid, 'hex') as oid from git_object order by oid`
+		).map((row) => row.oid)
+		const [baseRef] = await db.sql<{ oid: string }[]>`
+			select encode(oid, 'hex') as oid from git_ref where name = 'refs/heads/main'`
+		if (
+			!baseRef ||
+			baseRef.oid !== baseTip ||
+			actualOids.length !== expectedOids.length ||
+			actualOids.some((oid, i) => oid !== expectedOids[i])
+		) {
+			throw new Error("base Postgres refs/OIDs do not match canonical git")
 		}
 		console.log(
 			`base seeded: ${baseObjects.length} objects, repack ${seedRepack.wholes} wholes + ${seedRepack.deltas} deltas\n`,
@@ -188,7 +257,7 @@ async function main(): Promise<void> {
 
 		console.log(`## per-round trajectory\n`)
 		console.log(
-			`${padr("round", 6)} ${pad("obj MB", 8)} ${pad("edge MB", 8)} ${pad("enc MB", 8)} ${pad("file MB", 8)} ${pad("ref KB", 7)} ` +
+			`${padr("round", 6)} ${pad("obj MB", 8)} ${pad("commit MB", 9)} ${pad("enc MB", 8)} ${pad("file MB", 8)} ${pad("ref KB", 7)} ` +
 				`${pad("Σ MB", 8)} ${pad("dead", 8)} ${pad("autovac", 8)} ${pad("gc-del", 8)} ${pad("WAL MB", 8)} ${pad("hz lag", 8)}`,
 		)
 
@@ -204,6 +273,8 @@ async function main(): Promise<void> {
 				await spawnGit(["rev-parse", `refs/heads/round${r}`], { cwd: src })
 			).stdout.trim()
 			const objs = await objectsBetween(src, `refs/heads/round${r}`, "refs/heads/main")
+			if (objs.length === 0)
+				throw new Error(`round ${r}: fixture produced no new objects`)
 			await store.putPack(
 				REPO_ID,
 				objs.map((o) => ({ content: o.content, type: o.type })),
@@ -216,22 +287,43 @@ async function main(): Promise<void> {
 			await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", baseTip)
 
 			const gcRes = await gc.gc(REPO_ID, { graceSeconds: 0, maintain: false })
-			await repack.repack(REPO_ID)
+			if (gcRes.deletedObjects !== objs.length) {
+				throw new Error(
+					`round ${r}: GC deleted ${gcRes.deletedObjects}/${objs.length} newly orphaned objects`,
+				)
+			}
+			const repacked = await repack.repack(REPO_ID)
+			if (repacked.wholes + repacked.deltas !== 0) {
+				throw new Error(`round ${r}: repack unexpectedly wrote reachable encodings`)
+			}
 
 			const sizes = await sizesAll(db.sql)
+			for (const t of TABLES) requiredSize(sizes, t, `round ${r}`)
 			const agg = aggregate(await stats(db.sql, db.schema))
-			const dead = TABLES.reduce((n, t) => n + (agg[t]?.dead ?? 0), 0)
-			const autovac = TABLES.reduce((n, t) => n + (agg[t]?.autovac ?? 0), 0)
-			const total = TABLES.reduce((n, t) => n + (sizes[t]?.total ?? 0), 0)
+			const dead = TABLES.reduce((n, t) => n + requiredStat(agg, t, `round ${r}`).dead, 0)
+			const autovac = TABLES.reduce(
+				(n, t) => n + requiredStat(agg, t, `round ${r}`).autovac,
+				0,
+			)
+			const total = TABLES.reduce(
+				(n, t) => n + requiredSize(sizes, t, `round ${r}`).total,
+				0,
+			)
 			const wal = await walBytes(db.sql)
+			if (wal <= wal0)
+				throw new Error(`round ${r}: WAL counter did not record churn work`)
 			const hz = await horizon(db.sql)
-			if (hz.ageXids > 5000) horizonPinned = true
+			if (hz.ageXids > 5000) {
+				throw new Error(
+					`round ${r}: vacuum horizon became pinned by ${hz.ageXids} xids; refusing to score bloat`,
+				)
+			}
 			rounds.push({ autovac, dead, r, sizes })
 			if (r < 3 || (r + 1) % 5 === 0 || r === ROUNDS - 1) {
 				console.log(
-					`${padr(r, 6)} ${pad(mb(sizes.git_object?.total ?? 0), 8)} ${pad(mb(sizes.git_commit?.total ?? 0), 8)} ` +
-						`${pad(mb(sizes.git_pack_encoding?.total ?? 0), 8)} ${pad(mb(sizes.repo_file?.total ?? 0), 8)} ` +
-						`${pad((((sizes.git_ref?.total ?? 0) / 1000) | 0).toFixed(0), 7)} ${pad(mb(total), 8)} ${pad(dead, 8)} ` +
+					`${padr(r, 6)} ${pad(mb(requiredSize(sizes, "git_object", `round ${r}`).total), 8)} ${pad(mb(requiredSize(sizes, "git_commit", `round ${r}`).total), 9)} ` +
+						`${pad(mb(requiredSize(sizes, "git_pack_encoding", `round ${r}`).total), 8)} ${pad(mb(requiredSize(sizes, "repo_file", `round ${r}`).total), 8)} ` +
+						`${pad(((requiredSize(sizes, "git_ref", `round ${r}`).total / 1000) | 0).toFixed(0), 7)} ${pad(mb(total), 8)} ${pad(dead, 8)} ` +
 						`${pad(autovac, 8)} ${pad(gcRes.deletedObjects, 8)} ` +
 						`${pad(mb(wal - wal0), 8)} ${pad(hz.ageXids, 8)}`,
 				)
@@ -249,7 +341,8 @@ async function main(): Promise<void> {
 			select c.relname, c.reloptions
 			from pg_class c join pg_namespace n on n.oid = c.relnamespace
 			where n.nspname = ${db.schema} and c.relkind = 'r'
-				and (c.relname like 'git\\_object\\_p%' or c.relname like 'git\\_edge\\_p%'
+				and (c.relname like 'git\\_object\\_p%' or c.relname like 'git\\_commit\\_p%'
+					or c.relname like 'git\\_tag\\_p%'
 					or c.relname like 'git\\_pack\\_encoding\\_p%' or c.relname like 'repo\\_file\\_p%'
 					or c.relname in ('git_ref','repos'))
 			order by 1`
@@ -263,15 +356,32 @@ async function main(): Promise<void> {
 			`${padr("relation", 24)} ${pad("live", 8)} ${pad("dead", 8)} ${pad("threshold", 10)} ${pad("scale", 7)} ` +
 				`${pad("fires at", 10)} ${pad("autovac", 8)}  eligible?`,
 		)
-		const perTable = new Map<string, { need: number; dead: number; leaves: number }>()
+		const perTable = new Map<
+			string,
+			{ need: number; dead: number; eligible: boolean; leaves: number }
+		>()
 		for (const s of raw.filter((x) => !x.relname.startsWith("copy_stg"))) {
-			const thr = optOf(s.relname, "autovacuum_vacuum_threshold") ?? 50
-			const scale = optOf(s.relname, "autovacuum_vacuum_scale_factor") ?? 0.2
+			const thr = optOf(s.relname, "autovacuum_vacuum_threshold")
+			const scale = optOf(s.relname, "autovacuum_vacuum_scale_factor")
+			if (
+				thr === null ||
+				scale === null ||
+				!Number.isFinite(thr) ||
+				!Number.isFinite(scale)
+			) {
+				throw new Error(`${s.relname}: required autovacuum relation options are missing`)
+			}
 			const need = thr + scale * s.live
 			const base = s.relname.replace(/_p\d+$/, "")
-			const cur = perTable.get(base) ?? { dead: 0, leaves: 0, need: 0 }
+			const cur = perTable.get(base) ?? {
+				dead: 0,
+				eligible: false,
+				leaves: 0,
+				need: 0,
+			}
 			cur.need += need
 			cur.dead += s.dead
+			cur.eligible ||= s.dead >= need
 			cur.leaves++
 			perTable.set(base, cur)
 			// Only the occupied leaf (and the unpartitioned tables) carry any signal.
@@ -282,15 +392,56 @@ async function main(): Promise<void> {
 				)
 			}
 		}
+		const occupiedRows = await db.sql<
+			{ logical: string; occupied: string; rows: string }[]
+		>`
+			select logical, count(*)::text as occupied, sum(rows)::text as rows
+			from (
+				select 'git_object' as logical, tableoid, count(*) as rows from git_object group by tableoid
+				union all select 'git_commit', tableoid, count(*) from git_commit group by tableoid
+				union all select 'git_tag', tableoid, count(*) from git_tag group by tableoid
+				union all select 'git_pack_encoding', tableoid, count(*) from git_pack_encoding group by tableoid
+				union all select 'repo_file', tableoid, count(*) from repo_file group by tableoid
+			) occupied
+			group by logical`
+		for (const table of TABLES) {
+			const summary = perTable.get(table)
+			const expectedLeaves = table === "git_ref" || table === "repos" ? 1 : HASH_LEAVES
+			if (!summary || summary.leaves !== expectedLeaves) {
+				throw new Error(
+					`${table}: relation coverage leaves=${summary?.leaves ?? "missing"}/${expectedLeaves}`,
+				)
+			}
+			if (table !== "git_ref" && table !== "repos") {
+				const occupied = occupiedRows.find((row) => row.logical === table)
+				const expectedRows = expectedCounts[table]
+				if (
+					Number(occupied?.occupied ?? 0) !== (expectedRows === 0 ? 0 : 1) ||
+					Number(occupied?.rows ?? 0) !== expectedRows
+				) {
+					throw new Error(
+						`${table}: occupied-leaf census ${JSON.stringify(occupied)} does not prove ${expectedRows} rows in one hash leaf`,
+					)
+				}
+			}
+		}
 		// ── settle window: give autovacuum every chance ──────────────────────
 		console.log(`\n## settle window — ${SETTLE_S}s of idle (autovacuum_naptime is 60s)\n`)
 		const t0 = Date.now()
-		for (let waited = 0; waited < SETTLE_S; waited += 30) {
-			await sleep(30_000)
+		const settleMs = SETTLE_S * 1000
+		for (;;) {
+			const remainingMs = settleMs - (Date.now() - t0)
+			if (remainingMs <= 0) break
+			await sleep(Math.min(30_000, remainingMs))
 			const agg = aggregate(await stats(db.sql, db.schema))
-			const dead = TABLES.reduce((n, t) => n + (agg[t]?.dead ?? 0), 0)
-			const av = TABLES.reduce((n, t) => n + (agg[t]?.autovac ?? 0), 0)
+			const dead = TABLES.reduce((n, t) => n + requiredStat(agg, t, "settle").dead, 0)
+			const av = TABLES.reduce((n, t) => n + requiredStat(agg, t, "settle").autovac, 0)
 			const hz = await horizon(db.sql)
+			if (hz.ageXids > 5000) {
+				throw new Error(
+					`settle window: vacuum horizon became pinned by ${hz.ageXids} xids; refusing to score bloat`,
+				)
+			}
 			console.log(
 				`  t+${pad(((Date.now() - t0) / 1000).toFixed(0), 4)}s  dead=${pad(dead, 7)}  autovacuum_count=${pad(av, 4)}` +
 					`  horizon lag=${pad(hz.ageXids, 7)} xids, oldest open xact=${hz.oldestXactSeconds.toFixed(1)}s`,
@@ -305,6 +456,11 @@ async function main(): Promise<void> {
 		)
 		for (const b of hzNow.blockers) {
 			console.log(`  pid ${b.pid} db=${b.db} ${b.seconds.toFixed(0)}s — ${b.query}`)
+		}
+		if (hzNow.ageXids > 5000) {
+			throw new Error(
+				`vacuum horizon is pinned by ${hzNow.ageXids} xids after settling; refusing to score bloat`,
+			)
 		}
 		const occupied = (await stats(db.sql, db.schema))
 			.filter((s) => /^git_object_p\d+$/.test(s.relname) && s.dead > 0)
@@ -321,6 +477,11 @@ async function main(): Promise<void> {
 							`  >> measured under a pinned horizon says nothing about the tuning.`
 					: `  >> vacuum reclaimed cleanly; the horizon was free.`,
 			)
+			if (v.notRemovable > 0) {
+				throw new Error(
+					`VACUUM found ${v.notRemovable} dead tuples that the horizon made unremovable; refusing to score bloat`,
+				)
+			}
 		}
 
 		console.log(
@@ -329,23 +490,26 @@ async function main(): Promise<void> {
 		for (const [name, v] of perTable) {
 			console.log(
 				`${padr(name, 24)} ${pad(v.leaves, 7)} ${pad(v.dead, 11)} ${pad(v.need.toFixed(0), 13)}  ` +
-					`${v.dead >= v.need ? "some leaf eligible" : "no leaf eligible"}`,
+					`${v.eligible ? "some leaf eligible" : "no leaf eligible"}`,
 			)
 		}
 
 		// ── the three sizes ──────────────────────────────────────────────────
 		const asLeft = await sizesAll(db.sql)
+		for (const t of TABLES) requiredSize(asLeft, t, "as-left")
 		const statsLeft = aggregate(await stats(db.sql, db.schema))
 		for (const t of TABLES) await vacuumAnalyze(db.sql, t)
 		const afterVacuum = await sizesAll(db.sql)
+		for (const t of TABLES) requiredSize(afterVacuum, t, "after VACUUM")
 		for (const t of TABLES) await vacuumFull(db.sql, t)
 		const afterFull = await sizesAll(db.sql)
+		for (const t of TABLES) requiredSize(afterFull, t, "after VACUUM FULL")
 
 		// ── index bloat, specifically ────────────────────────────────────────
 		// btree VACUUM marks pages reusable but never returns them, and never
 		// re-densifies a page. So an index is the component that a plain VACUUM
 		// cannot fix and only REINDEX (or VACUUM FULL) can — the exact maintenance
-		// the drain declines to run.
+		// `maintain: false` declines to run.
 		const idxCommitLeft = await rawIndexSizes(db.sql, "git_commit")
 		const idxObjLeft = await rawIndexSizes(db.sql, "git_object")
 		const idxEncLeft = await rawIndexSizes(db.sql, "git_pack_encoding")
@@ -356,10 +520,28 @@ async function main(): Promise<void> {
 			const [c] = await db.sql.unsafe<{ n: string }[]>(
 				`select count(*)::text as n from ${t}`,
 			)
-			counts[t] = Number(c?.n ?? 0)
+			if (!c) throw new Error(`missing final row count for ${t}`)
+			counts[t] = Number(c.n)
+		}
+		const finalOids = (
+			await db.sql<
+				{ oid: string }[]
+			>`select encode(oid, 'hex') as oid from git_object order by oid`
+		).map((row) => row.oid)
+		const [finalRef] = await db.sql<{ oid: string }[]>`
+			select encode(oid, 'hex') as oid from git_ref where name = 'refs/heads/main'`
+		if (
+			!finalRef ||
+			finalRef.oid !== baseTip ||
+			finalOids.length !== expectedOids.length ||
+			finalOids.some((oid, i) => oid !== expectedOids[i])
+		) {
+			throw new Error("final Postgres refs/OIDs do not match canonical base after churn")
 		}
 
-		console.log(`\n## what the drain leaves behind vs what vacuum can reclaim\n`)
+		console.log(
+			`\n## what the candidate sequence leaves behind vs what vacuum can reclaim\n`,
+		)
 		console.log(
 			`the BASE column is the same reachable content, freshly pushed — every round since\n` +
 				`added and then reclaimed 20 commits, so the live row counts are identical to it.\n`,
@@ -370,19 +552,24 @@ async function main(): Promise<void> {
 		)
 		let failures = 0
 		for (const t of TABLES) {
-			const base = seedSizes[t]?.total ?? 0
-			const left = asLeft[t]?.total ?? 0
-			const vac = afterVacuum[t]?.total ?? 0
-			const full = afterFull[t]?.total ?? 0
-			const st = statsLeft[t]
-			const sameContent = (counts[t] ?? 0) === (seedCounts[t] ?? -1)
-			const vsBase = left / (base || 1)
+			const base = requiredSize(seedSizes, t, "base").total
+			const left = requiredSize(asLeft, t, "as-left").total
+			const vac = requiredSize(afterVacuum, t, "after VACUUM").total
+			const full = requiredSize(afterFull, t, "after VACUUM FULL").total
+			const st = requiredStat(statsLeft, t, "as-left")
+			const sameContent = counts[t] === seedCounts[t]
+			const vsBase = left / base
 			console.log(
-				`${padr(t, 19)} ${pad(counts[t] ?? 0, 9)} ${pad(seedCounts[t] ?? 0, 10)} ${pad(mb(base), 9)} ${pad(mb(left), 11)} ` +
+				`${padr(t, 19)} ${pad(counts[t] as number, 9)} ${pad(seedCounts[t] as number, 10)} ${pad(mb(base), 9)} ${pad(mb(left), 11)} ` +
 					`${pad(mb(vac), 11)} ${pad(mb(full), 12)} ${pad(vsBase.toFixed(2), 10)} ` +
-					`${pad(st?.dead ?? 0, 8)} ${pad(st?.autovac ?? 0, 8)}`,
+					`${pad(st.dead, 8)} ${pad(st.autovac, 8)}`,
 			)
-			if (sameContent && vsBase > BLOAT_THRESHOLD) failures++
+			if (!sameContent) {
+				throw new Error(
+					`${t} live rows changed across zero-net-content churn: ${seedCounts[t]} -> ${counts[t]}`,
+				)
+			}
+			if (vsBase > BLOAT_THRESHOLD) failures++
 		}
 
 		// ── index-only view: what VACUUM cannot fix ──────────────────────────
@@ -399,24 +586,24 @@ async function main(): Promise<void> {
 		for (const b of idxBefore) {
 			if (b.bytes < 100_000) continue
 			const a = idxAfter.find((x) => x.name === b.name)
+			if (!a || a.bytes <= 0) throw new Error(`rebuilt index census omitted ${b.name}`)
 			console.log(
-				`${padr(b.name, 34)} ${pad((b.bytes / 1000).toFixed(0), 12)} ${pad(((a?.bytes ?? 0) / 1000).toFixed(0), 12)} ` +
-					`${pad((b.bytes / Math.max(a?.bytes ?? 1, 1)).toFixed(2), 9)} ${pad((a?.tuples ?? 0).toFixed(0), 10)}`,
+				`${padr(b.name, 34)} ${pad((b.bytes / 1000).toFixed(0), 12)} ${pad((a.bytes / 1000).toFixed(0), 12)} ` +
+					`${pad((b.bytes / a.bytes).toFixed(2), 9)} ${pad(a.tuples.toFixed(0), 10)}`,
 			)
 		}
 		const idxLeftTotal = idxBefore.reduce((n, i) => n + i.bytes, 0)
 		const idxFullTotal = idxAfter.reduce((n, i) => n + i.bytes, 0)
+		if (idxLeftTotal <= 0 || idxFullTotal <= 0) {
+			throw new Error("index size census returned an empty denominator")
+		}
 		console.log(
-			`\nindexes total: ${mb(idxLeftTotal)} MB as the drain leaves them, ${mb(idxFullTotal)} MB rebuilt ` +
-				`= ${(idxLeftTotal / Math.max(idxFullTotal, 1)).toFixed(2)}× bloat.`,
+			`\nindexes total: ${mb(idxLeftTotal)} MB as the sequence leaves them, ${mb(idxFullTotal)} MB rebuilt ` +
+				`= ${(idxLeftTotal / idxFullTotal).toFixed(2)}× bloat.`,
 		)
 		console.log(
-			horizonPinned
-				? `A ratio near 1.00 here is NOT a clean bill: under a pinned horizon VACUUM FULL must\n` +
-						`copy the unremovable dead tuples too, so the "rebuilt" index is not a floor. The\n` +
-						`comparison only means something when the horizon is free.`
-				: `the drain runs no REINDEX, and plain VACUUM never re-densifies a btree page, so\n` +
-						`only this rebuild recovers whatever density the churn cost.`,
+			`the candidate sequence runs no REINDEX, and plain VACUUM never re-densifies a btree page, so\n` +
+				`only this rebuild recovers whatever density the churn cost.`,
 		)
 
 		console.log(`\n## component breakdown\n\nbase push (the reference state):\n`)
@@ -424,14 +611,23 @@ async function main(): Promise<void> {
 			`${padr("table", 19)} ${pad("heap MB", 8)} ${pad("toast MB", 8)} ${pad("index MB", 8)} ${pad("total MB", 9)}`,
 		)
 		for (const t of TABLES) console.log(sizeLine(t, seedSizes[t] as Sizes))
-		console.log(`\nas the drain leaves it after ${ROUNDS} rounds:\n`)
+		console.log(`\nas the candidate sequence leaves it after ${ROUNDS} rounds:\n`)
 		for (const t of TABLES) console.log(sizeLine(t, asLeft[t] as Sizes))
 		console.log(`\nafter VACUUM FULL (the rewrite floor):\n`)
 		for (const t of TABLES) console.log(sizeLine(t, afterFull[t] as Sizes))
 
-		const seedTotal = TABLES.reduce((n, t) => n + (seedSizes[t]?.total ?? 0), 0)
-		const leftTotal = TABLES.reduce((n, t) => n + (asLeft[t]?.total ?? 0), 0)
-		const fullTotal = TABLES.reduce((n, t) => n + (afterFull[t]?.total ?? 0), 0)
+		const seedTotal = TABLES.reduce(
+			(n, t) => n + requiredSize(seedSizes, t, "base").total,
+			0,
+		)
+		const leftTotal = TABLES.reduce(
+			(n, t) => n + requiredSize(asLeft, t, "as-left").total,
+			0,
+		)
+		const fullTotal = TABLES.reduce(
+			(n, t) => n + requiredSize(afterFull, t, "after VACUUM FULL").total,
+			0,
+		)
 		console.log(
 			`\nrepo total: ${mb(seedTotal)} MB after the base push → ${mb(leftTotal)} MB after ` +
 				`${ROUNDS} force-push cycles that added ZERO reachable content → ${mb(fullTotal)} MB compacted.`,
@@ -439,16 +635,9 @@ async function main(): Promise<void> {
 		console.log(
 			`\nEvery round pushed ${ADVANCE} commits and rewound them: the reachable set is ` +
 				`byte-identical to the base push (git_object rows ${counts.git_object}, same as the base),\n` +
-				`so ${mb(leftTotal - (seedSizes.git_object ? seedTotal : 0))} MB of the ${mb(leftTotal)} MB is churn residue ` +
+				`so ${mb(leftTotal - seedTotal)} MB of the ${mb(leftTotal)} MB is churn residue ` +
 				`— ${(leftTotal / seedTotal).toFixed(2)}× the content it holds.`,
 		)
-		if (horizonPinned) {
-			console.log(
-				`\n!! HORIZON WAS PINNED during this run (>5000 xids of lag). The trajectory above is\n` +
-					`!! valid, but it measures "vacuum could not reclaim", NOT "the tuning never fired".\n` +
-					`!! Re-run when no long transaction is open to separate the two.`,
-			)
-		}
 		if (failures > 0) process.exitCode = 1
 	} finally {
 		await db.drop()

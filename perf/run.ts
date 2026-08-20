@@ -1,18 +1,13 @@
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
+import { integerFlag, optionalFlag } from "./args"
 import { runScenario } from "./harness"
 import { printSummary, writeReport } from "./report"
 import { SCENARIOS } from "./scenarios"
 
 /** Read `--key=value` from argv. */
-function arg(name: string): string | undefined {
-	const prefix = `--${name}=`
-	const found = process.argv.find((a) => a.startsWith(prefix))
-	return found?.slice(prefix.length)
-}
-
 async function main(): Promise<void> {
-	const name = arg("scenario") ?? "markdown"
+	const name = optionalFlag("scenario") ?? "markdown"
 	const base = SCENARIOS[name]
 	if (!base) {
 		throw new Error(
@@ -21,14 +16,19 @@ async function main(): Promise<void> {
 	}
 	const scenario = {
 		...base,
-		blobCount: Number(arg("blobs") ?? base.blobCount),
-		churn: Number(arg("churn") ?? base.churn),
-		historyLen: Number(arg("history") ?? base.historyLen),
+		blobCount: integerFlag("blobs", base.blobCount, { min: 1 }),
+		churn: integerFlag("churn", base.churn, { min: 0 }),
+		historyLen: integerFlag("history", base.historyLen, { min: 1 }),
 	}
-	const seed = Number(arg("seed") ?? 1)
-	const repeat = Number(arg("repeat") ?? 1)
-	const rttArg = arg("rtt")
-	const rttMs = rttArg !== undefined ? Number(rttArg) : null
+	if (scenario.churn > scenario.blobCount) {
+		throw new Error(
+			`--churn (${scenario.churn}) cannot exceed --blobs (${scenario.blobCount})`,
+		)
+	}
+	const seed = integerFlag("seed", 1, { min: 0 })
+	const repeat = integerFlag("repeat", 1, { min: 1 })
+	const rttArg = optionalFlag("rtt")
+	const rttMs = rttArg === undefined ? null : integerFlag("rtt", 1, { min: 1 })
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-")
 	const outDir = join("perf", "runs", `${name}-${stamp}`)
 	mkdirSync(outDir, { recursive: true })

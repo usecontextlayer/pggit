@@ -2,12 +2,7 @@
  * PROBE: how many Postgres round-trips does ONE repack pass take, and what does
  * that cost when the database is not on loopback?
  *
- * Design concern C3 / work item W2 carry an UNVERIFIED estimate ("14k reads ×
- * ~30 ms ≈ 7 min"). This measures the multiplier instead of guessing it:
- * `createRepack` is handed a porsager client built with the driver's public
- * `debug` hook, which fires once per query execution, so the count is exact and
- * nothing inside pggit is touched. The same is done for a full clone off the wire
- * and for one gc pass, so the drain's three phases can be compared.
+ * Design concern C3 carries an UNVERIFIED estimate ("14k reads × ~30 ms ≈ 7 min"). This probe invokes `createRepack` directly — the production drain currently runs GC only — and measures the multiplier instead of guessing it. A porsager client built with the driver's public `debug` hook counts each query execution exactly without touching pggit internals. The same is done for a full clone off the wire and for one GC pass, so explicit maintenance work can be compared with the serve path.
  *
  * The modeled columns are count × RTT — the honest lower bound for a serialized
  * request/response workload (every read here is awaited before the next is
@@ -23,16 +18,24 @@ import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { allObjectOids, revParse } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { cleanupTmp, flag, mkTmp, PG_URL, secs, seedRepo, table } from "./_perf-util"
+import {
+	cleanupTmp,
+	increasingIntegerListFlag,
+	mkTmp,
+	PG_URL,
+	secs,
+	seedRepo,
+	table,
+} from "./_perf-util"
 
-const SIZES = flag("sizes", "250,500,1000,2000").split(",").map(Number)
+const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
 /** Round-trip times to model: loopback, same-region managed PG, cross-region. */
 const RTTS = [1, 15, 30]
 /** Modeled minutes for ONE repo at 30 ms RTT above which this is called broken.
- * Two minutes is one repo of a fleet the drain walks serially — the provisioning
- * window W2 asks for is sized by this number. */
+ * Two minutes is the per-repository budget for one explicitly invoked repack. */
 const MODELED_MINUTES_LIMIT = 2
 
 type Counter = { n: number; byShape: Map<string, number> }
@@ -68,32 +71,82 @@ async function measure(n: number): Promise<Row> {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
 			const seeded = await seedRepo(db.sql, "probe/rt", src)
+			const expectedOids = await allObjectOids(src)
+			const expectedTip = await revParse(src, "refs/heads/main")
+			if (seeded.objects !== expectedOids.length) {
+				throw new Error(
+					`seeded ${seeded.objects} objects, expected ${expectedOids.length}`,
+				)
+			}
 
 			const repackC = countingClient(db.schema)
-			const t0 = Date.now()
-			await createRepack(repackC.sql).repack("probe/rt")
-			const repackMs = Date.now() - t0
-			await repackC.sql.end()
+			const { repacked, repackMs } = await (async () => {
+				const t0 = Date.now()
+				try {
+					return {
+						repacked: await createRepack(repackC.sql).repack("probe/rt"),
+						repackMs: Date.now() - t0,
+					}
+				} finally {
+					await repackC.sql.end()
+				}
+			})()
+			if (repacked.wholes + repacked.deltas !== seeded.objects || repackC.c.n <= 0) {
+				throw new Error(
+					`repack coverage/queries invalid: ${repacked.wholes + repacked.deltas}/${seeded.objects}, q=${repackC.c.n}`,
+				)
+			}
 
 			const cloneC = countingClient(db.schema)
-			const server = await serveOnPort(createGitApp(createGitDeps(cloneC.sql)), 0)
-			const dest = join(mkTmp(`rt-clone-${n}`), "c")
-			mkdirSync(dest, { recursive: true })
-			await spawnGit([
-				"-c",
-				"protocol.version=2",
-				"clone",
-				"-q",
-				"--bare",
-				`http://127.0.0.1:${server.port}/probe/rt`,
-				dest,
-			])
-			await server.close()
-			await cloneC.sql.end()
+			let server: Awaited<ReturnType<typeof serveOnPort>> | undefined
+			try {
+				server = await serveOnPort(createGitApp(createGitDeps(cloneC.sql)), 0)
+				const dest = join(mkTmp(`rt-clone-${n}`), "c")
+				mkdirSync(dest, { recursive: true })
+				await spawnGit([
+					"-c",
+					"protocol.version=2",
+					"clone",
+					"-q",
+					"--bare",
+					`http://127.0.0.1:${server.port}/probe/rt`,
+					dest,
+				])
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+				const gotOids = await allObjectOids(dest)
+				const gotTip = await revParse(dest, "refs/heads/main")
+				if (
+					gotTip !== expectedTip ||
+					gotOids.length !== expectedOids.length ||
+					gotOids.some((oid, i) => oid !== expectedOids[i])
+				) {
+					throw new Error("clone diverged from canonical git ref tip/object set")
+				}
+			} finally {
+				try {
+					await server?.close()
+				} finally {
+					await cloneC.sql.end()
+				}
+			}
+			if (cloneC.c.n <= 0) throw new Error("clone query counter observed no queries")
 
 			const gcC = countingClient(db.schema)
-			await createGc(gcC.sql).gc("probe/rt", { graceSeconds: 0, maintain: false })
-			await gcC.sql.end()
+			const swept = await (async () => {
+				try {
+					return await createGc(gcC.sql).gc("probe/rt", {
+						graceSeconds: 0,
+						maintain: false,
+					})
+				} finally {
+					await gcC.sql.end()
+				}
+			})()
+			if (swept.deletedObjects !== 0 || swept.epoch !== "rebuilt" || gcC.c.n <= 0) {
+				throw new Error(
+					`completed GC receipt invalid: deleted=${swept.deletedObjects}, epoch=${swept.epoch}, q=${gcC.c.n}`,
+				)
+			}
 
 			const top = [...repackC.c.byShape.entries()]
 				.sort((a, b) => b[1] - a[1])
@@ -121,7 +174,7 @@ async function main(): Promise<void> {
 	const rows: Row[] = []
 	for (const n of SIZES) rows.push(await measure(n))
 
-	console.log("# Postgres round-trips per drain phase (append-only repo)\n")
+	console.log("# Postgres round-trips per explicit operation (append-only repo)\n")
 	console.log(
 		table(
 			[

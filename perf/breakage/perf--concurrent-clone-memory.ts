@@ -4,10 +4,10 @@
  * one client clones at once, and what does canonical git spend serving the same
  * clones?
  *
- * The pggit side is sampled in-process (`process.memoryUsage().rss`, 25 ms). The
- * git side is sampled from the OS: the summed RSS of every live `upload-pack` /
- * `pack-objects` process while the same number of `git clone file://` run
- * concurrently. Both serve the identical object set.
+ * The pggit side is sampled off-thread from process-wide RSS. The git side is
+ * sampled from the OS: the summed RSS of the fixture's own `upload-pack` process
+ * trees while the same number of `git clone file://` run concurrently. Both serve
+ * the identical object set.
  *
  * Shape: successive whole versions of a large binary file — the repo shape that
  * makes the served pack big (see perf--blob-delta-gap.ts).
@@ -21,14 +21,26 @@ import { join } from "node:path"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
+import { allObjectOids, revParse } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
-import { cleanupTmp, flag, mb, mkTmp, PG_URL, secs, seedRepo, table } from "./_perf-util"
+import {
+	cleanupTmp,
+	increasingIntegerListFlag,
+	mb,
+	mkTmp,
+	PG_URL,
+	positiveIntegerFlag,
+	secs,
+	seedRepo,
+	table,
+	withPeakRss,
+} from "./_perf-util"
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const CONC = flag("conc", "1,2,4").split(",").map(Number)
-const VERSIONS = Number(flag("versions", "15"))
+const CONC = increasingIntegerListFlag("conc", [1, 2, 4])
+const VERSIONS = positiveIntegerFlag("versions", 15)
 const BLOB_BYTES = 4_000_000
 const REPO_ID = "probe/conc"
 /** MB of server RSS per concurrent clone above which this is called broken. */
@@ -74,16 +86,46 @@ function stream(): Buffer {
 	return Buffer.concat(parts)
 }
 
-/** Summed RSS (bytes) of every live git pack-serving process. */
-function gitServerRss(): number {
-	const out = execSync("ps -axo rss=,command= || true").toString()
-	let total = 0
-	for (const line of out.split("\n")) {
-		if (!/pack-objects|upload-pack/.test(line)) continue
-		const kb = Number(line.trim().split(/\s+/)[0])
-		if (Number.isFinite(kb)) total += kb * 1024
+type ProcessRow = { pid: number; parentPid: number; rssKb: number; command: string }
+
+/** Summed RSS of this fixture's upload-pack roots and every descendant pack worker. */
+function gitServerRss(bareDir: string): number {
+	const rows: ProcessRow[] = []
+	for (const line of execSync("ps -axo pid=,ppid=,rss=,command=")
+		.toString()
+		.split("\n")) {
+		if (line.trim() === "") continue
+		const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/)
+		if (!match) throw new Error(`unexpected ps row: ${line}`)
+		rows.push({
+			command: match[4] as string,
+			parentPid: Number(match[2]),
+			pid: Number(match[1]),
+			rssKb: Number(match[3]),
+		})
 	}
-	return total
+	const fixturePids = new Set(
+		rows
+			.filter(
+				(row) =>
+					/(?:git-)?upload-pack/.test(row.command) && row.command.includes(bareDir),
+			)
+			.map((row) => row.pid),
+	)
+	let changed = true
+	while (changed) {
+		changed = false
+		for (const row of rows) {
+			if (!fixturePids.has(row.pid) && fixturePids.has(row.parentPid)) {
+				fixturePids.add(row.pid)
+				changed = true
+			}
+		}
+	}
+	return rows.reduce(
+		(total, row) => total + (fixturePids.has(row.pid) ? row.rssKb * 1024 : 0),
+		0,
+	)
 }
 
 async function main(): Promise<void> {
@@ -94,72 +136,118 @@ async function main(): Promise<void> {
 	const bare = join(mkTmp("conc-bare"), "remote.git")
 	await spawnGit(["clone", "--bare", "-q", src, bare], { cwd: "/tmp" })
 	await spawnGit(["repack", "-adf", "-q"], { cwd: bare })
+	const expectedOids = await allObjectOids(src)
+	const expectedTip = await revParse(src, "refs/heads/main")
+	const verify = async (dest: string): Promise<void> => {
+		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+		const oids = await allObjectOids(dest)
+		const tip = await revParse(dest, "refs/heads/main")
+		if (
+			tip !== expectedTip ||
+			oids.length !== expectedOids.length ||
+			oids.some((oid, i) => oid !== expectedOids[i])
+		) {
+			throw new Error(`clone ${dest} diverged from canonical refs/object set`)
+		}
+	}
 
 	const db = await createIsolatedSchema(PG_URL)
 	const rows: (string | number)[][] = []
 	let perClone = 0
 	try {
 		const seeded = await seedRepo(db.sql, REPO_ID, src)
-		await createRepack(db.sql).repack(REPO_ID)
-		const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-
-		for (const conc of CONC) {
-			// --- pggit: in-process RSS while N clients clone at once -----------
-			globalThis.gc?.()
-			await new Promise((r) => setTimeout(r, 50))
-			const base = process.memoryUsage().rss
-			let peak = base
-			const t1 = setInterval(() => {
-				const r = process.memoryUsage().rss
-				if (r > peak) peak = r
-			}, 25)
-			const t0 = Date.now()
-			await Promise.all(
-				Array.from({ length: conc }, (_, i) => {
-					const dest = join(mkTmp(`conc-pggit-${conc}-${i}`), "c")
-					return spawnGit([
-						"-c",
-						"protocol.version=2",
-						"clone",
-						"-q",
-						"--bare",
-						`http://127.0.0.1:${server.port}/${REPO_ID}`,
-						dest,
-					])
-				}),
-			)
-			const pggitMs = Date.now() - t0
-			clearInterval(t1)
-			const pggitRss = peak - base
-
-			// --- git: summed RSS of its pack-serving processes ------------------
-			let gitPeak = 0
-			const t2 = setInterval(() => {
-				const r = gitServerRss()
-				if (r > gitPeak) gitPeak = r
-			}, 25)
-			const g0 = Date.now()
-			await Promise.all(
-				Array.from({ length: conc }, (_, i) => {
-					const dest = join(mkTmp(`conc-git-${conc}-${i}`), "c")
-					return spawnGit(["clone", "-q", "--bare", "--no-local", `file://${bare}`, dest])
-				}),
-			)
-			const gitMs = Date.now() - g0
-			clearInterval(t2)
-
-			perClone = Math.max(perClone, pggitRss / conc / 1_000_000)
-			rows.push([
-				conc,
-				secs(pggitMs),
-				mb(pggitRss),
-				mb(pggitRss / conc),
-				secs(gitMs),
-				mb(gitPeak),
-				mb(gitPeak / conc),
-			])
+		if (seeded.objects !== expectedOids.length) {
+			throw new Error(`seeded ${seeded.objects} objects, expected ${expectedOids.length}`)
 		}
-		await server.close()
+		const repacked = await createRepack(db.sql).repack(REPO_ID)
+		if (repacked.wholes + repacked.deltas !== seeded.objects) {
+			throw new Error(
+				`repack covered ${repacked.wholes + repacked.deltas}/${seeded.objects} objects`,
+			)
+		}
+		const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+		try {
+			for (const conc of CONC) {
+				// --- pggit: in-process RSS while N clients clone at once -----------
+				if (typeof globalThis.gc !== "function") {
+					throw new Error("memory measurement requires NODE_OPTIONS=--expose-gc")
+				}
+				globalThis.gc()
+				globalThis.gc()
+				await new Promise((r) => setTimeout(r, 50))
+				const pggitDests = Array.from({ length: conc }, (_, i) =>
+					join(mkTmp(`conc-pggit-${conc}-${i}`), "c"),
+				)
+				const pggitRun = await withPeakRss(() =>
+					Promise.all(
+						pggitDests.map((dest) =>
+							spawnGit([
+								"-c",
+								"protocol.version=2",
+								"clone",
+								"-q",
+								"--bare",
+								`http://127.0.0.1:${server.port}/${REPO_ID}`,
+								dest,
+							]),
+						),
+					),
+				)
+				const pggitRss = pggitRun.peakRss - pggitRun.baseRss
+				if (pggitRss <= 0) {
+					throw new Error(
+						`pggit RSS peak did not exceed baseline at concurrency ${conc}: ${pggitRun.peakRss} <= ${pggitRun.baseRss}`,
+					)
+				}
+				for (const dest of pggitDests) await verify(dest)
+
+				// --- git: summed RSS of its pack-serving processes ------------------
+				let gitPeak = 0
+				let gitSampleError: unknown
+				const t2 = setInterval(() => {
+					try {
+						const r = gitServerRss(bare)
+						if (r > gitPeak) gitPeak = r
+					} catch (error) {
+						gitSampleError = error
+					}
+				}, 25)
+				const g0 = Date.now()
+				const gitDests = Array.from({ length: conc }, (_, i) =>
+					join(mkTmp(`conc-git-${conc}-${i}`), "c"),
+				)
+				try {
+					await Promise.all(
+						gitDests.map((dest) =>
+							spawnGit(["clone", "-q", "--bare", "--no-local", `file://${bare}`, dest]),
+						),
+					)
+				} finally {
+					clearInterval(t2)
+				}
+				const gitMs = Date.now() - g0
+				if (gitSampleError !== undefined) throw gitSampleError
+				for (const dest of gitDests) await verify(dest)
+				if (gitPeak <= 0) {
+					throw new Error(
+						`canonical RSS sampler missed every fixture process at concurrency ${conc}`,
+					)
+				}
+
+				perClone = Math.max(perClone, pggitRss / conc / 1_000_000)
+				rows.push([
+					conc,
+					secs(pggitRun.ms),
+					mb(pggitRss),
+					mb(pggitRss / conc),
+					secs(gitMs),
+					mb(gitPeak),
+					mb(gitPeak / conc),
+				])
+			}
+		} finally {
+			await server.close()
+		}
 		console.log(
 			`# concurrent clones — ${VERSIONS} whole versions of a ${mb(BLOB_BYTES)} MB file (${mb(seeded.rawBytes)} MB raw)\n`,
 		)

@@ -60,16 +60,17 @@ function buildStream(s: Scenario, rnd: () => number): string {
 
 	// Commits 1..historyLen-1: churn a deterministic subset (new blob versions).
 	for (let c = 1; c < s.historyLen; c++) {
-		const changed: number[] = []
-		for (let k = 0; k < s.churn; k++) {
+		const changed = new Set<number>()
+		while (changed.size < s.churn) {
 			const i = Math.floor(rnd() * s.blobCount)
+			if (changed.has(i)) continue
 			blobMark[i] = emitBlob(blobContent(`f${i}-v${c}`, s, rnd))
-			changed.push(i)
+			changed.add(i)
 		}
-		prev = emitCommit(`c${c}`, prev, changed)
+		prev = emitCommit(`c${c}`, prev, [...changed])
 	}
 
-	// Extra branch refs (stresses ls-refs / negotiation in the adversarial shape).
+	// Extra branch aliases exercise advertisement/ref cardinality; identical tips are one negotiation want.
 	for (let r = 0; r < s.refCount; r++) {
 		out.push(`reset refs/heads/branch${r}\nfrom :${prev}\n`)
 	}

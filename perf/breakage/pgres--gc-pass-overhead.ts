@@ -9,7 +9,7 @@
  *
  * 1. Tier-presence overhead on a no-op pass — now a REGRESSION GUARD: with no
  *    sweep left, the tier's presence should add ~nothing to a pass that reclaims
- *    nothing. The paired twin-repo bound (≤15%) must hold trivially; it firing
+ *    nothing. The paired same-repo bound (≤15%) must hold; it firing
  *    again means someone reintroduced per-pass tier work.
  *
  * 2. Staging-table catalog churn — still real, mechanism changed: a TEMP table is
@@ -18,9 +18,9 @@
  *    `pg_depend`, …), which are shared by every schema and never touched by
  *    `maintain()`. Measured here as catalog rows churned per GC pass.
  *
- * Also asserted: after the loop, ZERO `gc_live_%` relations remain in the
- * harness's own schema (TEMP tables live in `pg_temp` and die with their
- * sessions, so any survivor here means the design regressed to schema tables).
+ * Also asserted: after every fleet and scale pass, ZERO `gc_live_%` relations
+ * remain in the harness's own schema (TEMP tables live in `pg_temp`, so any
+ * survivor here means the design regressed to schema tables).
  *
  * NOISE: `pg_stat_sys_tables` counters are DATABASE-wide and this Postgres is
  * shared, so an idle control window of the same duration is measured and printed
@@ -28,10 +28,10 @@
  * anything.
  *
  * FAILURE BOUND (non-zero exit): any `gc_live_%` relation survives the loop, OR
- * — from the PAIRED TWIN-REPO sweep, whose two arms are byte-identical repos
- * measured in alternation so drift cancels — the tier's presence adds more than
- * 15% to a no-op pass. The 120-pass arm above it is reported for context but NOT
- * bounded: its two halves run in blocks minutes apart, and this shared box
+ * — from the paired same-repo sweep, measured before and after complete tier
+ * production — the tier's presence adds more than
+ * 15% to a no-op pass. The unpaired fleet arm above it is reported for context but
+ * NOT bounded: its two halves run in blocks minutes apart, and this shared box
  * drifts by more than the effect, which flipped sign between runs.
  *
  *   npx tsx perf/breakage/pgres--gc-pass-overhead.ts --passes=120 --repos=12
@@ -75,15 +75,19 @@ async function catalogState(pg: Sql): Promise<Catalog> {
 			left join pg_stat_sys_tables s on s.relid = c.oid
 		where n.nspname = 'pg_catalog'
 			and c.relname in ('pg_class','pg_attribute','pg_type','pg_depend','pg_index','pg_constraint','pg_shdepend')`
+	if (!r) throw new Error("system-catalog census returned no row")
 	return {
-		del: Number(r?.del ?? 0),
-		ins: Number(r?.ins ?? 0),
-		size: Number(r?.size ?? 0),
-		upd: Number(r?.upd ?? 0),
+		del: Number(r.del),
+		ins: Number(r.ins),
+		size: Number(r.size),
+		upd: Number(r.upd),
 	}
 }
 
 async function main(): Promise<void> {
+	if (PASSES < 1 || REPOS < 1 || COMMITS < 1) {
+		throw new Error("passes, repos, and commits must be positive")
+	}
 	const iso = await createIsolatedSchema(PG_URL)
 	let failed = false
 	try {
@@ -91,7 +95,8 @@ async function main(): Promise<void> {
 		const gc = createGc(pg)
 		const repack = createRepack(pg)
 
-		// A small fleet of repos — the drain's real shape (one pass per repo per tick).
+		// A small fleet modeling one scheduler tick whose eligible set contains these
+		// repos. The production scheduler runs GC only for repos selected by that tick.
 		const dir = await initRepo("gcpass")
 		await fastImport(
 			dir,
@@ -105,6 +110,7 @@ async function main(): Promise<void> {
 		)
 		const tip = await revParse(dir, "refs/heads/main")
 		const objects = await objectsBetween(dir, tip, [])
+		if (objects.length === 0) throw new Error("fixture produced no objects")
 		const names = Array.from({ length: REPOS }, (_, i) => `fleet-${i}`)
 		for (const n of names) {
 			await seedObjects(pg, n, objects)
@@ -113,15 +119,21 @@ async function main(): Promise<void> {
 
 		// ── C2: the cost of a NO-OP pass, tier absent vs tier present ───────────
 		// A pass over a repo with nothing unreachable reclaims nothing; what is left
-		// is the fixed cost — staging table create/truncate/drop, the closure walk,
-		// and the three sweeps (objects, edges, encodings).
+		// is the fixed cost — the TEMP live table, reachability plan, and object sweep.
 		const noop = async (rounds: number): Promise<number[]> => {
 			const out: number[] = []
 			for (let i = 0; i < rounds; i++) {
 				const name = names[i % names.length] as string
 				const t = Date.now()
-				await gc.gc(name, { graceSeconds: 3600, maintain: false })
-				out.push(Date.now() - t)
+				const result = await gc.gc(name, { graceSeconds: 3600, maintain: false })
+				if (result.deletedObjects !== 0) {
+					throw new Error(`${name}: no-op GC deleted ${result.deletedObjects} objects`)
+				}
+				const elapsed = Date.now() - t
+				if (!Number.isFinite(elapsed) || elapsed <= 0) {
+					throw new Error(`${name}: no-op GC returned invalid timing ${elapsed} ms`)
+				}
+				out.push(elapsed)
 			}
 			return out
 		}
@@ -139,18 +151,42 @@ async function main(): Promise<void> {
 		const c2 = await catalogState(pg)
 
 		// Now build the tier on every repo and repeat the identical loop.
-		for (const n of names) await repack.repack(n)
+		for (const n of names) {
+			const result = await repack.repack(n)
+			if (result.wholes + result.deltas !== objects.length) {
+				throw new Error(`${n}: repack covered incomplete object set`)
+			}
+		}
+		const [fleetTier] = await pg<
+			{ n: string }[]
+		>`select count(*)::text as n from git_pack_encoding`
+		if (!fleetTier || Number(fleetTier.n) !== names.length * objects.length) {
+			throw new Error(
+				`fleet tier has ${fleetTier?.n ?? "no count"}/${names.length * objects.length} rows`,
+			)
+		}
 		await noop(REPOS)
 		const c3 = await catalogState(pg)
 		const t1 = Date.now()
 		const withTier = await noop(PASSES)
 		const withMs = Date.now() - t1
 		const c4 = await catalogState(pg)
-
-		// ── leftovers ──────────────────────────────────────────────────────────
-		const left = await pg<{ relname: string }[]>`
-			select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace
-			where n.nspname = ${iso.schema} and c.relname like 'gc\\_live\\_%'`
+		const bareMedian = median(bare)
+		const withTierMedian = median(withTier)
+		if (
+			!Number.isFinite(bareMs) ||
+			bareMs <= 0 ||
+			!Number.isFinite(withMs) ||
+			withMs <= 0 ||
+			!Number.isFinite(bareMedian) ||
+			bareMedian <= 0 ||
+			!Number.isFinite(withTierMedian) ||
+			withTierMedian <= 0
+		) {
+			throw new Error(
+				`fleet timings must be positive: ${JSON.stringify({ bareMedian, bareMs, withMs, withTierMedian })}`,
+			)
+		}
 
 		console.log("# GC pass: fixed cost and catalog churn\n")
 		console.log(
@@ -163,35 +199,42 @@ async function main(): Promise<void> {
 					[
 						"tier ABSENT (never repacked)",
 						bare.length,
-						median(bare).toFixed(1),
-						[...bare].sort((a, b) => a - b)[Math.floor(bare.length * 0.95)] ?? 0,
+						bareMedian.toFixed(1),
+						[...bare].sort((a, b) => a - b)[Math.floor(bare.length * 0.95)] as number,
 						bareMs,
 						(bareMs / bare.length).toFixed(1),
 					],
 					[
 						"tier PRESENT (repacked)",
 						withTier.length,
-						median(withTier).toFixed(1),
-						[...withTier].sort((a, b) => a - b)[Math.floor(withTier.length * 0.95)] ?? 0,
+						withTierMedian.toFixed(1),
+						[...withTier].sort((a, b) => a - b)[
+							Math.floor(withTier.length * 0.95)
+						] as number,
 						withMs,
 						(withMs / withTier.length).toFixed(1),
 					],
 				],
 			),
 		)
-		const overhead = median(withTier) / median(bare) - 1
+		const overhead = withTierMedian / bareMedian - 1
 		console.log(
-			`\ntier-presence overhead on a NO-OP pass (regression guard; the sweep itself is gone, D14): ${(overhead * 100).toFixed(0)}% (median ${median(bare).toFixed(1)} → ${median(withTier).toFixed(1)} ms)`,
+			`\ntier-presence overhead on a NO-OP pass (regression guard; the sweep itself is gone, D14): ${(overhead * 100).toFixed(0)}% (median ${bareMedian.toFixed(1)} → ${withTierMedian.toFixed(1)} ms)`,
 		)
 
 		console.log("\n## system-catalog churn (DATABASE-wide — noisy, control included)\n")
-		const rate = (a: Catalog, b: Catalog, n: number): (string | number)[] => [
-			((b.ins - a.ins) / n).toFixed(1),
-			((b.del - a.del) / n).toFixed(1),
-			((b.upd - a.upd) / n).toFixed(1),
-			((b.size - a.size) / 1024).toFixed(0),
-			((b.size - a.size) / 1024 / n).toFixed(1),
-		]
+		const rate = (a: Catalog, b: Catalog, n: number): (string | number)[] => {
+			if (!Number.isFinite(n) || n <= 0) {
+				throw new Error(`catalog rate requires a positive pass count, got ${n}`)
+			}
+			return [
+				((b.ins - a.ins) / n).toFixed(1),
+				((b.del - a.del) / n).toFixed(1),
+				((b.upd - a.upd) / n).toFixed(1),
+				((b.size - a.size) / 1024).toFixed(0),
+				((b.size - a.size) / 1024 / n).toFixed(1),
+			]
+		}
 		console.log(
 			table(
 				[
@@ -210,13 +253,13 @@ async function main(): Promise<void> {
 			),
 		)
 		console.log(
-			"\nEvery GC pass creates and drops one `gc_live` TEMP table (D12; the old shared `gc_live_<id>` UNLOGGED table is gone). The create/drop cycle still churns catalog rows in pg_class/pg_attribute/pg_depend — shared by every repo and schema in the database, never vacuumed by `maintain()`, produced once per repo per drain interval.",
+			"\nEvery GC invocation creates and drops one `gc_live` TEMP table (D12; the old shared `gc_live_<id>` UNLOGGED table is gone). The create/drop cycle still churns catalog rows in pg_class/pg_attribute/pg_depend — shared by every repo and schema in the database, never vacuumed by `maintain()`. In production, the scheduler invokes GC only for repos eligible in that tick.",
 		)
 
 		// ── does the no-op sweep cost scale with the tier's SIZE? ───────────────
 		console.log("\n## does the fixed per-pass cost scale with the tier?\n")
 		const scale: (string | number)[][] = []
-		let pairedOverhead = 0
+		let worstPairedOverhead = Number.NEGATIVE_INFINITY
 		// Append-only history: tree bytes grow quadratically and so does the GC closure
 		// walk, so these stay small enough that ~14 passes per size fit the budget.
 		for (const size of [120, 360, 1000]) {
@@ -234,21 +277,47 @@ async function main(): Promise<void> {
 			)
 			const stip = await revParse(sdir, "refs/heads/main")
 			const sobjs = await objectsBetween(sdir, stip, [])
+			if (sobjs.length === 0) throw new Error(`${repo}: fixture produced no objects`)
 			await seedObjects(pg, repo, sobjs)
 			await setMain(pg, repo, stip)
 
 			const timeNoop = async (n: number): Promise<number> => {
+				if (!Number.isFinite(n) || n <= 0) {
+					throw new Error(`${repo}: timing requires a positive pass count, got ${n}`)
+				}
 				const xs: number[] = []
 				for (let i = 0; i < n; i++) {
 					const t = Date.now()
-					await gc.gc(repo, { graceSeconds: 3600, maintain: false })
-					xs.push(Date.now() - t)
+					const result = await gc.gc(repo, { graceSeconds: 3600, maintain: false })
+					if (result.deletedObjects !== 0) {
+						throw new Error(`${repo}: no-op GC deleted ${result.deletedObjects} objects`)
+					}
+					const elapsed = Date.now() - t
+					if (!Number.isFinite(elapsed) || elapsed <= 0) {
+						throw new Error(`${repo}: no-op GC returned invalid timing ${elapsed} ms`)
+					}
+					xs.push(elapsed)
 				}
-				return median(xs)
+				const measured = median(xs)
+				if (!Number.isFinite(measured) || measured <= 0) {
+					throw new Error(`${repo}: median timing must be positive, got ${measured}`)
+				}
+				return measured
 			}
 			await timeNoop(2)
 			const bareMed = await timeNoop(5)
-			await repack.repack(repo)
+			const scaled = await repack.repack(repo)
+			if (scaled.wholes + scaled.deltas !== sobjs.length) {
+				throw new Error(`${repo}: repack covered incomplete object set`)
+			}
+			const [tierRows] = await pg<{ n: string }[]>`
+				select count(*)::text as n from git_pack_encoding e
+				join repos r on r.id = e.repo_id where r.name = ${repo}`
+			if (!tierRows || Number(tierRows.n) !== sobjs.length) {
+				throw new Error(
+					`${repo}: tier has ${tierRows?.n ?? "no count"}/${sobjs.length} rows`,
+				)
+			}
 			await timeNoop(2)
 			const tierMed = await timeNoop(5)
 			scale.push([
@@ -258,7 +327,10 @@ async function main(): Promise<void> {
 				(tierMed - bareMed).toFixed(1),
 				`${(((tierMed - bareMed) / bareMed) * 100).toFixed(0)}%`,
 			])
-			pairedOverhead = (tierMed - bareMed) / bareMed
+			worstPairedOverhead = Math.max(worstPairedOverhead, (tierMed - bareMed) / bareMed)
+		}
+		if (!Number.isFinite(worstPairedOverhead)) {
+			throw new Error("paired overhead measurement produced no finite result")
 		}
 		console.log(
 			table(
@@ -275,19 +347,24 @@ async function main(): Promise<void> {
 		const first = scale[0] as (string | number)[]
 		const last = scale[scale.length - 1] as (string | number)[]
 		console.log(
-			`\nadded cost went ${Number(first[3]).toFixed(0)} ms → ${Number(last[3]).toFixed(0)} ms while the tier grew ${(Number(last[0]) / Number(first[0])).toFixed(1)}× — a no-op sweep must walk the repo's whole encoding tier before it can conclude the batch is empty (the \`limit\` applies AFTER the filter).`,
+			`\nadded cost went ${Number(first[3]).toFixed(0)} ms → ${Number(last[3]).toFixed(0)} ms while the tier grew ${(Number(last[0]) / Number(first[0])).toFixed(1)}×. No GC query should scan that tier; this is the regression signal the 15% bound protects.`,
 		)
 
+		// Query after the scale passes too: every GC invocation above is in scope.
+		const left = await pg<{ relname: string }[]>`
+			select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace
+			where n.nspname = ${iso.schema} and c.relname like 'gc\\_live\\_%'`
+
 		console.log(
-			`\nleftover gc_live_% relations in the harness's own schema after ${PASSES * 2 + REPOS * 2} passes: ${left.length === 0 ? "0 (clean)" : left.map((l) => l.relname).join(", ")}`,
+			`\nleftover gc_live_% relations in the harness's own schema after all fleet and scale passes: ${left.length === 0 ? "0 (clean)" : left.map((l) => l.relname).join(", ")}`,
 		)
 		if (left.length > 0) failed = true
-		if (pairedOverhead > 0.15) failed = true
+		if (worstPairedOverhead > 0.15) failed = true
 		console.log(
-			`\nunpaired 120-pass arm measured ${(overhead * 100).toFixed(0)}% — NOT bounded; its halves run minutes apart and this box drifts by more than that.`,
+			`\nunpaired ${PASSES}-pass arm measured ${(overhead * 100).toFixed(0)}% — NOT bounded; its halves run minutes apart and this box drifts by more than that.`,
 		)
 		console.log(
-			`\n${failed ? "FAIL" : "ok  "}  BOUND: no leftover staging tables, and the PAIRED twin-repo sweep adds ≤15% to a no-op pass (measured ${(pairedOverhead * 100).toFixed(0)}%).`,
+			`\n${failed ? "FAIL" : "ok  "}  BOUND: no leftover staging tables, and the worst paired same-repo measurement adds ≤15% to a no-op pass (worst ${(worstPairedOverhead * 100).toFixed(0)}%).`,
 		)
 	} finally {
 		cleanupTmp()

@@ -15,10 +15,13 @@
  * DEFAULT autovacuum policy — precisely the policy pggit overrides on its own
  * tables because it judged the default inadequate for its churn.
  *
- * The call volume is structural, not incidental: one `putPack` is 2 staging tables
- * (objects + edges); one `repo_file` rebuild is 1; one repack pass is one per
- * `WRITE_BATCH` = 1000 encodings; one GC pass is one per `LIVE_LOAD_BATCH` =
- * 10,000 live OIDs.
+ * The call volume is structural, not incidental: one `putPack` is one object
+ * staging table (commit/tag rows use value-list INSERTs); a full `repo_file`
+ * rebuild is one, while incremental projection advances use direct row changes;
+ * one repack pass uses one per `WRITE_BATCH` = 1000 encodings. GC's live TEMP
+ * table is loaded with direct binary COPY and does not use `copyInsert` staging.
+ * The workload measurement observes those calls at the driver's query boundary;
+ * none of these implementation counts is assumed when the gate is scored.
  *
  * MEASUREMENT DISCIPLINE. Catalog row counts and catalog file sizes on a shared
  * instance move for reasons that have nothing to do with pggit (any other session
@@ -32,11 +35,13 @@
  *
  *   npx tsx perf/breakage/pg-bloat--copy-staging-catalog-churn.ts --commits=600
  */
+import postgres from "postgres"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
@@ -52,6 +57,7 @@ import {
 	objectsBetween,
 	pad,
 	padr,
+	positiveIntegerFlag,
 	runDirName,
 	scratchRoot,
 	taggedPool,
@@ -66,8 +72,8 @@ const PUSH_APP = "pgbloat-staging-push"
 const LOOP = 200
 
 const PG_URL = flag("pg", DEFAULT_PG_URL)
-const COMMITS = Number(flag("commits", "600"))
-const PUSH_BATCH = Number(flag("batch", "10"))
+const COMMITS = positiveIntegerFlag("commits", 600)
+const PUSH_BATCH = positiveIntegerFlag("batch", 10)
 const REPO_ID = "workspace/slate/staging"
 
 function buildStream(): string {
@@ -102,10 +108,31 @@ function buildStream(): string {
 }
 
 async function main(): Promise<void> {
+	if (
+		!Number.isInteger(COMMITS) ||
+		COMMITS < 1 ||
+		!Number.isInteger(PUSH_BATCH) ||
+		PUSH_BATCH < 1
+	) {
+		throw new Error(
+			`commits and batch must be positive integers: ${COMMITS}, ${PUSH_BATCH}`,
+		)
+	}
 	const scratch = scratchRoot("stg")
 	const db = await createIsolatedSchema(PG_URL)
 	const stg = taggedPool(PG_URL, db.schema, STG_APP, 1)
-	const app = taggedPool(PG_URL, db.schema, PUSH_APP)
+	const stagingCreates = new Map<string, number>()
+	const app = postgres(PG_URL, {
+		connection: { application_name: PUSH_APP, search_path: db.schema },
+		debug: (_connection, query) => {
+			const target = query.match(/\bcreate\s+temp\s+table\s+copy_stg_([a-z_]+)/i)?.[1]
+			if (target !== undefined) {
+				stagingCreates.set(target, (stagingCreates.get(target) ?? 0) + 1)
+			}
+		},
+		max: 4,
+		onnotice: () => {},
+	})
 	try {
 		console.log(`# COPY-staging catalog churn (one temp table per bulk flush)\n`)
 		console.log(`schema ${db.schema}\n`)
@@ -152,6 +179,14 @@ async function main(): Promise<void> {
 		})
 
 		const perFlush = (stgWal - ctrlWal) / LOOP
+		if (!inTx[0] || Number(inTx[0].rels) <= 0 || Number(inTx[0].atts) <= 0) {
+			throw new Error(
+				"staging-table catalog census returned no live relations/attributes",
+			)
+		}
+		if (perFlush <= 0) {
+			throw new Error(`staging WAL attribution was nonpositive: ${perFlush}`)
+		}
 		console.log(`${padr("loop", 42)} ${pad("WAL bytes", 12)} ${pad("per iteration", 14)}`)
 		console.log(
 			`${padr(`control: BEGIN; select 1; COMMIT × ${LOOP}`, 42)} ${pad(ctrlWal, 12)} ${pad((ctrlWal / LOOP).toFixed(0), 14)}`,
@@ -163,20 +198,24 @@ async function main(): Promise<void> {
 			`${padr("attributable to the staging hop", 42)} ${pad(stgWal - ctrlWal, 12)} ${pad(perFlush.toFixed(0), 14)}`,
 		)
 		console.log(
-			`\nA staging table carries ${inTx[0]?.rels} relations in its temp namespace and ` +
-				`${inTx[0]?.atts} pg_attribute rows,\nall created and dropped inside the flush's transaction.\n`,
+			`\nA staging table carries ${inTx[0].rels} relations in its temp namespace and ` +
+				`${inTx[0].atts} pg_attribute rows,\nall created and dropped inside the flush's transaction.\n`,
 		)
 
 		// ── 2. how many flushes a realistic workload performs ───────────────
 		const src = scratch.dir("src")
 		await spawnGit(["init", "-q", "-b", "main", src])
 		await spawnGit(["fast-import", "--quiet"], { cwd: src, input: buildStream() })
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "refs/heads/main"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
-			.filter(Boolean)
+		const commits = parseRevListObjectOids(
+			(
+				await spawnGit(["rev-list", "--reverse", "refs/heads/main"], {
+					cwd: src,
+				})
+			).stdout,
+		)
+		if (commits.length !== COMMITS + 1) {
+			throw new Error(`fixture has ${commits.length} commits, expected ${COMMITS + 1}`)
+		}
 
 		const store = createObjectStore(app)
 		const refs = createRefStore(app)
@@ -188,8 +227,8 @@ async function main(): Promise<void> {
 		const tmpBefore = await tempStats(db.sql)
 		await flushStats(app)
 		const pushWal0 = await backendWal(db.sql, PUSH_APP)
+		stagingCreates.clear()
 
-		let flushes = 0
 		let prev = commits[0] as string
 		await store.putPack(
 			REPO_ID,
@@ -198,10 +237,8 @@ async function main(): Promise<void> {
 				type: o.type,
 			})),
 		)
-		flushes += 2
 		await refs.setRef(REPO_ID, "refs/heads/main", prev)
 		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", prev)
-		flushes += 1
 
 		for (let i = 1; i < commits.length; i += PUSH_BATCH) {
 			const tip = commits[Math.min(i + PUSH_BATCH - 1, commits.length - 1)] as string
@@ -212,40 +249,95 @@ async function main(): Promise<void> {
 					type: o.type,
 				})),
 			)
-			flushes += 2
 			await refs.setRef(REPO_ID, "refs/heads/main", tip)
 			await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", tip)
-			flushes += 1
 			prev = tip
 		}
 		const repackRes = await createRepack(app).repack(REPO_ID)
-		const repackFlushes = Math.ceil((repackRes.wholes + repackRes.deltas) / 1000)
-		flushes += repackFlushes
+		const finalTip = commits.at(-1) as string
+		const canonicalObjects = await objectsBetween(src, finalTip)
+		const expectedObjects = canonicalObjects.length
+		const [census] = await db.sql<
+			{
+				objects: string
+				commits: string
+				encodings: string
+				files: string
+				tip: string
+			}[]
+		>`select
+			(select count(*) from git_object)::text as objects,
+			(select count(*) from git_commit)::text as commits,
+			(select count(*) from git_pack_encoding)::text as encodings,
+			(select count(*) from repo_file)::text as files,
+			(select encode(oid, 'hex') from git_ref where name = 'refs/heads/main') as tip`
+		if (
+			!census ||
+			Number(census.objects) !== expectedObjects ||
+			Number(census.commits) !== commits.length ||
+			Number(census.encodings) !== expectedObjects ||
+			Number(census.files) !== 40 + COMMITS ||
+			census.tip !== finalTip ||
+			repackRes.wholes + repackRes.deltas !== expectedObjects
+		) {
+			throw new Error(
+				`workload prerequisite mismatch: ${JSON.stringify(census)}, expected objects/encodings=${expectedObjects}, commits=${commits.length}, files=${40 + COMMITS}, tip=${finalTip}`,
+			)
+		}
+		const expectedOids = canonicalObjects.map((object) => object.oid).sort()
+		const actualOids = (
+			await db.sql<
+				{ oid: string }[]
+			>`select encode(oid, 'hex') as oid from git_object order by oid`
+		).map((row) => row.oid)
+		if (
+			actualOids.length !== expectedOids.length ||
+			actualOids.some((oid, i) => oid !== expectedOids[i])
+		) {
+			throw new Error("workload Postgres OIDs do not match canonical git")
+		}
+		const requiredTargets = ["git_object", "git_pack_encoding", "repo_file"] as const
+		for (const target of requiredTargets) {
+			const observed = stagingCreates.get(target)
+			if (observed === undefined || observed <= 0) {
+				throw new Error(`workload did not observe COPY staging for ${target}`)
+			}
+		}
+		const observedFlushes = [...stagingCreates.values()].reduce(
+			(sum, count) => sum + count,
+			0,
+		)
+		if (observedFlushes <= 0) throw new Error("workload observed no COPY staging tables")
 
 		await flushStats(app)
 		const pushWal = (await backendWal(db.sql, PUSH_APP)) - pushWal0
+		if (pushWal <= 0) throw new Error(`workload WAL was nonpositive: ${pushWal}`)
 		const catAfter = await catalogSizes(db.sql)
 		const tmpAfter = await tempStats(db.sql)
 		const pushes = Math.ceil((commits.length - 1) / PUSH_BATCH) + 1
 
 		console.log(
 			`${pushes} pushes (${COMMITS} commits in batches of ${PUSH_BATCH}) + 1 repack ` +
-				`(${repackRes.wholes + repackRes.deltas} encodings, ${repackFlushes} write batches)\n` +
-				`  → ${flushes} staging tables created and dropped\n`,
+				`(${repackRes.wholes + repackRes.deltas} encodings)\n` +
+				`  → ${observedFlushes} observed staging tables created and dropped\n`,
 		)
 		console.log(`${padr("quantity", 46)} ${pad("value", 14)}`)
+		for (const [target, count] of [...stagingCreates].sort(([a], [b]) =>
+			a.localeCompare(b),
+		)) {
+			console.log(`${padr(`observed copy_stg_${target}`, 46)} ${pad(count, 14)}`)
+		}
 		console.log(
-			`${padr("staging tables per push (objects+edges+repo_file)", 46)} ${pad(3, 14)}`,
+			`${padr("observed staging tables total", 46)} ${pad(observedFlushes, 14)}`,
 		)
-		console.log(`${padr("staging tables total", 46)} ${pad(flushes, 14)}`)
 		console.log(
-			`${padr("WAL attributable to staging (est.)", 46)} ${pad(`${kb(perFlush * flushes)} kB`, 14)}`,
+			`${padr("WAL attributable to staging (est.)", 46)} ${pad(`${kb(perFlush * observedFlushes)} kB`, 14)}`,
 		)
 		console.log(
 			`${padr("WAL for the whole workload (measured)", 46)} ${pad(`${mb(pushWal)} MB`, 14)}`,
 		)
 		console.log(
-			`${padr("staging share of the workload's WAL", 46)} ${pad(`${(((perFlush * flushes) / Math.max(pushWal, 1)) * 100).toFixed(2)}%`, 14)}`,
+			`${padr("staging share of the workload's WAL", 46)} ${pad(`${(((perFlush * observedFlushes) / pushWal) * 100).toFixed(2)}%`, 14)}`,
 		)
 		console.log(
 			`\ntemp files spilled DATABASE-WIDE in the same window: ${tmpAfter.files - tmpBefore.files} ` +
@@ -267,7 +359,7 @@ async function main(): Promise<void> {
 				`over a 100k-object repo is ~10). The part worth watching is not WAL but that the rows\n` +
 				`land in DATABASE-WIDE catalogs running the default autovacuum policy.`,
 		)
-		if ((perFlush * flushes) / Math.max(pushWal, 1) > SHARE_LIMIT) process.exitCode = 1
+		if ((perFlush * observedFlushes) / pushWal > SHARE_LIMIT) process.exitCode = 1
 	} finally {
 		await stg.end()
 		await app.end()

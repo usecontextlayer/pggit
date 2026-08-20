@@ -1,25 +1,20 @@
 /**
- * Shared plumbing for the `perf/breakage/perf--*.ts` probes. Black-box only: every
- * helper drives a public surface (real `git`, `createObjectStore.putPack`,
- * `createRepack().repack()`, the wire server) and observes wall time, process
- * RSS, and byte counts. Nothing here reaches into pggit internals.
- *
- * Ported verbatim from `breakage/_perf-util.ts`; the one addition is the `flag`
- * reader so every probe takes `--pg=` the way `perf/delta-probe.ts` does.
+ * Shared plumbing for the `perf/breakage/perf--*.ts` probes. The helpers drive real Git and pggit surfaces, then use explicit store censuses where a named fixture must prove its internal preconditions. Malformed Git output, incomplete seed coverage, invalid CLI scales, missing subprocess metrics, and undersampled RSS all abort a probe before it can score a number.
  */
 import { spawn } from "node:child_process"
 import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { Sql } from "postgres"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { gitReachableOids, loadGitObjects, seedGitRefs } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { peakOf, startRssSampler } from "../memory"
 
-/** `--name=value` off argv, the same reader `perf/delta-probe.ts` uses. */
-export function flag(name: string, fallback: string): string {
-	const hit = process.argv.find((a) => a.startsWith(`--${name}=`))
-	return hit ? hit.slice(name.length + 3) : fallback
-}
+export { flag, increasingIntegerListFlag, positiveIntegerFlag } from "../args"
+
+import { flag } from "../args"
 
 export const PG_URL = flag("pg", "postgres://postgres:postgres@localhost:6489/postgres")
 
@@ -36,25 +31,27 @@ export function cleanupTmp(): void {
 	for (const d of scratch.splice(0)) rmSync(d, { force: true, recursive: true })
 }
 
-/** Peak-RSS sampler around an async call — the honest in-process memory number
- * (`process.memoryUsage().rss` sampled while the work runs, not just after). */
+/** Peak-RSS sampler around an async call — process-wide RSS sampled off-thread so synchronous encoding work cannot hide its own peak. */
 export async function withPeakRss<T>(
 	fn: () => Promise<T>,
 ): Promise<{ value: T; ms: number; peakRss: number; baseRss: number }> {
-	globalThis.gc?.()
-	await new Promise((r) => setTimeout(r, 30))
 	const baseRss = process.memoryUsage().rss
-	let peakRss = baseRss
-	const timer = setInterval(() => {
-		const rss = process.memoryUsage().rss
-		if (rss > peakRss) peakRss = rss
-	}, 25)
+	const sampler = startRssSampler()
 	const t0 = Date.now()
+	let outcome: { ok: true; value: T } | { ok: false; error: unknown }
 	try {
-		const value = await fn()
-		return { baseRss, ms: Date.now() - t0, peakRss, value }
-	} finally {
-		clearInterval(timer)
+		outcome = { ok: true, value: await fn() }
+	} catch (error) {
+		outcome = { error, ok: false }
+	}
+	const ms = Date.now() - t0
+	const series = await sampler.stop()
+	if (!outcome.ok) throw outcome.error
+	return {
+		baseRss,
+		ms,
+		peakRss: peakOf(series.map(([, rss]) => rss)),
+		value: outcome.value,
 	}
 }
 
@@ -76,9 +73,21 @@ export async function timedSpawn(
 		})
 		child.stdout.on("data", () => {})
 		child.on("error", reject)
-		child.on("close", (code) => {
+		child.on("close", (code, signal) => {
+			if (code === null) {
+				reject(new Error(`${cmd} was terminated by signal ${signal ?? "unknown"}`))
+				return
+			}
+			if (code !== 0) {
+				reject(new Error(`${cmd} exited ${code}: ${err.trim()}`))
+				return
+			}
 			const m = err.match(/(\d+)\s+maximum resident set size/)
-			resolve({ code: code ?? 0, ms: Date.now() - t0, peakRss: Number(m?.[1] ?? 0) })
+			if (m?.[1] === undefined) {
+				reject(new Error(`/usr/bin/time did not report maximum RSS for ${cmd}: ${err}`))
+				return
+			}
+			resolve({ code, ms: Date.now() - t0, peakRss: Number(m[1]) })
 		})
 	})
 }
@@ -93,7 +102,11 @@ export async function gitRepack(
 	cpSync(srcDir, dir, { recursive: true })
 	const r = await timedSpawn("git", ["repack", "-adf", "-q", ...extraArgs], dir)
 	const out = await spawnGit(["count-objects", "-v"], { cwd: dir })
-	const kb = Number(out.stdout.match(/size-pack: (\d+)/)?.[1] ?? 0)
+	const size = out.stdout.match(/^size-pack: (\d+)$/m)?.[1]
+	if (size === undefined) {
+		throw new Error(`git count-objects did not report size-pack:\n${out.stdout}`)
+	}
+	const kb = Number(size)
 	return { ms: r.ms, packBytes: kb * 1024, peakRss: r.peakRss }
 }
 
@@ -101,44 +114,18 @@ export type Obj = { oid: string; type: string; content: Buffer }
 
 /** Every reachable object of a repo, via ONE `git cat-file --batch`. */
 export async function reachableObjects(dir: string): Promise<Obj[]> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const objs: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		objs.push({ content: buf.subarray(start, start + size), oid, type })
-		pos = start + size + 1
-	}
-	return objs
+	return loadGitObjects(dir, await gitReachableOids(dir))
 }
 
 /** Seed a real repo's objects + refs into a pggit schema through the public store. */
 export async function seedRepo(
-	// biome-ignore lint/suspicious/noExplicitAny: porsager Sql, kept structural for the probes
-	sql: any,
+	sql: Sql,
 	repoId: string,
 	dir: string,
 	objects?: Obj[],
 ): Promise<{ objects: number; rawBytes: number; ms: number }> {
 	const objs = objects ?? (await reachableObjects(dir))
+	if (objs.length === 0) throw new Error(`cannot seed empty repository ${dir}`)
 	const store = createObjectStore(sql)
 	const refs = createRefStore(sql)
 	const t0 = Date.now()
@@ -164,14 +151,36 @@ export async function seedRepo(
 		if (bytes >= 16_000_000 || batch.length >= 20_000) await flush()
 	}
 	await flush()
-	for (const line of (await spawnGit(["show-ref", "--heads"], { cwd: dir })).stdout
-		.trim()
-		.split("\n")) {
-		const [oid, name] = line.split(" ")
-		if (oid && name) await refs.setRef(repoId, name, oid)
+	const seededRefs = await seedGitRefs(repoId, dir, refs)
+	// `repoId` is the WIRE NAME; the census reads by the bigint surrogate.
+	const [repoRow] = await sql<{ id: string }[]>`
+		select id::text as id from repos where name = ${repoId}`
+	if (repoRow === undefined) throw new Error(`seeded repo ${repoId} has no repos row`)
+	const [census] = await sql<
+		{ objects: string; commits: string; tags: string; refs: string }[]
+	>`select
+		(select count(*) from git_object where repo_id = ${repoRow.id}::bigint)::text as objects,
+		(select count(*) from git_commit where repo_id = ${repoRow.id}::bigint)::text as commits,
+		(select count(*) from git_tag where repo_id = ${repoRow.id}::bigint)::text as tags,
+		(select count(*) from git_ref where repo_id = ${repoRow.id}::bigint)::text as refs`
+	if (census === undefined) throw new Error(`seed census returned no row for ${repoId}`)
+	const expected = {
+		commits: objs.filter((object) => object.type === "commit").length,
+		objects: objs.length,
+		refs: seededRefs.directRefs + 1,
+		tags: objs.filter((object) => object.type === "tag").length,
 	}
-	const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: dir })).stdout.trim()
-	if (head) await refs.setSymref(repoId, "HEAD", head)
+	const actual = {
+		commits: Number(census.commits),
+		objects: Number(census.objects),
+		refs: Number(census.refs),
+		tags: Number(census.tags),
+	}
+	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+		throw new Error(
+			`seed census mismatch for ${repoId}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+		)
+	}
 	return { ms: Date.now() - t0, objects: objs.length, rawBytes }
 }
 

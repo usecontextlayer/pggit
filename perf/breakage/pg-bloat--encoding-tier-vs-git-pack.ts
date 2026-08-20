@@ -33,10 +33,12 @@
  *   npx tsx perf/breakage/pg-bloat--encoding-tier-vs-git-pack.ts --repo=/path/to/repo
  */
 import { createGitApp, createGitDeps } from "@/index"
+import { collectedRuns, resetCollected } from "@/instrument"
 import { serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import { allRefsOf, seedGitRefs } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
@@ -48,6 +50,7 @@ import {
 	mb,
 	pad,
 	padr,
+	positiveIntegerFlag,
 	reachableObjects,
 	runDirName,
 	scratchRoot,
@@ -59,8 +62,8 @@ const REPO_ID = "workspace/slate/tier"
 const TIER_LIMIT = 2.0
 
 const PG_URL = flag("pg", DEFAULT_PG_URL)
-const RUNS = Number(flag("runs", "1200"))
-const DOCS = Number(flag("docs", "120"))
+const RUNS = positiveIntegerFlag("runs", 1200)
+const DOCS = positiveIntegerFlag("docs", 120)
 const REPO = flag("repo", "")
 
 function buildStream(): string {
@@ -148,12 +151,12 @@ async function main(): Promise<void> {
 		const looseBytes = await duBytes(gcDir)
 		await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: gcDir })
 		const gcBytes = await duBytes(gcDir)
-		const sizePack =
-			Number(
-				(await spawnGit(["count-objects", "-v"], { cwd: gcDir })).stdout.match(
-					/size-pack: (\d+)/,
-				)?.[1] ?? 0,
-			) * 1024
+		const sizePackMatch = (
+			await spawnGit(["count-objects", "-v"], { cwd: gcDir })
+		).stdout.match(/size-pack: (\d+)/)
+		if (!sizePackMatch) throw new Error("git count-objects omitted size-pack")
+		const sizePack = Number(sizePackMatch[1]) * 1024
+		if (sizePack <= 0) throw new Error(`canonical git pack size is ${sizePack}`)
 		console.log(
 			`git: ${mb(looseBytes)} MB as received → ${mb(gcBytes)} MB after \`gc --aggressive\` ` +
 				`(packfile itself ${mb(sizePack)} MB)`,
@@ -179,18 +182,21 @@ async function main(): Promise<void> {
 			if (bytes >= 16_000_000) await flush()
 		}
 		await flush()
-		for (const line of (await spawnGit(["show-ref", "--heads"], { cwd: src })).stdout
-			.trim()
-			.split("\n")) {
-			const [oid, name] = line.split(" ")
-			if (oid && name) await refs.setRef(REPO_ID, name, oid)
-		}
-		const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
-		await refs.setSymref(REPO_ID, "HEAD", head || "refs/heads/main")
+		await seedGitRefs(REPO_ID, src, refs)
+		const canonicalRefs = await allRefsOf(src)
 
 		const beforeRepack = await sizeOf(db.sql, "git_pack_encoding")
 		const t0 = Date.now()
 		const res = await createRepack(db.sql).repack(REPO_ID)
+		if (
+			objects.length === 0 ||
+			res.wholes + res.deltas !== objects.length ||
+			res.deltas <= 0
+		) {
+			throw new Error(
+				`repack covered ${res.wholes + res.deltas}/${objects.length} canonical objects with ${res.deltas} deltas`,
+			)
+		}
 		const repackMs = Date.now() - t0
 		console.log(
 			`\nrepack: ${res.wholes} wholes + ${res.deltas} deltas in ${(repackMs / 1000).toFixed(1)}s ` +
@@ -198,9 +204,10 @@ async function main(): Promise<void> {
 		)
 
 		// ── the pack pggit actually serves ──────────────────────────────────
-		const app = createGitApp(createGitDeps(db.sql))
+		const app = createGitApp(createGitDeps(db.sql), { instrument: true })
 		const server = await serveOnPort(app, 0)
 		const dest = scratch.dir("clone")
+		resetCollected()
 		await spawnGit([
 			"-c",
 			"protocol.version=2",
@@ -211,15 +218,46 @@ async function main(): Promise<void> {
 			dest,
 		])
 		await server.close()
-		const servedPack =
-			Number(
-				(await spawnGit(["count-objects", "-v"], { cwd: dest })).stdout.match(
-					/size-pack: (\d+)/,
-				)?.[1] ?? 0,
-			) * 1024
+		const storedPackMatch = (
+			await spawnGit(["count-objects", "-v"], { cwd: dest })
+		).stdout.match(/size-pack: (\d+)/)
+		if (!storedPackMatch) throw new Error("client count-objects omitted size-pack")
+		const storedPack = Number(storedPackMatch[1]) * 1024
+		const fetchRuns = collectedRuns().filter((run) => run.label === "fetch")
+		if (fetchRuns.length !== 1) {
+			throw new Error(`expected one fetch instrumentation run, got ${fetchRuns.length}`)
+		}
+		const run = fetchRuns[0]
+		if (!run) throw new Error("fetch instrumentation run disappeared")
+		const servedPack = run.counters.get("packBytes")
+		const objectsServed = run.counters.get("objectsServed")
+		const deltasServed = run.counters.get("deltasServed")
+		if (servedPack === undefined || servedPack <= 0) {
+			throw new Error(`missing/nonpositive wire packBytes counter: ${String(servedPack)}`)
+		}
+		if (
+			objectsServed !== objects.length ||
+			deltasServed === undefined ||
+			deltasServed <= 0
+		) {
+			throw new Error(
+				`serve prerequisite failed: objects=${String(objectsServed)}/${objects.length}, deltas=${String(deltasServed)}`,
+			)
+		}
 		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+		const clonedRefs = await allRefsOf(dest)
+		const clonedObjects = await reachableObjects(dest)
+		const expectedOids = objects.map((object) => object.oid).sort()
+		const clonedOids = clonedObjects.map((object) => object.oid).sort()
+		if (
+			JSON.stringify(clonedRefs) !== JSON.stringify(canonicalRefs) ||
+			clonedOids.length !== expectedOids.length ||
+			clonedOids.some((oid, i) => oid !== expectedOids[i])
+		) {
+			throw new Error("pggit mirror clone diverged from canonical refs/object set")
+		}
 		console.log(
-			`served: a real \`git clone\` over the wire received ${mb(servedPack)} MB, fsck clean`,
+			`served: raw wire pack ${mb(servedPack)} MB; client stored ${mb(storedPack)} MB after index-pack, fsck clean`,
 		)
 
 		// ── the bill ────────────────────────────────────────────────────────
@@ -227,15 +265,38 @@ async function main(): Promise<void> {
 		const obj = await sizeOf(db.sql, "git_object")
 		const commit = await sizeOf(db.sql, "git_commit")
 		const [payload] = await db.sql<
-			{ n: string; oct: string; col: string; big: string; maxo: string }[]
+			{
+				n: string
+				oct: string
+				col: string
+				big: string
+				maxo: string
+				deltas: string
+			}[]
 		>`
 			select count(*)::text as n, sum(octet_length(data))::text as oct,
 				sum(pg_column_size(data))::text as col,
 				count(*) filter (where octet_length(data) > 2000)::text as big,
-				max(octet_length(data))::text as maxo
+				max(octet_length(data))::text as maxo,
+				count(*) filter (where base_oid is not null)::text as deltas
 			from git_pack_encoding`
-		const payloadBytes = Number(payload?.oct ?? 0)
-		const rows = Number(payload?.n ?? 0)
+		if (!payload) throw new Error("encoding payload census returned no row")
+		const payloadBytes = Number(payload.oct)
+		const rows = Number(payload.n)
+		const storedDeltas = Number(payload.deltas)
+		if (
+			rows !== objects.length ||
+			storedDeltas !== res.deltas ||
+			storedDeltas <= 0 ||
+			payloadBytes <= 0 ||
+			enc.total <= 0 ||
+			obj.total <= 0 ||
+			commit.total <= 0
+		) {
+			throw new Error(
+				`encoding census has ${rows}/${objects.length} rows, ${storedDeltas}/${res.deltas} deltas, and ${payloadBytes} payload bytes`,
+			)
+		}
 
 		console.log(`\n## the encoding tier, itemised\n`)
 		console.log(
@@ -253,8 +314,8 @@ async function main(): Promise<void> {
 			`${padr("TOTAL", 34)} ${pad(mb(enc.total), 9)} ${pad((enc.total / rows).toFixed(1), 11)}  100%`,
 		)
 		console.log(
-			`\n${rows} rows · ${payload?.big} of them (${((Number(payload?.big) / rows) * 100).toFixed(1)}%) exceed ~2 kB and ` +
-				`go out-of-line under STORAGE EXTERNAL (max ${payload?.maxo} B) — each is one extra\n` +
+			`\n${rows} rows · ${payload.big} of them (${((Number(payload.big) / rows) * 100).toFixed(1)}%) exceed ~2 kB and ` +
+				`go out-of-line under STORAGE EXTERNAL (max ${payload.maxo} B) — each is one extra\n` +
 				`TOAST index probe + chunk read on the serve path that an inline value would not pay.`,
 		)
 		console.log(
@@ -267,7 +328,7 @@ async function main(): Promise<void> {
 		console.log(`${padr("store", 34)} ${pad("MB", 9)} ${pad("× git pack", 11)}`)
 		const row = (name: string, v: number) =>
 			console.log(
-				`${padr(name, 34)} ${pad(mb(v), 9)} ${pad((v / Math.max(sizePack, 1)).toFixed(2), 11)}`,
+				`${padr(name, 34)} ${pad(mb(v), 9)} ${pad((v / sizePack).toFixed(2), 11)}`,
 			)
 		row("git packfile (gc --aggressive)", sizePack)
 		row("pack pggit serves", servedPack)
@@ -276,7 +337,7 @@ async function main(): Promise<void> {
 		row("git_commit (the topology rows)", commit.total)
 		row("all three", enc.total + obj.total + commit.total)
 
-		const ratio = enc.total / Math.max(servedPack, 1)
+		const ratio = enc.total / servedPack
 		console.log(
 			`\nthe tier weighs ${ratio.toFixed(2)}× the pack it exists to emit ` +
 				`(design premise: ~1×).`,
@@ -285,7 +346,7 @@ async function main(): Promise<void> {
 			`the design accepted that git_object does not shrink (D1); the measured consequence is\n` +
 				`that a repo whose packfile is ${mb(sizePack)} MB occupies ` +
 				`${mb(enc.total + obj.total + commit.total)} MB of Postgres — ` +
-				`${((enc.total + obj.total + commit.total) / Math.max(sizePack, 1)).toFixed(1)}× — of which the\n` +
+				`${((enc.total + obj.total + commit.total) / sizePack).toFixed(1)}× — of which the\n` +
 				`encoding tier is the smallest term.`,
 		)
 		if (ratio > TIER_LIMIT) process.exitCode = 1

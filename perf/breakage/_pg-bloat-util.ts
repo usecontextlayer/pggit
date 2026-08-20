@@ -16,18 +16,23 @@ import { readdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import postgresFactory, { type Sql } from "postgres"
-import { spawnGit } from "@/testing/spawn-git"
+import {
+	gitReachableOids,
+	loadGitObjects,
+	loadReachableObjects,
+} from "@/testing/git-fixtures"
+
+export {
+	flag,
+	increasingIntegerListFlag,
+	positiveIntegerFlag,
+	positiveNumberFlag,
+} from "../args"
 
 /** Default target for `--pg=`; every harness takes the flag and falls back here. */
 export const DEFAULT_PG_URL = "postgres://postgres:postgres@localhost:6489/postgres"
 export const WHEN = "1700000000 +0000"
 export const COMMITTER = `pggit oracle <oracle@pggit.test> ${WHEN}`
-
-/** `--<name>=<value>` off argv, or `fallback`. Wrap in `Number(...)` for numerics. */
-export function flag(name: string, fallback: string): string {
-	const hit = process.argv.find((a) => a.startsWith(`--${name}=`))
-	return hit ? hit.slice(name.length + 3) : fallback
-}
 
 /** The tables whose economics this hunt is about. */
 export const TABLES = [
@@ -68,24 +73,30 @@ export type Sizes = { heap: number; indexes: number; toast: number; total: numbe
 /** On-disk bytes for a table, summing leaf partitions when it is partitioned. */
 export async function sizeOf(sql: Sql, table: string): Promise<Sizes> {
 	if (PARTITIONED.has(table)) {
-		const [r] = await sql<{ total: string; heap: string; idx: string }[]>`
+		const [r] = await sql<{ total: string; heap: string; idx: string; leaves: string }[]>`
 			select
 				coalesce(sum(pg_total_relation_size(inhrelid)),0)::text as total,
 				coalesce(sum(pg_relation_size(inhrelid)),0)::text as heap,
-				coalesce(sum(pg_indexes_size(inhrelid)),0)::text as idx
+				coalesce(sum(pg_indexes_size(inhrelid)),0)::text as idx,
+				count(*)::text as leaves
 			from pg_inherits where inhparent = ${table}::regclass`
-		const total = Number(r?.total ?? 0)
-		const heap = Number(r?.heap ?? 0)
-		const indexes = Number(r?.idx ?? 0)
+		if (r === undefined) throw new Error(`size query returned no row for ${table}`)
+		if (Number(r.leaves) !== 16) {
+			throw new Error(`expected 16 leaf partitions for ${table}, found ${r.leaves}`)
+		}
+		const total = Number(r.total)
+		const heap = Number(r.heap)
+		const indexes = Number(r.idx)
 		return { heap, indexes, toast: total - heap - indexes, total }
 	}
 	const [r] = await sql<{ total: string; heap: string; idx: string }[]>`
 		select pg_total_relation_size(${table}::regclass)::text as total,
 			pg_relation_size(${table}::regclass)::text as heap,
 			pg_indexes_size(${table}::regclass)::text as idx`
-	const total = Number(r?.total ?? 0)
-	const heap = Number(r?.heap ?? 0)
-	const indexes = Number(r?.idx ?? 0)
+	if (r === undefined) throw new Error(`size query returned no row for ${table}`)
+	const total = Number(r.total)
+	const heap = Number(r.heap)
+	const indexes = Number(r.idx)
 	return { heap, indexes, toast: total - heap - indexes, total }
 }
 
@@ -208,15 +219,32 @@ export async function horizon(sql: Sql): Promise<Horizon> {
 		where backend_type = 'client backend' and xact_start is not null
 			and now() - xact_start > interval '5 seconds'
 		order by xact_start`
+	if (h === undefined) throw new Error("vacuum-horizon query returned no row")
+	const ageXids = Number(h.age ?? 0)
+	const oldestXactSeconds = Number(h.oldest ?? 0)
+	if (
+		!Number.isFinite(ageXids) ||
+		ageXids < 0 ||
+		!Number.isFinite(oldestXactSeconds) ||
+		oldestXactSeconds < 0
+	) {
+		throw new Error(`vacuum-horizon query returned invalid ages: ${JSON.stringify(h)}`)
+	}
 	return {
-		ageXids: Number(h?.age ?? 0),
-		blockers: blockers.map((b) => ({
-			db: b.db,
-			pid: b.pid,
-			query: b.q.replace(/\s+/g, " ").slice(0, 70),
-			seconds: Number(b.secs),
-		})),
-		oldestXactSeconds: Number(h?.oldest ?? 0),
+		ageXids,
+		blockers: blockers.map((b) => {
+			const seconds = Number(b.secs)
+			if (!Number.isFinite(seconds) || seconds < 0) {
+				throw new Error(`vacuum-horizon blocker ${b.pid} has invalid age ${b.secs}`)
+			}
+			return {
+				db: b.db,
+				pid: b.pid,
+				query: b.q.replace(/\s+/g, " ").slice(0, 70),
+				seconds,
+			}
+		}),
+		oldestXactSeconds,
 	}
 }
 
@@ -245,11 +273,16 @@ export async function vacuumVerbose(
 	const m = text.match(
 		/tuples: (\d+) removed, (\d+) remain, (\d+) are dead but not yet removable/,
 	)
+	if (m === null) {
+		throw new Error(
+			`VACUUM VERBOSE did not report tuple counts for ${relation}:\n${text}`,
+		)
+	}
 	return {
 		lines,
-		notRemovable: m ? Number(m[3]) : 0,
-		remain: m ? Number(m[2]) : 0,
-		removed: m ? Number(m[1]) : 0,
+		notRemovable: Number(m[3]),
+		remain: Number(m[2]),
+		removed: Number(m[1]),
 	}
 }
 
@@ -289,14 +322,16 @@ export async function backendWal(sql: Sql, app: string): Promise<number> {
 		select coalesce(sum(w.wal_bytes), 0)::text as n
 		from pg_stat_activity a, lateral pg_stat_get_backend_wal(a.pid) w
 		where a.application_name = ${app}`
-	return Number(r?.n ?? 0)
+	if (r === undefined) throw new Error("backend WAL query returned no row")
+	return Number(r.n)
 }
 
 /** WAL bytes generated so far (monotonic; deltas are the useful quantity). */
 export async function walBytes(sql: Sql): Promise<number> {
 	const [r] = await sql<{ n: string }[]>`
 		select (pg_current_wal_lsn() - '0/0'::pg_lsn)::text as n`
-	return Number(r?.n ?? 0)
+	if (r === undefined) throw new Error("WAL position query returned no row")
+	return Number(r.n)
 }
 
 /** Temp files + temp bytes for this database since stats reset. */
@@ -304,7 +339,8 @@ export async function tempStats(sql: Sql): Promise<{ files: number; bytes: numbe
 	const [r] = await sql<{ files: string; bytes: string }[]>`
 		select temp_files::text as files, temp_bytes::text as bytes
 		from pg_stat_database where datname = current_database()`
-	return { bytes: Number(r?.bytes ?? 0), files: Number(r?.files ?? 0) }
+	if (r === undefined) throw new Error("temporary-file statistics returned no row")
+	return { bytes: Number(r.bytes), files: Number(r.files) }
 }
 
 /** Physical size of the shared catalogs the temp-table pattern churns. */
@@ -316,11 +352,12 @@ export async function catalogSizes(
 			pg_total_relation_size('pg_attribute')::text as a,
 			pg_total_relation_size('pg_type')::text as t,
 			pg_total_relation_size('pg_depend')::text as d`
+	if (r === undefined) throw new Error("catalog-size query returned no row")
 	return {
-		attribute: Number(r?.a ?? 0),
-		class: Number(r?.c ?? 0),
-		depend: Number(r?.d ?? 0),
-		type: Number(r?.t ?? 0),
+		attribute: Number(r.a),
+		class: Number(r.c),
+		depend: Number(r.d),
+		type: Number(r.t),
 	}
 }
 
@@ -408,38 +445,7 @@ export type Obj = {
 }
 
 export async function reachableObjects(dir: string): Promise<Obj[]> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	if (oids.length === 0) return []
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const objs: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		objs.push({
-			content: buf.subarray(start, start + size),
-			oid,
-			type: type as Obj["type"],
-		})
-		pos = start + size + 1
-	}
-	return objs
+	return loadGitObjects(dir, await gitReachableOids(dir))
 }
 
 /**
@@ -452,40 +458,7 @@ export async function objectsBetween(
 	rev: string,
 	exclude?: string,
 ): Promise<Obj[]> {
-	const args = ["rev-list", "--objects", rev]
-	if (exclude) args.push(`^${exclude}`)
-	const list = await spawnGit(args, { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	if (oids.length === 0) return []
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const out: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		out.push({
-			content: buf.subarray(start, start + size),
-			oid,
-			type: type as Obj["type"],
-		})
-		pos = start + size + 1
-	}
-	return out
+	return loadReachableObjects(dir, [rev, ...(exclude ? [`^${exclude}`] : [])])
 }
 
 // ---------------------------------------------------------------------------
@@ -556,24 +529,31 @@ export async function whoHoldsXmin(baseUrl = DEFAULT_PG_URL): Promise<void> {
 		}
 
 		const [h] = await pg<
-			{ snap: string; oldest: string; slots: string; prep: string; frozen: string }[]
+			{
+				snap: string
+				oldest: string | null
+				slots: string
+				prep: string
+				frozen: string
+			}[]
 		>`
 			select pg_snapshot_xmin(pg_current_snapshot())::text as snap,
 				(select min(age(backend_xmin))::text from pg_stat_activity where backend_xmin is not null) as oldest,
 				(select count(*)::text from pg_replication_slots) as slots,
 				(select count(*)::text from pg_prepared_xacts) as prep,
 				(select max(age(datfrozenxid))::text from pg_database) as frozen`
+		if (!h) throw new Error("xmin-holder summary query returned no row")
 		console.log(
 			"\nsnapshot xmin:",
-			h?.snap,
+			h.snap,
 			"| min backend_xmin age:",
-			h?.oldest,
+			h.oldest,
 			"| slots:",
-			h?.slots,
+			h.slots,
 			"| prepared:",
-			h?.prep,
+			h.prep,
 			"| max datfrozenxid age:",
-			h?.frozen,
+			h.frozen,
 		)
 
 		const maxAge = await pg<

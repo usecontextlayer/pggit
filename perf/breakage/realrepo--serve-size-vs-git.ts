@@ -9,10 +9,7 @@
  * (lockfiles, generated types, long markdown) are REWRITTEN commit after commit, the
  * blob side is where git wins and pggit pays full deflate for every version.
  *
- * Black-box: real `git push` over the wire → `createRepack().repack()` → real
- * `git clone`. The served pack is the clone's packfile, so `verify-pack -v` on it is
- * a direct, per-object measurement of what pggit actually put on the wire, compared
- * against `git gc --aggressive` over the identical object set.
+ * Black-box setup remains real `git push` over the wire followed by `createRepack().repack()`. Measurement sends one identical no-have v2 request to pggit and canonical `git upload-pack`, captures the raw band-1 PACK bytes before client indexing can append thin bases, proves the transmitted OID sets are identical, and only then indexes those captured packs for strict `verify-pack -v` attribution. Separate mirror clones prove exact refs, object bytes, and fsck state.
  *
  * A perf harness rather than a vitest e2e test on both counts: the verdict is a
  * MEASURED size ratio, and the corpus is a REAL local repository handed in at run
@@ -24,18 +21,35 @@
  * parity the design measured on pggit's own history plus headroom).
  * Exit 1 = reproduced: the ratio is past that, with the per-type attribution printed.
  */
-import { readdirSync } from "node:fs"
 import { join } from "node:path"
 import { createGitApp, createGitDeps } from "@/index"
+import { readPack } from "@/pack/read-pack"
 import { serveOnPort } from "@/server"
-import { createRepack } from "@/store/repack"
+import {
+	allRefsOf,
+	compareMirrorClones,
+	type VerifyPackObject,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { createScratch, DEFAULT_PG_URL, flag, mb, prepareMirror } from "./_realrepo-util"
+import { fetchRequest } from "@/testing/wire-fetch"
+import {
+	canonicalV2Pack,
+	createScratch,
+	DEFAULT_PG_URL,
+	flag,
+	indexRawPack,
+	mb,
+	positiveNumberFlag,
+	postPggitV2Pack,
+	prepareMirror,
+	repackExactly,
+} from "./_realrepo-util"
 
 const SLUG = flag("slug", "repo")
-const MAX_RATIO = Number(flag("max-ratio", "3.0"))
+const MAX_RATIO = positiveNumberFlag("max-ratio", 3)
 const PG_URL = flag("pg", DEFAULT_PG_URL)
+if (!SLUG) throw new Error("--slug must not be empty")
 
 const scratch = createScratch(`serve-size-${SLUG}`)
 
@@ -43,28 +57,30 @@ type Attribution = Map<string, { n: number; packed: number; deltified: number }>
 
 /** Per-type bytes-in-packfile, straight from `git verify-pack -v`: the authoritative
  * account of what a pack actually spent, including whether each entry is a delta. */
-async function attribute(bareDir: string): Promise<{ by: Attribution; total: number }> {
-	const packDir = join(bareDir, "objects", "pack")
-	const idx = readdirSync(packDir).filter((f) => f.endsWith(".idx"))
+function attribute(
+	entries: readonly VerifyPackObject[],
+	source: string,
+): { by: Attribution; total: number } {
 	const by: Attribution = new Map()
 	let total = 0
-	for (const f of idx) {
-		const out = await spawnGit(["verify-pack", "-v", join(packDir, f)], { cwd: bareDir })
-		for (const line of out.stdout.split("\n")) {
-			const parts = line.trim().split(/\s+/)
-			if (parts.length < 5 || !/^[0-9a-f]{40}$/.test(parts[0] as string)) continue
-			const type = parts[1] as string
-			const packed = Number(parts[3])
-			if (!Number.isFinite(packed)) continue
-			const slot = by.get(type) ?? { deltified: 0, n: 0, packed: 0 }
-			slot.n++
-			slot.packed += packed
-			if (parts.length >= 7) slot.deltified++
-			by.set(type, slot)
-			total += packed
-		}
+	for (const object of entries) {
+		const slot = by.get(object.type) ?? { deltified: 0, n: 0, packed: 0 }
+		slot.n++
+		slot.packed += object.packedSize
+		if (object.kind === "delta") slot.deltified++
+		by.set(object.type, slot)
+		total += object.packedSize
+	}
+	if (total === 0 || by.size === 0) {
+		throw new Error(`${source}: verify-pack attributed zero objects or bytes`)
 	}
 	return { by, total }
+}
+
+async function wantedRefOids(dir: string): Promise<string[]> {
+	const wants = [...new Set((await allRefsOf(dir)).map(({ oid }) => oid))]
+	if (wants.length === 0) throw new Error(`${dir}: zero ref wants`)
+	return wants
 }
 
 function table(label: string, a: { by: Attribution; total: number }): void {
@@ -89,28 +105,81 @@ async function main(): Promise<void> {
 	const url = `http://127.0.0.1:${server.port}/${repoId}`
 	try {
 		await spawnGit(["push", url, "--mirror"], { cwd: MIRROR })
-		const r = await createRepack(db.sql).repack(repoId)
+		const r = await repackExactly(db.sql, repoId)
+		if (r.deltas === 0) {
+			throw new Error(
+				`serve-size fixture did not exercise the delta tier (${r.wholes} wholes, ${r.deltas} deltas)`,
+			)
+		}
 		console.log(`  repack: ${r.wholes} wholes + ${r.deltas} deltas`)
 
-		const pggitDir = join(scratch.mk("pggit"), "c.git")
-		await spawnGit(["-c", "protocol.version=2", "clone", "--mirror", "-q", url, pggitDir])
-		await spawnGit(["fsck", "--strict"], { cwd: pggitDir })
-
 		// git's own answer over the SAME object set: replay the same push into a plain
-		// file:// bare remote, gc it, clone it.
+		// file:// bare remote and gc it.
 		const oracle = join(scratch.mk("oracle"), "o.git")
 		await spawnGit(["init", "-q", "--bare", oracle])
 		await spawnGit(["push", `file://${oracle}`, "--mirror"], { cwd: MIRROR })
 		await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: oracle })
+
+		const pggitDir = join(scratch.mk("pggit"), "c.git")
 		const gitDir = join(scratch.mk("git"), "g.git")
-		await spawnGit(["clone", "--mirror", "-q", `file://${oracle}`, gitDir])
+		const comparison = await compareMirrorClones(
+			{ dest: pggitDir, url },
+			{ dest: gitDir, url: `file://${oracle}` },
+		)
+		if (
+			comparison.served.fsck !== "" ||
+			comparison.oracle.fsck !== "" ||
+			comparison.objects.onlyServed.length > 0 ||
+			comparison.objects.onlyOracle.length > 0 ||
+			comparison.served.digest !== comparison.oracle.digest ||
+			JSON.stringify(comparison.served.refs) !== JSON.stringify(comparison.oracle.refs)
+		) {
+			throw new Error(
+				`serve-size clone prerequisite diverged (served-only ${comparison.objects.onlyServed.length}, oracle-only ${comparison.objects.onlyOracle.length}, refs ${comparison.served.refs.length}/${comparison.oracle.refs.length}, fsck ${JSON.stringify(comparison.served.fsck)}/${JSON.stringify(comparison.oracle.fsck)})`,
+			)
+		}
 
-		const p = await attribute(pggitDir)
-		const g = await attribute(gitDir)
-		table("pggit (repacked, served over the wire)", p)
-		table("git (gc --aggressive, same objects)", g)
+		const request = fetchRequest({
+			done: true,
+			includeTag: true,
+			wants: await wantedRefOids(oracle),
+		})
+		const [pggitPack, gitPack] = await Promise.all([
+			postPggitV2Pack(url, request),
+			canonicalV2Pack(oracle, request),
+		])
+		const [pggitObjects, gitObjects] = await Promise.all([
+			readPack(pggitPack),
+			readPack(gitPack),
+		])
+		const pggitOids = pggitObjects.map((object) => object.oid).sort()
+		const gitOids = gitObjects.map((object) => object.oid).sort()
+		if (gitOids.length === 0 || JSON.stringify(pggitOids) !== JSON.stringify(gitOids)) {
+			throw new Error(
+				`serve-size raw pack prerequisite failed (${pggitOids.length}/${gitOids.length} transmitted objects)`,
+			)
+		}
 
-		const ratio = p.total / Math.max(g.total, 1)
+		const pggitIndexed = join(scratch.mk("pggit-raw-pack"), "p.git")
+		const gitIndexed = join(scratch.mk("git-raw-pack"), "g.git")
+		await spawnGit(["init", "-q", "--bare", pggitIndexed])
+		await spawnGit(["init", "-q", "--bare", gitIndexed])
+		const [pggitIndex, gitIndex] = await Promise.all([
+			indexRawPack(pggitIndexed, pggitPack, false),
+			indexRawPack(gitIndexed, gitPack, false),
+		])
+
+		const p = attribute(pggitIndex.entries, "pggit raw pack")
+		const g = attribute(gitIndex.entries, "canonical raw pack")
+		if (p.total > pggitPack.length || g.total > gitPack.length) {
+			throw new Error(
+				`verify-pack entry bytes exceed raw pack length (pggit ${p.total}/${pggitPack.length}, git ${g.total}/${gitPack.length})`,
+			)
+		}
+		table("pggit raw response pack", p)
+		table("git raw response pack (gc --aggressive)", g)
+
+		const ratio = pggitPack.length / gitPack.length
 		console.log(`\n### where the gap is`)
 		console.log("| type | pggit | git | pggit / git |")
 		console.log("|---|---|---|---|")
@@ -119,29 +188,51 @@ async function main(): Promise<void> {
 			const gs = g.by.get(t)
 			if (!ps || !gs) continue
 			console.log(
-				`| ${t} | ${mb(ps.packed)} | ${mb(gs.packed)} | ${(ps.packed / Math.max(gs.packed, 1)).toFixed(2)}x |`,
+				`| ${t} | ${mb(ps.packed)} | ${mb(gs.packed)} | ${(ps.packed / gs.packed).toFixed(2)}x |`,
 			)
 		}
 		console.log(
-			`| **total** | **${mb(p.total)}** | **${mb(g.total)}** | **${ratio.toFixed(2)}x** |`,
+			`| **raw pack** | **${mb(pggitPack.length)}** | **${mb(gitPack.length)}** | **${ratio.toFixed(2)}x** |`,
 		)
 
-		const blobP = p.by.get("blob")?.packed ?? 0
-		const blobG = g.by.get("blob")?.packed ?? 0
-		const treeP = p.by.get("tree")?.packed ?? 0
-		const treeG = g.by.get("tree")?.packed ?? 0
-		const gap = p.total - g.total
+		const pggitBlobs = p.by.get("blob")
+		const gitBlobs = g.by.get("blob")
+		const pggitTrees = p.by.get("tree")
+		const gitTrees = g.by.get("tree")
+		if (
+			pggitBlobs === undefined ||
+			gitBlobs === undefined ||
+			pggitTrees === undefined ||
+			gitTrees === undefined ||
+			pggitBlobs.n === 0 ||
+			gitBlobs.n !== pggitBlobs.n ||
+			pggitBlobs.deltified !== 0 ||
+			gitBlobs.deltified === 0
+		) {
+			throw new Error(
+				`blob-delta prerequisite failed: pggit=${JSON.stringify(pggitBlobs)}, git=${JSON.stringify(gitBlobs)}`,
+			)
+		}
+		const blobP = pggitBlobs.packed
+		const blobG = gitBlobs.packed
+		const treeP = pggitTrees.packed
+		const treeG = gitTrees.packed
+		const gap = pggitPack.length - gitPack.length
+		if (gap > 0) {
+			console.log(
+				`\nof the ${mb(gap)} gap: ${(((blobP - blobG) / gap) * 100).toFixed(0)}% is blobs, ` +
+					`${(((treeP - treeG) / gap) * 100).toFixed(0)}% is trees`,
+			)
+		} else {
+			console.log(`\npggit has no positive raw-pack gap to attribute (${mb(gap)}).`)
+		}
 		console.log(
-			`\nof the ${mb(gap)} gap: ${(((blobP - blobG) / Math.max(gap, 1)) * 100).toFixed(0)}% is blobs, ` +
-				`${(((treeP - treeG) / Math.max(gap, 1)) * 100).toFixed(0)}% is trees`,
-		)
-		console.log(
-			`blob entries stored as deltas — pggit ${p.by.get("blob")?.deltified ?? 0} / git ${g.by.get("blob")?.deltified ?? 0}`,
+			`blob entries stored as deltas — pggit ${pggitBlobs.deltified} / git ${gitBlobs.deltified}`,
 		)
 
 		if (ratio > MAX_RATIO) {
 			console.log(
-				`\nREPRODUCED: ${SLUG} serves ${ratio.toFixed(2)}x git's pack (${mb(p.total)} vs ${mb(g.total)}), ` +
+				`\nREPRODUCED: ${SLUG} serves ${ratio.toFixed(2)}x git's raw pack (${mb(pggitPack.length)} vs ${mb(gitPack.length)}), ` +
 					`past the ${MAX_RATIO}x bar set by the design's measured ~2.4x parity.`,
 			)
 			process.exitCode = 1

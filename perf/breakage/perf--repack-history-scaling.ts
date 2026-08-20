@@ -17,8 +17,8 @@ import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema } from "@/testing/pg"
 import {
 	cleanupTmp,
-	flag,
 	gitRepack,
+	increasingIntegerListFlag,
 	mb,
 	PG_URL,
 	reachableObjects,
@@ -28,7 +28,7 @@ import {
 	withPeakRss,
 } from "./_perf-util"
 
-const SIZES = flag("sizes", "250,500,1000,2000").split(",").map(Number)
+const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
 
 /** Ratio at which pggit's repack is declared divergent from git's. */
 const WALL_RATIO_LIMIT = 10
@@ -55,12 +55,30 @@ async function measure(n: number): Promise<Row> {
 		const treeBytes = objects
 			.filter((o) => o.type === "tree")
 			.reduce((a, o) => a + o.content.length, 0)
+		if (objects.length === 0 || treeBytes === 0) {
+			throw new Error(
+				`fixture is empty: objects=${objects.length}, treeBytes=${treeBytes}`,
+			)
+		}
 		const git = await gitRepack(dir, `scale-git-${n}`)
+		if (git.packBytes <= 0 || git.peakRss <= 0 || git.ms <= 0) {
+			throw new Error("git repack metrics missing")
+		}
 		const db = await createIsolatedSchema(PG_URL)
 		try {
 			await seedRepo(db.sql, "probe/scale", dir, objects)
 			const repack = createRepack(db.sql)
 			const r = await withPeakRss(() => repack.repack("probe/scale"))
+			if (
+				r.ms <= 0 ||
+				r.peakRss <= r.baseRss ||
+				r.value.wholes + r.value.deltas !== objects.length ||
+				r.value.deltas === 0
+			) {
+				throw new Error(
+					`repack produced ${r.value.wholes} wholes + ${r.value.deltas} deltas for ${objects.length} objects`,
+				)
+			}
 			return {
 				deltas: r.value.deltas,
 				gitMs: git.ms,
@@ -109,7 +127,7 @@ async function main(): Promise<void> {
 				secs(r.gitMs),
 				mb(r.gitRss),
 				mb(r.gitPack),
-				`${(r.pggitMs / Math.max(r.gitMs, 1)).toFixed(1)}×`,
+				`${(r.pggitMs / r.gitMs).toFixed(1)}×`,
 				`${r.wholes}w+${r.deltas}d`,
 			]),
 		),
@@ -124,10 +142,10 @@ async function main(): Promise<void> {
 		exps.push([
 			`${a.n}→${b.n}`,
 			(Math.log2(b.pggitMs / a.pggitMs) / k).toFixed(2),
-			(Math.log2(b.gitMs / Math.max(a.gitMs, 1)) / k).toFixed(2),
+			(Math.log2(b.gitMs / a.gitMs) / k).toFixed(2),
 			(Math.log2(b.treeMb / a.treeMb) / k).toFixed(2),
-			(Math.log2(b.pggitRss / Math.max(a.pggitRss, 1)) / k).toFixed(2),
-			(b.pggitMs / Math.max(b.gitMs, 1) / (a.pggitMs / Math.max(a.gitMs, 1))).toFixed(2),
+			(Math.log2(b.pggitRss / a.pggitRss) / k).toFixed(2),
+			(b.pggitMs / b.gitMs / (a.pggitMs / a.gitMs)).toFixed(2),
 		])
 	}
 	console.log(
@@ -145,7 +163,7 @@ async function main(): Promise<void> {
 	)
 
 	const last = rows[rows.length - 1] as Row
-	const ratio = last.pggitMs / Math.max(last.gitMs, 1)
+	const ratio = last.pggitMs / last.gitMs
 	const worstGrowth = Math.max(...exps.map((e) => Number(e[5])))
 	console.log(
 		`\nFAIL CONDITION: pggit/git wall ratio > ${WALL_RATIO_LIMIT}× at the largest N,` +

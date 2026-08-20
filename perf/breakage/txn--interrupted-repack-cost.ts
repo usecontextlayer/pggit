@@ -1,44 +1,30 @@
 /**
- * TRANSACTIONAL-INTEGRITY PROBE 2b — what an interrupted repack COSTS.
+ * TRANSACTIONAL-INTEGRITY PROBE 2b — an interrupted repack must not create a permanent transfer-size penalty.
  *
- * Probe 2 (`src/e2e/breakage/txn--interrupted-repack.test.ts`) showed a resumed
- * pass is correct (clone is fsck-clean) but produces a DIFFERENT tier from an
- * uninterrupted one. Rows are never rewritten (design D4), so whatever the resume
- * decided is permanent. This measures the difference where the customer pays it:
- * the bytes a real `git clone` pulls down.
+ * Repack emits changed subtrees before their roots, so every committed crash prefix is subtree-closed. A resumed pass should therefore converge without downgrading unseen subtrees to whole encodings. This probe injects exact failures at named COPY flushes, proves each injection fired, completes a clean pass, requires full nonzero encoding coverage and exact source/client object equality, and measures pggit's request-scoped raw pack-byte counter rather than Git's client-rewritten packfiles.
  *
- * The suspected mechanism, from repack.ts `encodeTreePair`:
- *
- *     if (!pendingByOid.has(treeOid)) return    // <- returns BEFORE the recursion
- *
- * A tree that already has a row ends the walk at that node, so its CHANGED
- * SUBTREES are never paired with their predecessors. When a crash commits a root
- * tree but not the subtree chain below it, the resumed pass cannot re-enter that
- * lineage — those subtrees fall through to phase 2 and ship WHOLE.
- *
- * It is a PERF harness, not a vitest test, because its verdict is a BYTE
- * MEASUREMENT: clone bytes under each crash schedule against the uninterrupted
- * baseline. Every run still carries the correctness sub-check the probe had — each
- * clone must be fsck-clean, or `spawnGit` throws and the harness exits non-zero.
- *
- * THRESHOLD — non-zero exit when any crash schedule's clone is LARGER than the
- * uninterrupted baseline. A crash is allowed to cost wall time; it is not allowed
- * to cost the customer permanent transfer bytes.
+ * THRESHOLD — non-zero exit when any crash schedule's raw served pack is larger than the uninterrupted baseline. A crash may cost wall time; it must not cost permanent transfer bytes.
  *
  *   npx tsx perf/breakage/txn--interrupted-repack-cost.ts
  *   npx tsx perf/breakage/txn--interrupted-repack-cost.ts --pg=postgres://…
  */
-import { mkdtempSync, rmSync, statSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Sql } from "postgres"
+import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createGitApp } from "@/index"
+import { collectedRuns, resetCollected } from "@/instrument"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { PACK_DIR, packFiles, seedRepoIntoStore } from "@/testing/git-fixtures"
+import {
+	branchAndTagRefsOf,
+	gitReachableOids,
+	seedRepoIntoStore,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { PG_URL, table } from "./_txn-util"
@@ -49,42 +35,65 @@ const RUNS = 400
 /** A client whose `begin()` throws on the Nth call — the pass dies with N-1
  * flushes committed, exactly what a killed process or a dropped connection
  * leaves behind. */
-function dieAtFlush(pg: Sql, n: number): Sql {
+function dieAtFlush(pg: Sql, n: number): { sql: Sql; fired: () => boolean } {
 	let seen = 0
-	return new Proxy(pg, {
+	let fired = false
+	const sql = new Proxy(pg, {
 		get(target, prop, receiver) {
 			if (prop !== "begin") return Reflect.get(target, prop, receiver)
 			const real = Reflect.get(target, prop, target) as Sql["begin"]
 			return (...args: unknown[]) => {
-				if (++seen === n) throw new Error(`crash@${n}`)
+				if (++seen === n) {
+					fired = true
+					throw new Error(`crash@${n}`)
+				}
 				return (real as (...a: unknown[]) => unknown).apply(target, args)
 			}
 		},
 	}) as Sql
+	return { fired: () => fired, sql }
 }
 
-type TierStats = { rows: number; bytes: number; deltas: number; wholetrees: number }
+type TierStats = {
+	rows: number
+	bytes: number
+	deltas: number
+	wholetrees: number
+	eligibleObjects: number
+	ineligibleRows: number
+}
 
 async function stats(db: IsolatedDb): Promise<TierStats> {
 	const [row] = await db.sql<TierStats[]>`
 		select count(*)::int as rows,
-			sum(octet_length(e.data))::int as bytes,
+			coalesce(sum(octet_length(e.data)), 0)::int as bytes,
 			count(*) filter (where e.base_oid is not null)::int as deltas,
-			count(*) filter (where e.base_oid is null and o.type = 2)::int as wholetrees
+			count(*) filter (where e.base_oid is null and o.type = 2)::int as wholetrees,
+			(select count(*)::int from git_object where size < ${MAX_INLINE_BYTEA_BYTES}) as "eligibleObjects",
+			count(*) filter (where o.size >= ${MAX_INLINE_BYTEA_BYTES})::int as "ineligibleRows"
 		from git_pack_encoding e
 			join git_object o on o.repo_id = e.repo_id and o.oid = e.oid`
 	if (!row) throw new Error("tier-stats query returned no row")
 	return row
 }
 
-/** Total bytes of a checkout's pack files — the transfer, measured client-side. */
-function clonePackBytes(dir: string): number {
-	return packFiles(dir)
-		.map((f) => statSync(join(dir, PACK_DIR, f)).size)
-		.reduce((a, b) => a + b, 0)
+function requireRawPackBytes(label: string): number {
+	const runs = collectedRuns().filter((run) => run.label === "fetch")
+	if (runs.length !== 1) {
+		throw new Error(`${label}: expected one fetch collector, got ${runs.length}`)
+	}
+	const run = runs[0]
+	if (!run) throw new Error(`${label}: fetch collector disappeared`)
+	for (const counter of ["objectsServed", "packBytes", "wireBytes"]) {
+		const value = run.counters.get(counter)
+		if (value === undefined || value <= 0) {
+			throw new Error(`${label}: ${counter} is missing or nonpositive`)
+		}
+	}
+	return run.counters.get("packBytes") as number
 }
 
-type Run = { label: string; tier: TierStats; wire: number }
+type Run = { label: string; packBytes: number; tier: TierStats }
 
 /** Build the tier under a crash schedule, then report tier bytes + clone bytes. */
 async function run(
@@ -96,21 +105,52 @@ async function run(
 	const db = await createIsolatedSchema(PG_URL)
 	let server: GitServer | undefined
 	try {
+		mkdirSync(scratchDir, { recursive: true })
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		await seedRepoIntoStore(REPO, src, { objects, refs })
 		for (const at of crashes) {
+			const fault = dieAtFlush(db.sql, at)
+			let thrown: unknown
 			try {
-				await createRepack(dieAtFlush(db.sql, at)).repack(REPO)
-			} catch {
-				/* the crash under test */
+				await createRepack(fault.sql).repack(REPO)
+			} catch (error) {
+				thrown = error
+			}
+			if (
+				!fault.fired() ||
+				!(thrown instanceof Error) ||
+				thrown.message !== `crash@${at}`
+			) {
+				throw new Error(
+					`${label}: fault crash@${at} did not fire exactly (fired=${fault.fired()}, error=${String(thrown)})`,
+					{ cause: thrown },
+				)
 			}
 		}
-		await createRepack(db.sql).repack(REPO) // the eventual clean pass
+		const beforeClean = await stats(db)
+		const clean = await createRepack(db.sql).repack(REPO)
+		if (clean.wholes + clean.deltas !== beforeClean.eligibleObjects - beforeClean.rows) {
+			throw new Error(
+				`${label}: clean pass covered ${clean.wholes + clean.deltas}/${beforeClean.eligibleObjects - beforeClean.rows} pending objects`,
+			)
+		}
 		const tier = await stats(db)
+		if (
+			tier.eligibleObjects === 0 ||
+			tier.rows !== tier.eligibleObjects ||
+			tier.ineligibleRows !== 0 ||
+			tier.bytes === 0 ||
+			tier.deltas === 0
+		) {
+			throw new Error(
+				`${label}: incomplete or vacuous tier (${tier.rows}/${tier.eligibleObjects} rows, ${tier.ineligibleRows} ineligible, ${tier.bytes} bytes, ${tier.deltas} deltas)`,
+			)
+		}
 
-		server = await serveOnPort(createGitApp({ objects, refs }), 0)
+		server = await serveOnPort(createGitApp({ objects, refs }, { instrument: true }), 0)
 		const dest = join(scratchDir, "c")
+		resetCollected()
 		await spawnGit([
 			"-c",
 			"protocol.version=2",
@@ -122,7 +162,30 @@ async function run(
 		// The correctness sub-check the probe carried: a resumed tier must still serve
 		// a repository canonical git accepts. `spawnGit` throws on a non-zero exit.
 		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-		return { label, tier, wire: clonePackBytes(dest) }
+		const [expected, actual, expectedRefs, actualRefs] = await Promise.all([
+			gitReachableOids(src),
+			gitReachableOids(dest),
+			branchAndTagRefsOf(src),
+			branchAndTagRefsOf(dest),
+		])
+		if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+			throw new Error(
+				`${label}: clone object set differs from source (${actual.length}/${expected.length})`,
+			)
+		}
+		if (JSON.stringify(actualRefs) !== JSON.stringify(expectedRefs)) {
+			throw new Error(`${label}: clone refs differ from source`)
+		}
+		const [expectedTip, actualTip] = await Promise.all([
+			spawnGit(["rev-parse", "HEAD"], { cwd: src }),
+			spawnGit(["rev-parse", "HEAD"], { cwd: dest }),
+		])
+		if (expectedTip.stdout.trim() !== actualTip.stdout.trim()) {
+			throw new Error(
+				`${label}: clone HEAD ${actualTip.stdout.trim()} != source ${expectedTip.stdout.trim()}`,
+			)
+		}
+		return { label, packBytes: requireRawPackBytes(label), tier }
 	} finally {
 		await server?.close()
 		await db.drop()
@@ -147,28 +210,28 @@ async function main(): Promise<void> {
 
 		console.log(
 			table(
-				["schedule", "tier bytes", "deltas", "whole trees", "CLONE bytes"],
+				["schedule", "tier bytes", "deltas", "whole trees", "RAW PACK bytes"],
 				runs.map((r) => [
 					r.label,
 					r.tier.bytes,
 					r.tier.deltas,
 					r.tier.wholetrees,
-					r.wire,
+					r.packBytes,
 				]),
 			),
 		)
 
 		const pct = (n: number): string =>
-			`${(((n - base.wire) / base.wire) * 100).toFixed(1)}%`
+			`${(((n - base.packBytes) / base.packBytes) * 100).toFixed(1)}%`
 		console.log(
-			`\nclone-byte regression vs uninterrupted: one=${pct(one.wire)} ` +
-				`two=${pct(two.wire)} many=${pct(many.wire)}`,
+			`\nraw-pack regression vs uninterrupted: one=${pct(one.packBytes)} ` +
+				`two=${pct(two.packBytes)} many=${pct(many.packBytes)}`,
 		)
 
-		const regressed = runs.filter((r) => r.wire > base.wire)
+		const regressed = runs.filter((r) => r.packBytes > base.packBytes)
 		for (const r of regressed) {
 			console.error(
-				`THRESHOLD VIOLATED: "${r.label}" clones ${r.wire}B vs the uninterrupted ${base.wire}B (${pct(r.wire)})`,
+				`THRESHOLD VIOLATED: "${r.label}" serves ${r.packBytes}B vs the uninterrupted ${base.packBytes}B (${pct(r.packBytes)})`,
 			)
 		}
 		console.log(`\n${regressed.length === 0 ? "OK" : `${regressed.length} REGRESSIONS`}`)

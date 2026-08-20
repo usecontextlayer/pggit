@@ -2,21 +2,20 @@
  * pgres — GC HOLDS A SNAPSHOT FOR ITS WHOLE CLOSURE WALK, AND THAT BLOCKS THE
  * RECLAMATION OF ITS OWN CHURN.
  *
- * `gc.ts liveSet()` reserves one connection, opens `begin isolation level
- * repeatable read`, and holds it across the ref read AND the entire multi-statement
- * `reachableClosure` walk before committing. That is deliberate and correct — §5
- * defense (a), one MVCC snapshot so a concurrent push cannot interleave. The
- * resource consequence is what this harness prices:
+ * `gc.ts` reserves one connection and `livePlan()` opens `begin isolation level
+ * repeatable read` across the ref read and epoch plan. On a fresh fixture the absent
+ * epoch forces a full `originClosure` walk inside that snapshot. That is deliberate
+ * and correct — §5 defense (a), one MVCC snapshot so a concurrent push cannot
+ * interleave. The resource consequence is what this harness prices:
  *
  *   While ANY transaction holds a snapshot, VACUUM — autovacuum included — cannot
  *   remove a tuple deleted after that snapshot began. Not just in the GC'd repo:
  *   the xmin horizon is DATABASE-wide, so one repo's closure walk suspends
  *   reclamation for every repo, every schema, and both tiers.
  *
- * The drain runs GC per eligible repo, `concurrency` at a time, on a hot cadence.
- * If the per-repo hold is long relative to the interval, the horizon is held
- * continuously and NOTHING is ever reclaimed — which is exactly the state this
- * shared instance is in (see the sibling-agent lag printed below).
+ * A host can run GC passes back to back over a fleet. If the per-repo hold is long
+ * relative to the interval, the horizon can be held nearly continuously; the
+ * sibling-agent lag printed below is context, not evidence about this harness.
  *
  * Part 1 — MEASUREMENT: how long is the snapshot held, as a function of repo size?
  * Sampled from `pg_stat_activity` filtered to this harness's OWN application_name.
@@ -79,7 +78,8 @@ async function ownSnapshotAge(watch: Sql): Promise<number> {
 		select coalesce(max(extract(epoch from (clock_timestamp() - xact_start)) * 1000), 0)::int::text as ms
 		from pg_stat_activity
 		where application_name = ${APP} and backend_xmin is not null`
-	return Number(r?.ms ?? 0)
+	if (!r) throw new Error("own-snapshot census returned no row")
+	return Number(r.ms)
 }
 
 /** Longest-held snapshot age (s) among OTHER backends — the sibling agents. */
@@ -89,7 +89,8 @@ async function othersLag(watch: Sql): Promise<number> {
 		from pg_stat_activity
 		where application_name <> ${APP} and backend_type = 'client backend'
 			and backend_xmin is not null`
-	return Number(r?.s ?? 0)
+	if (!r) throw new Error("other-snapshot census returned no row")
+	return Number(r.s)
 }
 
 async function main(): Promise<void> {
@@ -126,21 +127,40 @@ async function main(): Promise<void> {
 			)
 			const tip = await revParse(dir, "refs/heads/main")
 			const objects = await objectsBetween(dir, tip, [])
+			if (objects.length === 0) throw new Error(`${repo}: fixture produced no objects`)
 			await seedObjects(gcPg, repo, objects)
 			await setMain(gcPg, repo, tip)
-			await repack.repack(repo)
+			const encoded = await repack.repack(repo)
+			if (encoded.wholes + encoded.deltas !== objects.length) {
+				throw new Error(`${repo}: repack covered incomplete object set`)
+			}
 
 			let holdMs = 0
-			const sampler = setInterval(() => {
-				void ownSnapshotAge(watch).then((ms) => {
+			let sampling = true
+			let observed = 0
+			const sampler = (async () => {
+				while (sampling) {
+					const ms = await ownSnapshotAge(watch)
+					if (ms > 0) observed++
 					if (ms > holdMs) holdMs = ms
-				})
-			}, 20)
+					await sleep(20)
+				}
+			})()
 			const t0 = Date.now()
-			await gc.gc(repo, { graceSeconds: 3600, maintain: false })
-			const gcMs = Date.now() - t0
-			clearInterval(sampler)
-			await sleep(50)
+			let gcMs = 0
+			let result: Awaited<ReturnType<typeof gc.gc>>
+			try {
+				result = await gc.gc(repo, { graceSeconds: 3600, maintain: false })
+				gcMs = Date.now() - t0
+			} finally {
+				sampling = false
+				await sampler
+			}
+			if (result.deletedObjects !== 0 || observed === 0 || holdMs <= 0 || gcMs <= 0) {
+				throw new Error(
+					`${repo}: invalid GC measurement deleted=${result.deletedObjects}, observed=${observed}, hold=${holdMs}, wall=${gcMs}`,
+				)
+			}
 			samples.push({
 				commits,
 				dutyCycle: holdMs / gcMs,
@@ -196,6 +216,7 @@ async function main(): Promise<void> {
 		})
 		await fastImport(dir, base.stream)
 		const baseTip = await revParse(dir, "refs/heads/main")
+		const baseObjects = await objectsBetween(dir, baseTip, [])
 		await fastImport(
 			dir,
 			runCommits({
@@ -208,162 +229,211 @@ async function main(): Promise<void> {
 			}).stream,
 		)
 		const tip = await revParse(dir, "refs/heads/main")
-		await seedObjects(gcPg, repo, await objectsBetween(dir, tip, []))
+		const allObjects = await objectsBetween(dir, tip, [])
+		const tailObjects = await objectsBetween(dir, tip, [baseTip])
+		await seedObjects(gcPg, repo, allObjects)
 		await setMain(gcPg, repo, tip)
-		await repack.repack(repo)
+		const demoRepack = await repack.repack(repo)
+		if (
+			demoRepack.wholes + demoRepack.deltas !== allObjects.length ||
+			tailObjects.length === 0
+		) {
+			throw new Error("snapshot demo did not establish a complete nonempty churn tier")
+		}
 
 		const deadNow = async (): Promise<{ enc: number; obj: number }> => {
 			await sleep(1200)
 			const s = await schemaStats(gcPg, iso.schema)
+			if (!s.git_pack_encoding || !s.git_object) {
+				throw new Error("snapshot demo storage stats missing measured tables")
+			}
 			return { enc: stat(s, "git_pack_encoding").dead, obj: stat(s, "git_object").dead }
 		}
 
 		// 1. Open OUR OWN REPEATABLE READ snapshot BEFORE the deletions — exactly the
 		//    shape of a concurrent GC pass on some other repo.
 		const holder = await gcPg.reserve()
-		await holder`begin isolation level repeatable read`
-		await holder`select 1`
+		let holderInTransaction = false
+		let holderReleased = false
+		let verbose: ReturnType<typeof postgres> | undefined
+		try {
+			await holder`begin isolation level repeatable read`
+			holderInTransaction = true
+			await holder`select 1`
 
-		// 2. Churn: rewind to the base and GC, deleting ~all of the 400-commit tail in
-		//    both tiers.
-		await setMain(gcPg, repo, baseTip)
-		const g = await gc.gc(repo, { graceSeconds: 0, maintain: false })
-
-		// 3. VACUUM under the held snapshot, capturing Postgres's own verdict. VACUUM
-		//    VERBOSE emits INFO messages; porsager surfaces them through `onnotice`.
-		// VACUUM VERBOSE emits one INFO per relation; porsager surfaces them through
-		// `onnotice`. Only three numbers matter, and they are Postgres's own words:
-		// how many tuples it removed, how many it saw as "dead but not yet
-		// removable", and how many XIDs behind the removable cutoff was.
-		type Verdict = {
-			removed: number
-			notRemovable: number
-			xidsOld: number
-			rels: number
-		}
-		let acc: Verdict = { notRemovable: 0, rels: 0, removed: 0, xidsOld: 0 }
-		const verbose = postgres(PG_URL, {
-			connection: { application_name: `${APP}-vac`, search_path: iso.schema },
-			max: 1,
-			onnotice: (n) => {
-				const m = `${n.message ?? ""}`.replace(/\s+/g, " ")
-				if (!/finished vacuuming/.test(m)) return
-				if (!/git_pack_encoding|git_object/.test(m)) return
-				const t = m.match(
-					/tuples: (\d+) removed, \d+ remain, (\d+) are dead but not yet removable/,
+			// 2. Churn: rewind to the base and GC, deleting ~all of the 400-commit tail in
+			//    both tiers.
+			await setMain(gcPg, repo, baseTip)
+			const g = await gc.gc(repo, { graceSeconds: 0, maintain: false })
+			const [postGc] = await gcPg<{ objects: string; encodings: string }[]>`
+			select (select count(*) from git_object)::text as objects,
+				(select count(*) from git_pack_encoding)::text as encodings`
+			if (
+				!postGc ||
+				g.deletedObjects !== tailObjects.length ||
+				Number(postGc.objects) !== baseObjects.length ||
+				Number(postGc.encodings) !== baseObjects.length
+			) {
+				throw new Error(
+					`snapshot demo GC mismatch: deleted=${g.deletedObjects}/${tailObjects.length}, rows=${JSON.stringify(postGc)}`,
 				)
-				const x = m.match(/which was (\d+) XIDs old/)
-				if (t) {
-					acc.removed += Number(t[1])
-					acc.notRemovable += Number(t[2])
-					acc.rels++
-				}
-				if (x) acc.xidsOld = Math.max(acc.xidsOld, Number(x[1]))
-			},
-		})
-		const vacuumVerbose = async (): Promise<Verdict> => {
-			acc = { notRemovable: 0, rels: 0, removed: 0, xidsOld: 0 }
-			await verbose.unsafe("vacuum (verbose, analyze) git_pack_encoding")
-			await verbose.unsafe("vacuum (verbose, analyze) git_object")
-			return acc
-		}
-		const underVerdict = await vacuumVerbose()
-		const under = await deadNow()
-
-		// 4. Release the snapshot, wait for a clear horizon, VACUUM again.
-		await holder`commit`
-		holder.release()
-		let waited = 0
-		let clear = false
-		while (waited < 20_000) {
-			if ((await othersLag(watch)) < 2) {
-				clear = true
-				break
 			}
-			await sleep(500)
-			waited += 500
-		}
-		const afterVerdict = await vacuumVerbose()
-		const after = await deadNow()
-		await verbose.end()
 
-		console.log(
-			table(
-				["stage", "git_pack_encoding dead tuples", "git_object dead tuples"],
-				[
+			// 3. VACUUM under the held snapshot, capturing Postgres's own verdict. VACUUM
+			// VERBOSE emits one INFO per relation; porsager surfaces them through
+			// `onnotice`. Only three numbers matter, and they are Postgres's own words:
+			// how many tuples it removed, how many it saw as "dead but not yet
+			// removable", and how many XIDs behind the removable cutoff was.
+			type Verdict = {
+				removed: number
+				notRemovable: number
+				xidsOld: number
+				rels: number
+			}
+			let acc: Verdict = { notRemovable: 0, rels: 0, removed: 0, xidsOld: 0 }
+			const vacuum = postgres(PG_URL, {
+				connection: { application_name: `${APP}-vac`, search_path: iso.schema },
+				max: 1,
+				onnotice: (n) => {
+					const m = `${n.message ?? ""}`.replace(/\s+/g, " ")
+					if (!/finished vacuuming/.test(m)) return
+					if (!/git_pack_encoding|git_object/.test(m)) return
+					const t = m.match(
+						/tuples: (\d+) removed, \d+ remain, (\d+) are dead but not yet removable/,
+					)
+					const x = m.match(/which was (\d+) XIDs old/)
+					if (t) {
+						acc.removed += Number(t[1])
+						acc.notRemovable += Number(t[2])
+						acc.rels++
+					}
+					if (x) acc.xidsOld = Math.max(acc.xidsOld, Number(x[1]))
+				},
+			})
+			verbose = vacuum
+			const vacuumVerbose = async (): Promise<Verdict> => {
+				acc = { notRemovable: 0, rels: 0, removed: 0, xidsOld: 0 }
+				await vacuum.unsafe("vacuum (verbose, analyze) git_pack_encoding")
+				await vacuum.unsafe("vacuum (verbose, analyze) git_object")
+				return acc
+			}
+			const underVerdict = await vacuumVerbose()
+			const under = await deadNow()
+			if (underVerdict.rels === 0 || underVerdict.notRemovable === 0 || under.enc === 0) {
+				throw new Error(
+					`snapshot demo did not prove blocked reclaim: ${JSON.stringify({ under, underVerdict })}`,
+				)
+			}
+
+			// 4. Release the snapshot, wait for a clear horizon, VACUUM again.
+			await holder`commit`
+			holderInTransaction = false
+			holder.release()
+			holderReleased = true
+			let waited = 0
+			let clear = false
+			while (waited < 20_000) {
+				if ((await othersLag(watch)) < 2) {
+					clear = true
+					break
+				}
+				await sleep(500)
+				waited += 500
+			}
+			if (!clear) {
+				throw new Error(
+					`release-side prerequisite failed: database snapshot horizon did not clear within ${waited} ms`,
+				)
+			}
+			const afterVerdict = await vacuumVerbose()
+			const after = await deadNow()
+			if (afterVerdict.notRemovable !== 0 || after.enc >= under.enc) {
+				throw new Error(
+					`clear-horizon VACUUM did not reclaim the blocked tier rows: ${JSON.stringify({ after, afterVerdict, under })}`,
+				)
+			}
+
+			console.log(
+				table(
+					["stage", "git_pack_encoding dead tuples", "git_object dead tuples"],
 					[
-						`after gc (deleted ${g.deletedObjects} objects; encodings went with them by cascade)`,
-						"—",
-						"—",
+						[
+							`after gc (deleted ${g.deletedObjects} objects; encodings went with them by cascade)`,
+							"—",
+							"—",
+						],
+						["VACUUM taken UNDER a held snapshot", under.enc, under.obj],
+						["VACUUM after release and clear horizon", after.enc, after.obj],
 					],
-					["VACUUM taken UNDER a held snapshot", under.enc, under.obj],
+				),
+			)
+			console.log("\nPostgres's own verdict, from VACUUM (VERBOSE) over the two tiers:\n")
+			console.log(
+				table(
 					[
-						`VACUUM after release${clear ? "" : " (horizon NOT clear — see caveat)"}`,
-						after.enc,
-						after.obj,
-					],
-				],
-			),
-		)
-		console.log("\nPostgres's own verdict, from VACUUM (VERBOSE) over the two tiers:\n")
-		console.log(
-			table(
-				[
-					"VACUUM taken",
-					"relations",
-					"tuples REMOVED",
-					"dead but NOT YET REMOVABLE",
-					"removable cutoff was N XIDs old",
-				],
-				[
-					[
-						"UNDER a held snapshot",
-						underVerdict.rels,
-						underVerdict.removed,
-						underVerdict.notRemovable,
-						underVerdict.xidsOld,
+						"VACUUM taken",
+						"relations",
+						"tuples REMOVED",
+						"dead but NOT YET REMOVABLE",
+						"removable cutoff was N XIDs old",
 					],
 					[
-						"AFTER releasing it",
-						afterVerdict.rels,
-						afterVerdict.removed,
-						afterVerdict.notRemovable,
-						afterVerdict.xidsOld,
+						[
+							"UNDER a held snapshot",
+							underVerdict.rels,
+							underVerdict.removed,
+							underVerdict.notRemovable,
+							underVerdict.xidsOld,
+						],
+						[
+							"AFTER releasing it",
+							afterVerdict.rels,
+							afterVerdict.removed,
+							afterVerdict.notRemovable,
+							afterVerdict.xidsOld,
+						],
 					],
-				],
-			),
-		)
-		console.log(
-			"\n`dead but not yet removable` is Postgres refusing to reclaim a tuple because some snapshot can still see it; `XIDs old` is how far behind the horizon was. Neither number is about pggit's code — they are the server naming the cost of holding a snapshot.",
-		)
-		console.log(
-			`\nwaited ${waited} ms for a clear horizon; other backends' oldest snapshot at the second VACUUM: ${await othersLag(watch)} s (${clear ? "clear" : "STILL HELD by a sibling agent — the second VACUUM is therefore also blocked and its row under-reports"})`,
-		)
-		// What is actually holding the horizon right now? Named, not guessed.
-		const holders = await watch<{ app: string; age: string; q: string }[]>`
+				),
+			)
+			console.log(
+				"\n`dead but not yet removable` is Postgres refusing to reclaim a tuple because some snapshot can still see it; `XIDs old` is how far behind the horizon was. Neither number is about pggit's code — they are the server naming the cost of holding a snapshot.",
+			)
+			console.log(
+				`\nwaited ${waited} ms for a clear horizon; other backends' oldest snapshot at the second VACUUM: ${await othersLag(watch)} s`,
+			)
+			// What is actually holding the horizon right now? Named, not guessed.
+			const holders = await watch<{ app: string; age: string; q: string }[]>`
 			select application_name as app,
 				extract(epoch from (clock_timestamp() - xact_start))::int::text as age,
 				left(coalesce(query, ''), 90) as q
 			from pg_stat_activity
 			where backend_type = 'client backend' and backend_xmin is not null
 			order by xact_start limit 3`
-		console.log("\noldest snapshot holders on the instance right now:")
-		for (const h of holders)
-			console.log(`  ${h.age}s  app=${h.app}  ${h.q?.replace(/\s+/g, " ").trim()}`)
-		const blocked = under.enc > 0
-		const released = after.enc < under.enc
-		console.log(
-			blocked && released
-				? "\nCONFIRMED: the held snapshot blocked reclamation; releasing it let the same VACUUM reclaim."
-				: blocked && !released
-					? "\nINCONCLUSIVE on this shared box: dead tuples survived BOTH vacuums — a sibling agent's snapshot never cleared."
+			console.log("\noldest snapshot holders on the instance right now:")
+			for (const h of holders)
+				console.log(`  ${h.age}s  app=${h.app}  ${h.q?.replace(/\s+/g, " ").trim()}`)
+			const blocked = under.enc > 0
+			const released = after.enc < under.enc
+			console.log(
+				blocked && released
+					? "\nCONFIRMED: the held snapshot blocked reclamation; releasing it let the same VACUUM reclaim."
 					: "\nNot reproduced in this window (dead tuples were already reclaimable).",
-		)
-
-		if (worst > 0.5) failed = true
-		console.log(
-			`\n${failed ? "FAIL" : "ok  "}  BOUND: a GC pass holds its snapshot for ≤50% of its own wall time — measured ${(worst * 100).toFixed(0)}%.`,
-		)
+			)
+			if (worst > 0.5) failed = true
+			console.log(
+				`\n${failed ? "FAIL" : "ok  "}  BOUND: a GC pass holds its snapshot for ≤50% of its own wall time — measured ${(worst * 100).toFixed(0)}%.`,
+			)
+		} finally {
+			try {
+				if (holderInTransaction) await holder`rollback`
+			} finally {
+				try {
+					if (!holderReleased) holder.release()
+				} finally {
+					await verbose?.end()
+				}
+			}
+		}
 	} finally {
 		await gcPg.end()
 		await watch.end()

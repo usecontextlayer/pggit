@@ -30,7 +30,7 @@ import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { allObjectOids, refsOf } from "@/testing/git-fixtures"
+import { allObjectOids, branchAndTagRefsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -76,7 +76,7 @@ describe("§8.4 generative — incremental push (M2) differential", () => {
 							const stored = (await refs.listRefs("repo"))
 								.map((r) => ({ name: r.name, oid: r.oid }))
 								.sort((a, b) => a.name.localeCompare(b.name))
-							expect(stored).toEqual(await refsOf(client))
+							expect(stored).toEqual(await branchAndTagRefsOf(client))
 
 							// 2. The CAS half: a ref that existed after the FIRST push now names a
 							//    different oid. Without this the whole property is satisfied by a

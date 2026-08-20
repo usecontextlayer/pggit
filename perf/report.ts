@@ -17,8 +17,8 @@ export type PhaseReport = {
 export type MemorySummary = Omit<MemoryReport, "rssSeries">
 
 /**
- * The report is split into two layers, the distinction that keeps it valid
- * across the code + schema restructure this harness exists to drive:
+ * The report is split into two layers so the top-line comparison stays valid
+ * across implementation changes:
  *
  *   contract  — LAYER 1, implementation-AGNOSTIC. Every field is observed at a
  *               boundary (HTTP response / Postgres query log) or the process
@@ -26,9 +26,8 @@ export type MemorySummary = Omit<MemoryReport, "rssSeries">
  *               This is the before/after yardstick; gains are claimed HERE.
  *
  *   diagnostics — LAYER 2, implementation-COUPLED. Pinpoints where cost lives in
- *               the CURRENT design (per-phase splits, whole-pack re-read counters,
- *               amplification ratios). EXPECTED to go stale or undefined after the
- *               restructure. Never the basis for a gain claim — it is scaffolding.
+ *               the CURRENT design (per-phase splits and counters). Never the basis
+ *               for a gain claim — it explains the contract measurements.
  */
 export type Report = {
 	scenario: Scenario
@@ -54,11 +53,6 @@ export type Report = {
 	diagnostics: {
 		phases: PhaseReport[]
 		counters: Record<string, number>
-		derived: {
-			packReadAmplification: number
-			getObjectCallsPerObject: number
-			gbInflated: number
-		}
 		hotspots: Hotspot[]
 	}
 	notes: string[]
@@ -71,8 +65,8 @@ export type Report = {
 	}
 }
 
-// Canonical phase order; phases not seen in a run are dropped.
-const PHASE_ORDER = ["ref-advertise", "graph-walk", "read-objects", "write-pack"]
+// Canonical order for the three required current phases; additional phases sort last.
+const PHASE_ORDER = ["ref-advertise", "closure", "pack-encode"]
 
 // Counters that are Layer-1 (semantically stable) and surface in the contract;
 // everything else `count()` records is Layer-2 diagnostics.
@@ -96,6 +90,90 @@ export type AssembleInput = {
 }
 
 export function assembleReport(input: AssembleInput): Report {
+	if (!Number.isSafeInteger(input.objectsInRepo) || input.objectsInRepo < 1) {
+		throw new Error("perf report requires a nonempty repository")
+	}
+	if (
+		input.wallMsRuns.length !== input.repeat ||
+		!Number.isSafeInteger(input.repeat) ||
+		input.repeat < 1
+	) {
+		throw new Error(
+			`perf report expected ${input.repeat} wall samples, got ${input.wallMsRuns.length}`,
+		)
+	}
+	for (const [index, wallMs] of input.wallMsRuns.entries()) {
+		if (!Number.isFinite(wallMs) || wallMs <= 0) {
+			throw new Error(`perf report wall sample ${index} is invalid: ${wallMs}`)
+		}
+	}
+	for (const [name, value] of Object.entries({
+		serverSystemMs: input.serverSystemMs,
+		serverUserMs: input.serverUserMs,
+	})) {
+		if (!Number.isFinite(value) || value < 0) {
+			throw new Error(`perf report received invalid CPU metric ${name}=${value}`)
+		}
+	}
+	const fetchCollectors = input.collectors.filter(
+		(collector) => collector.label === "fetch",
+	)
+	if (fetchCollectors.length !== 1) {
+		throw new Error(
+			`perf report requires exactly one fetch collector, got ${fetchCollectors.length}`,
+		)
+	}
+	const fetchCollector = fetchCollectors[0] as Collector
+	for (const metric of ["objectsServed", "wireBytes", "packBytes"] as const) {
+		const value = fetchCollector.counters.get(metric)
+		if (value === undefined || !Number.isFinite(value) || value <= 0) {
+			throw new Error(`fetch collector is missing required positive ${metric}`)
+		}
+	}
+	if (fetchCollector.counters.get("objectsServed") !== input.objectsInRepo) {
+		throw new Error(
+			`fetch collector served ${fetchCollector.counters.get("objectsServed")} objects for a ${input.objectsInRepo}-object canonical clone`,
+		)
+	}
+	if (input.rttMs === null) {
+		if (input.rttSweep.length !== 0) {
+			throw new Error("perf report received an RTT sweep without --rtt")
+		}
+	} else if (
+		!Number.isFinite(input.rttMs) ||
+		input.rttMs <= 0 ||
+		input.rttSweep.length !== 2 ||
+		input.rttSweep[0]?.rttMs !== 0 ||
+		input.rttSweep[1]?.rttMs !== input.rttMs
+	) {
+		throw new Error(
+			`perf report requires complete 0/${input.rttMs}ms RTT samples, got ${JSON.stringify(input.rttSweep)}`,
+		)
+	}
+	for (const [index, sample] of input.rttSweep.entries()) {
+		if (!Number.isFinite(sample.wallMs) || sample.wallMs <= 0) {
+			throw new Error(
+				`perf report RTT sample ${index} has invalid wallMs=${sample.wallMs}`,
+			)
+		}
+	}
+	if (
+		input.memory.peakRssBytes <= 0 ||
+		input.memory.sampler.samples < 2 ||
+		!Number.isFinite(input.memory.sampler.meanIntervalMs) ||
+		input.memory.sampler.meanIntervalMs <= 0
+	) {
+		throw new Error("perf report received incomplete memory-sampler evidence")
+	}
+	for (const [name, value] of Object.entries({
+		eventLoopDelayMaxMs: input.process.eventLoopDelayMaxMs,
+		eventLoopDelayMeanMs: input.process.eventLoopDelayMeanMs,
+		eventLoopDelayP99Ms: input.process.eventLoopDelayP99Ms,
+	})) {
+		if (!Number.isFinite(value)) {
+			throw new Error(`perf report received invalid process metric ${name}=${value}`)
+		}
+	}
 	const phaseAgg = new Map<string, PhaseReport>()
 	const phase = (name: string): PhaseReport => {
 		const existing = phaseAgg.get(name)
@@ -107,14 +185,35 @@ export function assembleReport(input: AssembleInput): Report {
 	const counters: Record<string, number> = {}
 
 	for (const collector of input.collectors) {
-		for (const [name, ms] of collector.phaseMs) phase(name).wallMs += ms
+		for (const [name, ms] of collector.phaseMs) {
+			if (!Number.isFinite(ms) || ms < 0) {
+				throw new Error(`collector ${collector.label} has invalid ${name} phase=${ms}`)
+			}
+			phase(name).wallMs += ms
+		}
 		for (const query of collector.queries) {
+			if (!Number.isFinite(query.durationMs) || query.durationMs < 0) {
+				throw new Error(
+					`collector ${collector.label} has invalid query duration=${query.durationMs}`,
+				)
+			}
 			const p = phase(query.phase)
 			p.queryCount += 1
 			p.dbMs += query.durationMs
 		}
 		for (const [key, value] of collector.counters) {
+			if (!Number.isFinite(value) || value < 0) {
+				throw new Error(
+					`collector ${collector.label} has invalid ${key} counter=${value}`,
+				)
+			}
 			counters[key] = (counters[key] ?? 0) + value
+		}
+	}
+	for (const name of PHASE_ORDER) {
+		const value = phaseAgg.get(name)?.wallMs
+		if (value === undefined || value <= 0) {
+			throw new Error(`perf report is missing required positive ${name} phase evidence`)
 		}
 	}
 
@@ -122,18 +221,26 @@ export function assembleReport(input: AssembleInput): Report {
 		(a, b) => indexOrLast(a.name) - indexOrLast(b.name),
 	)
 
-	const wallMsMin = input.wallMsRuns.length > 0 ? Math.min(...input.wallMsRuns) : 0
-	const objectsServed = counters.objectsServed ?? 0
-	const wireBytes = counters.wireBytes ?? 0
-	const packBytes = counters.packBytes ?? 0
-	const packBytesRead = counters.packBytesRead ?? 0
-	const bytesInflated = counters.bytesInflated ?? 0
-	const getObjectCalls = counters.getObjectCalls ?? 0
+	const wallMsMin = Math.min(...input.wallMsRuns)
+	const objectsServed = counters.objectsServed
+	const wireBytes = counters.wireBytes
+	if (objectsServed === undefined || objectsServed < 1) {
+		throw new Error("perf report is missing the required nonzero objectsServed counter")
+	}
+	if (wireBytes === undefined || wireBytes < 1) {
+		throw new Error("perf report is missing the required nonzero wireBytes counter")
+	}
+	if (objectsServed !== input.objectsInRepo) {
+		throw new Error(
+			`instrumentation served ${objectsServed} objects for a ${input.objectsInRepo}-object canonical clone`,
+		)
+	}
 
 	// Contract DB metric: sum every recorded query, ignoring its phase tag (the
 	// per-phase split is the Layer-2 view). This stays valid across a restructure.
 	const queryCount = phases.reduce((n, p) => n + p.queryCount, 0)
 	const dbMs = phases.reduce((n, p) => n + p.dbMs, 0)
+	if (queryCount < 1) throw new Error("perf report recorded no Postgres queries")
 
 	// Strip the Layer-1 counters out of the diagnostics counter dump.
 	const diagCounters: Record<string, number> = {}
@@ -157,18 +264,13 @@ export function assembleReport(input: AssembleInput): Report {
 			memory: memorySummary,
 			process: input.process,
 			throughput: {
-				objectsPerSec: wallMsMin > 0 ? objectsServed / (wallMsMin / 1000) : 0,
+				objectsPerSec: objectsServed / (wallMsMin / 1000),
 			},
 			wall: { ms0Min: wallMsMin, rttSweep: input.rttSweep, runs: input.wallMsRuns },
 			wire: { bytes: wireBytes, objectsServed },
 		},
 		diagnostics: {
 			counters: diagCounters,
-			derived: {
-				gbInflated: bytesInflated / 1024 / 1024 / 1024,
-				getObjectCallsPerObject: objectsServed > 0 ? getObjectCalls / objectsServed : 0,
-				packReadAmplification: packBytes > 0 ? packBytesRead / packBytes : 0,
-			},
 			hotspots: input.hotspots,
 			phases,
 		},
@@ -180,13 +282,12 @@ export function assembleReport(input: AssembleInput): Report {
 		},
 		notes: [
 			"contract = Layer-1, implementation-agnostic. Survives a code/schema restructure; claim gains HERE.",
-			"diagnostics = Layer-2, coupled to the current design (whole-pack re-read, per-phase split). EXPECTED to go stale after the restructure — never the basis for a gain claim.",
+			"diagnostics = Layer-2, coupled to the current design (phase split and implementation counters). Use them to explain a contract result, never as the result itself.",
 			"contract.db.queryCount is measured at the Postgres driver boundary, so it is blind to table shape and is the cleanest single readout of the per-object round-trip cost the rtt sweep exposes.",
 			"memory.peakRssBytes is sampled off-thread, so it captures peaks during the main-thread sync blocks (deflateSync + SHA-1) a main-thread timer would miss.",
-			"memory.peakRssBytes is the WARM-process RSS ceiling: the harness serves several clones in one process and RSS is sticky (the allocator reuses/holds pages), so it is cumulative — representative of a warm long-running server, NOT one clone's footprint. For the per-clone working set read memory.peakByField.",
-			"memory.peakByField (heapUsed/external/arrayBuffers) is the per-clone working set — live allocations freed between clones (retained arrayBuffers ~0 confirms it). Main-thread sampled, so it may understate a peak inside a sync block.",
-			"memory.retainedAfterGcBytes.rss is sticky (the allocator does not return pages to the OS); read retained heapUsed/external/arrayBuffers for the live set, not retained rss.",
-			"Async zlib inflate runs on the libuv threadpool, INVISIBLE to the main-thread CPU flamegraph; read the process + memory metrics to see it.",
+			"memory.peakRssBytes is the WARM-process RSS ceiling: the harness serves several clones in one process and RSS is sticky (the allocator reuses/holds pages), so it is cumulative — representative of a warm long-running server, NOT one clone's footprint.",
+			"memory.peakByField is the absolute warm-process peak of heapUsed/external/arrayBuffers during the measured clone. It is main-thread sampled and may understate a peak inside a synchronous block; it is composition evidence, not a per-clone delta.",
+			"memory.retainedAfterGcBytes is the absolute process live set after the measured clone and two forced collections. RSS remains sticky; heapUsed/external/arrayBuffers are the useful retained-allocation fields.",
 		],
 		objectsInRepo: input.objectsInRepo,
 		scenario: input.scenario,
@@ -235,7 +336,7 @@ export function printSummary(report: Report): void {
 		`    peak rss (warm ceiling) ${mb(c.memory.peakRssBytes)}  (p99 ${mb(c.memory.rssP99Bytes)}, off-thread)`,
 	)
 	lines.push(
-		`    working set (per clone) heapUsed ${mb(c.memory.peakByField.heapUsed)}  external ${mb(c.memory.peakByField.external)}  arrayBuffers ${mb(c.memory.peakByField.arrayBuffers)}`,
+		`    field peaks (warm process) heapUsed ${mb(c.memory.peakByField.heapUsed)}  external ${mb(c.memory.peakByField.external)}  arrayBuffers ${mb(c.memory.peakByField.arrayBuffers)}`,
 	)
 	lines.push(
 		`    retained after gc       heapUsed ${mb(c.memory.retainedAfterGcBytes.heapUsed)}  external ${mb(c.memory.retainedAfterGcBytes.external)}  arrayBuffers ${mb(c.memory.retainedAfterGcBytes.arrayBuffers)}  (rss sticky: ${mb(c.memory.retainedAfterGcBytes.rss)})`,
@@ -259,9 +360,7 @@ export function printSummary(report: Report): void {
 			`    ${p.name.padEnd(14)} ${ms(p.wallMs).padStart(11)}  ${String(p.queryCount).padStart(6)} q  ${ms(p.dbMs).padStart(10)} db`,
 		)
 	}
-	lines.push(
-		`  packReadAmplification ${d.derived.packReadAmplification.toFixed(0)}x   getObjectCalls/obj ${d.derived.getObjectCallsPerObject.toFixed(1)}x   inflated ${d.derived.gbInflated.toFixed(2)}GB`,
-	)
+	lines.push(`  counters              ${JSON.stringify(d.counters)}`)
 	lines.push("  top hotspots (main-thread self-time):")
 	for (const h of d.hotspots.slice(0, 6)) {
 		lines.push(`    ${h.selfPct.toFixed(1).padStart(5)}%  ${h.fn}  ${h.file}:${h.line}`)

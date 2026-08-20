@@ -12,9 +12,7 @@
  * sequence. Two orders because a frozen policy that is order-dependent in a way that
  * matters would show up as one order diverging and the other not.
  *
- * It also checks the design's central read-side invariant the way a CLIENT sees it:
- * `git verify-pack -v` on the served pack prints each delta entry's chain depth, so
- * "depth <= 1, structurally" (D2/D9) is directly falsifiable from outside.
+ * It also checks the design's central read-side invariant after the client has indexed the received pack: `git verify-pack -v` prints each delta entry's chain depth, so "depth <= 1, structurally" (D2/D9) is directly falsifiable. This is client-storage evidence, not a raw-wire byte measurement; thin-pack indexing may append external bases.
  *
  * A perf harness rather than a vitest e2e test because its corpus is a REAL local
  * repository handed in at run time (`--repo=`), which no committed fixture can stand
@@ -22,14 +20,14 @@
  *
  *   npx tsx perf/breakage/realrepo--branch-order.ts --repo=/path/to/checkout --slug=<name>
  *
- * Exit 0 = both orders served packs identical to git's, at depth <= 1.
+ * Exit 0 = both orders serve canonical refs and objects, at depth <= 1.
  * Exit 1 = reproduced, with the diverging ref/object or the offending depth named.
  */
 import { mkdirSync, readdirSync } from "node:fs"
 import { join } from "node:path"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
-import { createRepack } from "@/store/repack"
+import { allRefsOf, parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
@@ -38,13 +36,16 @@ import {
 	DEFAULT_PG_URL,
 	flag,
 	oidSet,
+	positiveIntegerFlag,
 	prepareMirror,
+	repackExactly,
 	tryGit,
 } from "./_realrepo-util"
 
 const SLUG = flag("slug", "repo")
-const MAX_DEPTH = Number(flag("max-depth", "1"))
+const MAX_DEPTH = positiveIntegerFlag("max-depth", 1)
 const PG_URL = flag("pg", DEFAULT_PG_URL)
+if (SLUG.length === 0) throw new Error("--slug must not be empty")
 
 const scratch = createScratch(`border-${SLUG}`)
 const { fail, findings, report } = createLedger(SLUG)
@@ -52,9 +53,7 @@ const { fail, findings, report } = createLedger(SLUG)
 let MIRROR = ""
 
 async function refList(dir: string): Promise<string> {
-	return (
-		await spawnGit(["for-each-ref", "--format=%(refname) %(objectname)"], { cwd: dir })
-	).stdout.trim()
+	return (await allRefsOf(dir)).map(({ name, oid }) => `${name} ${oid}`).join("\n")
 }
 
 /** Delta chain depths as the CLIENT measures them, from `git verify-pack -v`.
@@ -62,14 +61,13 @@ async function refList(dir: string): Promise<string> {
 async function depthHistogram(bareDir: string): Promise<Map<number, number>> {
 	const packDir = join(bareDir, "objects", "pack")
 	const hist = new Map<number, number>()
-	for (const f of readdirSync(packDir).filter((x) => x.endsWith(".idx"))) {
+	const indexes = readdirSync(packDir).filter((x) => x.endsWith(".idx"))
+	if (indexes.length === 0) throw new Error(`${bareDir}: clone contains no pack index`)
+	for (const f of indexes) {
 		const out = await spawnGit(["verify-pack", "-v", join(packDir, f)], { cwd: bareDir })
-		for (const line of out.stdout.split("\n")) {
-			const p = line.trim().split(/\s+/)
-			if (p.length < 7 || !/^[0-9a-f]{40}$/.test(p[0] as string)) continue
-			const depth = Number(p[5])
-			if (!Number.isFinite(depth)) continue
-			hist.set(depth, (hist.get(depth) ?? 0) + 1)
+		for (const object of parseVerifyPackObjects(out.stdout)) {
+			if (object.kind !== "delta") continue
+			hist.set(object.depth, (hist.get(object.depth) ?? 0) + 1)
 		}
 	}
 	return hist
@@ -89,6 +87,8 @@ async function runOrder(
 
 	let totalW = 0
 	let totalD = 0
+	let accepted = 0
+	let postFirstObjects = 0
 	for (const ref of refs) {
 		const p = await tryGit(["push", url, `+${ref}:${ref}`], MIRROR)
 		const o = await tryGit(["push", `file://${oracle}`, `+${ref}:${ref}`], MIRROR)
@@ -98,11 +98,24 @@ async function runOrder(
 				(p.ok ? o : p).stderr.trim().slice(0, 500),
 			)
 		}
+		if (!o.ok) {
+			throw new Error(
+				`${label}: canonical git rejected fixture ref ${ref}: ${o.stderr.trim().slice(0, 500)}`,
+			)
+		}
+		if (!p.ok) continue
+		accepted++
 		// repack after EVERY ref: anchors freeze over a partial DAG, then the next
 		// ref extends it. This is the D4 stress.
-		const r = await createRepack(db.sql).repack(repoId)
+		const r = await repackExactly(db.sql, repoId)
 		totalW += r.wholes
 		totalD += r.deltas
+		if (accepted > 1) postFirstObjects += r.wholes + r.deltas
+	}
+	if (accepted < 2 || postFirstObjects === 0 || totalD === 0) {
+		throw new Error(
+			`${label}: branch-order fixture exercised ${accepted} accepted refs, ${postFirstObjects} objects introduced after the first, and ${totalD} deltas`,
+		)
 	}
 	console.log(
 		`  ${label}: ${refs.length} refs pushed one at a time, repack totals ${totalW}w + ${totalD}d`,
@@ -149,6 +162,9 @@ async function runOrder(
 		)
 
 	const hist = await depthHistogram(clone)
+	if (hist.size === 0) {
+		throw new Error(`${label}: client-indexed clone contains zero delta entries`)
+	}
 	const depths = [...hist.entries()].sort((a, b) => a[0] - b[0])
 	const maxDepth =
 		depths.length > 0 ? (depths[depths.length - 1] as [number, number])[0] : 0
@@ -173,17 +189,20 @@ async function runOrder(
 async function main(): Promise<void> {
 	MIRROR = await prepareMirror(scratch)
 	console.log(`# branch-order stress — ${SLUG}\n  mirror ${MIRROR}`)
-	const refs = (
-		await spawnGit(["for-each-ref", "--format=%(refname)"], { cwd: MIRROR })
-	).stdout
-		.trim()
-		.split("\n")
-		.filter(
-			(r) =>
-				r.startsWith("refs/heads/") ||
-				r.startsWith("refs/tags/") ||
-				r.startsWith("refs/remotes/"),
-		)
+	const fixtureRefs = (await allRefsOf(MIRROR)).filter(
+		({ name }) =>
+			name.startsWith("refs/heads/") ||
+			name.startsWith("refs/tags/") ||
+			name.startsWith("refs/remotes/"),
+	)
+	const refs = fixtureRefs.map(({ name }) => name)
+	if (refs.length < 2) {
+		throw new Error(`branch-order fixture needs at least two refs, got ${refs.length}`)
+	}
+	const distinctTips = new Set(fixtureRefs.map(({ oid }) => oid))
+	if (distinctTips.size < 2) {
+		throw new Error(`branch-order fixture needs at least two distinct ref tips`)
+	}
 	console.log(`  ${refs.length} refs`)
 
 	const db = await createIsolatedSchema(PG_URL)

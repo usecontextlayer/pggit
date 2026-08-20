@@ -48,11 +48,16 @@ export function collectProcessMetrics(): { stop: () => ProcessMetrics } {
 		minor: { count: 0, pauseMs: 0 },
 		weakCb: { count: 0, pauseMs: 0 },
 	}
+	let unknownGcKind: number | undefined
 	const gcObserver = new PerformanceObserver((list) => {
 		for (const entry of list.getEntries()) {
-			const kind = (entry.detail as { kind: number } | undefined)?.kind
+			const kind = (entry as PerformanceEntry & { detail?: { kind: number } }).detail
+				?.kind
 			const bucket = kind === undefined ? undefined : GC_KIND[kind]
-			if (!bucket) continue
+			if (!bucket) {
+				unknownGcKind = kind
+				continue
+			}
 			gc[bucket].count += 1
 			gc[bucket].pauseMs += entry.duration // PerformanceEntry.duration is milliseconds
 		}
@@ -63,6 +68,9 @@ export function collectProcessMetrics(): { stop: () => ProcessMetrics } {
 		stop() {
 			eld.disable()
 			gcObserver.disconnect()
+			if (unknownGcKind !== undefined) {
+				throw new Error(`unhandled Node performance GC kind ${unknownGcKind}`)
+			}
 			return {
 				eventLoopDelayMaxMs: eld.max / 1e6,
 				eventLoopDelayMeanMs: eld.mean / 1e6,

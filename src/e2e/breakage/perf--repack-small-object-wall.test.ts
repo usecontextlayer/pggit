@@ -39,7 +39,7 @@ import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
-import { loadReachableObjects, refsOf } from "@/testing/git-fixtures"
+import { branchAndTagRefsOf, loadReachableObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -118,7 +118,7 @@ describe("repack — the small-object bind-parameter wall", () => {
 		for (let i = 0; i < objs.length; i += SEED_BATCH) {
 			await objects.putPack(repoId, objs.slice(i, i + SEED_BATCH))
 		}
-		for (const ref of await refsOf(dir)) {
+		for (const ref of await branchAndTagRefsOf(dir)) {
 			await refs.setRef(repoId, ref.name, ref.oid)
 		}
 		const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: dir })).stdout.trim()

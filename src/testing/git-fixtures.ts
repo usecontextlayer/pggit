@@ -98,18 +98,94 @@ export async function gitReachableOids(dir: string): Promise<string[]> {
 	return [...oids].sort()
 }
 
+/** Same-path target-to-base pairs from one parent-before-child `git log --raw` stream. */
+export async function gitLogRawBasePairs(dir: string): Promise<Map<string, string>> {
+	const log = await spawnGit(
+		[
+			"log",
+			"--reverse",
+			"--topo-order",
+			"--raw",
+			"-r",
+			"-t",
+			"--no-renames",
+			"--abbrev=40",
+			"--format=@%H %T %P",
+			"--all",
+		],
+		{ cwd: dir },
+	)
+	const pairs = new Map<string, string>()
+	const commitTree = new Map<string, string>()
+	let sawCommit = false
+	for (const line of log.stdout.split("\n")) {
+		if (line.length === 0) continue
+		if (line.startsWith("@")) {
+			const fields = line.slice(1).trimEnd().split(" ").filter(Boolean)
+			if (fields.length < 2) throw new Error(`unexpected git log header: ${line}`)
+			const [rawCommit, rawTree, ...rawParents] = fields as [string, string, ...string[]]
+			const commit = requireGitOid(rawCommit, `git log header ${JSON.stringify(line)}`)
+			const tree = requireGitOid(rawTree, `git log header ${JSON.stringify(line)}`)
+			const parents = rawParents.map((parent) =>
+				requireGitOid(parent, `git log header ${JSON.stringify(line)}`),
+			)
+			commitTree.set(commit, tree)
+			const firstParent = parents[0]
+			if (firstParent !== undefined) {
+				const parentTree = commitTree.get(firstParent)
+				if (parentTree === undefined) {
+					throw new Error(`git log was not parent-before-child at commit ${commit}`)
+				}
+				if (parentTree !== tree && !pairs.has(tree)) pairs.set(tree, parentTree)
+			}
+			sawCommit = true
+			continue
+		}
+		if (!line.startsWith(":")) throw new Error(`unexpected git log --raw line: ${line}`)
+		if (!sawCommit) throw new Error(`git log emitted a raw row before a commit: ${line}`)
+		const tab = line.indexOf("\t")
+		if (tab < 0 || tab === line.length - 1) {
+			throw new Error(`unexpected git log --raw row: ${line}`)
+		}
+		const fields = line.slice(1, tab).split(" ")
+		if (
+			fields.length !== 5 ||
+			!fields[0]?.match(/^[0-7]{6}$/) ||
+			!fields[1]?.match(/^[0-7]{6}$/) ||
+			!fields[4]?.match(/^[A-Z][0-9]*$/)
+		) {
+			throw new Error(`unexpected git log --raw metadata: ${line}`)
+		}
+		const oldOid = fields[2] as string
+		const newOid = fields[3] as string
+		const zero = "0".repeat(40)
+		if (oldOid !== zero)
+			requireGitOid(oldOid, `git log --raw row ${JSON.stringify(line)}`)
+		if (newOid !== zero)
+			requireGitOid(newOid, `git log --raw row ${JSON.stringify(line)}`)
+		if (oldOid === zero || newOid === zero || oldOid === newOid || pairs.has(newOid)) {
+			continue
+		}
+		pairs.set(newOid, oldOid)
+	}
+	if (!sawCommit) throw new Error("git log --raw returned no commits")
+	return pairs
+}
+
+export type GitObjectWithOid = PackInputObject & { oid: Oid }
+
 /** Read the requested objects through one binary-safe `cat-file --batch` process. */
-async function loadObjects(
+export async function loadGitObjects(
 	dir: string,
 	oids: readonly string[],
-): Promise<PackInputObject[]> {
+): Promise<GitObjectWithOid[]> {
 	if (oids.length === 0) return []
 	const requested = oids.map((oid) => requireGitOid(oid, "cat-file --batch request"))
 	const batch = await spawnGit(["cat-file", "--batch"], {
 		cwd: dir,
 		input: `${requested.join("\n")}\n`,
 	})
-	const objects: PackInputObject[] = []
+	const objects: GitObjectWithOid[] = []
 	let pos = 0
 	for (const expectedOid of requested) {
 		const newline = batch.stdoutBytes.indexOf(0x0a, pos)
@@ -141,6 +217,7 @@ async function loadObjects(
 		}
 		objects.push({
 			content: batch.stdoutBytes.subarray(contentStart, contentEnd),
+			oid: expectedOid,
 			type: requireGitObjectType(rawType, `cat-file header ${JSON.stringify(header)}`),
 		})
 		pos = contentEnd + 1
@@ -153,6 +230,13 @@ async function loadObjects(
 	return objects
 }
 
+async function loadObjects(
+	dir: string,
+	oids: readonly string[],
+): Promise<PackInputObject[]> {
+	return loadGitObjects(dir, oids)
+}
+
 /** Every object in a real repo, as pack inputs (content read binary-safe). */
 export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
 	return loadObjects(dir, await allObjectOids(dir))
@@ -162,9 +246,9 @@ export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
 export async function loadReachableObjects(
 	dir: string,
 	revisions: readonly string[],
-): Promise<PackInputObject[]> {
+): Promise<GitObjectWithOid[]> {
 	const list = await spawnGit(["rev-list", "--objects", ...revisions], { cwd: dir })
-	return loadObjects(dir, [...new Set(parseRevListObjectOids(list.stdout))])
+	return loadGitObjects(dir, [...new Set(parseRevListObjectOids(list.stdout))])
 }
 
 /** Parse `git ls-tree[-r]` output: `<mode> <type> <oid>\t<name-or-path>`. */
@@ -202,6 +286,12 @@ export async function lsTreeSnapshot(dir: string, revision: string): Promise<str
 	return parseLsTree(out.stdout)
 		.map((entry) => `${entry.path}\0${entry.mode}\0${entry.oid}`)
 		.sort()
+}
+
+/** Resolve a rev (ref name, HEAD, oid^) to its full validated oid. */
+export async function revParse(dir: string, rev: string): Promise<string> {
+	const out = await spawnGit(["rev-parse", rev], { cwd: dir })
+	return requireGitOid(out.stdout.trim(), `rev-parse ${rev}`)
 }
 
 /** Sorted list of every object OID in a real repo. */
@@ -258,6 +348,46 @@ export type MirrorComparison = {
 	}
 }
 
+export type TypedGitRef = { name: string; oid: Oid; type: GitObjectType }
+
+/** Every direct ref with the object type named by its OID. */
+export async function typedRefsOf(dir: string): Promise<TypedGitRef[]> {
+	const out = await spawnGit(
+		["for-each-ref", "--format=%(objectname) %(refname) %(objecttype)"],
+		{ cwd: dir },
+	)
+	const refs: TypedGitRef[] = []
+	for (const line of out.stdout.trim().split("\n").filter(Boolean)) {
+		const fields = line.split(" ")
+		if (fields.length !== 3) {
+			throw new Error(`unexpected for-each-ref line: ${line}`)
+		}
+		const [rawOid, name, rawType] = fields as [string, string, string]
+		if (!name.startsWith("refs/")) throw new Error(`unexpected ref name: ${line}`)
+		refs.push({
+			name,
+			oid: requireGitOid(rawOid, `for-each-ref line ${JSON.stringify(line)}`),
+			type: requireGitObjectType(rawType, `for-each-ref line ${JSON.stringify(line)}`),
+		})
+	}
+	return refs.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/** Symbolic HEAD target and the OID it resolves to. */
+export async function repositoryHeadOf(
+	dir: string,
+): Promise<{ oid: Oid; target: string }> {
+	const target = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: dir })).stdout.trim()
+	if (!target.startsWith("refs/")) {
+		throw new Error(`repository has invalid HEAD target ${JSON.stringify(target)}`)
+	}
+	const oid = requireGitOid(
+		(await spawnGit(["rev-parse", "HEAD"], { cwd: dir })).stdout.trim(),
+		"repository HEAD",
+	)
+	return { oid, target }
+}
+
 function parseRefRows(
 	stdout: string,
 	command: "for-each-ref" | "show-ref",
@@ -285,13 +415,10 @@ function parseRefRows(
 export async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
 	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-	const refsOutput = await spawnGit(
-		["for-each-ref", "--format=%(objectname) %(refname)"],
-		{ cwd: dest },
-	)
-	const refs = parseRefRows(refsOutput.stdout, "for-each-ref")
-		.map(({ name, oid }) => `${oid} ${name}`)
-		.sort()
+	const refs = (await allRefsOf(dest)).map(({ name, oid }) => `${oid} ${name}`)
+	const head = await repositoryHeadOf(dest)
+	refs.push(`${head.oid} HEAD -> ${head.target}`)
+	refs.sort()
 	const complaints = `${fsck.stdout}${fsck.stderr}`
 		.split("\n")
 		.map((line) => line.trim())
@@ -323,12 +450,15 @@ export async function compareMirrorClones(
 	}
 }
 
-/**
- * A repo's local branches + tags as sorted {name, oid} pairs — matching what the
- * RefStore stores (an annotated tag's ref points at the tag object). For asserting
- * a push landed exactly the client's refs.
- */
-export async function refsOf(dir: string): Promise<{ name: string; oid: string }[]> {
+/** Every direct ref in a repository as sorted name/OID pairs. */
+export async function allRefsOf(dir: string): Promise<{ name: string; oid: string }[]> {
+	return (await typedRefsOf(dir)).map(({ name, oid }) => ({ name, oid }))
+}
+
+/** A repo's local branches + tags as sorted name/OID pairs, matching the refs a normal push transfers. */
+export async function branchAndTagRefsOf(
+	dir: string,
+): Promise<{ name: string; oid: string }[]> {
 	const out = await spawnGit(
 		["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/"],
 		{ cwd: dir },
@@ -336,6 +466,21 @@ export async function refsOf(dir: string): Promise<{ name: string; oid: string }
 	return parseRefRows(out.stdout, "for-each-ref").sort((a, b) =>
 		a.name.localeCompare(b.name),
 	)
+}
+
+/** Write every direct ref plus symbolic HEAD from a canonical repository into a RefStore. */
+export async function seedGitRefs(
+	repoId: string,
+	srcDir: string,
+	refs: RefStore,
+): Promise<{ directRefs: number; head: string }> {
+	const showRef = await spawnGit(["show-ref"], { cwd: srcDir })
+	const direct = parseRefRows(showRef.stdout, "show-ref")
+	if (direct.length === 0) throw new Error(`${srcDir}: repository has no direct refs`)
+	for (const { name, oid } of direct) await refs.setRef(repoId, name, oid)
+	const { target: head } = await repositoryHeadOf(srcDir)
+	await refs.setSymref(repoId, "HEAD", head)
+	return { directRefs: direct.length, head }
 }
 
 /**
@@ -349,12 +494,7 @@ export async function seedRepoIntoStore(
 	stores: { objects: ObjectStore; refs: RefStore },
 ): Promise<void> {
 	await stores.objects.putPack(repoId, await loadAllObjects(srcDir))
-	const showRef = await spawnGit(["show-ref"], { cwd: srcDir })
-	for (const { name, oid } of parseRefRows(showRef.stdout, "show-ref")) {
-		await stores.refs.setRef(repoId, name, oid)
-	}
-	const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: srcDir })).stdout.trim()
-	await stores.refs.setSymref(repoId, "HEAD", head)
+	await seedGitRefs(repoId, srcDir, stores.refs)
 }
 
 export const PACK_DIR = ".git/objects/pack"
@@ -378,9 +518,25 @@ export async function packFileBytes(dir: string): Promise<number> {
 		.reduce((total, size) => total + size, 0)
 }
 
-type VerifyPackObject =
-	| { kind: "whole"; oid: string; offset: number }
-	| { kind: "delta"; baseOid: string; depth: number; oid: string; offset: number }
+export type VerifyPackObject =
+	| {
+			kind: "whole"
+			oid: string
+			offset: number
+			packedSize: number
+			size: number
+			type: GitObjectType
+	  }
+	| {
+			baseOid: string
+			depth: number
+			kind: "delta"
+			oid: string
+			offset: number
+			packedSize: number
+			size: number
+			type: GitObjectType
+	  }
 
 function verifyPackInteger(value: string, field: string, line: string): number {
 	const parsed = Number(value)
@@ -399,14 +555,18 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 			/^([0-9a-f]{40})\s+(commit|tree|blob|tag)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)(?:\s+([0-9]+)\s+([0-9a-f]{40}))?$/,
 		)
 		if (object?.[1]) {
-			const [, rawOid, , rawSize, rawPackedSize, rawOffset, rawDepth, rawBaseOid] =
+			const [, rawOid, rawType, rawSize, rawPackedSize, rawOffset, rawDepth, rawBaseOid] =
 				object as [string, string, string, string, string, string, string?, string?]
 			const oid = requireGitOid(rawOid, `verify-pack line ${JSON.stringify(line)}`)
-			verifyPackInteger(rawSize, "object size", line)
-			verifyPackInteger(rawPackedSize, "packed size", line)
+			const type = requireGitObjectType(
+				rawType,
+				`verify-pack line ${JSON.stringify(line)}`,
+			)
+			const size = verifyPackInteger(rawSize, "object size", line)
+			const packedSize = verifyPackInteger(rawPackedSize, "packed size", line)
 			const offset = verifyPackInteger(rawOffset, "offset", line)
 			if (rawDepth === undefined || rawBaseOid === undefined) {
-				objects.push({ kind: "whole", offset, oid })
+				objects.push({ kind: "whole", offset, oid, packedSize, size, type })
 				continue
 			}
 			const depth = verifyPackInteger(rawDepth, "delta depth", line)
@@ -422,6 +582,9 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 				kind: "delta",
 				offset,
 				oid,
+				packedSize,
+				size,
+				type,
 			})
 			continue
 		}

@@ -22,16 +22,17 @@ import { createGitApp, createGitDeps } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
+import { allObjectOids, revParse } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 import {
 	cleanupTmp,
-	flag,
 	gitRepack,
 	importRepo,
 	mb,
 	mkTmp,
 	PG_URL,
+	positiveIntegerFlag,
 	secs,
 	seedRepo,
 	table,
@@ -39,8 +40,8 @@ import {
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const WIDTH = Number(flag("width", "20000"))
-const COMMITS = Number(flag("commits", "50"))
+const WIDTH = positiveIntegerFlag("width", 20_000)
+const COMMITS = positiveIntegerFlag("commits", 50)
 /** Slowdown/size ratio between the two arms at which this is called broken. */
 const ARM_RATIO_LIMIT = 3
 
@@ -105,8 +106,18 @@ async function arm(distinct: boolean): Promise<Arm> {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
 			const objs = await seedRepo(db.sql, "probe/dup", dir)
+			const expectedOids = await allObjectOids(dir)
+			const expectedTip = await revParse(dir, "refs/heads/main")
+			if (objs.objects !== expectedOids.length) {
+				throw new Error(`seeded ${objs.objects} objects, expected ${expectedOids.length}`)
+			}
 			const t0 = Date.now()
 			const r = await createRepack(db.sql).repack("probe/dup")
+			if (r.wholes + r.deltas !== objs.objects || r.deltas === 0) {
+				throw new Error(
+					`delta fixture produced ${r.wholes} wholes + ${r.deltas} deltas for ${objs.objects} objects`,
+				)
+			}
 			const repackMs = Date.now() - t0
 			const server = await serveOnPort(
 				createGitApp(createGitDeps(db.sql), { instrument: true }),
@@ -126,20 +137,43 @@ async function arm(distinct: boolean): Promise<Arm> {
 			])
 			await server.close()
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+			const cloneOids = await allObjectOids(dest)
+			const cloneTip = await revParse(dest, "refs/heads/main")
+			if (
+				cloneTip !== expectedTip ||
+				cloneOids.length !== expectedOids.length ||
+				cloneOids.some((oid, i) => oid !== expectedOids[i])
+			) {
+				throw new Error(`${label} clone diverged from canonical refs/object set`)
+			}
 			const run = collectedRuns().find((r2) => r2.label === "fetch")
-			const treeBytes = Number(
-				(
-					await db.sql<{ n: string }[]>`
-						select coalesce(sum(size),0)::text as n from git_object where type = 2`
-				)[0]?.n ?? 0,
-			)
+			if (!run) throw new Error(`${label}: missing fetch instrumentation run`)
+			const packBytes = run.counters.get("packBytes")
+			const objectsServed = run.counters.get("objectsServed")
+			const deltasServed = run.counters.get("deltasServed")
+			if (packBytes === undefined || packBytes <= 0) {
+				throw new Error(`${label}: missing/nonpositive packBytes counter`)
+			}
+			if (objectsServed !== expectedOids.length) {
+				throw new Error(
+					`${label}: served ${String(objectsServed)}/${expectedOids.length} canonical objects`,
+				)
+			}
+			if (deltasServed === undefined || deltasServed <= 0) {
+				throw new Error(`${label}: served no deltas`)
+			}
+			const [treeRow] = await db.sql<{ n: string }[]>`
+				select coalesce(sum(size),0)::text as n from git_object where type = 2`
+			if (!treeRow) throw new Error(`${label}: tree-byte census returned no row`)
+			const treeBytes = Number(treeRow.n)
+			if (treeBytes <= 0) throw new Error(`${label}: fixture contains no tree bytes`)
 			return {
 				deltas: r.deltas,
 				gitMs: git.ms,
 				gitPack: git.packBytes,
 				label,
 				objects: objs.objects,
-				packBytes: run?.counters.get("packBytes") ?? 0,
+				packBytes,
 				repackMs,
 				treeMb: treeBytes,
 				wholes: r.wholes,
@@ -155,6 +189,9 @@ async function arm(distinct: boolean): Promise<Arm> {
 async function main(): Promise<void> {
 	const a = await arm(true)
 	const b = await arm(false)
+	if (a.treeMb !== b.treeMb) {
+		throw new Error(`tree-byte precondition failed: ${a.treeMb} != ${b.treeMb}`)
+	}
 
 	console.log(
 		`# delta candidate-chain cap — ${WIDTH}-entry flat dir, ${COMMITS} single-file edits\n`,
@@ -183,13 +220,16 @@ async function main(): Promise<void> {
 				mb(r.packBytes),
 				secs(r.gitMs),
 				mb(r.gitPack),
-				`${(r.packBytes / Math.max(r.gitPack, 1)).toFixed(1)}×`,
+				`${(r.packBytes / r.gitPack).toFixed(1)}×`,
 			]),
 		),
 	)
 
-	const timeRatio = b.repackMs / Math.max(a.repackMs, 1)
-	const packRatio = b.packBytes / Math.max(a.packBytes, 1)
+	if (a.repackMs <= 0 || b.repackMs <= 0 || a.gitPack <= 0 || b.gitPack <= 0) {
+		throw new Error("delta-arm timer or canonical pack measurement was nonpositive")
+	}
+	const timeRatio = b.repackMs / a.repackMs
+	const packRatio = b.packBytes / a.packBytes
 	console.log(
 		`\nshared-blob arm vs distinct-blob arm: repack ${timeRatio.toFixed(2)}× the wall, ${packRatio.toFixed(2)}× the served bytes` +
 			` (tree bytes identical by construction: ${mb(a.treeMb)} vs ${mb(b.treeMb)} MB)`,

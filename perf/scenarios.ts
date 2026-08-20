@@ -23,7 +23,7 @@ export type Scenario = {
 }
 
 export const SCENARIOS: Record<string, Scenario> = {
-	// Stresses graph-walk + ref advertisement: deep history, many refs, deep trees.
+	// Stresses reachability + ref advertisement: deep history, many refs, deep trees.
 	adversarial: {
 		blobCount: 120,
 		blobMaxBytes: 1024,

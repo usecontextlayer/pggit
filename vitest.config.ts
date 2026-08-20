@@ -34,11 +34,6 @@ export default defineConfig({
 		// concurrent files share one server safely. Tests that deliberately start
 		// their own container ignore it.
 		globalSetup: ["./src/testing/pg-global-setup.ts"],
-		root: projectRoot,
-		// The oracle rig spins up real `git` + a real Postgres and round-trips
-		// packfiles; a generative property runs many such candidates per `it`, so
-		// give each ample headroom (matches the old spec-suite ceiling).
-		testTimeout: 600_000,
 		projects: [
 			{
 				extends: true,
@@ -67,5 +62,10 @@ export default defineConfig({
 				},
 			},
 		],
+		root: projectRoot,
+		// The oracle rig spins up real `git` + a real Postgres and round-trips
+		// packfiles; a generative property runs many such candidates per `it`, so
+		// give each ample headroom (matches the old spec-suite ceiling).
+		testTimeout: 600_000,
 	},
 })

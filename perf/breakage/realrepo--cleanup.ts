@@ -38,12 +38,9 @@ async function main(): Promise<void> {
 				foreign++
 				continue
 			}
-			// The schema name comes from pg_namespace and matched `t\_%`, so it is already
-			// a bare identifier — quote it and interpolate; porsager's identifier helper
-			// only renders inside a tagged template, not inside `unsafe`.
-			const rows = await sql.unsafe<{ name: string }[]>(
-				`select name from "${nspname}".repos limit 200`,
-			)
+			const rows = await sql<
+				{ name: string }[]
+			>`select name from ${sql(nspname)}.repos limit 200`
 			const names = rows.map((r) => r.name)
 			if (names.length > 0 && names.every((n) => MINE.some((p) => n.startsWith(p)))) {
 				mine.push({ repos: names.slice(0, 3), schema: nspname })
@@ -57,7 +54,7 @@ async function main(): Promise<void> {
 		for (const m of mine) console.log(`  ${m.schema}  repos: ${m.repos.join(", ")}`)
 		if (DROP) {
 			for (const m of mine) {
-				await sql.unsafe(`drop schema "${m.schema}" cascade`)
+				await sql`drop schema ${sql(m.schema)} cascade`
 				console.log(`  dropped ${m.schema}`)
 			}
 		} else if (mine.length > 0) {

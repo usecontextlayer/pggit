@@ -34,7 +34,7 @@ import {
 	FAST_IMPORT_COMMITTER,
 	runDirName,
 } from "@/testing/append-only-repo"
-import { parseVerifyPackObjects, refsOf } from "@/testing/git-fixtures"
+import { branchAndTagRefsOf, parseVerifyPackObjects } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -82,7 +82,7 @@ async function objectList(dir: string): Promise<string[]> {
 }
 
 async function refList(dir: string): Promise<string[]> {
-	return (await refsOf(dir)).map(({ name, oid }) => `${oid} ${name}`)
+	return (await branchAndTagRefsOf(dir)).map(({ name, oid }) => `${oid} ${name}`)
 }
 
 /** Delta entries in the packs a bare clone actually retained, per canonical git. */

@@ -89,13 +89,54 @@ async function trial(
 	try {
 		const pg = iso.sql
 		const objects = await objectsBetween(dir, tip, [])
+		const rootObjects = await objectsBetween(dir, rootCommit, [])
+		const reclaimedObjects = await objectsBetween(dir, tip, [rootCommit])
 		const rawBytes = objects.reduce((s, o) => s + o.content.length, 0)
+		if (
+			objects.length === 0 ||
+			rootObjects.length === 0 ||
+			reclaimedObjects.length === 0 ||
+			rawBytes === 0
+		) {
+			throw new Error(
+				"WAL fixture did not establish nonempty push, root, and rewind sets",
+			)
+		}
+		const assertRows = async (
+			expectedObjects: number,
+			expectedEncodings: number,
+		): Promise<void> => {
+			const [row] = await pg<
+				{
+					encodings: string
+					objects: string
+					refs: string
+					tip: string | null
+				}[]
+			>`
+				select (select count(*)::text from git_object) as objects,
+					(select count(*)::text from git_pack_encoding) as encodings,
+					(select count(*)::text from git_ref) as refs,
+					(select encode(oid, 'hex') from git_ref where name = 'refs/heads/main') as tip`
+			if (
+				!row ||
+				Number(row.objects) !== expectedObjects ||
+				Number(row.encodings) !== expectedEncodings ||
+				Number(row.refs) !== 1 ||
+				row.tip !== (expectedObjects === rootObjects.length ? rootCommit : tip)
+			) {
+				throw new Error(
+					`WAL fixture census mismatch: ${JSON.stringify(row)}, expected objects=${expectedObjects} encodings=${expectedEncodings}`,
+				)
+			}
+		}
 
 		// PUSH
 		const w0 = await walLsn(pg)
 		const t0 = Date.now()
 		await seedObjects(pg, REPO, objects)
 		await setMain(pg, REPO, tip)
+		await assertRows(objects.length, 0)
 		const pushMs = Date.now() - t0
 		const w1 = await walLsn(pg)
 
@@ -105,43 +146,94 @@ async function trial(
 
 		// REPACK (skipped in the tier-absent arm)
 		const t1 = Date.now()
-		if (tier) await createRepack(pg).repack(REPO)
+		if (tier) {
+			const receipt = await createRepack(pg).repack(REPO)
+			if (receipt.wholes + receipt.deltas !== objects.length) {
+				throw new Error(
+					`repack covered ${receipt.wholes + receipt.deltas}/${objects.length} objects`,
+				)
+			}
+		}
 		const repackMs = Date.now() - t1
 		const w3 = await walLsn(pg)
 
 		const census = await encodingCensus(pg)
+		if (census.rows !== (tier ? objects.length : 0) || (tier && census.dataBytes === 0)) {
+			throw new Error(
+				`encoding census does not match repack arm: ${JSON.stringify(census)}, objects=${objects.length}`,
+			)
+		}
+		await assertRows(objects.length, tier ? objects.length : 0)
 
 		// GC after a rewind to the ROOT commit: reclaims almost everything, in both
 		// tiers, so the delete-side WAL of the derived tier is visible too.
 		await setMain(pg, REPO, rootCommit)
 		const w4 = await walLsn(pg)
-		await createGc(pg).gc(REPO, { graceSeconds: 0, maintain: false })
+		const gcReceipt = await createGc(pg).gc(REPO, {
+			graceSeconds: 0,
+			maintain: false,
+		})
 		const w5 = await walLsn(pg)
+		if (gcReceipt.deletedObjects !== reclaimedObjects.length) {
+			throw new Error(
+				`GC deleted ${gcReceipt.deletedObjects}/${reclaimedObjects.length} rewind objects`,
+			)
+		}
+		await assertRows(rootObjects.length, tier ? rootObjects.length : 0)
 
 		// DELETE the repo: one `DELETE FROM repos`, everything else is the cascade.
 		// Re-seed first so the cascade has a full repo to tear down, not a GC'd husk.
 		await seedObjects(pg, REPO, objects)
 		await setMain(pg, REPO, tip)
-		if (tier) await createRepack(pg).repack(REPO)
+		if (tier) {
+			const receipt = await createRepack(pg).repack(REPO)
+			if (receipt.wholes + receipt.deltas !== reclaimedObjects.length) {
+				throw new Error(
+					`cascade fixture repack covered ${receipt.wholes + receipt.deltas}/${reclaimedObjects.length} restored objects`,
+				)
+			}
+		}
+		await assertRows(objects.length, tier ? objects.length : 0)
 		const w6 = await walLsn(pg)
 		const t2 = Date.now()
 		await createGitDeps(pg).admin.deleteRepo(REPO)
 		const deleteMs = Date.now() - t2
 		const w7 = await walLsn(pg)
+		const [remaining] = await pg<{ encodings: string; objects: string; repos: string }[]>`
+			select (select count(*)::text from repos) as repos,
+				(select count(*)::text from git_object) as objects,
+				(select count(*)::text from git_pack_encoding) as encodings`
+		if (
+			!remaining ||
+			Number(remaining.repos) !== 0 ||
+			Number(remaining.objects) !== 0 ||
+			Number(remaining.encodings) !== 0
+		) {
+			throw new Error(`repo cascade left rows behind: ${JSON.stringify(remaining)}`)
+		}
+		const pushWal = Number(w1 - w0)
+		const repackWal = Number(w3 - w2)
+		const gcWal = Number(w5 - w4)
+		const deleteWal = Number(w7 - w6)
+		if (pushWal <= 0 || gcWal <= 0 || deleteWal <= 0 || (tier && repackWal <= 0)) {
+			throw new Error(
+				`WAL counters did not record required work: ${JSON.stringify({ deleteWal, gcWal, pushWal, repackWal, tier })}`,
+			)
+		}
 
 		return {
 			deleteMs,
-			deleteWal: Number(w7 - w6),
+			deleteWal,
 			encBytes: census.dataBytes,
 			encRows: census.rows,
-			gcWal: Number(w5 - w4),
+			gcWal,
 			idleWal: Number(w2 - w1),
 			n,
 			pushMs,
-			pushWal: Number(w1 - w0),
+			pushWal,
 			rawBytes,
 			repackMs,
-			repackWal: Number(w3 - w2),
+			repackWal,
 			tier,
 		}
 	} finally {
@@ -150,6 +242,9 @@ async function trial(
 }
 
 async function main(): Promise<void> {
+	if (TRIALS < 1 || COMMITS < 2) {
+		throw new Error("trials must be positive and commits must be at least 2")
+	}
 	const iso = await createIsolatedSchema(PG_URL)
 	const [cfg] = await iso.sql<{ fpw: string; fsync: string; wc: string; wl: string }[]>`
 		select
@@ -158,9 +253,10 @@ async function main(): Promise<void> {
 			(select setting from pg_settings where name = 'wal_compression') as wc,
 			(select setting from pg_settings where name = 'wal_level') as wl`
 	await iso.drop()
+	if (!cfg) throw new Error("Postgres WAL configuration query returned no row")
 	console.log("# WAL cost of the derived pack-encoding tier\n")
 	console.log(
-		`instance: wal_level=${cfg?.wl} full_page_writes=${cfg?.fpw} fsync=${cfg?.fsync} wal_compression=${cfg?.wc}`,
+		`instance: wal_level=${cfg.wl} full_page_writes=${cfg.fpw} fsync=${cfg.fsync} wal_compression=${cfg.wc}`,
 	)
 	console.log(
 		"NOISY: pg_current_wal_lsn() is instance-wide and this Postgres is shared. Medians over trials; the idle column is the ambient rate.\n",
@@ -183,6 +279,9 @@ async function main(): Promise<void> {
 	const rootCommit = (
 		await spawnGit(["rev-list", "--max-parents=0", tip], { cwd: dir })
 	).stdout.trim()
+	if (!/^[0-9a-f]{40}$/.test(rootCommit)) {
+		throw new Error(`canonical git did not return one root commit: ${rootCommit}`)
+	}
 	// Interleaved, not blocked: this box is shared and drifts.
 	for (let i = 1; i <= TRIALS; i++) {
 		all.push(await trial(i, dir, tip, rootCommit, true))
@@ -240,8 +339,11 @@ async function main(): Promise<void> {
 	)
 	const delWith = median(trials.map((t) => t.deleteMs))
 	const delWithout = median(noTier.map((t) => t.deleteMs))
+	if (delWith <= 0 || delWithout <= 0) {
+		throw new Error(`repo deletion timers must be positive: ${delWith}/${delWithout}`)
+	}
 	console.log(
-		`\nthe tier adds ${(delWith - delWithout).toFixed(0)} ms (×${(delWith / Math.max(1, delWithout)).toFixed(2)}) to a repo deletion — ONE statement, ONE transaction, holding its locks for that whole time.`,
+		`\nthe tier adds ${(delWith - delWithout).toFixed(0)} ms (×${(delWith / delWithout).toFixed(2)}) to a repo deletion — ONE statement, ONE transaction, holding its locks for that whole time.`,
 	)
 
 	const push = median(trials.map((t) => t.pushWal))
@@ -260,7 +362,7 @@ async function main(): Promise<void> {
 		`WAL amplification vs the bytes actually stored: push ${(push / t0.rawBytes).toFixed(2)}× raw · repack ${(repack / t0.encBytes).toFixed(2)}× deflated-encoding`,
 	)
 	console.log(
-		`\nNOTE: full_page_writes=${cfg?.fpw} here. With FPW on (any production instance) both numbers rise, and the repack side rises MORE — it dirties fresh pages in a table with fillfactor=100.`,
+		`\nNOTE: full_page_writes=${cfg.fpw} here. With FPW on (any production instance) both numbers rise; this lower-bound fixture does not quantify that production difference.`,
 	)
 
 	cleanupTmp()

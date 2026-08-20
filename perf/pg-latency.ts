@@ -9,7 +9,7 @@ const TOXIPROXY_IMAGE = "ghcr.io/shopify/toxiproxy:2.12.0"
 /**
  * A Postgres endpoint for the harness. `setLatencyMs` injects a per-response
  * round-trip delay so the per-object query COUNT becomes visible wall-time;
- * it is a no-op on the plain (loopback) handle.
+ * the plain (loopback) handle rejects latency injection.
  */
 export type PgHandle = {
 	baseUrl: string
@@ -22,7 +22,9 @@ export async function startPlainPg(): Promise<PgHandle> {
 	const container = await startPostgres()
 	return {
 		baseUrl: container.getConnectionUri(),
-		setLatencyMs: async () => {},
+		setLatencyMs: async () => {
+			throw new Error("cannot inject latency into a plain Postgres handle")
+		},
 		stop: async () => {
 			await container.stop()
 		},
@@ -48,6 +50,11 @@ export async function startLatencyPg(): Promise<PgHandle> {
 	return {
 		baseUrl,
 		setLatencyMs: async (ms, jitter = 0) => {
+			if (!Number.isFinite(ms) || ms < 0 || !Number.isFinite(jitter) || jitter < 0) {
+				throw new Error(
+					`latency and jitter must be finite nonnegative numbers: ${ms}/${jitter}`,
+				)
+			}
 			if (toxic) {
 				await toxic.remove()
 				toxic = undefined

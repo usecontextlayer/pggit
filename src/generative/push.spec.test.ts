@@ -20,7 +20,7 @@ import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { allObjectOids, refsOf } from "@/testing/git-fixtures"
+import { allObjectOids, branchAndTagRefsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -50,12 +50,12 @@ describe("§8.4 generative — push to an empty repo (M2) differential", () => {
 						)
 
 						// 1. The stored refs are EXACTLY the client's branches + tags. listRefs
-						//    order is unspecified, so sort both sides (refsOf already sorts).
+						//    order is unspecified, so sort both sides (branchAndTagRefsOf already sorts).
 						//    Compare name+oid only — `peeled` is derived metadata, not ref state.
 						const stored = (await refs.listRefs("repo"))
 							.map((r) => ({ name: r.name, oid: r.oid }))
 							.sort((a, b) => a.name.localeCompare(b.name))
-						expect(stored).toEqual(await refsOf(client))
+						expect(stored).toEqual(await branchAndTagRefsOf(client))
 
 						// 2. Differential: a fresh git clones the server back to a byte-identical
 						//    object set, fsck-clean. --no-checkout: the server has no HEAD symref

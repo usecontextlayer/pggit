@@ -35,7 +35,11 @@ import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids, loadReachableObjects, refsOf } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	branchAndTagRefsOf,
+	loadReachableObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -73,10 +77,10 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS + 40 })
 		scratch.push(srcBase, src)
 		baseObjects = await loadReachableObjects(srcBase, ["--all"])
-		baseRefs = await refsOf(srcBase)
+		baseRefs = await branchAndTagRefsOf(srcBase)
 		head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
 		fullObjects = await loadReachableObjects(src, ["--all"])
-		fullRefs = await refsOf(src)
+		fullRefs = await branchAndTagRefsOf(src)
 		srcOidsFull = await allObjectOids(src)
 		const baseTip = (
 			await spawnGit(["rev-parse", "HEAD"], { cwd: srcBase })

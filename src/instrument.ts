@@ -10,7 +10,7 @@ import { performance } from "node:perf_hooks"
  *
  * Concurrency note: phase attribution uses a single mutable `current` per
  * collector. That is correct because a single git request runs its phases
- * (graph-walk → read-objects → write-pack) sequentially, never overlapping.
+ * (ref-advertise → closure → pack-encode) sequentially, never overlapping.
  */
 
 export type QueryRecord = { sql: string; durationMs: number; phase: string }
