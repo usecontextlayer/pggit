@@ -1,58 +1,62 @@
 /**
  * Race conditions created by directly driving the candidate serialized maintenance sequence on real repository history.
  *
- * R1 checks that two clients indexing the same unchanged repacked state produce byte-identical stored packs. R2 starts a clone only after observing committed partial encoding coverage while repack is still unsettled. R3 starts a push at that same proven partial-coverage seam, then converges and clones the result. Promise co-start is not evidence of overlap, so both race cases fail as unmet fixture preconditions unless the intermediate state is observed.
+ * R1 checks that two identical raw v2 fetches of the same unchanged repacked state produce byte-identical wire packs. R2 starts a clone only after observing committed partial encoding coverage while repack is still unsettled. R3 starts a push at that same proven partial-coverage seam, then converges and clones the result. Promise co-start is not evidence of overlap, so both race cases fail as unmet fixture preconditions unless the intermediate state is observed.
  *
  * Black-box behavior remains real `git push` / `git clone` over the wire plus direct `createRepack().repack()` calls. Every successful clone must be fsck-clean and match a plain `file://` oracle exactly in refs and objects. Concurrent repack-vs-repack is deliberately absent because this harness models serialized maintenance; the still-deferred production integration is not evidence supplied by this probe.
  *
- * A perf harness rather than a vitest e2e test because its corpus is a REAL local
- * repository handed in at run time (`--repo=`), which no committed fixture can stand
- * in for — the same reason `perf/delta-corpus.ts` lives here.
+ * A perf harness rather than a vitest e2e test because its corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for — the same reason `perf/delta-corpus.ts` lives here.
  *
  *   npx tsx perf/breakage/realrepo--drain-races.ts --repo=/path/to/checkout --slug=<name>
  *
  * Exit 0 = every established race produced canonical refs and objects. Non-zero = divergence or an unestablished named precondition.
  */
 import { createHash } from "node:crypto"
-import { mkdirSync, readdirSync, readFileSync } from "node:fs"
+import { mkdirSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
-import { parseRevListObjectOids, typedRefsOf } from "@/testing/git-fixtures"
+import { parseRevListObjectOids, requiredAt, typedRefsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { fetchRequest } from "@/testing/wire-fetch"
+import { nonemptyStringArg, parseArgs, pgUrlArg } from "../args"
 import {
+	assertCanonicalRealRepoStore,
 	createLedger,
 	createScratch,
-	DEFAULT_PG_URL,
 	type EncodingCoverage,
 	encodingCoverage,
-	flag,
+	mirrorSourceFromArgs,
 	oidSet,
+	postPggitV2Pack,
 	prepareMirror,
 	tryGit,
 } from "./_realrepo-util"
 
-const SLUG = flag("slug", "repo")
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-if (SLUG.length === 0) throw new Error("--slug must not be empty")
+const args = parseArgs(
+	z
+		.object({
+			mirror: nonemptyStringArg.optional(),
+			pg: pgUrlArg,
+			repo: nonemptyStringArg.optional(),
+			slug: nonemptyStringArg.default("repo"),
+		})
+		.strict()
+		.transform(({ mirror, repo, ...values }) => ({
+			...values,
+			source: mirrorSourceFromArgs({ mirror, repo }),
+		})),
+)
+const SLUG = args.slug
+const PG_URL = args.pg
 
 const scratch = createScratch(`races-${SLUG}`)
 const { fail, findings, report } = createLedger(SLUG)
-/** The private mirror clone of `--repo=`; set by `prepareMirror` in `main`. */
+/** The private mirror clone of the selected source; set by `prepareMirror` in `main`. */
 let MIRROR = ""
-
-function packDigest(bareDir: string): string {
-	const dir = join(bareDir, "objects", "pack")
-	const packs = readdirSync(dir)
-		.filter((f) => f.endsWith(".pack"))
-		.sort()
-	if (packs.length === 0) throw new Error(`${bareDir}: clone contains no pack`)
-	const h = createHash("sha256")
-	for (const f of packs) h.update(readFileSync(join(dir, f)))
-	return h.digest("hex")
-}
 
 /** A clone must be fsck-clean and hold exactly the oracle's object set. */
 async function verifyClone(
@@ -61,7 +65,7 @@ async function verifyClone(
 	expect: { oids: Set<string>; refs: string },
 ): Promise<boolean> {
 	const fsck = await tryGit(["fsck", "--strict"], dir)
-	if (!fsck.ok) {
+	if (fsck.status === "failure") {
 		fail(`${label}: git fsck --strict FAILED`, fsck.stderr.trim().slice(0, 800))
 		return false
 	}
@@ -130,7 +134,7 @@ async function waitForPartialCoverage(
 }
 
 async function main(): Promise<void> {
-	MIRROR = await prepareMirror(scratch)
+	MIRROR = await prepareMirror(scratch, args.source)
 	console.log(`# drain races — ${SLUG}\n  mirror ${MIRROR}`)
 	const chain = parseRevListObjectOids(
 		(
@@ -141,8 +145,8 @@ async function main(): Promise<void> {
 	)
 	if (chain.length < 3)
 		throw new Error(`drain-race fixture needs at least 3 commits, got ${chain.length}`)
-	const mid = chain[Math.floor(chain.length * 0.6)] as string
-	const head = chain[chain.length - 1] as string
+	const mid = requiredAt(chain, Math.floor(chain.length * 0.6), "mid-history commit")
+	const head = requiredAt(chain, chain.length - 1, "head commit")
 	if (mid === head)
 		throw new Error("drain-race fixture mid and head revisions are identical")
 
@@ -152,7 +156,7 @@ async function main(): Promise<void> {
 	// the oracle: a plain file:// remote receiving the identical pushes
 	const oracle = join(scratch.mk("oracle"), "o.git")
 	mkdirSync(oracle, { recursive: true })
-	await spawnGit(["init", "-q", "--bare", oracle])
+	await spawnGit(["init", "-q", "-b", "main", "--bare", oracle])
 
 	try {
 		// ── seed: push half the history, repack fully ───────────────────────────
@@ -166,26 +170,42 @@ async function main(): Promise<void> {
 				`seed repack did not exercise deltas (${seed.wholes} wholes, ${seed.deltas} deltas)`,
 			)
 		}
+		await assertCanonicalRealRepoStore(db.sql, `races/${SLUG}`, oracle, {
+			kind: "repacked",
+		})
 		console.log(`  seed repack: ${seed.wholes} wholes + ${seed.deltas} deltas`)
 		const midOracle = join(scratch.mk("midoracle"), "m.git")
 		await spawnGit(["clone", "--bare", "-q", `file://${oracle}`, midOracle])
 		const midExpect = await oracleState(midOracle)
 
-		// ── R1: determinism — two clones of one state, byte-identical packs ─────
-		const c1 = join(scratch.mk("det1"), "c.git")
-		const c2 = join(scratch.mk("det2"), "c.git")
-		await spawnGit(["-c", "protocol.version=2", "clone", "--bare", "-q", url, c1])
-		await spawnGit(["-c", "protocol.version=2", "clone", "--bare", "-q", url, c2])
-		const [d1, d2] = [packDigest(c1), packDigest(c2)]
+		// ── R1: determinism — two raw fetches of one state, byte-identical packs ─
+		const midWants = [...new Set((await typedRefsOf(midOracle)).map(({ oid }) => oid))]
+		if (midWants.length === 0) throw new Error("R1 fixture has no canonical ref wants")
+		const request = fetchRequest({ done: true, includeTag: true, wants: midWants })
+		const [raw1, raw2] = await Promise.all([
+			postPggitV2Pack(url, request),
+			postPggitV2Pack(url, request),
+		])
+		const d1 = createHash("sha256").update(raw1).digest("hex")
+		const d2 = createHash("sha256").update(raw2).digest("hex")
+		if (raw1.length === 0 || raw2.length === 0) {
+			throw new Error("R1 raw fetch returned an empty pack")
+		}
 		if (d1 !== d2) {
 			fail(
-				"R1 two clones of an unchanged repacked state produced DIFFERENT pack bytes",
+				"R1 two identical raw fetches of an unchanged repacked state produced DIFFERENT wire packs",
 				`sha256 ${d1.slice(0, 16)} vs ${d2.slice(0, 16)} — buildPack documents deterministic packs`,
 			)
 		}
 		report.push(
-			`| R1 | determinism (2 clones, same state) | ${d1 === d2 ? "byte-identical" : "DIVERGED"} |`,
+			`| R1 | determinism (2 raw v2 fetches, same state) | ${d1 === d2 ? "byte-identical" : "DIVERGED"} |`,
 		)
+
+		// Independent client correctness: both clones must accept that state.
+		const c1 = join(scratch.mk("det1"), "c.git")
+		const c2 = join(scratch.mk("det2"), "c.git")
+		await spawnGit(["-c", "protocol.version=2", "clone", "--bare", "-q", url, c1])
+		await spawnGit(["-c", "protocol.version=2", "clone", "--bare", "-q", url, c2])
 		await Promise.all([
 			verifyClone("R1 clone 1", c1, midExpect),
 			verifyClone("R1 clone 2", c2, midExpect),
@@ -236,17 +256,20 @@ async function main(): Promise<void> {
 				`R2 repack left encoding coverage ${afterR2.encoded}/${afterR2.eligible}`,
 			)
 		}
+		await assertCanonicalRealRepoStore(db.sql, `races/${SLUG}`, oracle, {
+			kind: "repacked",
+		})
 		console.log(
-			`  R2 concurrent repack: ${rp.wholes} wholes + ${rp.deltas} deltas; clone ${cl.ok ? "ok" : `FAILED exit ${cl.code}`}`,
+			`  R2 concurrent repack: ${rp.wholes} wholes + ${rp.deltas} deltas; clone ${cl.status === "success" ? "ok" : `FAILED exit ${cl.code}`}`,
 		)
-		if (!cl.ok)
+		if (cl.status === "failure")
 			fail(
 				"R2 a clone running concurrently with repack FAILED",
 				cl.stderr.trim().slice(0, 800),
 			)
 		else await verifyClone("R2 clone racing repack", raceDir, headExpect)
 		report.push(
-			`| R2 | clone ‖ repack | ${cl.ok ? "pack valid, matches git" : "CLONE FAILED"} |`,
+			`| R2 | clone ‖ repack | ${cl.status === "success" ? "pack valid, matches git" : "CLONE FAILED"} |`,
 		)
 
 		// ── R3: a push racing a repack, then a clone of the result ──────────────
@@ -256,7 +279,7 @@ async function main(): Promise<void> {
 		const url2 = `http://127.0.0.1:${server.port}/${rid2}`
 		const oracle2 = join(scratch.mk("oracle2"), "o.git")
 		mkdirSync(oracle2, { recursive: true })
-		await spawnGit(["init", "-q", "--bare", oracle2])
+		await spawnGit(["init", "-q", "-b", "main", "--bare", oracle2])
 		await spawnGit(["push", url2, `${mid}:refs/heads/main`], { cwd: MIRROR })
 		await spawnGit(["push", `file://${oracle2}`, `${mid}:refs/heads/main`], {
 			cwd: MIRROR,
@@ -284,9 +307,9 @@ async function main(): Promise<void> {
 			cwd: MIRROR,
 		})
 		console.log(
-			`  R3 repack ‖ push: repack ${rp3.wholes}w+${rp3.deltas}d, push ${pu3.ok ? "ok" : `FAILED exit ${pu3.code}`}`,
+			`  R3 repack ‖ push: repack ${rp3.wholes}w+${rp3.deltas}d, push ${pu3.status === "success" ? "ok" : `FAILED exit ${pu3.code}`}`,
 		)
-		if (!pu3.ok)
+		if (pu3.status === "failure")
 			fail(
 				"R3 a push running concurrently with repack FAILED",
 				pu3.stderr.trim().slice(0, 800),
@@ -305,6 +328,9 @@ async function main(): Promise<void> {
 				`R3 convergence left encoding coverage ${afterConverge.encoded}/${afterConverge.eligible}`,
 			)
 		}
+		if (pu3.status === "success") {
+			await assertCanonicalRealRepoStore(db.sql, rid2, oracle2, { kind: "repacked" })
+		}
 		const oracle2Clone = join(scratch.mk("oracle2c"), "o.git")
 		await spawnGit(["clone", "--mirror", "-q", `file://${oracle2}`, oracle2Clone])
 		const expect2 = await oracleState(oracle2Clone)
@@ -318,11 +344,11 @@ async function main(): Promise<void> {
 			url2,
 			after3,
 		])
-		if (!cl3.ok)
+		if (cl3.status === "failure")
 			fail("R3 clone after a push/repack race FAILED", cl3.stderr.trim().slice(0, 800))
 		else await verifyClone("R3 clone after push‖repack", after3, expect2)
 		report.push(
-			`| R3 | push ‖ repack (+converging repack ${rp3b.wholes}w+${rp3b.deltas}d) | ${cl3.ok ? "pack valid, matches git" : "CLONE FAILED"} |`,
+			`| R3 | push ‖ repack (+converging repack ${rp3b.wholes}w+${rp3b.deltas}d) | ${cl3.status === "success" ? "pack valid, matches git" : "CLONE FAILED"} |`,
 		)
 	} finally {
 		await server.close()

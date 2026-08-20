@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import pprof from "@datadog/pprof"
 import * as flame from "@platformatic/flame"
+import { z } from "zod"
 
 export type Hotspot = {
 	fn: string
@@ -45,22 +46,33 @@ export async function stopProfile(outDir: string, topN = 20): Promise<ProfileRes
 	return { hotspots, htmlPath, mdPath, pbPath }
 }
 
-// Minimal view of the pprof-format Profile (flame.parseProfile returns it).
-type PprofLine = { functionId: number; line: number }
-type PprofProfile = {
-	sampleType: { type: number; unit: number }[]
-	sample: { locationId: number[]; value: number[] }[]
-	location: { id: number; line: PprofLine[] }[]
-	function: { id: number; name: number; filename: number }[]
-	stringTable: { strings: string[] }
-}
+const profileIndex = z.coerce.number().int().safe().nonnegative()
+const pprofProfileSchema = z.object({
+	function: z.array(
+		z.object({ filename: profileIndex, id: profileIndex, name: profileIndex }),
+	),
+	location: z.array(
+		z.object({
+			id: profileIndex,
+			line: z.array(z.object({ functionId: profileIndex, line: profileIndex })),
+		}),
+	),
+	sample: z.array(
+		z.object({
+			locationId: z.array(profileIndex),
+			value: z.array(z.coerce.number().finite().nonnegative()),
+		}),
+	),
+	sampleType: z.array(z.object({ type: profileIndex, unit: profileIndex })),
+	stringTable: z.object({ strings: z.array(z.string()) }),
+})
 
 /** Aggregate self-time (leaf-attributed wall nanos) per function, top-N. */
 async function topHotspots(pbPath: string, topN: number): Promise<Hotspot[]> {
 	if (!Number.isSafeInteger(topN) || topN < 1) {
 		throw new Error(`topN must be a positive safe integer, got ${topN}`)
 	}
-	const p = (await flame.parseProfile(pbPath)) as unknown as PprofProfile
+	const p = pprofProfileSchema.parse(await flame.parseProfile(pbPath))
 	const strings = p.stringTable.strings
 	if (p.sampleType.length === 0) throw new Error("profile contains no sample types")
 	// The report promises wall self-time, so a count-only profile is not scoreable.

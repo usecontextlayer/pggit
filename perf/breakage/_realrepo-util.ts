@@ -15,22 +15,21 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Sql } from "postgres"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
+import type { Oid } from "@/oid"
 import { createRepack } from "@/store/repack"
 import {
 	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	type GitObjectWithOid,
+	loadAllObjects,
 	parseVerifyPackObjects,
+	repackEligibleObjects,
 	type VerifyPackObject,
 } from "@/testing/git-fixtures"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 import { spawnUploadPack } from "@/testing/upload-pack-oracle"
-
-export { flag, positiveIntegerFlag, positiveNumberFlag } from "../args"
-
-import { flag } from "../args"
-
-/** The shared docker-compose Postgres every perf harness defaults to. */
-export const DEFAULT_PG_URL = "postgres://postgres:postgres@localhost:6489/postgres"
 
 export const kb = (n: number): string => `${(n / 1000).toFixed(0)} KB`
 export const mb = (n: number): string => `${(n / 1_000_000).toFixed(2)} MB`
@@ -68,19 +67,54 @@ export function createScratch(prefix: string): Scratch {
  * `--no-hardlinks` keeps the clone's object files physically its own, so nothing
  * here can reach back into the source's store.
  */
-export async function prepareMirror(scratch: Scratch): Promise<string> {
-	const repo = flag("repo", "")
-	const mirror = flag("mirror", "")
-	if ((repo === "") === (mirror === "")) {
-		throw new Error("exactly one of --repo=<path> or --mirror=<bare.git> is required")
+export type MirrorSource = { path: string }
+
+export function mirrorSourceFromArgs(args: {
+	repo?: string
+	mirror?: string
+}): MirrorSource {
+	if (args.repo !== undefined && args.mirror === undefined) {
+		return { path: args.repo }
 	}
-	const source = repo || mirror
+	if (args.mirror !== undefined && args.repo === undefined) {
+		return { path: args.mirror }
+	}
+	throw new Error("exactly one of --repo or --mirror is required")
+}
+
+export async function prepareMirror(
+	scratch: Scratch,
+	source: MirrorSource,
+): Promise<string> {
 	const work = join(scratch.mk("mirror"), "source.git")
-	await spawnGit(["clone", "--mirror", "--no-hardlinks", "-q", source, work])
+	await spawnGit(["clone", "--mirror", "--no-hardlinks", "-q", source.path, work])
 	return work
 }
 
-export type GitOutcome = { ok: boolean; code: number; stdout: string; stderr: string }
+export type CanonicalStoreEncoding = { kind: "unencoded" } | { kind: "repacked" }
+
+/** Prove a real-repository store before any harness measurement is scored. */
+export async function assertCanonicalRealRepoStore(
+	sql: Sql,
+	repo: string,
+	dir: string,
+	encoding: CanonicalStoreEncoding,
+): Promise<GitObjectWithOid[]> {
+	const objects = await loadAllObjects(dir)
+	await assertCanonicalStoreFixture(sql, repo, {
+		encodings: {
+			kind: "exact",
+			objects: encoding.kind === "unencoded" ? [] : repackEligibleObjects(objects),
+		},
+		objects,
+		refs: await canonicalStoreRefsOf(dir),
+	})
+	return objects
+}
+
+export type GitOutcome =
+	| { status: "success"; stdout: string; stderr: string }
+	| { status: "failure"; code: number; stdout: string; stderr: string }
 
 /** `spawnGit`, but a non-zero exit is an OUTCOME to compare against the oracle's,
  * not a throw — "pggit rejected what git accepted" is the finding these harnesses
@@ -92,10 +126,15 @@ export async function tryGit(
 ): Promise<GitOutcome> {
 	try {
 		const r = await spawnGit(args, { cwd, input })
-		return { code: 0, ok: true, stderr: r.stderr, stdout: r.stdout }
+		return { status: "success", stderr: r.stderr, stdout: r.stdout }
 	} catch (err) {
 		if (err instanceof GitCommandError) {
-			return { code: err.code, ok: false, stderr: err.stderr, stdout: err.stdout }
+			return {
+				code: err.code,
+				status: "failure",
+				stderr: err.stderr,
+				stdout: err.stdout,
+			}
 		}
 		throw err
 	}
@@ -151,7 +190,7 @@ export async function canonicalV2Pack(dir: string, request: Buffer): Promise<Buf
 export async function indexRawPack(
 	dir: string,
 	pack: Buffer,
-	fixThin: boolean,
+	mode: "complete" | "thin",
 ): Promise<{ appendedBases: number; entries: VerifyPackObject[] }> {
 	if (pack.length < 12 || pack.subarray(0, 4).toString("ascii") !== "PACK") {
 		throw new Error(`raw pack has no complete PACK header (${pack.length} bytes)`)
@@ -159,7 +198,7 @@ export async function indexRawPack(
 	const headerCount = pack.readUInt32BE(8)
 	if (headerCount === 0) throw new Error("raw pack declares zero transmitted objects")
 	const indexed = await spawnGit(
-		["index-pack", "--stdin", ...(fixThin ? ["--fix-thin"] : [])],
+		["index-pack", "--stdin", ...(mode === "thin" ? ["--fix-thin"] : [])],
 		{ cwd: dir, input: pack },
 	)
 	const receipt = indexed.stdout.trim()
@@ -202,9 +241,9 @@ export async function indexRawPack(
 export async function rawPackObjectOids(
 	dir: string,
 	pack: Buffer,
-	fixThin: boolean,
-): Promise<{ appendedBases: number; oids: string[] }> {
-	const indexed = await indexRawPack(dir, pack, fixThin)
+	mode: "complete" | "thin",
+): Promise<{ appendedBases: number; oids: Oid[] }> {
+	const indexed = await indexRawPack(dir, pack, mode)
 	return {
 		appendedBases: indexed.appendedBases,
 		oids: indexed.entries.map((object) => object.oid).sort(),
@@ -235,7 +274,9 @@ export async function encodingCoverage(
 	if (rows.length !== 1) {
 		throw new Error(`${repo}: expected one repository coverage row, got ${rows.length}`)
 	}
-	const coverage = rows[0] as EncodingCoverage
+	const [coverage] = rows
+	if (coverage === undefined)
+		throw new Error(`${repo}: encoding coverage row disappeared`)
 	if (
 		!Number.isSafeInteger(coverage.eligible) ||
 		!Number.isSafeInteger(coverage.encoded) ||

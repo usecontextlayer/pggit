@@ -20,16 +20,33 @@
 import { rmSync } from "node:fs"
 import { join } from "node:path"
 import postgres from "postgres"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
+import type { Oid } from "@/oid"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids, revParse } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
+	requiredAt,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { increasingIntegerListFlag, mkTmp, PG_URL, seedRepo, table } from "./_perf-util"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
+import { mkTmp, seedRepo, table } from "./_perf-util"
 
-const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
+const { pg: PG_URL, sizes: SIZES } = parseArgs(
+	z
+		.object({
+			pg: pgUrlArg,
+			sizes: increasingIntegerListArg([250, 500, 1000, 2000]),
+		})
+		.strict(),
+)
 const REPO = "probe/bitmap-clone"
 /** The largest size must cut clone-serve queries by at least this factor. */
 const MIN_QUERY_FACTOR = 5
@@ -62,7 +79,7 @@ type Row = {
 async function cloneCounting(
 	schema: string,
 	label: string,
-): Promise<{ queries: number; ms: number; oids: string[]; tip: string }> {
+): Promise<{ queries: number; ms: number; oids: Oid[]; tip: Oid }> {
 	const { sql, c } = countingClient(schema)
 	try {
 		const server = await serveOnPort(createGitApp(createGitDeps(sql)), 0)
@@ -102,9 +119,10 @@ async function measure(n: number): Promise<Row> {
 	try {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
-			const seeded = await seedRepo(db.sql, REPO, src)
 			const expectedOids = await allObjectOids(src)
+			const expectedObjects = await loadGitObjects(src, expectedOids)
 			const expectedTip = await revParse(src, "refs/heads/main")
+			const seeded = await seedRepo(db.sql, REPO, src, expectedObjects)
 			if (seeded.objects !== expectedOids.length) {
 				throw new Error(
 					`seeded ${seeded.objects} objects, canonical git has ${expectedOids.length}`,
@@ -119,6 +137,29 @@ async function measure(n: number): Promise<Row> {
 			if (gc.epoch !== "rebuilt") {
 				throw new Error(`expected the drain to rebuild an epoch, got ${gc.epoch}`)
 			}
+			const [epoch] = await db.sql<
+				{ bitmaps: string; epochs: string; oidBytes: string; tipBytes: string }[]
+			>`select
+				(select count(*) from git_reach_epoch)::text as epochs,
+				(select count(*) from git_reach_bitmap)::text as bitmaps,
+				(select length(oids) from git_reach_epoch)::text as "oidBytes",
+				(select length(tips) from git_reach_epoch)::text as "tipBytes"`
+			if (
+				!epoch ||
+				Number(epoch.epochs) !== 1 ||
+				Number(epoch.bitmaps) !== 1 ||
+				Number(epoch.oidBytes) !== expectedOids.length * 20 ||
+				Number(epoch.tipBytes) !== 20
+			) {
+				throw new Error(
+					`epoch prerequisite mismatch: ${JSON.stringify(epoch)}, expected ${expectedOids.length} oid positions and one tip bitmap`,
+				)
+			}
+			await assertCanonicalStoreFixture(db.sql, REPO, {
+				encodings: { kind: "unchecked" },
+				objects: expectedObjects,
+				refs: await canonicalStoreRefsOf(src),
+			})
 
 			const bitmap = await cloneCounting(db.schema, `bitmap-${n}`)
 
@@ -136,9 +177,9 @@ async function measure(n: number): Promise<Row> {
 					throw new Error(`${label}-served clone diverged from canonical git`)
 				}
 			}
-			if (walk.queries <= 0 || bitmap.queries <= 0) {
+			if (walk.queries <= 0 || bitmap.queries <= 0 || walk.ms <= 0 || bitmap.ms <= 0) {
 				throw new Error(
-					`query counter did not observe both serves: walk=${walk.queries}, bitmap=${bitmap.queries}`,
+					`serve metrics missing: walk=${walk.queries}q/${walk.ms}ms, bitmap=${bitmap.queries}q/${bitmap.ms}ms`,
 				)
 			}
 
@@ -177,7 +218,7 @@ console.log(
 	),
 )
 
-const last = rows[rows.length - 1] as Row
+const last = requiredAt(rows, rows.length - 1, "largest bitmap-clone measurement")
 if (last.factor < MIN_QUERY_FACTOR) {
 	console.error(
 		`FAIL: epoch-served clone cut queries only ${last.factor.toFixed(1)}× at ${last.n} commits (limit ${MIN_QUERY_FACTOR}×)`,

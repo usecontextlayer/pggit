@@ -12,18 +12,25 @@
  * for the runs that did not — a killed process, a harness that threw past its
  * teardown, a `--phases` run abandoned mid-way.
  *
- *   npx tsx perf/breakage/realrepo--cleanup.ts          # report only
- *   npx tsx perf/breakage/realrepo--cleanup.ts --drop   # drop the attributed schemas
+ *   npx tsx perf/breakage/realrepo--cleanup.ts               # report only
+ *   npx tsx perf/breakage/realrepo--cleanup.ts --drop=true   # drop the attributed schemas
  */
 import postgres from "postgres"
-import { DEFAULT_PG_URL, flag } from "./_realrepo-util"
+import { z } from "zod"
+import { parseArgs, pgUrlArg } from "../args"
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-const DROP = process.argv.includes("--drop")
+const args = parseArgs(
+	z
+		.object({
+			drop: z.stringbool().default(false),
+			pg: pgUrlArg,
+		})
+		.strict(),
+)
 const MINE = ["realrepo/", "races/", "border/", "warm/", "sizecheck/"]
 
 async function main(): Promise<void> {
-	const sql = postgres(PG_URL, { max: 1, onnotice: () => {} })
+	const sql = postgres(args.pg, { max: 1, onnotice: () => {} })
 	try {
 		const schemas = await sql<{ nspname: string }[]>`
 			select nspname from pg_namespace where nspname like 't\\_%' order by nspname`
@@ -38,12 +45,10 @@ async function main(): Promise<void> {
 				foreign++
 				continue
 			}
-			const rows = await sql<
-				{ name: string }[]
-			>`select name from ${sql(nspname)}.repos limit 200`
+			const rows = await sql<{ name: string }[]>`select name from ${sql(nspname)}.repos`
 			const names = rows.map((r) => r.name)
 			if (names.length > 0 && names.every((n) => MINE.some((p) => n.startsWith(p)))) {
-				mine.push({ repos: names.slice(0, 3), schema: nspname })
+				mine.push({ repos: names, schema: nspname })
 			} else {
 				foreign++
 			}
@@ -52,13 +57,13 @@ async function main(): Promise<void> {
 			`${schemas.length} t_* schemas; ${mine.length} attributable to this exercise, ${foreign} NOT mine (left alone)`,
 		)
 		for (const m of mine) console.log(`  ${m.schema}  repos: ${m.repos.join(", ")}`)
-		if (DROP) {
+		if (args.drop) {
 			for (const m of mine) {
 				await sql`drop schema ${sql(m.schema)} cascade`
 				console.log(`  dropped ${m.schema}`)
 			}
 		} else if (mine.length > 0) {
-			console.log(`\nre-run with --drop to remove them`)
+			console.log(`\nre-run with --drop=true to remove them`)
 		}
 	} finally {
 		await sql.end()

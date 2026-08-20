@@ -32,15 +32,19 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { deflateSync } from "node:zlib"
+import { z } from "zod"
 import type { GitObjectType } from "@/object/object"
-import { applyDelta, encodeDelta } from "@/pack/delta"
+import type { Oid } from "@/oid"
+import { applyDelta, DELTA_SIZE_MIN, encodeDelta } from "@/pack/delta"
 import { encodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 import {
+	type GitObjectWithOid,
 	gitLogRawBasePairs,
 	gitReachableOids,
 	loadGitObjects,
 } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseRepeatedArgs } from "./args"
 
 const PACK_TYPE_CODE: Record<GitObjectType, number> = {
 	blob: PACK_OBJ_TYPE.BLOB,
@@ -49,10 +53,10 @@ const PACK_TYPE_CODE: Record<GitObjectType, number> = {
 	tree: PACK_OBJ_TYPE.TREE,
 }
 
-type Obj = { oid: string; type: GitObjectType; content: Buffer }
+type Obj = GitObjectWithOid
 type PackEntry =
 	| { content: Buffer; kind: "base"; type: GitObjectType }
-	| { baseOid: string; delta: Buffer; kind: "ref" }
+	| { baseOid: Oid; delta: Buffer; kind: "ref" }
 
 /** Every reachable object with its bytes, in one strict `cat-file --batch`. */
 async function reachableObjects(dir: string): Promise<Obj[]> {
@@ -62,13 +66,9 @@ async function reachableObjects(dir: string): Promise<Obj[]> {
 const mb = (n: number): string => `${(n / 1_000_000).toFixed(2)} MB`
 
 function repoArgs(): string[] {
-	const repos = process.argv
-		.filter((a) => a.startsWith("--repo="))
-		.map((a) => a.slice("--repo=".length))
-	if (repos.length === 0) {
-		throw new Error("delta-corpus: at least one --repo=<path> is required")
-	}
-	return repos
+	return parseRepeatedArgs(
+		z.object({ repo: z.tuple([z.string().min(1)], z.string().min(1)) }).strict(),
+	).repo
 }
 
 /**
@@ -139,8 +139,8 @@ async function verifyRepo(repo: string, scratch: string[]): Promise<Verdict> {
 	// invariant makes every base a whole encoding), but this harness models
 	// unconstrained chains, so it must break cycles itself: an object whose pair
 	// chain leads back to it ships whole.
-	const inCycle = (start: string): boolean => {
-		const seen = new Set<string>([start])
+	const inCycle = (start: Oid): boolean => {
+		const seen = new Set<Oid>([start])
 		let cursor = pairs.get(start)
 		while (cursor !== undefined) {
 			if (seen.has(cursor)) return true
@@ -170,7 +170,7 @@ async function verifyRepo(repo: string, scratch: string[]): Promise<Verdict> {
 			continue
 		}
 		const encoded = deflateSync(delta)
-		if (encoded.length < whole.length) {
+		if (delta.length >= DELTA_SIZE_MIN && encoded.length < whole.length) {
 			entries.push({ baseOid: base.oid, delta, kind: "ref" })
 			deltified++
 		} else {

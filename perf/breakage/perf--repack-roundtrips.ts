@@ -13,25 +13,34 @@
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import postgres from "postgres"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids, revParse } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
+	repackEligibleObjects,
+	requiredAt,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import {
-	cleanupTmp,
-	increasingIntegerListFlag,
-	mkTmp,
-	PG_URL,
-	secs,
-	seedRepo,
-	table,
-} from "./_perf-util"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
+import { cleanupTmp, mkTmp, secs, seedRepo, table } from "./_perf-util"
 
-const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
+const { pg: PG_URL, sizes: SIZES } = parseArgs(
+	z
+		.object({
+			pg: pgUrlArg,
+			sizes: increasingIntegerListArg([250, 500, 1000, 2000]),
+		})
+		.strict(),
+)
 /** Round-trip times to model: loopback, same-region managed PG, cross-region. */
 const RTTS = [1, 15, 30]
 /** Modeled minutes for ONE repo at 30 ms RTT above which this is called broken.
@@ -70,9 +79,10 @@ async function measure(n: number): Promise<Row> {
 	try {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
-			const seeded = await seedRepo(db.sql, "probe/rt", src)
 			const expectedOids = await allObjectOids(src)
+			const expectedObjects = await loadGitObjects(src, expectedOids)
 			const expectedTip = await revParse(src, "refs/heads/main")
+			const seeded = await seedRepo(db.sql, "probe/rt", src, expectedObjects)
 			if (seeded.objects !== expectedOids.length) {
 				throw new Error(
 					`seeded ${seeded.objects} objects, expected ${expectedOids.length}`,
@@ -91,11 +101,24 @@ async function measure(n: number): Promise<Row> {
 					await repackC.sql.end()
 				}
 			})()
-			if (repacked.wholes + repacked.deltas !== seeded.objects || repackC.c.n <= 0) {
+			if (
+				repacked.wholes + repacked.deltas !== seeded.eligibleObjects ||
+				repacked.deltas <= 0 ||
+				repackC.c.n <= 0 ||
+				repackMs <= 0
+			) {
 				throw new Error(
-					`repack coverage/queries invalid: ${repacked.wholes + repacked.deltas}/${seeded.objects}, q=${repackC.c.n}`,
+					`repack prerequisite invalid: ${repacked.wholes} wholes + ${repacked.deltas} deltas/${seeded.eligibleObjects} eligible objects, q=${repackC.c.n}, ms=${repackMs}`,
 				)
 			}
+			await assertCanonicalStoreFixture(db.sql, "probe/rt", {
+				encodings: {
+					kind: "exact",
+					objects: repackEligibleObjects(expectedObjects),
+				},
+				objects: expectedObjects,
+				refs: await canonicalStoreRefsOf(src),
+			})
 
 			const cloneC = countingClient(db.schema)
 			let server: Awaited<ReturnType<typeof serveOnPort>> | undefined
@@ -147,6 +170,14 @@ async function measure(n: number): Promise<Row> {
 					`completed GC receipt invalid: deleted=${swept.deletedObjects}, epoch=${swept.epoch}, q=${gcC.c.n}`,
 				)
 			}
+			await assertCanonicalStoreFixture(db.sql, "probe/rt", {
+				encodings: {
+					kind: "exact",
+					objects: repackEligibleObjects(expectedObjects),
+				},
+				objects: expectedObjects,
+				refs: await canonicalStoreRefsOf(src),
+			})
 
 			const top = [...repackC.c.byShape.entries()]
 				.sort((a, b) => b[1] - a[1])
@@ -200,10 +231,10 @@ async function main(): Promise<void> {
 		),
 	)
 	console.log(
-		`\nbusiest repack statements at the largest size:\n  ${(rows[rows.length - 1] as Row).top}`,
+		`\nbusiest repack statements at the largest size:\n  ${requiredAt(rows, rows.length - 1, "largest repack-roundtrip measurement").top}`,
 	)
 
-	const last = rows[rows.length - 1] as Row
+	const last = requiredAt(rows, rows.length - 1, "largest repack-roundtrip measurement")
 	const modeled = (last.repack * 30) / 60000
 	console.log(
 		`\nFAIL CONDITION: one repo's first repack modeled at 30 ms RTT exceeds ${MODELED_MINUTES_LIMIT} min.`,

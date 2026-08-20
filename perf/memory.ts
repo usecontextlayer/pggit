@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads"
+import { z } from "zod"
 
 /**
  * Layer-1 (implementation-agnostic) memory instrumentation. Everything here is a
@@ -8,7 +9,7 @@ import { Worker } from "node:worker_threads"
  * yardstick straight across a code or schema restructure.
  *
  * The headline (peak RSS) is sampled from a WORKER thread on purpose: the serve
- * path blocks the main thread (synchronous `deflateSync` + SHA-1 over the pack),
+ * path can block the main thread during synchronous pack assembly,
  * during which a main-thread timer is starved and would miss the very peak we
  * care about. RSS is an OS-level, process-wide number, so a worker reads the
  * true main-thread peak even while main is blocked. The per-field breakdown
@@ -26,6 +27,23 @@ export type MemoryBreakdown = {
 	rss: number
 }
 
+export type NonEmptySamples<T> = readonly [T, ...T[]]
+export type RssSample = [number, number]
+export type RssSeries = [RssSample, RssSample, ...RssSample[]]
+
+/** Establish a measurement boundary before reducers score a series. */
+export function requireSamples<T>(samples: readonly T[]): NonEmptySamples<T> {
+	const [first, ...rest] = samples
+	if (first === undefined) throw new Error("measurement requires at least one sample")
+	return [first, ...rest]
+}
+
+/** Project a validated RSS series without losing its nonempty evidence type. */
+export function rssBytes(series: RssSeries): [number, number, ...number[]] {
+	const [first, second, ...rest] = series
+	return [first[1], second[1], ...rest.map(([, bytes]) => bytes)]
+}
+
 export type MemoryReport = {
 	/** True peak RSS (bytes), off-thread sampled — survives main-thread sync blocks. */
 	peakRssBytes: number
@@ -37,37 +55,51 @@ export type MemoryReport = {
 	/** Live set after a forced full GC once the request settled — resting / leak signal. */
 	retainedAfterGcBytes: MemoryBreakdown
 	/** Off-thread RSS timeseries: `[msSinceStart, rssBytes]` — written to the artifact. */
-	rssSeries: [number, number][]
+	rssSeries: RssSeries
 	/** Honesty: how densely the off-thread sampler actually fired. */
 	sampler: { samples: number; meanIntervalMs: number }
 }
 
-/** Max of `values`; 0 for an empty series. Folds (never spreads) — series can be huge. */
-export function peakOf(values: number[]): number {
-	let max = 0
-	for (const v of values) if (v > max) max = v
+/** Max of a measured series. Folds (never spreads) because series can be huge. */
+export function peakOf(values: NonEmptySamples<number>): number {
+	const [first, ...rest] = values
+	let max = first
+	for (const value of rest) if (value > max) max = value
 	return max
 }
 
-/** Nearest-rank percentile of `values` (p in [0,100]); 0 for an empty series. */
-export function percentile(values: number[], p: number): number {
-	if (values.length === 0) return 0
-	const sorted = [...values].sort((a, b) => a - b)
-	if (p <= 0) return sorted[0] as number
-	const rank = Math.ceil((p / 100) * sorted.length)
-	const idx = Math.min(rank, sorted.length) - 1
-	return sorted[idx] as number
+/** Nearest-rank percentile of a measured series (p in [0,100]). */
+export function percentile(values: NonEmptySamples<number>, p: number): number {
+	if (!Number.isFinite(p) || p < 0 || p > 100) {
+		throw new Error(`percentile must be between 0 and 100, got ${p}`)
+	}
+	const sorted: [number, ...number[]] = [...values]
+	sorted.sort((a, b) => a - b)
+	const [minimum, ...remaining] = sorted
+	if (p === 0) return minimum
+	const rank = Math.ceil((p / 100) * values.length)
+	let value = minimum
+	let position = 1
+	for (const candidate of remaining) {
+		if (position >= rank) break
+		value = candidate
+		position += 1
+	}
+	return value
 }
 
-/** Element-wise max across breakdown samples; all-zero for no samples. */
-export function peakPerField(samples: MemoryBreakdown[]): MemoryBreakdown {
-	return {
-		arrayBuffers: peakOf(samples.map((s) => s.arrayBuffers)),
-		external: peakOf(samples.map((s) => s.external)),
-		heapTotal: peakOf(samples.map((s) => s.heapTotal)),
-		heapUsed: peakOf(samples.map((s) => s.heapUsed)),
-		rss: peakOf(samples.map((s) => s.rss)),
+/** Element-wise max across breakdown samples. */
+export function peakPerField(samples: NonEmptySamples<MemoryBreakdown>): MemoryBreakdown {
+	const [first, ...rest] = samples
+	const peak = { ...first }
+	for (const sample of rest) {
+		peak.arrayBuffers = Math.max(peak.arrayBuffers, sample.arrayBuffers)
+		peak.external = Math.max(peak.external, sample.external)
+		peak.heapTotal = Math.max(peak.heapTotal, sample.heapTotal)
+		peak.heapUsed = Math.max(peak.heapUsed, sample.heapUsed)
+		peak.rss = Math.max(peak.rss, sample.rss)
 	}
+	return peak
 }
 
 function breakdownOf(u: NodeJS.MemoryUsage): MemoryBreakdown {
@@ -87,7 +119,7 @@ function breakdownOf(u: NodeJS.MemoryUsage): MemoryBreakdown {
  * skip would hide that the retained number is missing.
  */
 function retainedAfterGc(): MemoryBreakdown {
-	const gc = (globalThis as { gc?: () => void }).gc
+	const gc = Reflect.get(globalThis, "gc")
 	if (typeof gc !== "function") {
 		throw new Error(
 			"perf/memory: retained-set measurement needs --expose-gc (the `perf` script sets NODE_OPTIONS=--expose-gc)",
@@ -114,25 +146,31 @@ parentPort.on("message", () => {
 })
 `
 
-export function startRssSampler(): { stop: () => Promise<[number, number][]> } {
+const rssSampleSchema = z.tuple([
+	z.number().finite().nonnegative(),
+	z.number().int().safe().nonnegative(),
+])
+const rssSeriesSchema = z.tuple([rssSampleSchema, rssSampleSchema], rssSampleSchema)
+
+export function startRssSampler(): { stop: () => Promise<RssSeries> } {
 	const worker = new Worker(RSS_WORKER_SRC, { eval: true })
 	return {
 		stop: async () => {
 			try {
-				const series = await new Promise<[number, number][]>((resolve, reject) => {
-					worker.once("message", (message: [number, number][]) => resolve(message))
+				const series = await new Promise<RssSeries>((resolve, reject) => {
+					worker.once("message", (message: unknown) => {
+						resolve(rssSeriesSchema.parse(message))
+					})
 					worker.once("error", reject)
 					worker.once("exit", (code) => {
 						reject(new Error(`RSS sampler exited ${code} before returning its series`))
 					})
 					worker.postMessage("stop")
 				})
-				if (series.length < 2) {
-					throw new Error(`RSS sampler returned only ${series.length} sample(s)`)
-				}
-				const firstAt = series[0]?.[0]
-				const lastAt = series.at(-1)?.[0]
-				if (firstAt === undefined || lastAt === undefined || lastAt <= firstAt) {
+				const [first, second, ...rest] = series
+				const firstAt = first[0]
+				const lastAt = (rest.at(-1) ?? second)[0]
+				if (lastAt <= firstAt) {
 					throw new Error(
 						`RSS sampler returned no positive sampling span: ${firstAt}..${lastAt}`,
 					)
@@ -146,7 +184,9 @@ export function startRssSampler(): { stop: () => Promise<[number, number][]> } {
 }
 
 function startBreakdownSampler(): { stop: () => MemoryBreakdown } {
-	const samples: MemoryBreakdown[] = [breakdownOf(process.memoryUsage())]
+	const samples: [MemoryBreakdown, ...MemoryBreakdown[]] = [
+		breakdownOf(process.memoryUsage()),
+	]
 	const timer = setInterval(() => samples.push(breakdownOf(process.memoryUsage())), 5)
 	return {
 		stop: () => {
@@ -168,10 +208,12 @@ export function startMemorySampler(): { stop: () => Promise<MemoryReport> } {
 		stop: async () => {
 			const peakByField = breakdown.stop()
 			const series = await rss.stop()
-			const firstAt = (series[0] as [number, number])[0]
-			const lastAt = (series.at(-1) as [number, number])[0]
+			const [first, second, ...rest] = series
+			const last = rest.at(-1) ?? second
+			const [firstAt] = first
+			const [lastAt] = last
 			const retainedAfterGcBytes = retainedAfterGc()
-			const rssValues = series.map(([, bytes]) => bytes)
+			const rssValues = rssBytes(series)
 			const meanIntervalMs = (lastAt - firstAt) / (series.length - 1)
 			return {
 				peakByField,

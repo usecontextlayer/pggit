@@ -19,7 +19,7 @@
  * this harness invokes the intended engine-side sequence directly.
  *
  * WHAT IT PRINTS
- *   - per round: total/heap/toast/index bytes for all five tables, dead tuples,
+ *   - per round: total/heap/toast/index bytes for all seven measured tables, dead tuples,
  *     and autovacuum_count for each.
  *   - the autovacuum eligibility arithmetic per leaf partition: dead vs
  *     threshold + scale_factor * live.
@@ -38,27 +38,30 @@
  *   npx tsx perf/breakage/pg-bloat--force-push-churn.ts --rounds=40 --settle=180
  */
 import { setTimeout as sleep } from "node:timers/promises"
+import { z } from "zod"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import {
+	assertCanonicalStoreFixture,
+	repackEligibleObjects,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg, positiveNumberArg } from "../args"
 import {
 	aggregate,
 	COMMITTER,
-	DEFAULT_PG_URL,
 	filler,
-	flag,
 	horizon,
 	mb,
 	objectsBetween,
 	pad,
 	padr,
-	positiveIntegerFlag,
-	positiveNumberFlag,
 	rawIndexSizes,
 	runDirName,
 	type Sizes,
@@ -75,11 +78,23 @@ import {
 
 const REPO_ID = "workspace/slate/churn"
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-const ROUNDS = positiveIntegerFlag("rounds", 40)
-const ADVANCE = positiveIntegerFlag("advance", 20)
-const BASE = positiveIntegerFlag("base", 200)
-const SETTLE_S = positiveNumberFlag("settle", 180)
+const {
+	advance: ADVANCE,
+	base: BASE,
+	pg: PG_URL,
+	rounds: ROUNDS,
+	settle: SETTLE_S,
+} = parseArgs(
+	z
+		.object({
+			advance: positiveIntegerArg.default(20),
+			base: positiveIntegerArg.default(200),
+			pg: pgUrlArg,
+			rounds: positiveIntegerArg.default(40),
+			settle: positiveNumberArg.default(180),
+		})
+		.strict(),
+)
 /** Growth over the base push, at identical live content, that counts as bloat. */
 const BLOAT_THRESHOLD = 2.0
 const HASH_LEAVES = 16
@@ -99,6 +114,16 @@ function requiredStat(
 ): Stat {
 	const value = statsByTable[table]
 	if (!value) throw new Error(`${phase}: statistics omitted ${table}`)
+	return value
+}
+
+function requiredCount(
+	counts: ReadonlyMap<string, number>,
+	table: string,
+	phase: string,
+): number {
+	const value = counts.get(table)
+	if (value === undefined) throw new Error(`${phase}: row census omitted ${table}`)
 	return value
 }
 
@@ -177,9 +202,7 @@ async function main(): Promise<void> {
 		const src = scratch.dir("src")
 		await spawnGit(["init", "-q", "-b", "main", src])
 		await spawnGit(["fast-import", "--quiet"], { cwd: src, input: buildStream() })
-		const baseTip = (
-			await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })
-		).stdout.trim()
+		const baseTip = await revParse(src, "refs/heads/main")
 
 		const store = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
@@ -192,33 +215,35 @@ async function main(): Promise<void> {
 		// the steady state the candidate maintenance sequence is meant to preserve.
 		const baseObjects = await objectsBetween(src, "refs/heads/main")
 		if (baseObjects.length === 0) throw new Error("base fixture produced no objects")
+		const eligibleBaseObjects = repackEligibleObjects(baseObjects)
 		await store.putPack(
 			REPO_ID,
 			baseObjects.map((o) => ({ content: o.content, type: o.type })),
 		)
 		await refs.setRef(REPO_ID, "refs/heads/main", baseTip)
+		await refs.setSymref(REPO_ID, "HEAD", "refs/heads/main")
 		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", baseTip)
 		const seedRepack = await repack.repack(REPO_ID)
-		if (seedRepack.wholes + seedRepack.deltas !== baseObjects.length) {
+		if (seedRepack.wholes + seedRepack.deltas !== eligibleBaseObjects.length) {
 			throw new Error(
-				`base repack covered ${seedRepack.wholes + seedRepack.deltas}/${baseObjects.length} objects`,
+				`base repack covered ${seedRepack.wholes + seedRepack.deltas}/${eligibleBaseObjects.length} eligible objects`,
 			)
 		}
 		const seedSizes = await sizesAll(db.sql)
 		for (const t of TABLES) requiredSize(seedSizes, t, "base")
-		const seedCounts: Record<string, number> = {}
+		const seedCounts = new Map<string, number>()
 		for (const t of TABLES) {
 			const [c] = await db.sql.unsafe<{ n: string }[]>(
 				`select count(*)::text as n from ${t}`,
 			)
 			if (!c) throw new Error(`missing base row count for ${t}`)
-			seedCounts[t] = Number(c.n)
+			seedCounts.set(t, Number(c.n))
 		}
 		const expectedCounts: Record<(typeof TABLES)[number], number> = {
 			git_commit: baseObjects.filter((object) => object.type === "commit").length,
 			git_object: baseObjects.length,
-			git_pack_encoding: baseObjects.length,
-			git_ref: 1,
+			git_pack_encoding: eligibleBaseObjects.length,
+			git_ref: 2,
 			git_tag: baseObjects.filter((object) => object.type === "tag").length,
 			repo_file: (
 				await spawnGit(["ls-tree", "-r", "--name-only", baseTip], { cwd: src })
@@ -229,28 +254,21 @@ async function main(): Promise<void> {
 			repos: 1,
 		}
 		for (const table of TABLES) {
-			if (seedCounts[table] !== expectedCounts[table]) {
+			const actual = requiredCount(seedCounts, table, "base")
+			if (actual !== expectedCounts[table]) {
 				throw new Error(
-					`base ${table} census ${seedCounts[table]}/${expectedCounts[table]} does not match canonical fixture`,
+					`base ${table} census ${actual}/${expectedCounts[table]} does not match canonical fixture`,
 				)
 			}
 		}
-		const expectedOids = baseObjects.map((object) => object.oid).sort()
-		const actualOids = (
-			await db.sql<
-				{ oid: string }[]
-			>`select encode(oid, 'hex') as oid from git_object order by oid`
-		).map((row) => row.oid)
-		const [baseRef] = await db.sql<{ oid: string }[]>`
-			select encode(oid, 'hex') as oid from git_ref where name = 'refs/heads/main'`
-		if (
-			!baseRef ||
-			baseRef.oid !== baseTip ||
-			actualOids.length !== expectedOids.length ||
-			actualOids.some((oid, i) => oid !== expectedOids[i])
-		) {
-			throw new Error("base Postgres refs/OIDs do not match canonical git")
-		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: eligibleBaseObjects },
+			objects: baseObjects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: baseTip },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
 		console.log(
 			`base seeded: ${baseObjects.length} objects, repack ${seedRepack.wholes} wholes + ${seedRepack.deltas} deltas\n`,
 		)
@@ -269,9 +287,7 @@ async function main(): Promise<void> {
 			autovac: number
 		}[] = []
 		for (let r = 0; r < ROUNDS; r++) {
-			const tip = (
-				await spawnGit(["rev-parse", `refs/heads/round${r}`], { cwd: src })
-			).stdout.trim()
+			const tip = await revParse(src, `refs/heads/round${r}`)
 			const objs = await objectsBetween(src, `refs/heads/round${r}`, "refs/heads/main")
 			if (objs.length === 0)
 				throw new Error(`round ${r}: fixture produced no new objects`)
@@ -346,10 +362,15 @@ async function main(): Promise<void> {
 					or c.relname like 'git\\_pack\\_encoding\\_p%' or c.relname like 'repo\\_file\\_p%'
 					or c.relname in ('git_ref','repos'))
 			order by 1`
-		const optOf = (relname: string, key: string): number | null => {
+		const optOf = (relname: string, key: string): number => {
 			const row = relopts.find((o) => o.relname === relname)
 			const hit = row?.reloptions?.find((o) => o.startsWith(`${key}=`))
-			return hit ? Number(hit.split("=")[1]) : null
+			if (!hit) throw new Error(`${relname}: required ${key} relation option is missing`)
+			const value = Number(hit.slice(key.length + 1))
+			if (!Number.isFinite(value)) {
+				throw new Error(`${relname}: ${key} relation option is invalid: ${hit}`)
+			}
+			return value
 		}
 		const raw = await stats(db.sql, db.schema)
 		console.log(
@@ -363,14 +384,6 @@ async function main(): Promise<void> {
 		for (const s of raw.filter((x) => !x.relname.startsWith("copy_stg"))) {
 			const thr = optOf(s.relname, "autovacuum_vacuum_threshold")
 			const scale = optOf(s.relname, "autovacuum_vacuum_scale_factor")
-			if (
-				thr === null ||
-				scale === null ||
-				!Number.isFinite(thr) ||
-				!Number.isFinite(scale)
-			) {
-				throw new Error(`${s.relname}: required autovacuum relation options are missing`)
-			}
 			const need = thr + scale * s.live
 			const base = s.relname.replace(/_p\d+$/, "")
 			const cur = perTable.get(base) ?? {
@@ -395,15 +408,19 @@ async function main(): Promise<void> {
 		const occupiedRows = await db.sql<
 			{ logical: string; occupied: string; rows: string }[]
 		>`
-			select logical, count(*)::text as occupied, sum(rows)::text as rows
-			from (
+			with relation_rows as (
 				select 'git_object' as logical, tableoid, count(*) as rows from git_object group by tableoid
 				union all select 'git_commit', tableoid, count(*) from git_commit group by tableoid
 				union all select 'git_tag', tableoid, count(*) from git_tag group by tableoid
 				union all select 'git_pack_encoding', tableoid, count(*) from git_pack_encoding group by tableoid
 				union all select 'repo_file', tableoid, count(*) from repo_file group by tableoid
-			) occupied
-			group by logical`
+			), logical(logical) as (
+				values ('git_object'), ('git_commit'), ('git_tag'), ('git_pack_encoding'), ('repo_file')
+			)
+			select l.logical, count(r.tableoid)::text as occupied,
+				coalesce(sum(r.rows), 0)::text as rows
+			from logical l left join relation_rows r using (logical)
+			group by l.logical`
 		for (const table of TABLES) {
 			const summary = perTable.get(table)
 			const expectedLeaves = table === "git_ref" || table === "repos" ? 1 : HASH_LEAVES
@@ -414,10 +431,11 @@ async function main(): Promise<void> {
 			}
 			if (table !== "git_ref" && table !== "repos") {
 				const occupied = occupiedRows.find((row) => row.logical === table)
+				if (!occupied) throw new Error(`${table}: occupied-leaf census omitted table`)
 				const expectedRows = expectedCounts[table]
 				if (
-					Number(occupied?.occupied ?? 0) !== (expectedRows === 0 ? 0 : 1) ||
-					Number(occupied?.rows ?? 0) !== expectedRows
+					Number(occupied.occupied) !== (expectedRows === 0 ? 0 : 1) ||
+					Number(occupied.rows) !== expectedRows
 				) {
 					throw new Error(
 						`${table}: occupied-leaf census ${JSON.stringify(occupied)} does not prove ${expectedRows} rows in one hash leaf`,
@@ -515,36 +533,29 @@ async function main(): Promise<void> {
 		const idxEncLeft = await rawIndexSizes(db.sql, "git_pack_encoding")
 
 		// Row counts, so "same reachable content" is a measured fact, not a claim.
-		const counts: Record<string, number> = {}
+		const counts = new Map<string, number>()
 		for (const t of TABLES) {
 			const [c] = await db.sql.unsafe<{ n: string }[]>(
 				`select count(*)::text as n from ${t}`,
 			)
 			if (!c) throw new Error(`missing final row count for ${t}`)
-			counts[t] = Number(c.n)
+			counts.set(t, Number(c.n))
 		}
-		const finalOids = (
-			await db.sql<
-				{ oid: string }[]
-			>`select encode(oid, 'hex') as oid from git_object order by oid`
-		).map((row) => row.oid)
-		const [finalRef] = await db.sql<{ oid: string }[]>`
-			select encode(oid, 'hex') as oid from git_ref where name = 'refs/heads/main'`
-		if (
-			!finalRef ||
-			finalRef.oid !== baseTip ||
-			finalOids.length !== expectedOids.length ||
-			finalOids.some((oid, i) => oid !== expectedOids[i])
-		) {
-			throw new Error("final Postgres refs/OIDs do not match canonical base after churn")
-		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: eligibleBaseObjects },
+			objects: baseObjects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: baseTip },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
 
 		console.log(
 			`\n## what the candidate sequence leaves behind vs what vacuum can reclaim\n`,
 		)
 		console.log(
 			`the BASE column is the same reachable content, freshly pushed — every round since\n` +
-				`added and then reclaimed 20 commits, so the live row counts are identical to it.\n`,
+				`added and then reclaimed ${ADVANCE} commits, so the live row counts are identical to it.\n`,
 		)
 		console.log(
 			`${padr("table", 19)} ${pad("rows now", 9)} ${pad("rows base", 10)} ${pad("base MB", 9)} ${pad("as-left MB", 11)} ` +
@@ -557,16 +568,18 @@ async function main(): Promise<void> {
 			const vac = requiredSize(afterVacuum, t, "after VACUUM").total
 			const full = requiredSize(afterFull, t, "after VACUUM FULL").total
 			const st = requiredStat(statsLeft, t, "as-left")
-			const sameContent = counts[t] === seedCounts[t]
+			const currentCount = requiredCount(counts, t, "final")
+			const baseCount = requiredCount(seedCounts, t, "base")
+			const sameContent = currentCount === baseCount
 			const vsBase = left / base
 			console.log(
-				`${padr(t, 19)} ${pad(counts[t] as number, 9)} ${pad(seedCounts[t] as number, 10)} ${pad(mb(base), 9)} ${pad(mb(left), 11)} ` +
+				`${padr(t, 19)} ${pad(currentCount, 9)} ${pad(baseCount, 10)} ${pad(mb(base), 9)} ${pad(mb(left), 11)} ` +
 					`${pad(mb(vac), 11)} ${pad(mb(full), 12)} ${pad(vsBase.toFixed(2), 10)} ` +
 					`${pad(st.dead, 8)} ${pad(st.autovac, 8)}`,
 			)
 			if (!sameContent) {
 				throw new Error(
-					`${t} live rows changed across zero-net-content churn: ${seedCounts[t]} -> ${counts[t]}`,
+					`${t} live rows changed across zero-net-content churn: ${baseCount} -> ${currentCount}`,
 				)
 			}
 			if (vsBase > BLOAT_THRESHOLD) failures++
@@ -610,11 +623,13 @@ async function main(): Promise<void> {
 		console.log(
 			`${padr("table", 19)} ${pad("heap MB", 8)} ${pad("toast MB", 8)} ${pad("index MB", 8)} ${pad("total MB", 9)}`,
 		)
-		for (const t of TABLES) console.log(sizeLine(t, seedSizes[t] as Sizes))
+		for (const t of TABLES) console.log(sizeLine(t, requiredSize(seedSizes, t, "base")))
 		console.log(`\nas the candidate sequence leaves it after ${ROUNDS} rounds:\n`)
-		for (const t of TABLES) console.log(sizeLine(t, asLeft[t] as Sizes))
+		for (const t of TABLES) console.log(sizeLine(t, requiredSize(asLeft, t, "as-left")))
 		console.log(`\nafter VACUUM FULL (the rewrite floor):\n`)
-		for (const t of TABLES) console.log(sizeLine(t, afterFull[t] as Sizes))
+		for (const t of TABLES) {
+			console.log(sizeLine(t, requiredSize(afterFull, t, "after VACUUM FULL")))
+		}
 
 		const seedTotal = TABLES.reduce(
 			(n, t) => n + requiredSize(seedSizes, t, "base").total,
@@ -634,7 +649,7 @@ async function main(): Promise<void> {
 		)
 		console.log(
 			`\nEvery round pushed ${ADVANCE} commits and rewound them: the reachable set is ` +
-				`byte-identical to the base push (git_object rows ${counts.git_object}, same as the base),\n` +
+				`byte-identical to the base push (git_object rows ${requiredCount(counts, "git_object", "final")}, same as the base),\n` +
 				`so ${mb(leftTotal - seedTotal)} MB of the ${mb(leftTotal)} MB is churn residue ` +
 				`— ${(leftTotal / seedTotal).toFixed(2)}× the content it holds.`,
 		)

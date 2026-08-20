@@ -5,8 +5,8 @@
  * The delta-pack design's premise (D1/D6) is that `git_pack_encoding` holds
  * exactly the bytes a served pack is made of, so the tier should weigh roughly
  * what git's own packfile weighs for the same objects. That is the claim this
- * harness checks, and it checks the whole bill rather than the payload: a row in
- * Postgres is not just its bytes — it carries a 24-byte tuple header, a line
+ * harness checks, and it checks the tier's complete physical footprint rather
+ * than the payload: a row in Postgres is not just its bytes — it carries a 24-byte tuple header, a line
  * pointer, an entry in the primary-key index, and (for values over ~2 kB under
  * `STORAGE EXTERNAL`) a TOAST chunk plus a TOAST index entry. Sixteen leaf
  * partitions each pay their own relation, index, TOAST relation and TOAST index
@@ -24,7 +24,8 @@
  *     index, and the per-row Postgres tax.
  *   - the pack pggit actually serves for a full clone, so "the tier is
  *     pack-sized" can be checked against the pack it produces, not against git's.
- *   - the whole-database bill against the packfile.
+ *   - the three measured storage tiers (`git_object`, `git_commit`, and
+ *     `git_pack_encoding`) against the packfile.
  *
  * EXIT NON-ZERO when the encoding tier's on-disk total exceeds `TIER_LIMIT`× the
  * pack it exists to emit.
@@ -32,25 +33,32 @@
  *   npx tsx perf/breakage/pg-bloat--encoding-tier-vs-git-pack.ts --runs=1200
  *   npx tsx perf/breakage/pg-bloat--encoding-tier-vs-git-pack.ts --repo=/path/to/repo
  */
+
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
 import { serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
-import { allRefsOf, seedGitRefs } from "@/testing/git-fixtures"
+import {
+	allRefsOf,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	repackEligibleObjects,
+	seedGitRefs,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { nonemptyStringArg, parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
 import {
 	COMMITTER,
-	DEFAULT_PG_URL,
 	duBytes,
 	filler,
-	flag,
 	mb,
 	pad,
 	padr,
-	positiveIntegerFlag,
 	reachableObjects,
 	runDirName,
 	scratchRoot,
@@ -60,11 +68,42 @@ import {
 const REPO_ID = "workspace/slate/tier"
 /** the tier may weigh this much more than the pack it emits before it is a defect */
 const TIER_LIMIT = 2.0
+type Source = { kind: "generated" } | { kind: "repository"; path: string }
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-const RUNS = positiveIntegerFlag("runs", 1200)
-const DOCS = positiveIntegerFlag("docs", 120)
-const REPO = flag("repo", "")
+const {
+	docs: DOCS,
+	pg: PG_URL,
+	source: SOURCE,
+	runs: RUNS,
+} = parseArgs(
+	z
+		.object({
+			docs: positiveIntegerArg.default(120),
+			pg: pgUrlArg,
+			repo: nonemptyStringArg.optional(),
+			runs: positiveIntegerArg.default(1200),
+		})
+		.strict()
+		.transform(
+			({
+				docs,
+				pg,
+				repo,
+				runs,
+			}): {
+				docs: number
+				pg: string
+				runs: number
+				source: Source
+			} => ({
+				docs,
+				pg,
+				runs,
+				source:
+					repo === undefined ? { kind: "generated" } : { kind: "repository", path: repo },
+			}),
+		),
+)
 
 function buildStream(): string {
 	const out: string[] = []
@@ -116,10 +155,10 @@ async function main(): Promise<void> {
 
 		// ── the source repo ─────────────────────────────────────────────────
 		const src = scratch.dir("src")
-		if (REPO) {
+		if (SOURCE.kind === "repository") {
 			// Never operate on the original: mirror-clone first (the design doc's rule).
-			await spawnGit(["clone", "-q", "--mirror", REPO, src])
-			console.log(`source: mirror clone of ${REPO}`)
+			await spawnGit(["clone", "-q", "--mirror", SOURCE.path, src])
+			console.log(`source: mirror clone of ${SOURCE.path}`)
 		} else {
 			await spawnGit(["init", "-q", "-b", "main", src])
 			await spawnGit(["fast-import", "--quiet"], { cwd: src, input: buildStream() })
@@ -129,6 +168,12 @@ async function main(): Promise<void> {
 		}
 
 		const objects = await reachableObjects(src)
+		const eligibleObjects = repackEligibleObjects(objects)
+		if (eligibleObjects.length !== objects.length) {
+			throw new Error(
+				`encoding-tier fixture has ${objects.length - eligibleObjects.length} objects above the stored-tier size ceiling`,
+			)
+		}
 		const rawBytes = objects.reduce((n, o) => n + o.content.length, 0)
 		const byType = new Map<string, { n: number; bytes: number }>()
 		for (const o of objects) {
@@ -190,13 +235,18 @@ async function main(): Promise<void> {
 		const res = await createRepack(db.sql).repack(REPO_ID)
 		if (
 			objects.length === 0 ||
-			res.wholes + res.deltas !== objects.length ||
+			res.wholes + res.deltas !== eligibleObjects.length ||
 			res.deltas <= 0
 		) {
 			throw new Error(
-				`repack covered ${res.wholes + res.deltas}/${objects.length} canonical objects with ${res.deltas} deltas`,
+				`repack covered ${res.wholes + res.deltas}/${eligibleObjects.length} eligible canonical objects with ${res.deltas} deltas`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: eligibleObjects },
+			objects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		const repackMs = Date.now() - t0
 		console.log(
 			`\nrepack: ${res.wholes} wholes + ${res.deltas} deltas in ${(repackMs / 1000).toFixed(1)}s ` +
@@ -207,41 +257,36 @@ async function main(): Promise<void> {
 		const app = createGitApp(createGitDeps(db.sql), { instrument: true })
 		const server = await serveOnPort(app, 0)
 		const dest = scratch.dir("clone")
-		resetCollected()
-		await spawnGit([
-			"-c",
-			"protocol.version=2",
-			"clone",
-			"-q",
-			"--mirror",
-			`http://127.0.0.1:${server.port}/${REPO_ID}`,
-			dest,
-		])
-		await server.close()
+		try {
+			resetCollected()
+			await spawnGit([
+				"-c",
+				"protocol.version=2",
+				"clone",
+				"-q",
+				"--mirror",
+				`http://127.0.0.1:${server.port}/${REPO_ID}`,
+				dest,
+			])
+		} finally {
+			await server.close()
+		}
 		const storedPackMatch = (
 			await spawnGit(["count-objects", "-v"], { cwd: dest })
 		).stdout.match(/size-pack: (\d+)/)
 		if (!storedPackMatch) throw new Error("client count-objects omitted size-pack")
 		const storedPack = Number(storedPackMatch[1]) * 1024
-		const fetchRuns = collectedRuns().filter((run) => run.label === "fetch")
-		if (fetchRuns.length !== 1) {
-			throw new Error(`expected one fetch instrumentation run, got ${fetchRuns.length}`)
-		}
-		const run = fetchRuns[0]
-		if (!run) throw new Error("fetch instrumentation run disappeared")
-		const servedPack = run.counters.get("packBytes")
-		const objectsServed = run.counters.get("objectsServed")
-		const deltasServed = run.counters.get("deltasServed")
-		if (servedPack === undefined || servedPack <= 0) {
-			throw new Error(`missing/nonpositive wire packBytes counter: ${String(servedPack)}`)
-		}
-		if (
-			objectsServed !== objects.length ||
-			deltasServed === undefined ||
-			deltasServed <= 0
-		) {
+		const run = requiredCollector(collectedRuns(), "fetch", "encoding-tier clone")
+		const servedPack = requiredPositiveCounter(run, "packBytes", "encoding-tier clone")
+		const objectsServed = requiredPositiveCounter(
+			run,
+			"objectsServed",
+			"encoding-tier clone",
+		)
+		requiredPositiveCounter(run, "deltasServed", "encoding-tier clone")
+		if (objectsServed !== objects.length) {
 			throw new Error(
-				`serve prerequisite failed: objects=${String(objectsServed)}/${objects.length}, deltas=${String(deltasServed)}`,
+				`serve prerequisite failed: objects=${objectsServed}/${objects.length}`,
 			)
 		}
 		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
@@ -285,7 +330,7 @@ async function main(): Promise<void> {
 		const rows = Number(payload.n)
 		const storedDeltas = Number(payload.deltas)
 		if (
-			rows !== objects.length ||
+			rows !== eligibleObjects.length ||
 			storedDeltas !== res.deltas ||
 			storedDeltas <= 0 ||
 			payloadBytes <= 0 ||
@@ -294,7 +339,7 @@ async function main(): Promise<void> {
 			commit.total <= 0
 		) {
 			throw new Error(
-				`encoding census has ${rows}/${objects.length} rows, ${storedDeltas}/${res.deltas} deltas, and ${payloadBytes} payload bytes`,
+				`encoding census has ${rows}/${eligibleObjects.length} eligible rows, ${storedDeltas}/${res.deltas} deltas, and ${payloadBytes} payload bytes`,
 			)
 		}
 
@@ -324,7 +369,7 @@ async function main(): Promise<void> {
 				`(${((enc.total - payloadBytes) / rows).toFixed(0)} bytes per object).`,
 		)
 
-		console.log(`\n## the whole bill\n`)
+		console.log(`\n## the three measured storage tiers\n`)
 		console.log(`${padr("store", 34)} ${pad("MB", 9)} ${pad("× git pack", 11)}`)
 		const row = (name: string, v: number) =>
 			console.log(

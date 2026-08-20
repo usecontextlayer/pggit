@@ -1,9 +1,10 @@
 import { constants, monitorEventLoopDelay, PerformanceObserver } from "node:perf_hooks"
+import { z } from "zod"
 
 /**
  * Layer-1 (implementation-agnostic) process-health signals for one clone. The
- * event-loop delay histogram is the proof that synchronous `deflateSync` blocks
- * the loop; the GC breakdown is the allocation-pressure readout. Both are
+ * event-loop delay histogram measures synchronous main-thread stalls; the GC
+ * breakdown is the allocation-pressure readout. Both are
  * process-level — they survive any code or schema restructure unchanged.
  *
  * Memory residency (peak RSS, field breakdown, retained set) lives in
@@ -31,12 +32,14 @@ export type ProcessMetrics = {
 
 // V8 GC kinds as exposed on `gc` PerformanceEntry `detail.kind` (probed, not
 // guessed: MINOR=1, MAJOR=4, INCREMENTAL=8, WEAKCB=16 on this Node).
-const GC_KIND = {
-	[constants.NODE_PERFORMANCE_GC_MINOR]: "minor",
-	[constants.NODE_PERFORMANCE_GC_MAJOR]: "major",
-	[constants.NODE_PERFORMANCE_GC_INCREMENTAL]: "incremental",
-	[constants.NODE_PERFORMANCE_GC_WEAKCB]: "weakCb",
-} as const
+type GcBucketName = "minor" | "major" | "incremental" | "weakCb"
+const GC_KIND = new Map<number, GcBucketName>([
+	[constants.NODE_PERFORMANCE_GC_MINOR, "minor"],
+	[constants.NODE_PERFORMANCE_GC_MAJOR, "major"],
+	[constants.NODE_PERFORMANCE_GC_INCREMENTAL, "incremental"],
+	[constants.NODE_PERFORMANCE_GC_WEAKCB, "weakCb"],
+])
+const gcDetailSchema = z.object({ kind: z.number().int().safe() })
 
 export function collectProcessMetrics(): { stop: () => ProcessMetrics } {
 	const eld = monitorEventLoopDelay({ resolution: 10 })
@@ -48,14 +51,19 @@ export function collectProcessMetrics(): { stop: () => ProcessMetrics } {
 		minor: { count: 0, pauseMs: 0 },
 		weakCb: { count: 0, pauseMs: 0 },
 	}
-	let unknownGcKind: number | undefined
+	let gcBoundary: { status: "valid" } | { status: "invalid"; detail: unknown } = {
+		status: "valid",
+	}
 	const gcObserver = new PerformanceObserver((list) => {
 		for (const entry of list.getEntries()) {
-			const kind = (entry as PerformanceEntry & { detail?: { kind: number } }).detail
-				?.kind
-			const bucket = kind === undefined ? undefined : GC_KIND[kind]
-			if (!bucket) {
-				unknownGcKind = kind
+			const parsed = gcDetailSchema.safeParse(Reflect.get(entry, "detail"))
+			if (!parsed.success) {
+				gcBoundary = { detail: parsed.error, status: "invalid" }
+				continue
+			}
+			const bucket = GC_KIND.get(parsed.data.kind)
+			if (bucket === undefined) {
+				gcBoundary = { detail: parsed.data, status: "invalid" }
 				continue
 			}
 			gc[bucket].count += 1
@@ -68,8 +76,8 @@ export function collectProcessMetrics(): { stop: () => ProcessMetrics } {
 		stop() {
 			eld.disable()
 			gcObserver.disconnect()
-			if (unknownGcKind !== undefined) {
-				throw new Error(`unhandled Node performance GC kind ${unknownGcKind}`)
+			if (gcBoundary.status === "invalid") {
+				throw new Error(`invalid Node performance GC detail ${String(gcBoundary.detail)}`)
 			}
 			return {
 				eventLoopDelayMaxMs: eld.max / 1e6,

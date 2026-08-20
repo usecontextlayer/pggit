@@ -1,6 +1,6 @@
 /**
- * PROBE: what does "blobs are never deltified" cost a client, measured at the
- * client, against real git doing the same job?
+ * PROBE: what does "blobs are never deltified" cost on the raw fetch wire,
+ * against canonical git answering the identical protocol-v2 request?
  *
  * The repack tier only ever deltas TREES (phase 1 walks tree pairs; phase 2 ships
  * everything else whole). A repo whose weight is successive near-identical
@@ -8,34 +8,42 @@
  * a snapshot of generated output — therefore ships every version WHOLE, forever,
  * while `git` deltas them to nearly nothing.
  *
- * Measured black-box: a real `git clone` off the wire server AFTER a full repack,
- * versus a real `git clone` from the same repo served by canonical git. Peak
- * server RSS is sampled through the pggit clone (the pack is materialized whole
- * before the first byte leaves).
+ * The size verdict compares the two raw response PACKs before either client can
+ * rewrite them. Both are decoded to prove their exact object sets and to establish
+ * the named blob-delta split. Real clones remain as correctness/RSS oracles: each
+ * is fsck'd, and pggit's server RSS is sampled while its pack is materialized.
  *
  *   NODE_OPTIONS=--expose-gc npx tsx perf/breakage/perf--blob-delta-gap.ts
  *   NODE_OPTIONS=--expose-gc npx tsx perf/breakage/perf--blob-delta-gap.ts --pg=postgres://…
  */
 import { execSync } from "node:child_process"
-import { createHash } from "node:crypto"
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createGitApp, createGitDeps } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
 import { readPack } from "@/pack/read-pack"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
-import { allObjectOids, loadGitObjects, revParse } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
+	repackEligibleObjects,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
 import {
 	cleanupTmp,
 	mb,
 	mkTmp,
-	PG_URL,
-	positiveIntegerFlag,
+	rewrittenArtifactStream,
 	secs,
 	seedRepo,
 	table,
@@ -44,74 +52,37 @@ import {
 } from "./_perf-util"
 import { canonicalV2Pack, indexRawPack, postPggitV2Pack } from "./_realrepo-util"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 const REPO_ID = "probe/blobs"
 
 /** Versions of the big file, and its size. 20 × 4 MB ≈ what a month of a daily
  * regenerated artifact looks like. */
-const VERSIONS = positiveIntegerFlag("versions", 20)
-const BLOB_BYTES = positiveIntegerFlag("bytes", 4_000_000)
+const {
+	bytes: BLOB_BYTES,
+	pg: PG_URL,
+	versions: VERSIONS,
+} = parseArgs(
+	z
+		.object({
+			bytes: positiveIntegerArg.max(MAX_INLINE_BYTEA_BYTES - 1).default(4_000_000),
+			pg: pgUrlArg,
+			versions: positiveIntegerArg.min(2).default(20),
+		})
+		.strict()
+		.superRefine(({ bytes, versions }, context) => {
+			const requiredBytes = (versions - 1) * 1000 + 200
+			if (bytes < requiredBytes) {
+				context.addIssue({
+					code: "custom",
+					message: `must be at least ${requiredBytes} for ${versions} distinct version edits`,
+					path: ["bytes"],
+				})
+			}
+		}),
+)
 /** Ratio of pggit's served pack to git's at which this is called broken. */
 const SIZE_RATIO_LIMIT = 3
 
-if (VERSIONS < 2) throw new Error("--versions must be at least 2")
-const LAST_EDIT_END = (VERSIONS - 1) * 1000 + 200
-if (BLOB_BYTES < LAST_EDIT_END) {
-	throw new Error(
-		`--bytes must be at least ${LAST_EDIT_END} for ${VERSIONS} distinct version edits`,
-	)
-}
-if (BLOB_BYTES >= MAX_INLINE_BYTEA_BYTES) {
-	throw new Error(
-		`--bytes must stay below the ${MAX_INLINE_BYTEA_BYTES}-byte repack eligibility ceiling`,
-	)
-}
-
-/** Deterministic incompressible bytes. */
-function noise(salt: string, len: number): Buffer {
-	const parts: Buffer[] = []
-	let total = 0
-	let i = 0
-	while (total < len) {
-		const b = createHash("sha256").update(`${salt}-${i++}`).digest()
-		parts.push(b)
-		total += b.length
-	}
-	return Buffer.concat(parts).subarray(0, len)
-}
-
-/** V commits, each rewriting `data/artifact.bin` with a 200-byte edit. */
-function stream(): Buffer {
-	const parts: Buffer[] = []
-	const base = noise("artifact", BLOB_BYTES)
-	let prev: number | null = null
-	let mark = 0
-	for (let v = 0; v < VERSIONS; v++) {
-		const body = Buffer.from(base)
-		// Only 200 bytes differ between consecutive versions — git deltas this to ~0.
-		noise(`edit-${v}`, 200).copy(body, v * 1000)
-		const bm = ++mark
-		parts.push(
-			Buffer.from(`blob\nmark :${bm}\ndata ${body.length}\n`),
-			body,
-			Buffer.from("\n"),
-		)
-		const cm = ++mark
-		const msg = `v${v}`
-		parts.push(
-			Buffer.from(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n` +
-					(prev === null ? "" : `from :${prev}\n`) +
-					`M 100644 :${bm} data/artifact.bin\n`,
-			),
-		)
-		prev = cm
-	}
-	return Buffer.concat(parts)
-}
-
-function dirBytes(dir: string): number {
+function allocatedDiskBytes(dir: string): number {
 	return (
 		Number(
 			execSync(`du -sk ${JSON.stringify(dir)}`)
@@ -125,7 +96,10 @@ async function main(): Promise<void> {
 	const src = join(mkTmp("blobs"), "repo")
 	mkdirSync(src, { recursive: true })
 	await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
-	await spawnGit(["fast-import", "--quiet"], { cwd: src, input: stream() })
+	await spawnGit(["fast-import", "--quiet"], {
+		cwd: src,
+		input: rewrittenArtifactStream({ blobBytes: BLOB_BYTES, versions: VERSIONS }),
+	})
 
 	// --- git's own clone answer ---------------------------------------------
 	const gitClonedTo = join(mkTmp("blobs-clone-git"), "c")
@@ -134,7 +108,11 @@ async function main(): Promise<void> {
 		["clone", "-q", "--no-local", `file://${src}`, gitClonedTo],
 		"/tmp",
 	)
-	if (gitClone.code !== 0) throw new Error(`canonical git clone exited ${gitClone.code}`)
+	if (gitClone.ms <= 0 || gitClone.peakRss <= 0) {
+		throw new Error(
+			`canonical clone measurement invalid: ms=${gitClone.ms}, peak=${gitClone.peakRss}`,
+		)
+	}
 	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: gitClonedTo })
 	const expectedOids = await allObjectOids(src)
 	const expectedTip = await revParse(src, "refs/heads/main")
@@ -153,7 +131,7 @@ async function main(): Promise<void> {
 	) {
 		throw new Error("canonical clone did not reproduce the source object set")
 	}
-	const gitCloneBytes = dirBytes(join(gitClonedTo, ".git", "objects"))
+	const gitCloneBytes = allocatedDiskBytes(join(gitClonedTo, ".git", "objects"))
 
 	// --- pggit's answer -----------------------------------------------------
 	const db = await createIsolatedSchema(PG_URL)
@@ -165,11 +143,16 @@ async function main(): Promise<void> {
 		if (seeded.objects !== expectedOids.length) {
 			throw new Error(`seeded ${seeded.objects} objects, expected ${expectedOids.length}`)
 		}
-		if (repack.value.wholes + repack.value.deltas !== seeded.objects) {
+		if (repack.value.wholes + repack.value.deltas !== seeded.eligibleObjects) {
 			throw new Error(
-				`repack covered ${repack.value.wholes + repack.value.deltas}/${seeded.objects} objects`,
+				`repack covered ${repack.value.wholes + repack.value.deltas}/${seeded.eligibleObjects} eligible objects`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(expectedObjects) },
+			objects: expectedObjects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		const server = await serveOnPort(
 			createGitApp(createGitDeps(db.sql), { instrument: true }),
 			0,
@@ -187,13 +170,7 @@ async function main(): Promise<void> {
 				postPggitV2Pack(url, request),
 				canonicalV2Pack(src, request),
 			])
-			const rawRuns = collectedRuns().filter((candidate) => candidate.label === "fetch")
-			run = rawRuns[0]
-			if (rawRuns.length !== 1 || run === undefined) {
-				throw new Error(
-					`expected one raw-fetch instrumentation run, got ${rawRuns.length}`,
-				)
-			}
+			run = requiredCollector(collectedRuns(), "fetch", "blob-delta raw fetch")
 			resetCollected()
 			clone = await withPeakRss(async () => {
 				await spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
@@ -202,6 +179,11 @@ async function main(): Promise<void> {
 			await server.close()
 		}
 		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+		if (clone.ms <= 0 || clone.peakRss <= clone.baseRss) {
+			throw new Error(
+				`pggit clone measurement invalid: ms=${clone.ms}, base=${clone.baseRss}, peak=${clone.peakRss}`,
+			)
+		}
 		const cloneOids = await allObjectOids(dest)
 		const cloneTip = await revParse(dest, "refs/heads/main")
 		if (
@@ -212,12 +194,13 @@ async function main(): Promise<void> {
 			throw new Error("pggit clone refs/object set diverged from canonical git")
 		}
 		if (run === undefined) throw new Error("missing raw-fetch instrumentation run")
-		const packBytes = run.counters.get("packBytes")
-		const deltasServed = run.counters.get("deltasServed")
-		const objectsServed = run.counters.get("objectsServed")
-		if (packBytes === undefined || packBytes <= 0) {
-			throw new Error(`missing/nonpositive packBytes counter: ${String(packBytes)}`)
-		}
+		const packBytes = requiredPositiveCounter(run, "packBytes", "blob-delta raw fetch")
+		requiredPositiveCounter(run, "deltasServed", "blob-delta raw fetch")
+		const objectsServed = requiredPositiveCounter(
+			run,
+			"objectsServed",
+			"blob-delta raw fetch",
+		)
 		if (packBytes !== pggitPack.length) {
 			throw new Error(
 				`packBytes counter ${packBytes} != captured pack ${pggitPack.length}`,
@@ -227,9 +210,6 @@ async function main(): Promise<void> {
 			throw new Error(
 				`objectsServed ${String(objectsServed)} != expected ${expectedOids.length}`,
 			)
-		}
-		if (deltasServed === undefined || deltasServed <= 0) {
-			throw new Error(`missing/nonpositive deltasServed counter: ${String(deltasServed)}`)
 		}
 		const [pggitRawObjects, gitRawObjects] = await Promise.all([
 			readPack(pggitPack),
@@ -250,8 +230,8 @@ async function main(): Promise<void> {
 		await spawnGit(["init", "-q", "--bare", pggitIndexDir])
 		await spawnGit(["init", "-q", "--bare", gitIndexDir])
 		const [pggitIndex, gitIndex] = await Promise.all([
-			indexRawPack(pggitIndexDir, pggitPack, false),
-			indexRawPack(gitIndexDir, gitPack, false),
+			indexRawPack(pggitIndexDir, pggitPack, "complete"),
+			indexRawPack(gitIndexDir, gitPack, "complete"),
 		])
 		const pggitBlobDeltas = pggitIndex.entries.filter(
 			(object) => object.type === "blob" && object.kind === "delta",

@@ -33,11 +33,21 @@
  *
  *   npx tsx perf/breakage/pgres--wal-per-repack.ts --trials=5 --commits=250
  */
+
+import { z } from "zod"
 import { createGitDeps } from "@/index"
+import type { Oid } from "@/oid"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
+import {
+	assertCanonicalStoreFixture,
+	repackEligibleObjects,
+	requiredAt,
+	requireGitOid,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	cleanupTmp,
 	encodingCensus,
@@ -45,9 +55,8 @@ import {
 	initRepo,
 	mb,
 	median,
-	numFlag,
+	type Obj,
 	objectsBetween,
-	PG_URL,
 	revParse,
 	runCommits,
 	seedObjects,
@@ -57,14 +66,24 @@ import {
 	walLsn,
 } from "./_pgres-util"
 
-const TRIALS = numFlag("trials", 5)
-const COMMITS = numFlag("commits", 250)
+const args = parseArgs(
+	z
+		.object({
+			commits: positiveIntegerArg.default(250),
+			pg: pgUrlArg,
+			trials: positiveIntegerArg.default(5),
+		})
+		.strict(),
+)
+const TRIALS = args.trials
+const COMMITS = args.commits
+const PG_URL = args.pg
 const BLOB_CHARS = 1200
 const REPO = "wal"
 
 type Trial = {
 	n: number
-	tier: boolean
+	mode: "tier-absent" | "tier-present"
 	rawBytes: number
 	pushWal: number
 	repackWal: number
@@ -81,9 +100,9 @@ type Trial = {
 async function trial(
 	n: number,
 	dir: string,
-	tip: string,
-	rootCommit: string,
-	tier: boolean,
+	tip: Oid,
+	rootCommit: Oid,
+	mode: Trial["mode"],
 ): Promise<Trial> {
 	const iso = await createIsolatedSchema(PG_URL)
 	try {
@@ -91,6 +110,9 @@ async function trial(
 		const objects = await objectsBetween(dir, tip, [])
 		const rootObjects = await objectsBetween(dir, rootCommit, [])
 		const reclaimedObjects = await objectsBetween(dir, tip, [rootCommit])
+		const eligibleObjects = repackEligibleObjects(objects)
+		const eligibleRootObjects = repackEligibleObjects(rootObjects)
+		const tierPresent = mode === "tier-present"
 		const rawBytes = objects.reduce((s, o) => s + o.content.length, 0)
 		if (
 			objects.length === 0 ||
@@ -103,32 +125,22 @@ async function trial(
 			)
 		}
 		const assertRows = async (
-			expectedObjects: number,
-			expectedEncodings: number,
+			expectedObjects: readonly Obj[],
+			expectedEncodings: readonly Obj[],
+			expectedTip: Oid,
 		): Promise<void> => {
-			const [row] = await pg<
-				{
-					encodings: string
-					objects: string
-					refs: string
-					tip: string | null
-				}[]
-			>`
-				select (select count(*)::text from git_object) as objects,
-					(select count(*)::text from git_pack_encoding) as encodings,
-					(select count(*)::text from git_ref) as refs,
-					(select encode(oid, 'hex') from git_ref where name = 'refs/heads/main') as tip`
-			if (
-				!row ||
-				Number(row.objects) !== expectedObjects ||
-				Number(row.encodings) !== expectedEncodings ||
-				Number(row.refs) !== 1 ||
-				row.tip !== (expectedObjects === rootObjects.length ? rootCommit : tip)
-			) {
-				throw new Error(
-					`WAL fixture census mismatch: ${JSON.stringify(row)}, expected objects=${expectedObjects} encodings=${expectedEncodings}`,
-				)
-			}
+			await assertCanonicalStoreFixture(pg, REPO, {
+				encodings: { kind: "exact", objects: expectedEncodings },
+				objects: expectedObjects,
+				refs: [
+					{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+					{
+						kind: "direct",
+						name: "refs/heads/main",
+						oid: expectedTip,
+					},
+				],
+			})
 		}
 
 		// PUSH
@@ -136,9 +148,9 @@ async function trial(
 		const t0 = Date.now()
 		await seedObjects(pg, REPO, objects)
 		await setMain(pg, REPO, tip)
-		await assertRows(objects.length, 0)
 		const pushMs = Date.now() - t0
 		const w1 = await walLsn(pg)
+		await assertRows(objects, [], tip)
 
 		// IDLE control window of comparable duration — the ambient sibling-agent rate.
 		await sleep(Math.min(2000, Math.max(300, pushMs)))
@@ -146,11 +158,11 @@ async function trial(
 
 		// REPACK (skipped in the tier-absent arm)
 		const t1 = Date.now()
-		if (tier) {
+		if (tierPresent) {
 			const receipt = await createRepack(pg).repack(REPO)
-			if (receipt.wholes + receipt.deltas !== objects.length) {
+			if (receipt.wholes + receipt.deltas !== eligibleObjects.length) {
 				throw new Error(
-					`repack covered ${receipt.wholes + receipt.deltas}/${objects.length} objects`,
+					`repack covered ${receipt.wholes + receipt.deltas}/${eligibleObjects.length} eligible objects`,
 				)
 			}
 		}
@@ -158,12 +170,15 @@ async function trial(
 		const w3 = await walLsn(pg)
 
 		const census = await encodingCensus(pg)
-		if (census.rows !== (tier ? objects.length : 0) || (tier && census.dataBytes === 0)) {
+		if (
+			census.rows !== (tierPresent ? eligibleObjects.length : 0) ||
+			(tierPresent && census.dataBytes === 0)
+		) {
 			throw new Error(
 				`encoding census does not match repack arm: ${JSON.stringify(census)}, objects=${objects.length}`,
 			)
 		}
-		await assertRows(objects.length, tier ? objects.length : 0)
+		await assertRows(objects, tierPresent ? eligibleObjects : [], tip)
 
 		// GC after a rewind to the ROOT commit: reclaims almost everything, in both
 		// tiers, so the delete-side WAL of the derived tier is visible too.
@@ -179,34 +194,50 @@ async function trial(
 				`GC deleted ${gcReceipt.deletedObjects}/${reclaimedObjects.length} rewind objects`,
 			)
 		}
-		await assertRows(rootObjects.length, tier ? rootObjects.length : 0)
+		await assertRows(rootObjects, tierPresent ? eligibleRootObjects : [], rootCommit)
 
 		// DELETE the repo: one `DELETE FROM repos`, everything else is the cascade.
 		// Re-seed first so the cascade has a full repo to tear down, not a GC'd husk.
 		await seedObjects(pg, REPO, objects)
 		await setMain(pg, REPO, tip)
-		if (tier) {
+		if (tierPresent) {
 			const receipt = await createRepack(pg).repack(REPO)
-			if (receipt.wholes + receipt.deltas !== reclaimedObjects.length) {
+			const restoredEncodings = eligibleObjects.length - eligibleRootObjects.length
+			if (receipt.wholes + receipt.deltas !== restoredEncodings) {
 				throw new Error(
-					`cascade fixture repack covered ${receipt.wholes + receipt.deltas}/${reclaimedObjects.length} restored objects`,
+					`cascade fixture repack covered ${receipt.wholes + receipt.deltas}/${restoredEncodings} restored eligible objects`,
 				)
 			}
 		}
-		await assertRows(objects.length, tier ? objects.length : 0)
+		await assertRows(objects, tierPresent ? eligibleObjects : [], tip)
 		const w6 = await walLsn(pg)
 		const t2 = Date.now()
 		await createGitDeps(pg).admin.deleteRepo(REPO)
 		const deleteMs = Date.now() - t2
 		const w7 = await walLsn(pg)
-		const [remaining] = await pg<{ encodings: string; objects: string; repos: string }[]>`
+		const [remaining] = await pg<
+			{
+				commits: string
+				encodings: string
+				objects: string
+				refs: string
+				repos: string
+				tags: string
+			}[]
+		>`
 			select (select count(*)::text from repos) as repos,
 				(select count(*)::text from git_object) as objects,
+				(select count(*)::text from git_commit) as commits,
+				(select count(*)::text from git_tag) as tags,
+				(select count(*)::text from git_ref) as refs,
 				(select count(*)::text from git_pack_encoding) as encodings`
 		if (
 			!remaining ||
 			Number(remaining.repos) !== 0 ||
 			Number(remaining.objects) !== 0 ||
+			Number(remaining.commits) !== 0 ||
+			Number(remaining.tags) !== 0 ||
+			Number(remaining.refs) !== 0 ||
 			Number(remaining.encodings) !== 0
 		) {
 			throw new Error(`repo cascade left rows behind: ${JSON.stringify(remaining)}`)
@@ -215,9 +246,9 @@ async function trial(
 		const repackWal = Number(w3 - w2)
 		const gcWal = Number(w5 - w4)
 		const deleteWal = Number(w7 - w6)
-		if (pushWal <= 0 || gcWal <= 0 || deleteWal <= 0 || (tier && repackWal <= 0)) {
+		if (pushWal <= 0 || gcWal <= 0 || deleteWal <= 0 || (tierPresent && repackWal <= 0)) {
 			throw new Error(
-				`WAL counters did not record required work: ${JSON.stringify({ deleteWal, gcWal, pushWal, repackWal, tier })}`,
+				`WAL counters did not record required work: ${JSON.stringify({ deleteWal, gcWal, mode, pushWal, repackWal })}`,
 			)
 		}
 
@@ -228,13 +259,13 @@ async function trial(
 			encRows: census.rows,
 			gcWal,
 			idleWal: Number(w2 - w1),
+			mode,
 			n,
 			pushMs,
 			pushWal,
 			rawBytes,
 			repackMs,
 			repackWal,
-			tier,
 		}
 	} finally {
 		await iso.drop()
@@ -273,24 +304,25 @@ async function main(): Promise<void> {
 			salt: "wal",
 		}).stream,
 	)
-	const tip = await revParse(dir, "refs/heads/main")
+	const tip = requireGitOid(
+		await revParse(dir, "refs/heads/main"),
+		"WAL fixture main tip",
+	)
 
 	const all: Trial[] = []
-	const rootCommit = (
-		await spawnGit(["rev-list", "--max-parents=0", tip], { cwd: dir })
-	).stdout.trim()
-	if (!/^[0-9a-f]{40}$/.test(rootCommit)) {
-		throw new Error(`canonical git did not return one root commit: ${rootCommit}`)
-	}
+	const rootCommit = requireGitOid(
+		(await spawnGit(["rev-list", "--max-parents=0", tip], { cwd: dir })).stdout.trim(),
+		"WAL fixture root commit",
+	)
 	// Interleaved, not blocked: this box is shared and drifts.
 	for (let i = 1; i <= TRIALS; i++) {
-		all.push(await trial(i, dir, tip, rootCommit, true))
-		all.push(await trial(i, dir, tip, rootCommit, false))
+		all.push(await trial(i, dir, tip, rootCommit, "tier-present"))
+		all.push(await trial(i, dir, tip, rootCommit, "tier-absent"))
 	}
-	const trials = all.filter((t) => t.tier)
-	const noTier = all.filter((t) => !t.tier)
+	const trials = all.filter((t) => t.mode === "tier-present")
+	const noTier = all.filter((t) => t.mode === "tier-absent")
 
-	const t0 = trials[0] as Trial
+	const t0 = requiredAt(trials, 0, "first WAL trial")
 	console.log(
 		`fixture: ${COMMITS} append-only commits · ${trials.length} trials · raw object bytes ${mb(t0.rawBytes)} MB · encoding rows ${t0.encRows} holding ${mb(t0.encBytes)} MB deflated\n`,
 	)

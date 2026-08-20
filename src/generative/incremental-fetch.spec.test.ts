@@ -93,7 +93,10 @@ describe("§8.4 generative — incremental fetch (M1) differential", () => {
 
 							const newPacks = packFiles(dest).filter((p) => !packsAfterClone.has(p))
 							expect(newPacks.length).toBe(1)
-							const transferred = await packObjectOids(dest, newPacks[0] as string)
+							const [newPack] = newPacks
+							if (newPack === undefined)
+								throw new Error("incremental fetch wrote no pack")
+							const transferred = await packObjectOids(dest, newPack)
 							const wireNew = transferred.filter((o) => !haveAfterClone.includes(o))
 							expect(wireNew).toEqual([...delta].sort())
 							await spawnGit(["fsck", "--full"], { cwd: dest })

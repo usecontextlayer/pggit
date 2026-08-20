@@ -11,21 +11,30 @@
  *   npx tsx perf/breakage/txn--hole-repair.ts --pg=postgres://…
  */
 import { rmSync } from "node:fs"
+import { z } from "zod"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
+import type { Oid } from "@/oid"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo, RUNS_DIR } from "@/testing/append-only-repo"
 import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
 	parseRevListObjectOids,
+	repackEligibleObjects,
 	requireGitOid,
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { PG_URL, table } from "./_txn-util"
+import { parseArgs, pgUrlArg } from "../args"
+import { table } from "./_txn-util"
 
 const REPO = "r"
+const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
 const RUNS = 150
 /** The slice of history whose `RUNS_DIR` lineage gets holed — 31 successive
  * versions of the growing tree, mid-history so anchors exist on both sides. */
@@ -68,7 +77,7 @@ async function lineageShape(db: IsolatedDb, oids: Buffer[]): Promise<LineageShap
 }
 
 /** The tree OID at a fixture path that must exist. */
-async function treeAt(dir: string, spec: string): Promise<string> {
+async function treeAt(dir: string, spec: string): Promise<Oid> {
 	return requireGitOid(
 		(await spawnGit(["rev-parse", spec], { cwd: dir })).stdout.trim(),
 		`rev-parse ${spec}`,
@@ -94,6 +103,19 @@ async function main(): Promise<void> {
 	try {
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
+		const canonicalObjects = await loadGitObjects(src, await allObjectOids(src))
+		const canonicalRefs = await canonicalStoreRefsOf(src)
+		const eligibleObjects = repackEligibleObjects(canonicalObjects)
+		const requireCanonicalTier = async (stage: string): Promise<void> => {
+			await assertCanonicalStoreFixture(db.sql, REPO, {
+				encodings: { kind: "exact", objects: eligibleObjects },
+				objects: canonicalObjects,
+				refs: canonicalRefs,
+			})
+			if (eligibleObjects.length === 0) {
+				throw new Error(`${stage}: canonical fixture has no repack-eligible objects`)
+			}
+		}
 		await seedRepoIntoStore(REPO, src, { objects, refs })
 		const seedPass = await createRepack(db.sql).repack(REPO)
 		const before = await tierSize(db)
@@ -103,6 +125,7 @@ async function main(): Promise<void> {
 			)
 		}
 		assertTierCoverage("before holes", before)
+		await requireCanonicalTier("before holes")
 		console.log(
 			`# txn--hole-repair — ${RUNS} runs, seed pass ${seedPass.wholes} wholes + ${seedPass.deltas} deltas\n`,
 		)
@@ -116,7 +139,7 @@ async function main(): Promise<void> {
 				`fixture has ${commits.length} commits; need at least ${LINEAGE_TO}`,
 			)
 		}
-		const lineage: string[] = []
+		const lineage: Oid[] = []
 		for (const c of commits.slice(LINEAGE_FROM, LINEAGE_TO)) {
 			const t = await treeAt(src, `${c}:${RUNS_DIR}`)
 			lineage.push(t)
@@ -152,6 +175,7 @@ async function main(): Promise<void> {
 		const afterRepair = await lineageShape(db, bufs)
 		const after = await tierSize(db)
 		assertTierCoverage("after repair", after)
+		await requireCanonicalTier("after repair")
 		if (afterRepair.rows !== holed.rows) {
 			throw new Error(`repair restored ${afterRepair.rows}/${holed.rows} lineage rows`)
 		}
@@ -165,6 +189,7 @@ async function main(): Promise<void> {
 		const repairTwice = await createRepack(db.sql).repack(REPO)
 		const afterTwice = await tierSize(db)
 		assertTierCoverage("after second repair", afterTwice)
+		await requireCanonicalTier("after second repair")
 		if (repairTwice.wholes !== 0 || repairTwice.deltas !== 0) {
 			throw new Error(
 				`second repair was not a no-op (${repairTwice.wholes} wholes, ${repairTwice.deltas} deltas)`,
@@ -193,6 +218,7 @@ async function main(): Promise<void> {
 		const control = await lineageShape(db, bufs)
 		const afterControl = await tierSize(db)
 		assertTierCoverage("after control repair", afterControl)
+		await requireCanonicalTier("after control repair")
 		if (control.rows !== holed.rows) {
 			throw new Error(`control restored ${control.rows}/${holed.rows} lineage rows`)
 		}

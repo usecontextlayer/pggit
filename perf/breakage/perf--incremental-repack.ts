@@ -16,44 +16,52 @@
  *   npx tsx perf/breakage/perf--incremental-repack.ts [--sizes=250,500,1000,2000]
  */
 import { rmSync } from "node:fs"
+import type { Sql } from "postgres"
+import { z } from "zod"
 import { createObjectStore } from "@/store/object-store"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
+	gitReachableOids,
+	loadGitObjects,
+	parseRevListObjectOids,
+	repackEligibleObjects,
+	requiredAt,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import {
-	cleanupTmp,
-	gitRepack,
-	increasingIntegerListFlag,
-	type Obj,
-	PG_URL,
-	reachableObjects,
-	secs,
-	table,
-} from "./_perf-util"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
+import { cleanupTmp, gitRepack, secs, table } from "./_perf-util"
 
-const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
+const { pg: PG_URL, sizes: SIZES } = parseArgs(
+	z
+		.object({
+			pg: pgUrlArg,
+			sizes: increasingIntegerListArg([250, 500, 1000, 2000]),
+		})
+		.strict(),
+)
 /** Growth exponent of the one-commit pass above which it is O(repo), not O(work). */
 const EXP_LIMIT = 0.5
 
 type Row = {
 	n: number
 	objects: number
-	newObjects: number
+	newEncodings: number
 	backfillMs: number
 	incrementalMs: number
 	gitMs: number
 }
 
 async function seedSubset(
-	// biome-ignore lint/suspicious/noExplicitAny: porsager Sql, structural
-	sql: any,
+	sql: Sql,
 	repoId: string,
-	objs: Obj[],
+	objs: GitObjectWithOid[],
 ): Promise<void> {
 	const store = createObjectStore(sql)
-	let batch: Obj[] = []
+	let batch: GitObjectWithOid[] = []
 	let bytes = 0
 	const flush = async (): Promise<void> => {
 		if (batch.length === 0) return
@@ -61,7 +69,7 @@ async function seedSubset(
 			repoId,
 			batch.map((o) => ({
 				content: o.content,
-				type: o.type as "blob" | "commit" | "tag" | "tree",
+				type: o.type,
 			})),
 		)
 		batch = []
@@ -78,7 +86,7 @@ async function seedSubset(
 async function measure(n: number): Promise<Row> {
 	const dir = await createAppendOnlyRepo({ docs: 8, runs: n })
 	try {
-		const all = await reachableObjects(dir)
+		const all = await loadGitObjects(dir, await gitReachableOids(dir))
 		const prior = new Set(
 			parseRevListObjectOids(
 				(await spawnGit(["rev-list", "--objects", "HEAD~1"], { cwd: dir })).stdout,
@@ -86,6 +94,8 @@ async function measure(n: number): Promise<Row> {
 		)
 		const base = all.filter((o) => prior.has(o.oid))
 		const fresh = all.filter((o) => !prior.has(o.oid))
+		const eligibleBase = repackEligibleObjects(base)
+		const eligibleFresh = repackEligibleObjects(fresh)
 		if (base.length === 0 || fresh.length === 0) {
 			throw new Error(
 				`fixture split is vacuous: base=${base.length}, fresh=${fresh.length}`,
@@ -96,38 +106,56 @@ async function measure(n: number): Promise<Row> {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
 			await seedSubset(db.sql, "probe/incrp", base)
+			await assertCanonicalStoreFixture(db.sql, "probe/incrp", {
+				encodings: { kind: "exact", objects: [] },
+				objects: base,
+				refs: [],
+			})
 			const repack = createRepack(db.sql)
 			const t0 = Date.now()
 			const backfill = await repack.repack("probe/incrp")
 			const backfillMs = Date.now() - t0
-			if (backfill.wholes + backfill.deltas !== base.length) {
+			if (
+				backfill.wholes + backfill.deltas !== eligibleBase.length ||
+				backfill.deltas <= 0
+			) {
 				throw new Error(
-					`backfill covered ${backfill.wholes + backfill.deltas}/${base.length} base objects`,
+					`backfill covered ${backfill.wholes + backfill.deltas}/${eligibleBase.length} eligible base objects with ${backfill.deltas} deltas`,
 				)
 			}
+			await assertCanonicalStoreFixture(db.sql, "probe/incrp", {
+				encodings: { kind: "exact", objects: eligibleBase },
+				objects: base,
+				refs: [],
+			})
 			await seedSubset(db.sql, "probe/incrp", fresh)
+			await assertCanonicalStoreFixture(db.sql, "probe/incrp", {
+				encodings: { kind: "exact", objects: eligibleBase },
+				objects: all,
+				refs: [],
+			})
 			const t1 = Date.now()
 			const r = await repack.repack("probe/incrp")
 			const incrementalMs = Date.now() - t1
 			if (backfillMs <= 0 || incrementalMs <= 0 || git.ms <= 0) {
 				throw new Error("repack timer recorded a nonpositive latency")
 			}
-			if (r.wholes + r.deltas !== fresh.length) {
+			if (r.wholes + r.deltas !== eligibleFresh.length || r.deltas <= 0) {
 				throw new Error(
-					`expected ${fresh.length} new encodings, got ${r.wholes + r.deltas}`,
+					`expected ${eligibleFresh.length} new eligible encodings including deltas, got ${r.wholes} wholes + ${r.deltas} deltas`,
 				)
 			}
-			const [count] = await db.sql<{ n: string }[]>`
-				select count(*)::text as n from git_pack_encoding`
-			if (!count || Number(count.n) !== all.length) {
-				throw new Error(`encoding tier has ${count?.n ?? "no count"}/${all.length} rows`)
-			}
+			await assertCanonicalStoreFixture(db.sql, "probe/incrp", {
+				encodings: { kind: "exact", objects: repackEligibleObjects(all) },
+				objects: all,
+				refs: [],
+			})
 			return {
 				backfillMs,
 				gitMs: git.ms,
 				incrementalMs,
 				n,
-				newObjects: fresh.length,
+				newEncodings: eligibleFresh.length,
 				objects: all.length,
 			}
 		} finally {
@@ -148,7 +176,7 @@ async function main(): Promise<void> {
 			[
 				"commits",
 				"objects in repo",
-				"new objects",
+				"new eligible objects",
 				"backfill s",
 				"one-commit pass ms",
 				"ms per new object",
@@ -157,10 +185,10 @@ async function main(): Promise<void> {
 			rows.map((r) => [
 				r.n + 1,
 				r.objects,
-				r.newObjects,
+				r.newEncodings,
 				secs(r.backfillMs),
 				r.incrementalMs,
-				(r.incrementalMs / r.newObjects).toFixed(1),
+				(r.incrementalMs / r.newEncodings).toFixed(1),
 				secs(r.gitMs),
 			]),
 		),
@@ -168,8 +196,8 @@ async function main(): Promise<void> {
 
 	const exps: (string | number)[][] = []
 	for (let i = 1; i < rows.length; i++) {
-		const a = rows[i - 1] as Row
-		const b = rows[i] as Row
+		const a = requiredAt(rows, i - 1, "previous incremental-repack measurement")
+		const b = requiredAt(rows, i, "current incremental-repack measurement")
 		const k = Math.log2(b.n / a.n)
 		exps.push([
 			`${a.n}→${b.n}`,

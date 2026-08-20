@@ -23,10 +23,15 @@
 import { mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { Oid } from "@/oid"
 import type { GitServer } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { objectsByType, parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	objectsByType,
+	parseRevListObjectOids,
+	requireGitOid,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -62,7 +67,7 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 
 	let deniedPush = ""
 	/** `lateTree`'s delta base after the first repack — null means it is not a delta. */
-	let keptAnchor: string | null = null
+	let keptAnchor: Oid | null = null
 	/** Whether GC actually reclaimed that anchor. */
 	let anchorGone = false
 	let gcFirst: GcResult
@@ -107,9 +112,6 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 				.map((object) => object.oid),
 		)
 		const sideTreesNewestFirst = sideOnly.filter((o) => sideTrees.has(o))
-		/** The object that must outlive its anchor; chosen after the repack below. */
-		let lateTree = ""
-
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
@@ -117,7 +119,11 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 		const repack = createRepack(db.sql)
 		const gc = createGc(db.sql)
 
-		const cloneAndCheck = async (label: string, tag: string): Promise<CloneCheck> => {
+		const cloneAndCheck = async (
+			label: string,
+			tag: string,
+			lateTree: Oid,
+		): Promise<CloneCheck> => {
 			const dest = join(mk(tag), "c")
 			const clone = await captureTestResult(async () => {
 				await spawnGit([
@@ -182,15 +188,21 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 				await db.sql<{ oid: string; base: string }[]>`
 					select encode(oid, 'hex') as oid, encode(base_oid, 'hex') as base
 					from git_pack_encoding where base_oid is not null`
-			).map((r) => [r.oid, r.base]),
+			).map((r) => [
+				requireGitOid(r.oid, "encoding target row"),
+				requireGitOid(r.base, "encoding base row"),
+			]),
 		)
-		lateTree =
-			sideTreesNewestFirst.find((t) => {
-				const base = deltaBase.get(t)
-				return base !== undefined && sideTrees.has(base)
-			}) ?? ""
-		if (lateTree === "") throw new Error("fixture wrong: no side-only tree is a delta")
-		keptAnchor = deltaBase.get(lateTree) ?? null
+		const lateTree = sideTreesNewestFirst.find((t) => {
+			const base = deltaBase.get(t)
+			return base !== undefined && sideTrees.has(base)
+		})
+		if (lateTree === undefined)
+			throw new Error("fixture wrong: no side-only tree is a delta")
+		const selectedAnchor = deltaBase.get(lateTree)
+		if (selectedAnchor === undefined)
+			throw new Error("fixture wrong: selected tree has no delta anchor")
+		keptAnchor = selectedAnchor
 		console.log(`kept tree ${lateTree} → delta anchor ${keptAnchor ?? "<none>"}`)
 
 		// Keep exactly ONE late tree alive: a commit whose root tree is `side`'s last.
@@ -212,12 +224,14 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 			if (anchorRow === undefined) throw new Error("anchor count query returned no row")
 			anchorGone = anchorRow.n === 0
 		}
-		clones.push(await cloneAndCheck("clone after gc (before repair repack)", "pre"))
+		clones.push(
+			await cloneAndCheck("clone after gc (before repair repack)", "pre", lateTree),
+		)
 		repackRepair = await repack.repack(REPO)
-		clones.push(await cloneAndCheck("clone after repair repack", "post"))
+		clones.push(await cloneAndCheck("clone after repair repack", "post", lateTree))
 
 		gcSecond = await gc.gc(REPO, { graceSeconds: 0 })
-		afterSecondGc = await cloneAndCheck("clone after second gc", "after")
+		afterSecondGc = await cloneAndCheck("clone after second gc", "after", lateTree)
 	}, 600_000)
 
 	afterAll(async () => {

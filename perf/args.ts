@@ -1,73 +1,74 @@
-/** Strict readers for the `--name=value` convention shared by standalone perf harnesses. */
-export function optionalFlag(name: string): string | undefined {
-	const prefix = `--${name}=`
-	const matches = process.argv.filter((arg) => arg.startsWith(prefix))
-	if (matches.length > 1) {
-		throw new Error(`--${name} was supplied ${matches.length} times`)
-	}
-	return matches[0]?.slice(prefix.length)
-}
+import { z } from "zod"
 
-export function flag(name: string, fallback: string): string {
-	return optionalFlag(name) ?? fallback
-}
+export const DEFAULT_PG_URL = "postgres://postgres:postgres@localhost:6489/postgres"
 
-export function integerFlag(
-	name: string,
-	fallback: number,
-	limits: { min: number; max?: number },
-): number {
-	const raw = optionalFlag(name)
-	const value = raw === undefined ? fallback : Number(raw)
-	if (
-		!Number.isSafeInteger(value) ||
-		value < limits.min ||
-		(limits.max !== undefined && value > limits.max)
-	) {
-		const range =
-			limits.max === undefined ? `>= ${limits.min}` : `${limits.min}..${limits.max}`
-		throw new Error(`--${name}=${raw ?? fallback} must be a safe integer in ${range}`)
-	}
-	return value
-}
+const argPairSchema = z
+	.string()
+	.regex(/^--[a-z][a-z0-9-]*=[\s\S]*$/, "expected --name=value argument")
+	.transform((arg) => {
+		const separator = arg.indexOf("=")
+		return {
+			name: arg.slice(2, separator),
+			value: arg.slice(separator + 1),
+		}
+	})
 
-export function positiveIntegerFlag(name: string, fallback: number): number {
-	const raw = optionalFlag(name) ?? String(fallback)
-	const value = Number(raw)
-	if (!Number.isSafeInteger(value) || value < 1) {
-		throw new Error(`--${name}=${raw} must be a positive safe integer`)
-	}
-	return value
-}
+export const nonemptyStringArg = z.string().min(1)
+export const integerArg = z.coerce.number().int().safe()
+export const positiveIntegerArg = integerArg.positive()
+export const positiveNumberArg = z.coerce.number().finite().positive()
+export const pgUrlArg = nonemptyStringArg.default(DEFAULT_PG_URL)
+const positiveIntegerStringArg = z
+	.string()
+	.transform(Number)
+	.pipe(z.number().int().safe().positive())
 
-export function positiveNumberFlag(name: string, fallback: number): number {
-	const raw = optionalFlag(name) ?? String(fallback)
-	const value = Number(raw)
-	if (!Number.isFinite(value) || value <= 0) {
-		throw new Error(`--${name}=${raw} must be a positive finite number`)
-	}
-	return value
-}
-
-/** A scale sweep: at least `minLength` positive safe integers in strict ascending order. */
-export function increasingIntegerListFlag(
-	name: string,
+/** A comma-separated scale sweep resolved to increasing positive safe integers. */
+export function increasingIntegerListArg(
 	fallback: readonly number[],
-	minLength = 2,
-): number[] {
-	if (!Number.isSafeInteger(minLength) || minLength < 1) {
-		throw new Error(`minimum --${name} list length must be a positive safe integer`)
-	}
-	const raw = optionalFlag(name) ?? fallback.join(",")
-	const values = raw.split(",").map((part) => Number(part))
-	if (
-		values.length < minLength ||
-		values.some((value) => !Number.isSafeInteger(value) || value < 1) ||
-		values.some((value, index) => index > 0 && value <= (values[index - 1] as number))
-	) {
-		throw new Error(
-			`--${name}=${raw} must contain at least ${minLength} strictly increasing positive safe integers`,
+): z.ZodType<number[]> {
+	return z
+		.string()
+		.default(fallback.join(","))
+		.transform((raw) => raw.split(","))
+		.pipe(
+			z
+				.array(positiveIntegerStringArg)
+				.min(2)
+				.refine(
+					(values) =>
+						values.every((value, index) => {
+							const previous = values[index - 1]
+							return previous === undefined || value > previous
+						}),
+					"must contain strictly increasing values",
+				),
 		)
+}
+
+function argPairs(): { name: string; value: string }[] {
+	return process.argv.slice(2).map((arg) => argPairSchema.parse(arg))
+}
+
+/** Parse a complete standalone entrypoint argv into a caller-owned strict schema.
+ * Bare, positional, duplicate, and unknown arguments fail before the entrypoint runs. */
+export function parseArgs<T>(schema: z.ZodType<T>): T {
+	const values: Record<string, string> = {}
+	for (const { name, value } of argPairs()) {
+		if (values[name] !== undefined)
+			throw new Error(`--${name} was supplied more than once`)
+		values[name] = value
 	}
-	return values
+	return schema.parse(values)
+}
+
+/** Parse a complete entrypoint whose named flags may intentionally repeat. */
+export function parseRepeatedArgs<T>(schema: z.ZodType<T>): T {
+	const values: Record<string, string[]> = {}
+	for (const { name, value } of argPairs()) {
+		const existing = values[name]
+		if (existing === undefined) values[name] = [value]
+		else existing.push(value)
+	}
+	return schema.parse(values)
 }

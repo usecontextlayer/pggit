@@ -39,22 +39,29 @@
  */
 import { join } from "node:path"
 import postgres from "postgres"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { branchAndTagRefsOf, parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	branchAndTagRefsOf,
+	parseRevListObjectOids,
+	repackEligibleObjects,
+	requiredAt,
+	requireGitOid,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	cleanupTmp,
 	fastImport,
 	initRepo,
 	median,
 	mkTmp,
-	numFlag,
 	objectsBetween,
-	PG_URL,
 	revParse,
 	runCommits,
 	seedObjects,
@@ -64,29 +71,54 @@ import {
 } from "./_pgres-util"
 
 /** porsager's default `max` — exactly what `startServer` gets today. */
-const APP_POOL_MAX = numFlag("pool", 10)
+const args = parseArgs(
+	z
+		.object({
+			clones: positiveIntegerArg.default(4),
+			commits: positiveIntegerArg.default(600),
+			cycles: positiveIntegerArg.default(4),
+			pg: pgUrlArg,
+			pool: positiveIntegerArg.default(10),
+		})
+		.strict(),
+)
+const APP_POOL_MAX = args.pool
 /** Kept low on purpose: this Postgres is shared with sibling agents. */
-const CLONES = numFlag("clones", 4)
+const CLONES = args.clones
 /** Round-robin cycles; each cycle runs every arm once. */
-const CYCLES = numFlag("cycles", 4)
-const COMMITS = numFlag("commits", 600)
+const CYCLES = args.cycles
+const COMMITS = args.commits
+const PG_URL = args.pg
 const REPO = "pool"
 const APP_NAME = "pgres-pool-probe"
 
 type Arm = {
+	kind: "background" | "baseline"
 	name: string
 	latencies: number[]
-	bgMs: number
+	wallMs: number
 	peakConns: number
 	overlapRuns: number
 }
+
+type RepackReceipt = { deltas: number; wholes: number }
+type Workload =
+	| { kind: "baseline" }
+	| { kind: "background"; run: () => Promise<RepackReceipt> }
+type WorkloadEvidence =
+	| { kind: "baseline" }
+	| { kind: "background"; receipt: RepackReceipt }
 
 function pct(xs: number[], p: number): number {
 	if (xs.length === 0 || xs.some((x) => !Number.isFinite(x) || x <= 0)) {
 		throw new Error("latency percentile requires finite positive samples")
 	}
 	const s = [...xs].sort((a, b) => a - b)
-	return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))] as number
+	return requiredAt(
+		s,
+		Math.min(s.length - 1, Math.floor((p / 100) * s.length)),
+		"latency percentile",
+	)
 }
 
 async function main(): Promise<void> {
@@ -124,6 +156,10 @@ async function main(): Promise<void> {
 		)
 		const tip = await revParse(dir, "refs/heads/main")
 		const objects = await objectsBetween(dir, tip, [])
+		const eligibleObjects = repackEligibleObjects(objects)
+		if (eligibleObjects.length === 0) {
+			throw new Error("pool fixture produced no repack-eligible objects")
+		}
 		await seedObjects(appPg, REPO, objects)
 		await setMain(appPg, REPO, tip)
 
@@ -157,10 +193,16 @@ async function main(): Promise<void> {
 			}
 		}
 
-		/** One run of one arm: `CLONES` concurrent clones with `bg` running beside. */
+		/** One run of one arm: `CLONES` concurrent clones with background work beside. */
 		const runArm = async (
-			bg: (() => Promise<unknown>) | null,
-		): Promise<{ latencies: number[]; overlap: boolean; peak: number; ms: number }> => {
+			workload: Workload,
+		): Promise<{
+			latencies: number[]
+			ms: number
+			overlap: boolean
+			peak: number
+			workload: WorkloadEvidence
+		}> => {
 			const latencies: number[] = []
 			let peak = 0
 			let overlap = false
@@ -188,10 +230,10 @@ async function main(): Promise<void> {
 					peak = Math.max(peak, Number(sample.total))
 					const encodings = Number(sample.encodings)
 					if (
-						bg &&
+						workload.kind === "background" &&
 						Number(sample.active) >= 2 &&
 						encodings > 0 &&
-						encodings < objects.length
+						encodings < eligibleObjects.length
 					) {
 						overlap = true
 					}
@@ -216,69 +258,90 @@ async function main(): Promise<void> {
 					return Date.now() - started
 				}),
 			)
-			const bgPromise = bg ? bg() : Promise.resolve()
+			const backgroundPromise: Promise<WorkloadEvidence> =
+				workload.kind === "background"
+					? workload.run().then((receipt) => ({ kind: "background", receipt }))
+					: Promise.resolve({ kind: "baseline" })
+			let evidence: WorkloadEvidence | undefined
+			let wallMs = 0
 			try {
-				const [clonesResult, bgResult] = await Promise.allSettled([
+				const [clonesResult, backgroundResult] = await Promise.allSettled([
 					clonePromise,
-					bgPromise,
+					backgroundPromise,
 				])
 				if (clonesResult.status === "rejected") throw clonesResult.reason
-				if (bgResult.status === "rejected") throw bgResult.reason
+				if (backgroundResult.status === "rejected") throw backgroundResult.reason
 				latencies.push(...clonesResult.value)
+				evidence = backgroundResult.value
+				wallMs = Date.now() - t0
 			} finally {
 				sampling = false
 				await sampler
 			}
 			await Promise.all(destinations.map(verifyClone))
-			return { latencies, ms: Date.now() - t0, overlap, peak }
+			if (evidence === undefined || wallMs <= 0) {
+				throw new Error(
+					"pool arm completed without workload evidence or positive wall time",
+				)
+			}
+			return { latencies, ms: wallMs, overlap, peak, workload: evidence }
 		}
 
 		const repackShared = createRepack(appPg)
 		const repackSide = createRepack(sidePg)
 		const gcShared = createGc(appPg)
+		const requireFixture = async (encodings: "absent" | "present"): Promise<void> => {
+			await assertCanonicalStoreFixture(appPg, REPO, {
+				encodings:
+					encodings === "present"
+						? { kind: "exact", objects: eligibleObjects }
+						: { kind: "exact", objects: [] },
+				objects,
+				refs: [
+					{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+					{
+						kind: "direct",
+						name: "refs/heads/main",
+						oid: requireGitOid(tip, "pool fixture main tip"),
+					},
+				],
+			})
+		}
 		// A repack must have work to do, so the tier is dropped before each arm that
 		// runs one. (`truncate` on the harness's own table, in the harness's own schema.)
 		const clearTier = async (): Promise<void> => {
 			await appPg.unsafe("truncate git_pack_encoding")
-			const [row] = await appPg<
-				{ n: string }[]
-			>`select count(*)::text as n from git_pack_encoding`
-			if (!row || Number(row.n) !== 0) throw new Error("encoding tier did not clear")
+			await requireFixture("absent")
 			await sleep(150)
 		}
-		const checkedRepack = async (
-			repack: ReturnType<typeof createRepack>,
-		): Promise<void> => {
-			const result = await repack.repack(REPO)
-			const [row] = await appPg<
-				{ n: string }[]
-			>`select count(*)::text as n from git_pack_encoding`
-			if (
-				result.wholes + result.deltas !== objects.length ||
-				!row ||
-				Number(row.n) !== objects.length
-			) {
+		const requireRepack = async (receipt: RepackReceipt): Promise<void> => {
+			if (receipt.wholes + receipt.deltas !== eligibleObjects.length) {
 				throw new Error(
-					`repack did not cover the fixture: receipt=${result.wholes + result.deltas}/${objects.length}, rows=${row?.n ?? "missing"}`,
+					`repack did not cover the eligible fixture: receipt=${receipt.wholes + receipt.deltas}/${eligibleObjects.length}`,
 				)
 			}
+			await requireFixture("present")
 		}
 
-		type Spec = { name: string; bg: (() => Promise<unknown>) | null; clear: boolean }
+		type Spec =
+			| { kind: "baseline"; name: string }
+			| { kind: "background"; name: string; run: () => Promise<RepackReceipt> }
 		const specs: Spec[] = [
-			{ bg: null, clear: true, name: "1 baseline (clones alone)" },
+			{ kind: "baseline", name: "1 baseline (clones alone)" },
 			{
-				bg: () => checkedRepack(repackShared),
-				clear: true,
+				kind: "background",
 				name: "2 clones + repack on the SERVER pool",
+				run: () => repackShared.repack(REPO),
 			},
 			{
-				bg: () => checkedRepack(repackSide),
-				clear: true,
+				kind: "background",
 				name: "3 clones + repack on a SEPARATE pool",
+				run: () => repackSide.repack(REPO),
 			},
 			{
-				bg: async () => {
+				kind: "background",
+				name: "4 clones + gc+repack on the SERVER pool",
+				run: async () => {
 					const gcResult = await gcShared.gc(REPO, {
 						graceSeconds: 3600,
 						maintain: false,
@@ -286,31 +349,42 @@ async function main(): Promise<void> {
 					if (gcResult.deletedObjects !== 0) {
 						throw new Error(`no-op GC deleted ${gcResult.deletedObjects} objects`)
 					}
-					await checkedRepack(repackShared)
+					return repackShared.repack(REPO)
 				},
-				clear: true,
-				name: "4 clones + gc+repack on the SERVER pool",
 			},
 		]
 		const arms: Arm[] = specs.map((sp) => ({
-			bgMs: 0,
+			kind: sp.kind,
 			latencies: [],
 			name: sp.name,
 			overlapRuns: 0,
 			peakConns: 0,
+			wallMs: 0,
 		}))
 
 		for (let cycle = 0; cycle < CYCLES; cycle++) {
 			for (let i = 0; i < specs.length; i++) {
-				const spec = specs[i] as Spec
-				const acc = arms[i] as Arm
-				if (spec.clear) await clearTier()
-				const r = await runArm(spec.bg)
+				const spec = requiredAt(specs, i, "pool-starvation arm spec")
+				const acc = requiredAt(arms, i, "pool-starvation arm result")
+				await clearTier()
+				const workload: Workload =
+					spec.kind === "baseline"
+						? { kind: "baseline" }
+						: { kind: "background", run: spec.run }
+				const r = await runArm(workload)
+				if (spec.kind === "background") {
+					if (r.workload.kind !== "background") {
+						throw new Error(`${spec.name}: missing background receipt`)
+					}
+					await requireRepack(r.workload.receipt)
+				} else if (r.workload.kind !== "baseline") {
+					throw new Error(`${spec.name}: baseline reported background evidence`)
+				}
 				acc.latencies.push(...r.latencies)
-				acc.bgMs += r.ms
+				acc.wallMs += r.ms
 				if (r.overlap) acc.overlapRuns++
 				if (r.peak > acc.peakConns) acc.peakConns = r.peak
-				if (spec.bg && !r.overlap) {
+				if (spec.kind === "background" && !r.overlap) {
 					throw new Error(
 						`${spec.name}: sampler did not observe clones overlapping a partial repack`,
 					)
@@ -322,7 +396,7 @@ async function main(): Promise<void> {
 		console.log(
 			`server pool max=${APP_POOL_MAX} (porsager default, = startServer) · ${CLONES} concurrent clones × ${CYCLES} interleaved cycles · repo ${objects.length} objects\n`,
 		)
-		const base = arms[0] as Arm
+		const base = requiredAt(arms, 0, "baseline arm")
 		const expectedSamples = CLONES * CYCLES
 		for (const arm of arms) {
 			if (
@@ -359,14 +433,14 @@ async function main(): Promise<void> {
 					Math.max(...a.latencies),
 					`×${(pct(a.latencies, 95) / baseP95).toFixed(2)}`,
 					a.peakConns,
-					`${a.overlapRuns}/${a.name.startsWith("1 ") ? 0 : CYCLES}`,
-					a.bgMs,
+					`${a.overlapRuns}/${a.kind === "baseline" ? 0 : CYCLES}`,
+					a.wallMs,
 				]),
 			),
 		)
 
-		const shared = arms[1] as Arm
-		const separate = arms[2] as Arm
+		const shared = requiredAt(arms, 1, "shared-pool arm")
+		const separate = requiredAt(arms, 2, "separate-pool arm")
 		// Drift check: the spread of the BASELINE arm's own latencies across cycles is
 		// how much this shared box moved under us. An arm-to-arm difference smaller
 		// than that spread is not a finding.

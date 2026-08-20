@@ -15,20 +15,28 @@
  *   npx tsx perf/breakage/perf--gc-encoding-sweep.ts [--sizes=250,500,1000,2000]
  */
 import { rmSync } from "node:fs"
+import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { createIsolatedSchema } from "@/testing/pg"
 import {
-	cleanupTmp,
-	increasingIntegerListFlag,
-	PG_URL,
-	secs,
-	seedRepo,
-	table,
-} from "./_perf-util"
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	repackEligibleObjects,
+	requiredAt,
+} from "@/testing/git-fixtures"
+import { createIsolatedSchema } from "@/testing/pg"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
+import { cleanupTmp, reachableObjects, secs, seedRepo, table } from "./_perf-util"
 
-const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
+const { pg: PG_URL, sizes: SIZES } = parseArgs(
+	z
+		.object({
+			pg: pgUrlArg,
+			sizes: increasingIntegerListArg([250, 500, 1000, 2000]),
+		})
+		.strict(),
+)
 const REPEATS = 5
 /** Added share of a zero-garbage pass at which this is called broken. */
 const OVERHEAD_LIMIT = 0.25
@@ -44,35 +52,49 @@ async function measure(n: number): Promise<Row> {
 	try {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
-			const seeded = await seedRepo(db.sql, "probe/gc", src)
-			if (seeded.objects <= 0) throw new Error("fixture seeded no objects")
+			const objects = await reachableObjects(src)
+			const seeded = await seedRepo(db.sql, "probe/gc", src, objects)
 			const gc = createGc(db.sql)
-			const pass = async (): Promise<number> => {
+			const pass = async (expectedEpoch: "rebuilt" | "unchanged"): Promise<number> => {
 				const t0 = Date.now()
 				const r = await gc.gc("probe/gc", { graceSeconds: 0, maintain: false })
 				const ms = Date.now() - t0
-				if (r.deletedObjects !== 0) {
-					throw new Error(`expected zero garbage, got ${r.deletedObjects}`)
+				if (r.deletedObjects !== 0 || r.epoch !== expectedEpoch) {
+					throw new Error(
+						`expected zero garbage and epoch ${expectedEpoch}, got deleted=${r.deletedObjects}, epoch=${r.epoch}`,
+					)
 				}
 				if (ms <= 0) throw new Error("GC timer recorded a nonpositive latency")
 				return ms
 			}
-			const pre: number[] = []
-			for (let i = 0; i < REPEATS; i++) pre.push(await pass())
+			const pre = [await pass("rebuilt")]
+			for (let i = 1; i < REPEATS; i++) pre.push(await pass("unchanged"))
 			const repacked = await createRepack(db.sql).repack("probe/gc")
 			const encodings = repacked.wholes + repacked.deltas
-			if (encodings !== seeded.objects) {
-				throw new Error(`repack covered ${encodings}/${seeded.objects} objects`)
+			if (encodings !== seeded.eligibleObjects) {
+				throw new Error(
+					`repack covered ${encodings}/${seeded.eligibleObjects} eligible objects`,
+				)
 			}
 			const [count] = await db.sql<{ n: string }[]>`
 				select count(*)::text as n from git_pack_encoding`
-			if (!count || Number(count.n) !== seeded.objects) {
+			if (!count || Number(count.n) !== seeded.eligibleObjects) {
 				throw new Error(
-					`encoding tier has ${count?.n ?? "no count"} rows, expected ${seeded.objects}`,
+					`encoding tier has ${count?.n ?? "no count"} rows, expected ${seeded.eligibleObjects}`,
 				)
 			}
+			await assertCanonicalStoreFixture(db.sql, "probe/gc", {
+				encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+				objects,
+				refs: await canonicalStoreRefsOf(src),
+			})
 			const post: number[] = []
-			for (let i = 0; i < REPEATS; i++) post.push(await pass())
+			for (let i = 0; i < REPEATS; i++) post.push(await pass("unchanged"))
+			await assertCanonicalStoreFixture(db.sql, "probe/gc", {
+				encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+				objects,
+				refs: await canonicalStoreRefsOf(src),
+			})
 			return {
 				encodings,
 				n,
@@ -118,8 +140,8 @@ async function main(): Promise<void> {
 
 	const exps: (string | number)[][] = []
 	for (let i = 1; i < rows.length; i++) {
-		const a = rows[i - 1] as Row
-		const b = rows[i] as Row
+		const a = requiredAt(rows, i - 1, "previous GC encoding-sweep measurement")
+		const b = requiredAt(rows, i, "current GC encoding-sweep measurement")
 		const k = Math.log2(b.n / a.n)
 		const aAdded = a.post - a.pre
 		const bAdded = b.post - b.pre
@@ -140,7 +162,12 @@ async function main(): Promise<void> {
 	)
 	console.log(`observed worst: ${(worst * 100).toFixed(0)}%`)
 	if (worst > OVERHEAD_LIMIT) process.exitCode = 1
-	console.log(`(largest pass: ${secs((rows[rows.length - 1] as Row).post)}s)`)
+	const largest = requiredAt(
+		rows,
+		rows.length - 1,
+		"largest GC encoding-sweep measurement",
+	)
+	console.log(`(largest pass: ${secs(largest.post)}s)`)
 }
 
 main()

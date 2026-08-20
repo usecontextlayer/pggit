@@ -1,13 +1,27 @@
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
-import { integerFlag, optionalFlag } from "./args"
+import { z } from "zod"
+import { integerArg, nonemptyStringArg, parseArgs } from "./args"
 import { runScenario } from "./harness"
+import type { RttMode } from "./pg-latency"
 import { printSummary, writeReport } from "./report"
 import { SCENARIOS } from "./scenarios"
 
-/** Read `--key=value` from argv. */
+const argsSchema = z
+	.object({
+		blobs: integerArg.min(1).optional(),
+		churn: integerArg.min(0).optional(),
+		history: integerArg.min(1).optional(),
+		repeat: integerArg.min(1).default(1),
+		rtt: integerArg.min(1).optional(),
+		scenario: nonemptyStringArg.default("markdown"),
+		seed: integerArg.min(0).default(1),
+	})
+	.strict()
+
 async function main(): Promise<void> {
-	const name = optionalFlag("scenario") ?? "markdown"
+	const args = parseArgs(argsSchema)
+	const name = args.scenario
 	const base = SCENARIOS[name]
 	if (!base) {
 		throw new Error(
@@ -16,28 +30,34 @@ async function main(): Promise<void> {
 	}
 	const scenario = {
 		...base,
-		blobCount: integerFlag("blobs", base.blobCount, { min: 1 }),
-		churn: integerFlag("churn", base.churn, { min: 0 }),
-		historyLen: integerFlag("history", base.historyLen, { min: 1 }),
+		blobCount: args.blobs ?? base.blobCount,
+		churn: args.churn ?? base.churn,
+		historyLen: args.history ?? base.historyLen,
 	}
 	if (scenario.churn > scenario.blobCount) {
 		throw new Error(
 			`--churn (${scenario.churn}) cannot exceed --blobs (${scenario.blobCount})`,
 		)
 	}
-	const seed = integerFlag("seed", 1, { min: 0 })
-	const repeat = integerFlag("repeat", 1, { min: 1 })
-	const rttArg = optionalFlag("rtt")
-	const rttMs = rttArg === undefined ? null : integerFlag("rtt", 1, { min: 1 })
+	const rtt: RttMode =
+		args.rtt === undefined
+			? { kind: "loopback" }
+			: { kind: "sweep", requestedMs: args.rtt }
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-")
 	const outDir = join("perf", "runs", `${name}-${stamp}`)
 	mkdirSync(outDir, { recursive: true })
 
 	console.log(
-		`[perf] scenario=${name} blobs=${scenario.blobCount} history=${scenario.historyLen} churn=${scenario.churn} repeat=${repeat} rtt=${rttMs ?? "off"}`,
+		`[perf] scenario=${name} blobs=${scenario.blobCount} history=${scenario.historyLen} churn=${scenario.churn} repeat=${args.repeat} rtt=${rtt.kind === "loopback" ? "off" : rtt.requestedMs}`,
 	)
 	console.log(`[perf] out=${outDir}`)
-	const report = await runScenario({ outDir, repeat, rttMs, scenario, seed })
+	const report = await runScenario({
+		outDir,
+		repeat: args.repeat,
+		rtt,
+		scenario,
+		seed: args.seed,
+	})
 	await writeReport(report)
 	printSummary(report)
 }

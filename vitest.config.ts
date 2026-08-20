@@ -34,6 +34,9 @@ export default defineConfig({
 		// concurrent files share one server safely. Tests that deliberately start
 		// their own container ignore it.
 		globalSetup: ["./src/testing/pg-global-setup.ts"],
+		// Hooks build the heavy half (schemas, containers, seeded fixtures), so they
+		// get the same ceiling as tests — the 10 s default flakes under load.
+		hookTimeout: 600_000,
 		projects: [
 			{
 				extends: true,

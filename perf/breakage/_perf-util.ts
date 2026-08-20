@@ -2,24 +2,77 @@
  * Shared plumbing for the `perf/breakage/perf--*.ts` probes. The helpers drive real Git and pggit surfaces, then use explicit store censuses where a named fixture must prove its internal preconditions. Malformed Git output, incomplete seed coverage, invalid CLI scales, missing subprocess metrics, and undersampled RSS all abort a probe before it can score a number.
  */
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Sql } from "postgres"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { gitReachableOids, loadGitObjects, seedGitRefs } from "@/testing/git-fixtures"
-import { spawnGit } from "@/testing/spawn-git"
-import { peakOf, startRssSampler } from "../memory"
+import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	type GitObjectWithOid,
+	gitReachableOids,
+	loadGitObjects,
+	repackEligibleObjects,
+	seedGitRefs,
+} from "@/testing/git-fixtures"
+import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { peakOf, rssBytes, startRssSampler } from "../memory"
 
-export { flag, increasingIntegerListFlag, positiveIntegerFlag } from "../args"
-
-import { flag } from "../args"
-
-export const PG_URL = flag("pg", "postgres://postgres:postgres@localhost:6489/postgres")
+export { table } from "../table"
 
 export const mb = (bytes: number): string => `${(bytes / 1_000_000).toFixed(1)}`
 export const secs = (ms: number): string => `${(ms / 1000).toFixed(2)}`
+
+const REWRITTEN_ARTIFACT_WHEN = "1700000000 +0000"
+const REWRITTEN_ARTIFACT_COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${REWRITTEN_ARTIFACT_WHEN}`
+
+function deterministicNoise(salt: string, length: number): Buffer {
+	const parts: Buffer[] = []
+	let total = 0
+	let index = 0
+	while (total < length) {
+		const part = createHash("sha256").update(`${salt}-${index++}`).digest()
+		parts.push(part)
+		total += part.length
+	}
+	return Buffer.concat(parts).subarray(0, length)
+}
+
+/** Successive whole versions of one artifact, each carrying a distinct 200-byte edit. */
+export function rewrittenArtifactStream(options: {
+	blobBytes: number
+	versions: number
+}): Buffer {
+	const parts: Buffer[] = []
+	const base = deterministicNoise("artifact", options.blobBytes)
+	type CommitParent = { kind: "root" } | { kind: "child"; mark: number }
+	let parent: CommitParent = { kind: "root" }
+	let mark = 0
+	for (let version = 0; version < options.versions; version++) {
+		const body = Buffer.from(base)
+		deterministicNoise(`edit-${version}`, 200).copy(body, version * 1000)
+		const blobMark = ++mark
+		parts.push(
+			Buffer.from(`blob\nmark :${blobMark}\ndata ${body.length}\n`),
+			body,
+			Buffer.from("\n"),
+		)
+		const commitMark = ++mark
+		const message = `v${version}`
+		parts.push(
+			Buffer.from(
+				`commit refs/heads/main\nmark :${commitMark}\ncommitter ${REWRITTEN_ARTIFACT_COMMITTER}\ndata ${message.length}\n${message}\n` +
+					(parent.kind === "root" ? "" : `from :${parent.mark}\n`) +
+					`M 100644 :${blobMark} data/artifact.bin\n`,
+			),
+		)
+		parent = { kind: "child", mark: commitMark }
+	}
+	return Buffer.concat(parts)
+}
 
 const scratch: string[] = []
 export function mkTmp(tag: string): string {
@@ -50,7 +103,7 @@ export async function withPeakRss<T>(
 	return {
 		baseRss,
 		ms,
-		peakRss: peakOf(series.map(([, rss]) => rss)),
+		peakRss: peakOf(rssBytes(series)),
 		value: outcome.value,
 	}
 }
@@ -60,7 +113,7 @@ export async function timedSpawn(
 	cmd: string,
 	args: string[],
 	cwd: string,
-): Promise<{ ms: number; peakRss: number; code: number }> {
+): Promise<{ ms: number; peakRss: number }> {
 	const t0 = Date.now()
 	return await new Promise((resolve, reject) => {
 		const child = spawn("/usr/bin/time", ["-l", cmd, ...args], {
@@ -87,7 +140,7 @@ export async function timedSpawn(
 				reject(new Error(`/usr/bin/time did not report maximum RSS for ${cmd}: ${err}`))
 				return
 			}
-			resolve({ code, ms: Date.now() - t0, peakRss: Number(m[1]) })
+			resolve({ ms: Date.now() - t0, peakRss: Number(m[1]) })
 		})
 	})
 }
@@ -110,7 +163,7 @@ export async function gitRepack(
 	return { ms: r.ms, packBytes: kb * 1024, peakRss: r.peakRss }
 }
 
-export type Obj = { oid: string; type: string; content: Buffer }
+export type Obj = GitObjectWithOid
 
 /** Every reachable object of a repo, via ONE `git cat-file --batch`. */
 export async function reachableObjects(dir: string): Promise<Obj[]> {
@@ -123,7 +176,7 @@ export async function seedRepo(
 	repoId: string,
 	dir: string,
 	objects?: Obj[],
-): Promise<{ objects: number; rawBytes: number; ms: number }> {
+): Promise<{ objects: number; eligibleObjects: number; rawBytes: number; ms: number }> {
 	const objs = objects ?? (await reachableObjects(dir))
 	if (objs.length === 0) throw new Error(`cannot seed empty repository ${dir}`)
 	const store = createObjectStore(sql)
@@ -133,13 +186,7 @@ export async function seedRepo(
 	let bytes = 0
 	const flush = async (): Promise<void> => {
 		if (batch.length === 0) return
-		await store.putPack(
-			repoId,
-			batch.map((o) => ({
-				content: o.content,
-				type: o.type as "blob" | "commit" | "tag" | "tree",
-			})),
-		)
+		await store.putPack(repoId, batch)
 		batch = []
 		bytes = 0
 	}
@@ -151,37 +198,18 @@ export async function seedRepo(
 		if (bytes >= 16_000_000 || batch.length >= 20_000) await flush()
 	}
 	await flush()
-	const seededRefs = await seedGitRefs(repoId, dir, refs)
-	// `repoId` is the WIRE NAME; the census reads by the bigint surrogate.
-	const [repoRow] = await sql<{ id: string }[]>`
-		select id::text as id from repos where name = ${repoId}`
-	if (repoRow === undefined) throw new Error(`seeded repo ${repoId} has no repos row`)
-	const [census] = await sql<
-		{ objects: string; commits: string; tags: string; refs: string }[]
-	>`select
-		(select count(*) from git_object where repo_id = ${repoRow.id}::bigint)::text as objects,
-		(select count(*) from git_commit where repo_id = ${repoRow.id}::bigint)::text as commits,
-		(select count(*) from git_tag where repo_id = ${repoRow.id}::bigint)::text as tags,
-		(select count(*) from git_ref where repo_id = ${repoRow.id}::bigint)::text as refs`
-	if (census === undefined) throw new Error(`seed census returned no row for ${repoId}`)
-	const expected = {
-		commits: objs.filter((object) => object.type === "commit").length,
+	await seedGitRefs(repoId, dir, refs)
+	await assertCanonicalStoreFixture(sql, repoId, {
+		encodings: { kind: "exact", objects: [] },
+		objects: objs,
+		refs: await canonicalStoreRefsOf(dir),
+	})
+	return {
+		eligibleObjects: repackEligibleObjects(objs).length,
+		ms: Date.now() - t0,
 		objects: objs.length,
-		refs: seededRefs.directRefs + 1,
-		tags: objs.filter((object) => object.type === "tag").length,
+		rawBytes,
 	}
-	const actual = {
-		commits: Number(census.commits),
-		objects: Number(census.objects),
-		refs: Number(census.refs),
-		tags: Number(census.tags),
-	}
-	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-		throw new Error(
-			`seed census mismatch for ${repoId}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
-		)
-	}
-	return { ms: Date.now() - t0, objects: objs.length, rawBytes }
 }
 
 /** Build a repo from a raw fast-import stream. */
@@ -191,17 +219,4 @@ export async function importRepo(tag: string, stream: string): Promise<string> {
 	await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: stream })
 	return dir
-}
-
-/** A row of any probe's result table. */
-export function table(headers: string[], rows: (string | number)[][]): string {
-	const all = [headers, ...rows.map((r) => r.map(String))]
-	const w = headers.map((_, i) => Math.max(...all.map((r) => (r[i] ?? "").length)))
-	const line = (r: string[]): string =>
-		`| ${r.map((c, i) => c.padEnd(w[i] as number)).join(" | ")} |`
-	return [
-		line(headers),
-		`|${w.map((n) => "-".repeat(n + 2)).join("|")}|`,
-		...all.slice(1).map(line),
-	].join("\n")
 }

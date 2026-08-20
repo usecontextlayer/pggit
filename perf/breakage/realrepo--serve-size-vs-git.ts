@@ -11,9 +11,7 @@
  *
  * Black-box setup remains real `git push` over the wire followed by `createRepack().repack()`. Measurement sends one identical no-have v2 request to pggit and canonical `git upload-pack`, captures the raw band-1 PACK bytes before client indexing can append thin bases, proves the transmitted OID sets are identical, and only then indexes those captured packs for strict `verify-pack -v` attribution. Separate mirror clones prove exact refs, object bytes, and fsck state.
  *
- * A perf harness rather than a vitest e2e test on both counts: the verdict is a
- * MEASURED size ratio, and the corpus is a REAL local repository handed in at run
- * time (`--repo=`), which no committed fixture can stand in for.
+ * A perf harness rather than a vitest e2e test on both counts: the verdict is a MEASURED size ratio, and the corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for.
  *
  *   npx tsx perf/breakage/realrepo--serve-size-vs-git.ts --repo=/path/to/checkout --slug=<name>
  *
@@ -22,7 +20,9 @@
  * Exit 1 = reproduced: the ratio is past that, with the per-type attribution printed.
  */
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
+import type { Oid } from "@/oid"
 import { readPack } from "@/pack/read-pack"
 import { serveOnPort } from "@/server"
 import {
@@ -33,23 +33,37 @@ import {
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
+import { nonemptyStringArg, parseArgs, pgUrlArg, positiveNumberArg } from "../args"
 import {
+	assertCanonicalRealRepoStore,
 	canonicalV2Pack,
 	createScratch,
-	DEFAULT_PG_URL,
-	flag,
 	indexRawPack,
 	mb,
-	positiveNumberFlag,
+	mirrorSourceFromArgs,
 	postPggitV2Pack,
 	prepareMirror,
 	repackExactly,
 } from "./_realrepo-util"
 
-const SLUG = flag("slug", "repo")
-const MAX_RATIO = positiveNumberFlag("max-ratio", 3)
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-if (!SLUG) throw new Error("--slug must not be empty")
+const args = parseArgs(
+	z
+		.object({
+			"max-ratio": positiveNumberArg.default(3),
+			mirror: nonemptyStringArg.optional(),
+			pg: pgUrlArg,
+			repo: nonemptyStringArg.optional(),
+			slug: nonemptyStringArg.default("repo"),
+		})
+		.strict()
+		.transform(({ mirror, repo, ...values }) => ({
+			...values,
+			source: mirrorSourceFromArgs({ mirror, repo }),
+		})),
+)
+const SLUG = args.slug
+const MAX_RATIO = args["max-ratio"]
+const PG_URL = args.pg
 
 const scratch = createScratch(`serve-size-${SLUG}`)
 
@@ -77,7 +91,7 @@ function attribute(
 	return { by, total }
 }
 
-async function wantedRefOids(dir: string): Promise<string[]> {
+async function wantedRefOids(dir: string): Promise<Oid[]> {
 	const wants = [...new Set((await allRefsOf(dir)).map(({ oid }) => oid))]
 	if (wants.length === 0) throw new Error(`${dir}: zero ref wants`)
 	return wants
@@ -97,7 +111,7 @@ function table(label: string, a: { by: Attribution; total: number }): void {
 }
 
 async function main(): Promise<void> {
-	const MIRROR = await prepareMirror(scratch)
+	const MIRROR = await prepareMirror(scratch, args.source)
 	console.log(`# serve-size vs git — ${SLUG}\n  mirror ${MIRROR}`)
 	const repoId = `sizecheck/${SLUG}`
 	const db = await createIsolatedSchema(PG_URL)
@@ -116,9 +130,10 @@ async function main(): Promise<void> {
 		// git's own answer over the SAME object set: replay the same push into a plain
 		// file:// bare remote and gc it.
 		const oracle = join(scratch.mk("oracle"), "o.git")
-		await spawnGit(["init", "-q", "--bare", oracle])
+		await spawnGit(["init", "-q", "-b", "main", "--bare", oracle])
 		await spawnGit(["push", `file://${oracle}`, "--mirror"], { cwd: MIRROR })
 		await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: oracle })
+		await assertCanonicalRealRepoStore(db.sql, repoId, oracle, { kind: "repacked" })
 
 		const pggitDir = join(scratch.mk("pggit"), "c.git")
 		const gitDir = join(scratch.mk("git"), "g.git")
@@ -165,8 +180,8 @@ async function main(): Promise<void> {
 		await spawnGit(["init", "-q", "--bare", pggitIndexed])
 		await spawnGit(["init", "-q", "--bare", gitIndexed])
 		const [pggitIndex, gitIndex] = await Promise.all([
-			indexRawPack(pggitIndexed, pggitPack, false),
-			indexRawPack(gitIndexed, gitPack, false),
+			indexRawPack(pggitIndexed, pggitPack, "complete"),
+			indexRawPack(gitIndexed, gitPack, "complete"),
 		])
 
 		const p = attribute(pggitIndex.entries, "pggit raw pack")

@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto"
 import { readdirSync, statSync } from "node:fs"
 import { join } from "node:path"
+import type { Sql } from "postgres"
 import { z } from "zod"
+import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import type { GitObjectType } from "@/object/object"
 import { isOid, type Oid } from "@/oid"
 import type { PackInputObject } from "@/pack/write-pack"
@@ -40,6 +42,16 @@ export function listDifferences<T>(
 	}
 }
 
+function oidDifference(actual: readonly Oid[], expected: readonly Oid[]): string {
+	const difference = listDifferences(actual, expected)
+	return JSON.stringify({
+		actual: actual.length,
+		expected: expected.length,
+		onlyActual: difference.onlyLeft.slice(0, 8),
+		onlyExpected: difference.onlyRight.slice(0, 8),
+	})
+}
+
 /** Index a fixture list, failing with the caller's semantic context. */
 export function requiredAt<T>(values: readonly T[], index: number, context: string): T {
 	const value = values[index]
@@ -54,7 +66,7 @@ export function cyclicAt<T>(values: readonly T[], index: number): T {
 }
 
 /** Parse every `<oid>[ <path>]` row emitted by `git rev-list --objects`. */
-export function parseRevListObjectOids(stdout: string): string[] {
+export function parseRevListObjectOids(stdout: string): Oid[] {
 	return stdout
 		.trim()
 		.split("\n")
@@ -67,7 +79,7 @@ export function parseRevListObjectOids(stdout: string): string[] {
 }
 
 /** Canonical git's reachable object closure, including annotated-tag objects that `rev-list --objects --all` reports only through their peeled targets. */
-export async function gitReachableOids(dir: string): Promise<string[]> {
+export async function gitReachableOids(dir: string): Promise<Oid[]> {
 	const revList = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
 	const oids = new Set(parseRevListObjectOids(revList.stdout))
 	// Annotated-tag OBJECTS: `rev-list --objects --all` lists a tag ref's peeled
@@ -78,10 +90,10 @@ export async function gitReachableOids(dir: string): Promise<string[]> {
 	)
 	for (const line of refLines.stdout.trim().split("\n").filter(Boolean)) {
 		const fields = line.split(" ")
-		if (fields.length !== 2) {
+		const [type, oid] = fields
+		if (fields.length !== 2 || type === undefined || oid === undefined) {
 			throw new Error(`unexpected for-each-ref line: ${line}`)
 		}
-		const [type, oid] = fields as [string, string]
 		const parsedOid = requireGitOid(oid, `for-each-ref line ${JSON.stringify(line)}`)
 		switch (type) {
 			case "tag":
@@ -99,7 +111,7 @@ export async function gitReachableOids(dir: string): Promise<string[]> {
 }
 
 /** Same-path target-to-base pairs from one parent-before-child `git log --raw` stream. */
-export async function gitLogRawBasePairs(dir: string): Promise<Map<string, string>> {
+export async function gitLogRawBasePairs(dir: string): Promise<Map<Oid, Oid>> {
 	const log = await spawnGit(
 		[
 			"log",
@@ -115,15 +127,17 @@ export async function gitLogRawBasePairs(dir: string): Promise<Map<string, strin
 		],
 		{ cwd: dir },
 	)
-	const pairs = new Map<string, string>()
-	const commitTree = new Map<string, string>()
+	const pairs = new Map<Oid, Oid>()
+	const commitTree = new Map<Oid, Oid>()
 	let sawCommit = false
 	for (const line of log.stdout.split("\n")) {
 		if (line.length === 0) continue
 		if (line.startsWith("@")) {
 			const fields = line.slice(1).trimEnd().split(" ").filter(Boolean)
-			if (fields.length < 2) throw new Error(`unexpected git log header: ${line}`)
-			const [rawCommit, rawTree, ...rawParents] = fields as [string, string, ...string[]]
+			const [rawCommit, rawTree, ...rawParents] = fields
+			if (rawCommit === undefined || rawTree === undefined) {
+				throw new Error(`unexpected git log header: ${line}`)
+			}
 			const commit = requireGitOid(rawCommit, `git log header ${JSON.stringify(line)}`)
 			const tree = requireGitOid(rawTree, `git log header ${JSON.stringify(line)}`)
 			const parents = rawParents.map((parent) =>
@@ -148,25 +162,40 @@ export async function gitLogRawBasePairs(dir: string): Promise<Map<string, strin
 			throw new Error(`unexpected git log --raw row: ${line}`)
 		}
 		const fields = line.slice(1, tab).split(" ")
+		const [oldMode, newMode, oldOid, newOid, status] = fields
 		if (
 			fields.length !== 5 ||
-			!fields[0]?.match(/^[0-7]{6}$/) ||
-			!fields[1]?.match(/^[0-7]{6}$/) ||
-			!fields[4]?.match(/^[A-Z][0-9]*$/)
+			oldMode === undefined ||
+			newMode === undefined ||
+			oldOid === undefined ||
+			newOid === undefined ||
+			status === undefined ||
+			!oldMode.match(/^[0-7]{6}$/) ||
+			!newMode.match(/^[0-7]{6}$/) ||
+			!status.match(/^[A-Z][0-9]*$/)
 		) {
 			throw new Error(`unexpected git log --raw metadata: ${line}`)
 		}
-		const oldOid = fields[2] as string
-		const newOid = fields[3] as string
-		const zero = "0".repeat(40)
-		if (oldOid !== zero)
-			requireGitOid(oldOid, `git log --raw row ${JSON.stringify(line)}`)
-		if (newOid !== zero)
-			requireGitOid(newOid, `git log --raw row ${JSON.stringify(line)}`)
-		if (oldOid === zero || newOid === zero || oldOid === newOid || pairs.has(newOid)) {
+		const parseEntryOid = (
+			value: string,
+		): { kind: "zero" } | { kind: "oid"; oid: Oid } =>
+			value === "0".repeat(40)
+				? { kind: "zero" }
+				: {
+						kind: "oid",
+						oid: requireGitOid(value, `git log --raw row ${JSON.stringify(line)}`),
+					}
+		const oldEntry = parseEntryOid(oldOid)
+		const newEntry = parseEntryOid(newOid)
+		if (
+			oldEntry.kind === "zero" ||
+			newEntry.kind === "zero" ||
+			oldEntry.oid === newEntry.oid ||
+			pairs.has(newEntry.oid)
+		) {
 			continue
 		}
-		pairs.set(newOid, oldOid)
+		pairs.set(newEntry.oid, oldEntry.oid)
 	}
 	if (!sawCommit) throw new Error("git log --raw returned no commits")
 	return pairs
@@ -197,7 +226,10 @@ export async function loadGitObjects(
 		if (match === null) {
 			throw new Error(`cat-file --batch: unexpected header ${JSON.stringify(header)}`)
 		}
-		const [, returnedOid, rawType, rawSize] = match as [string, string, string, string]
+		const [, returnedOid, rawType, rawSize] = match
+		if (returnedOid === undefined || rawType === undefined || rawSize === undefined) {
+			throw new Error(`cat-file --batch: incomplete header ${JSON.stringify(header)}`)
+		}
 		if (returnedOid !== expectedOid) {
 			throw new Error(
 				`cat-file --batch: returned ${returnedOid} while reading ${expectedOid}`,
@@ -238,8 +270,8 @@ async function loadObjects(
 }
 
 /** Every object in a real repo, as pack inputs (content read binary-safe). */
-export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
-	return loadObjects(dir, await allObjectOids(dir))
+export async function loadAllObjects(dir: string): Promise<GitObjectWithOid[]> {
+	return loadGitObjects(dir, await allObjectOids(dir))
 }
 
 /** Every object reachable from the supplied revisions, as pack inputs. */
@@ -252,9 +284,7 @@ export async function loadReachableObjects(
 }
 
 /** Parse `git ls-tree[-r]` output: `<mode> <type> <oid>\t<name-or-path>`. */
-export function parseLsTree(
-	stdout: string,
-): { mode: string; oid: string; path: string }[] {
+export function parseLsTree(stdout: string): { mode: string; oid: Oid; path: string }[] {
 	return stdout
 		.trim()
 		.split("\n")
@@ -264,10 +294,16 @@ export function parseLsTree(
 			if (tab < 0) throw new Error(`unexpected ls-tree line: ${line}`)
 			const path = line.slice(tab + 1)
 			const meta = line.slice(0, tab).split(" ")
-			if (meta.length !== 3 || path.length === 0) {
+			const [mode, type, oid] = meta
+			if (
+				meta.length !== 3 ||
+				mode === undefined ||
+				type === undefined ||
+				oid === undefined ||
+				path.length === 0
+			) {
 				throw new Error(`unexpected ls-tree meta: ${line}`)
 			}
-			const [mode, type, oid] = meta as [string, string, string]
 			if (!/^[0-7]{6}$/.test(mode)) {
 				throw new Error(`unexpected ls-tree mode: ${line}`)
 			}
@@ -289,13 +325,13 @@ export async function lsTreeSnapshot(dir: string, revision: string): Promise<str
 }
 
 /** Resolve a rev (ref name, HEAD, oid^) to its full validated oid. */
-export async function revParse(dir: string, rev: string): Promise<string> {
+export async function revParse(dir: string, rev: string): Promise<Oid> {
 	const out = await spawnGit(["rev-parse", rev], { cwd: dir })
 	return requireGitOid(out.stdout.trim(), `rev-parse ${rev}`)
 }
 
 /** Sorted list of every object OID in a real repo. */
-export async function allObjectOids(dir: string): Promise<string[]> {
+export async function allObjectOids(dir: string): Promise<Oid[]> {
 	const list = await spawnGit(
 		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
 		{ cwd: dir },
@@ -333,7 +369,7 @@ export async function objectBytesDigest(
 /** Everything a client can observe through a canonical mirror clone. */
 export type MirrorState = {
 	refs: string[]
-	objects: string[]
+	objects: Oid[]
 	digest: string
 	fsck: string
 }
@@ -343,8 +379,8 @@ export type MirrorComparison = {
 	served: MirrorState
 	oracle: MirrorState
 	objects: {
-		onlyServed: string[]
-		onlyOracle: string[]
+		onlyServed: Oid[]
+		onlyOracle: Oid[]
 	}
 }
 
@@ -359,10 +395,15 @@ export async function typedRefsOf(dir: string): Promise<TypedGitRef[]> {
 	const refs: TypedGitRef[] = []
 	for (const line of out.stdout.trim().split("\n").filter(Boolean)) {
 		const fields = line.split(" ")
-		if (fields.length !== 3) {
+		const [rawOid, name, rawType] = fields
+		if (
+			fields.length !== 3 ||
+			rawOid === undefined ||
+			name === undefined ||
+			rawType === undefined
+		) {
 			throw new Error(`unexpected for-each-ref line: ${line}`)
 		}
-		const [rawOid, name, rawType] = fields as [string, string, string]
 		if (!name.startsWith("refs/")) throw new Error(`unexpected ref name: ${line}`)
 		refs.push({
 			name,
@@ -373,19 +414,13 @@ export async function typedRefsOf(dir: string): Promise<TypedGitRef[]> {
 	return refs.sort((a, b) => a.name.localeCompare(b.name))
 }
 
-/** Symbolic HEAD target and the OID it resolves to. */
-export async function repositoryHeadOf(
-	dir: string,
-): Promise<{ oid: Oid; target: string }> {
+/** A repository's symbolic HEAD target, including when the target is unborn. */
+export async function repositoryHeadTargetOf(dir: string): Promise<string> {
 	const target = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: dir })).stdout.trim()
 	if (!target.startsWith("refs/")) {
 		throw new Error(`repository has invalid HEAD target ${JSON.stringify(target)}`)
 	}
-	const oid = requireGitOid(
-		(await spawnGit(["rev-parse", "HEAD"], { cwd: dir })).stdout.trim(),
-		"repository HEAD",
-	)
-	return { oid, target }
+	return target
 }
 
 function parseRefRows(
@@ -416,8 +451,9 @@ export async function mirrorClone(url: string, dest: string): Promise<MirrorStat
 	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 	const refs = (await allRefsOf(dest)).map(({ name, oid }) => `${oid} ${name}`)
-	const head = await repositoryHeadOf(dest)
-	refs.push(`${head.oid} HEAD -> ${head.target}`)
+	// HEAD is listed by target only: a symref's OID is its target ref's line, and
+	// an emptied repository's HEAD is unborn — it has a target but no OID.
+	refs.push(`HEAD -> ${await repositoryHeadTargetOf(dest)}`)
 	refs.sort()
 	const complaints = `${fsck.stdout}${fsck.stderr}`
 		.split("\n")
@@ -451,14 +487,14 @@ export async function compareMirrorClones(
 }
 
 /** Every direct ref in a repository as sorted name/OID pairs. */
-export async function allRefsOf(dir: string): Promise<{ name: string; oid: string }[]> {
+export async function allRefsOf(dir: string): Promise<{ name: string; oid: Oid }[]> {
 	return (await typedRefsOf(dir)).map(({ name, oid }) => ({ name, oid }))
 }
 
 /** A repo's local branches + tags as sorted name/OID pairs, matching the refs a normal push transfers. */
 export async function branchAndTagRefsOf(
 	dir: string,
-): Promise<{ name: string; oid: string }[]> {
+): Promise<{ name: string; oid: Oid }[]> {
 	const out = await spawnGit(
 		["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/"],
 		{ cwd: dir },
@@ -478,7 +514,7 @@ export async function seedGitRefs(
 	const direct = parseRefRows(showRef.stdout, "show-ref")
 	if (direct.length === 0) throw new Error(`${srcDir}: repository has no direct refs`)
 	for (const { name, oid } of direct) await refs.setRef(repoId, name, oid)
-	const { target: head } = await repositoryHeadOf(srcDir)
+	const head = await repositoryHeadTargetOf(srcDir)
 	await refs.setSymref(repoId, "HEAD", head)
 	return { directRefs: direct.length, head }
 }
@@ -495,6 +531,111 @@ export async function seedRepoIntoStore(
 ): Promise<void> {
 	await stores.objects.putPack(repoId, await loadAllObjects(srcDir))
 	await seedGitRefs(repoId, srcDir, stores.refs)
+}
+
+export type CanonicalStoreRef =
+	| { kind: "direct"; name: string; oid: Oid }
+	| { kind: "symbolic"; name: string; target: string }
+
+export type CanonicalStoreFixture = {
+	objects: readonly GitObjectWithOid[]
+	refs: readonly CanonicalStoreRef[]
+	encodings:
+		| { kind: "unchecked" }
+		| { kind: "exact"; objects: readonly GitObjectWithOid[] }
+}
+
+/** The complete direct-ref plus symbolic-HEAD identity stored for a canonical repo. */
+export async function canonicalStoreRefsOf(dir: string): Promise<CanonicalStoreRef[]> {
+	const [directRefs, head] = await Promise.all([
+		typedRefsOf(dir),
+		repositoryHeadTargetOf(dir),
+	])
+	const expectedDirectRefs: CanonicalStoreRef[] = directRefs.map(({ name, oid }) => ({
+		kind: "direct",
+		name,
+		oid,
+	}))
+	return [...expectedDirectRefs, { kind: "symbolic", name: "HEAD", target: head }]
+}
+
+/** Objects eligible for the stored encoding tier's inline-payload contract. */
+export function repackEligibleObjects(
+	objects: readonly GitObjectWithOid[],
+): GitObjectWithOid[] {
+	return objects.filter((object) => object.content.length < MAX_INLINE_BYTEA_BYTES)
+}
+
+/** Prove one Postgres fixture against its complete canonical object/ref identity. */
+export async function assertCanonicalStoreFixture(
+	sql: Sql,
+	repoName: string,
+	expected: CanonicalStoreFixture,
+): Promise<void> {
+	const [repo] = await sql<{ id: string }[]>`
+		select id::text as id from repos where name = ${repoName}`
+	if (repo === undefined)
+		throw new Error(`canonical fixture ${repoName} has no repos row`)
+	const expectedOids = (type?: GitObjectType): Oid[] =>
+		expected.objects
+			.filter((object) => type === undefined || object.type === type)
+			.map(({ oid }) => oid)
+			.sort()
+	const storedOids = async (
+		table: "git_object" | "git_commit" | "git_tag",
+	): Promise<Oid[]> =>
+		(
+			await sql<{ oid: string }[]>`
+				select encode(oid, 'hex') as oid from ${sql(table)}
+				where repo_id = ${repo.id}::bigint order by oid`
+		).map(({ oid }) => requireGitOid(oid, `${table} fixture row`))
+	const identities: readonly (readonly [string, readonly Oid[], readonly Oid[]])[] = [
+		["objects", await storedOids("git_object"), expectedOids()],
+		["commits", await storedOids("git_commit"), expectedOids("commit")],
+		["tags", await storedOids("git_tag"), expectedOids("tag")],
+	]
+	for (const [label, actual, wanted] of identities) {
+		if (JSON.stringify(actual) !== JSON.stringify(wanted)) {
+			throw new Error(
+				`canonical fixture ${repoName} has the wrong ${label}: ${oidDifference(actual, wanted)}`,
+			)
+		}
+	}
+	const rows = await sql<{ name: string; oid: string | null; target: string | null }[]>`
+		select name, encode(oid, 'hex') as oid, symref_target as target from git_ref
+		where repo_id = ${repo.id}::bigint order by name`
+	const actualRefs: CanonicalStoreRef[] = rows.map((row) => {
+		if (row.oid !== null && row.target === null) {
+			return {
+				kind: "direct",
+				name: row.name,
+				oid: requireGitOid(row.oid, `git_ref fixture row ${row.name}`),
+			}
+		}
+		if (row.oid === null && row.target !== null) {
+			return { kind: "symbolic", name: row.name, target: row.target }
+		}
+		throw new Error(`canonical fixture ${repoName} has malformed ref ${row.name}`)
+	})
+	const expectedRefs = [...expected.refs].sort((a, b) => a.name.localeCompare(b.name))
+	if (JSON.stringify(actualRefs) !== JSON.stringify(expectedRefs)) {
+		throw new Error(
+			`canonical fixture ${repoName} has the wrong refs: actual=${JSON.stringify(actualRefs)}, expected=${JSON.stringify(expectedRefs)}`,
+		)
+	}
+	if (expected.encodings.kind === "exact") {
+		const encodingOids = (
+			await sql<{ oid: string }[]>`
+				select encode(oid, 'hex') as oid from git_pack_encoding
+				where repo_id = ${repo.id}::bigint order by oid`
+		).map(({ oid }) => requireGitOid(oid, "git_pack_encoding fixture row"))
+		const expectedEncodingOids = expected.encodings.objects.map(({ oid }) => oid).sort()
+		if (JSON.stringify(encodingOids) !== JSON.stringify(expectedEncodingOids)) {
+			throw new Error(
+				`canonical fixture ${repoName} has the wrong encoding OIDs: ${oidDifference(encodingOids, expectedEncodingOids)}`,
+			)
+		}
+	}
 }
 
 export const PACK_DIR = ".git/objects/pack"
@@ -521,17 +662,17 @@ export async function packFileBytes(dir: string): Promise<number> {
 export type VerifyPackObject =
 	| {
 			kind: "whole"
-			oid: string
+			oid: Oid
 			offset: number
 			packedSize: number
 			size: number
 			type: GitObjectType
 	  }
 	| {
-			baseOid: string
+			baseOid: Oid
 			depth: number
 			kind: "delta"
-			oid: string
+			oid: Oid
 			offset: number
 			packedSize: number
 			size: number
@@ -554,9 +695,18 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 		const object = line.match(
 			/^([0-9a-f]{40})\s+(commit|tree|blob|tag)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)(?:\s+([0-9]+)\s+([0-9a-f]{40}))?$/,
 		)
-		if (object?.[1]) {
+		if (object !== null) {
 			const [, rawOid, rawType, rawSize, rawPackedSize, rawOffset, rawDepth, rawBaseOid] =
-				object as [string, string, string, string, string, string, string?, string?]
+				object
+			if (
+				rawOid === undefined ||
+				rawType === undefined ||
+				rawSize === undefined ||
+				rawPackedSize === undefined ||
+				rawOffset === undefined
+			) {
+				throw new Error(`verify-pack object row omitted a field: ${line}`)
+			}
 			const oid = requireGitOid(rawOid, `verify-pack line ${JSON.stringify(line)}`)
 			const type = requireGitObjectType(
 				rawType,
@@ -606,14 +756,14 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 }
 
 /** The sorted OIDs inside one pack, per `git verify-pack -v`. */
-export function parseVerifyPackObjectOids(stdout: string): string[] {
+export function parseVerifyPackObjectOids(stdout: string): Oid[] {
 	return parseVerifyPackObjects(stdout)
 		.map((object) => object.oid)
 		.sort()
 }
 
 /** The OIDs inside one pack, per `git verify-pack -v` (the bytes git received). */
-export async function packObjectOids(dir: string, packFile: string): Promise<string[]> {
+export async function packObjectOids(dir: string, packFile: string): Promise<Oid[]> {
 	const idx = join(dir, PACK_DIR, packFile.replace(/\.pack$/, ".idx"))
 	const out = await spawnGit(["verify-pack", "-v", idx], { cwd: dir })
 	return parseVerifyPackObjectOids(out.stdout)
@@ -623,12 +773,12 @@ export async function packObjectOids(dir: string, packFile: string): Promise<str
  * scan). */
 export async function objectsByType(
 	dir: string,
-): Promise<{ oid: string; type: GitObjectType }[]> {
+): Promise<{ oid: Oid; type: GitObjectType }[]> {
 	const list = await spawnGit(
 		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
 		{ cwd: dir },
 	)
-	const out: { oid: string; type: GitObjectType }[] = []
+	const out: { oid: Oid; type: GitObjectType }[] = []
 	for (const line of list.stdout.trim().split("\n").filter(Boolean)) {
 		const [oid, type] = line.split(" ")
 		if (oid === undefined || type === undefined || line.split(" ").length !== 2) {

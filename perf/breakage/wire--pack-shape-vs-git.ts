@@ -24,21 +24,24 @@
 import { mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
+import type { Oid } from "@/oid"
 import { serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
 	allRefsOf,
 	parseVerifyPackObjects,
-	repositoryHeadOf,
+	repositoryHeadTargetOf,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
+	assertCanonicalRealRepoStore,
 	canonicalV2Pack,
-	flag,
-	positiveIntegerFlag,
+	encodingCoverage,
 	postPggitV2Pack,
 	rawPackObjectOids,
 	repackExactly,
@@ -47,9 +50,18 @@ import {
 const REPO = "workspace/probe/shape"
 /** Two pggit repos in one schema: only one receives stored encodings. */
 const RAW_REPO = `${REPO}-raw`
-const RUNS_1 = positiveIntegerFlag("runs", 300)
-const RUNS_2 = positiveIntegerFlag("new", 60)
-const PG_URL = flag("pg", "postgres://postgres:postgres@localhost:6489/postgres")
+const args = parseArgs(
+	z
+		.object({
+			new: positiveIntegerArg.default(60),
+			pg: pgUrlArg,
+			runs: positiveIntegerArg.default(300),
+		})
+		.strict(),
+)
+const RUNS_1 = args.runs
+const RUNS_2 = args.new
+const PG_URL = args.pg
 
 const scratch: string[] = []
 const mk = (tag: string): string => {
@@ -85,7 +97,7 @@ async function packShape(dir: string): Promise<{
 	for (const f of indexes) {
 		const out = await spawnGit(["verify-pack", "-v", join(p, f)], { cwd: dir })
 		const offsetOf = new Map<string, number>()
-		const rows: { oid: string; offset: number; base?: string }[] = []
+		const rows: { oid: Oid; offset: number; base?: Oid }[] = []
 		for (const object of parseVerifyPackObjects(out.stdout)) {
 			entries++
 			offsetOf.set(object.oid, object.offset)
@@ -120,11 +132,10 @@ async function inventory(dir: string): Promise<string> {
 async function refs(dir: string): Promise<string> {
 	const direct = (await allRefsOf(dir)).map(({ name, oid }) => `${oid} ${name}`)
 	if (direct.length === 0) throw new Error(`${dir}: ref inventory was empty`)
-	const head = await repositoryHeadOf(dir)
-	return [...direct, `${head.oid} HEAD -> ${head.target}`].sort().join("\n")
+	return [...direct, `HEAD -> ${await repositoryHeadTargetOf(dir)}`].sort().join("\n")
 }
 
-function requireSameOids(label: string, observations: readonly string[][]): void {
+function requireSameOids(label: string, observations: readonly Oid[][]): void {
 	const expected = observations[observations.length - 1]
 	if (expected === undefined || expected.length === 0) {
 		throw new Error(`${label}: canonical git transmitted no objects`)
@@ -195,6 +206,16 @@ async function main(): Promise<void> {
 				`initial repack did not exercise stored deltas: ${JSON.stringify(r)}`,
 			)
 		}
+		const rawCoverage = await encodingCoverage(db.sql, RAW_REPO)
+		if (rawCoverage.encoded !== 0) {
+			throw new Error(
+				`unencoded control has ${rawCoverage.encoded} stored encodings before the cold fetch`,
+			)
+		}
+		await Promise.all([
+			assertCanonicalRealRepoStore(db.sql, REPO, src, { kind: "repacked" }),
+			assertCanonicalRealRepoStore(db.sql, RAW_REPO, src, { kind: "unencoded" }),
+		])
 		console.log(`repack: ${r.wholes} wholes + ${r.deltas} deltas\n`)
 
 		// ---- A. cold fetch -------------------------------------------------------
@@ -237,9 +258,9 @@ async function main(): Promise<void> {
 			canonicalV2Pack(bare, coldRequest),
 		])
 		const coldObjects = await Promise.all([
-			rawPackObjectOids(requireCloneDir(clones, "pggit-repacked"), coldPggit, false),
-			rawPackObjectOids(requireCloneDir(clones, "pggit-raw"), coldUnencoded, false),
-			rawPackObjectOids(requireCloneDir(clones, "git"), coldGit, false),
+			rawPackObjectOids(requireCloneDir(clones, "pggit-repacked"), coldPggit, "complete"),
+			rawPackObjectOids(requireCloneDir(clones, "pggit-raw"), coldUnencoded, "complete"),
+			rawPackObjectOids(requireCloneDir(clones, "git"), coldGit, "complete"),
 		])
 		requireSameOids(
 			"cold fetch",
@@ -276,13 +297,23 @@ async function main(): Promise<void> {
 				`incremental repack did not exercise stored deltas: ${JSON.stringify(r2)}`,
 			)
 		}
+		const rawCoverageAfterPush = await encodingCoverage(db.sql, RAW_REPO)
+		if (rawCoverageAfterPush.encoded !== 0) {
+			throw new Error(
+				`unencoded control has ${rawCoverageAfterPush.encoded} stored encodings before the warm fetch`,
+			)
+		}
+		await Promise.all([
+			assertCanonicalRealRepoStore(db.sql, REPO, grown, { kind: "repacked" }),
+			assertCanonicalRealRepoStore(db.sql, RAW_REPO, grown, { kind: "unencoded" }),
+		])
 		console.log(`\nrepack #2: ${r2.wholes} wholes + ${r2.deltas} deltas\n`)
 
 		console.log(`## B. +${RUNS_2}-commit warm fetch: client-indexed shape\n`)
 		console.log("| remote | max chain depth after |")
 		console.log("|---|---|")
 		for (const [label] of remotes) {
-			const dest = clones.get(label) as string
+			const dest = requireCloneDir(clones, label)
 			await spawnGit(["-c", "protocol.version=2", "fetch", "-q", "origin"], { cwd: dest })
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 			const s = await packShape(dest)
@@ -308,9 +339,9 @@ async function main(): Promise<void> {
 			canonicalV2Pack(bare, warmRequest),
 		])
 		const warmObjects = await Promise.all([
-			rawPackObjectOids(requireCloneDir(clones, "pggit-repacked"), warmPggit, true),
-			rawPackObjectOids(requireCloneDir(clones, "pggit-raw"), warmUnencoded, true),
-			rawPackObjectOids(requireCloneDir(clones, "git"), warmGit, true),
+			rawPackObjectOids(requireCloneDir(clones, "pggit-repacked"), warmPggit, "thin"),
+			rawPackObjectOids(requireCloneDir(clones, "pggit-raw"), warmUnencoded, "thin"),
+			rawPackObjectOids(requireCloneDir(clones, "git"), warmGit, "thin"),
 		])
 		requireSameOids(
 			"warm fetch",

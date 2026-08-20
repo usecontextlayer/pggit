@@ -17,34 +17,60 @@
  */
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
+import type { Oid } from "@/oid"
 import { serveOnPort } from "@/server"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids, listDifferences, revParse } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	listDifferences,
+	repackEligibleObjects,
+	requiredAt,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
+import {
+	requiredCollector,
+	requiredPhase,
+	requiredPositiveCounter,
+} from "../collector-evidence"
 import {
 	cleanupTmp,
-	increasingIntegerListFlag,
 	mb,
 	mkTmp,
-	PG_URL,
+	reachableObjects,
 	secs,
 	seedRepo,
 	table,
 } from "./_perf-util"
 
-const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
+const { pg: PG_URL, sizes: SIZES } = parseArgs(
+	z
+		.object({
+			pg: pgUrlArg,
+			sizes: increasingIntegerListArg([250, 500, 1000, 2000]),
+		})
+		.strict(),
+)
 /** Incremental steps measured per size (the last N commits are held back). */
 const STEPS = 8
 /** pggit/git per-fetch latency ratio at which this is called broken. */
 const RATIO_LIMIT = 5
 
 const median = (xs: number[]): number =>
-	[...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)] as number
+	requiredAt(
+		[...xs].sort((a, b) => a - b),
+		Math.floor(xs.length / 2),
+		"median sample",
+	)
 /** The least contention-polluted statistic on a loaded machine: the best case. */
 const best = (xs: number[]): number => Math.min(...xs)
 
@@ -67,7 +93,7 @@ async function measure(n: number): Promise<Row> {
 			throw new Error(`fixture has ${commits.length} commits; need more than ${STEPS}`)
 		}
 		const start = commits.length - STEPS - 1
-		const tip = (i: number): string => commits[start + i] as string
+		const tip = (i: number) => requiredAt(commits, start + i, "incremental-fetch commit")
 
 		// --- canonical git: a bare repo holding every object, ref rewound ----
 		const gitRemote = join(mkTmp(`inc-git-${n}`), "remote.git")
@@ -78,7 +104,7 @@ async function measure(n: number): Promise<Row> {
 			cwd: "/tmp",
 		})
 		const gitFetches: number[] = []
-		const gitStates: { objectsServed: number; oids: string[]; tip: string }[] = []
+		const gitStates: { objectsServed: number; oids: Oid[]; tip: Oid }[] = []
 		let previousGitOids = await allObjectOids(gitClient)
 		for (let i = 1; i <= STEPS; i++) {
 			await spawnGit(["update-ref", "refs/heads/main", tip(i)], { cwd: gitRemote })
@@ -96,17 +122,30 @@ async function measure(n: number): Promise<Row> {
 
 		// --- pggit: same objects, same walk ---------------------------------
 		const db = await createIsolatedSchema(PG_URL)
+		let server: Awaited<ReturnType<typeof serveOnPort>> | undefined
 		try {
-			const seeded = await seedRepo(db.sql, "probe/inc", src)
+			const expectedObjects = await reachableObjects(src)
+			const seeded = await seedRepo(db.sql, "probe/inc", src, expectedObjects)
 			const repacked = await createRepack(db.sql).repack("probe/inc")
-			if (repacked.wholes + repacked.deltas !== seeded.objects || repacked.deltas <= 0) {
+			if (
+				repacked.wholes + repacked.deltas !== seeded.eligibleObjects ||
+				repacked.deltas <= 0
+			) {
 				throw new Error(
-					`delta fixture repacked ${repacked.wholes} wholes + ${repacked.deltas} deltas for ${seeded.objects} objects`,
+					`delta fixture repacked ${repacked.wholes} wholes + ${repacked.deltas} deltas for ${seeded.eligibleObjects} eligible objects`,
 				)
 			}
+			await assertCanonicalStoreFixture(db.sql, "probe/inc", {
+				encodings: {
+					kind: "exact",
+					objects: repackEligibleObjects(expectedObjects),
+				},
+				objects: expectedObjects,
+				refs: await canonicalStoreRefsOf(src),
+			})
 			const refs = createRefStore(db.sql)
 			await refs.setRef("probe/inc", "refs/heads/main", tip(0))
-			const server = await serveOnPort(
+			server = await serveOnPort(
 				createGitApp(createGitDeps(db.sql), { instrument: true }),
 				0,
 			)
@@ -131,34 +170,19 @@ async function measure(n: number): Promise<Row> {
 					cwd: client,
 				})
 				pggitFetches.push(Date.now() - t0)
-				const runs = collectedRuns().filter((r) => r.label === "fetch")
-				if (runs.length !== 1) {
-					throw new Error(
-						`step ${i}: expected one fetch instrumentation run, got ${runs.length}`,
-					)
-				}
-				const run = runs[0]
-				if (!run) throw new Error(`step ${i}: fetch instrumentation run disappeared`)
-				const packBytes = run.counters.get("packBytes")
-				const objectsServed = run.counters.get("objectsServed")
-				const deltasServed = run.counters.get("deltasServed")
-				const closure = run.phaseMs.get("closure")
-				const encode = run.phaseMs.get("pack-encode")
-				if (packBytes === undefined || packBytes <= 0) {
-					throw new Error(`step ${i}: missing/nonpositive packBytes counter`)
-				}
-				if (closure === undefined || encode === undefined || closure + encode <= 0) {
-					throw new Error(`step ${i}: missing closure/pack-encode instrumentation`)
-				}
+				const context = `incremental-fetch step ${i}`
+				const run = requiredCollector(collectedRuns(), "fetch", context)
+				const packBytes = requiredPositiveCounter(run, "packBytes", context)
+				const objectsServed = requiredPositiveCounter(run, "objectsServed", context)
+				requiredPositiveCounter(run, "deltasServed", context)
+				const closure = requiredPhase(run, "closure", context)
+				const encode = requiredPhase(run, "pack-encode", context)
 				const expected = gitStates[i - 1]
 				if (!expected) throw new Error(`step ${i}: missing canonical state`)
 				if (objectsServed !== expected.objectsServed) {
 					throw new Error(
 						`step ${i}: served ${String(objectsServed)}/${expected.objectsServed} canonical new objects`,
 					)
-				}
-				if (deltasServed === undefined || deltasServed <= 0) {
-					throw new Error(`step ${i}: served no deltas`)
 				}
 				packs.push(packBytes)
 				closures.push(closure / (closure + encode))
@@ -171,8 +195,18 @@ async function measure(n: number): Promise<Row> {
 				) {
 					throw new Error(`step ${i}: pggit fetch diverged from canonical git`)
 				}
+				await assertCanonicalStoreFixture(db.sql, "probe/inc", {
+					encodings: {
+						kind: "exact",
+						objects: repackEligibleObjects(expectedObjects),
+					},
+					objects: expectedObjects,
+					refs: [
+						{ kind: "direct", name: "refs/heads/main", oid: tip(i) },
+						{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+					],
+				})
 			}
-			await server.close()
 			if (pggitFetches.some((ms) => ms <= 0) || gitFetches.some((ms) => ms <= 0)) {
 				throw new Error("fetch timer recorded a nonpositive latency")
 			}
@@ -187,7 +221,11 @@ async function measure(n: number): Promise<Row> {
 				pggitMs: median(pggitFetches),
 			}
 		} finally {
-			await db.drop()
+			try {
+				await server?.close()
+			} finally {
+				await db.drop()
+			}
 		}
 	} finally {
 		rmSync(src, { force: true, recursive: true })
@@ -228,8 +266,8 @@ async function main(): Promise<void> {
 
 	const exps: (string | number)[][] = []
 	for (let i = 1; i < rows.length; i++) {
-		const a = rows[i - 1] as Row
-		const b = rows[i] as Row
+		const a = requiredAt(rows, i - 1, "previous incremental-fetch measurement")
+		const b = requiredAt(rows, i, "current incremental-fetch measurement")
 		const k = Math.log2(b.n / a.n)
 		exps.push([
 			`${a.n}→${b.n}`,
@@ -242,7 +280,7 @@ async function main(): Promise<void> {
 	)
 	console.log(table(["step", "pggit exp", "git exp"], exps))
 
-	const last = rows[rows.length - 1] as Row
+	const last = requiredAt(rows, rows.length - 1, "largest incremental-fetch measurement")
 	const ratio = last.pggitBest / last.gitBest
 	console.log(
 		`\nFAIL CONDITION: a one-commit fetch costs > ${RATIO_LIMIT}× canonical git's, or grows with history length.`,

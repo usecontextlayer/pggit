@@ -28,24 +28,33 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { deflateSync } from "node:zlib"
+import { z } from "zod"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createGitApp, createGitDeps } from "@/index"
-import { type Collector, collectedRuns, resetCollected } from "@/instrument"
-import { parseOid } from "@/oid"
+import { collectedRuns, resetCollected } from "@/instrument"
+import type { Oid } from "@/oid"
 import { applyDelta, encodeDelta } from "@/pack/delta"
 import { serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
 	gitLogRawBasePairs,
 	gitReachableOids,
 	loadGitObjects,
+	repackEligibleObjects,
 	seedGitRefs,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
-import { flag, positiveIntegerFlag } from "./args"
+import { nonemptyStringArg, parseArgs, pgUrlArg, positiveIntegerArg } from "./args"
+import {
+	requiredCollector,
+	requiredPhase,
+	requiredPositiveCounter,
+} from "./collector-evidence"
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
@@ -53,10 +62,37 @@ const REPO_ID = "workspace/slate/probe"
 /** Cap the bytes in one COPY round-trip; late-history trees are ~90 KB each. */
 const INGEST_BYTES = 16_000_000
 
-const REPO = flag("repo", "")
-const RUNS = positiveIntegerFlag("runs", 1476)
-const DOC_COUNT = positiveIntegerFlag("docs", 145)
-const PG_URL = flag("pg", "postgres://postgres:postgres@localhost:6489/postgres")
+type ProbeSource = { kind: "generated" } | { kind: "repository"; path: string }
+
+const args = parseArgs(
+	z
+		.object({
+			docs: positiveIntegerArg.default(145),
+			pg: pgUrlArg,
+			repo: nonemptyStringArg.optional(),
+			runs: positiveIntegerArg.default(1476),
+		})
+		.strict()
+		.transform(
+			({
+				repo,
+				...values
+			}): {
+				docs: number
+				pg: string
+				runs: number
+				source: ProbeSource
+			} => ({
+				...values,
+				source:
+					repo === undefined ? { kind: "generated" } : { kind: "repository", path: repo },
+			}),
+		),
+)
+const SOURCE = args.source
+const RUNS = args.runs
+const DOC_COUNT = args.docs
+const PG_URL = args.pg
 
 const mb = (bytes: number): string => `${(bytes / 1_000_000).toFixed(2)} MB`
 const secs = (ms: number): string => `${(ms / 1000).toFixed(2)}s`
@@ -136,32 +172,7 @@ async function reachableObjects(dir: string): Promise<Obj[]> {
 	return loadGitObjects(dir, await gitReachableOids(dir))
 }
 
-function requiredMetric(
-	run: Collector | undefined,
-	metric: string,
-	where: string,
-	positive = false,
-): number {
-	if (run === undefined)
-		throw new Error(`${where}: fetch instrumentation was not collected`)
-	const value = run.counters.get(metric)
-	if (value === undefined || !Number.isFinite(value) || (positive && value <= 0)) {
-		throw new Error(`${where}: required ${metric} counter is missing or invalid`)
-	}
-	return value
-}
-
-function requiredPhase(run: Collector | undefined, phase: string, where: string): number {
-	if (run === undefined)
-		throw new Error(`${where}: fetch instrumentation was not collected`)
-	const value = run.phaseMs.get(phase)
-	if (value === undefined || !Number.isFinite(value) || value <= 0) {
-		throw new Error(`${where}: required ${phase} phase is missing or invalid`)
-	}
-	return value
-}
-
-async function verifyClone(dir: string, expectedOids: readonly string[]): Promise<void> {
+async function verifyClone(dir: string, expectedOids: readonly Oid[]): Promise<void> {
 	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dir })
 	const actual = await gitReachableOids(dir)
 	const expected = [...expectedOids].sort()
@@ -217,10 +228,10 @@ async function main(): Promise<void> {
 
 	// --- the repo under test ------------------------------------------------
 	const src = join(mkdir("src"), "repo")
-	if (REPO) {
-		console.log(`# delta-probe — real repo: ${REPO}\n`)
+	if (SOURCE.kind === "repository") {
+		console.log(`# delta-probe — real repo: ${SOURCE.path}\n`)
 		// Copy before touching anything: the customer mirror stays pristine.
-		cpSync(REPO, src, { recursive: true })
+		cpSync(SOURCE.path, src, { recursive: true })
 	} else {
 		console.log(`# delta-probe — generated shape: ${RUNS} runs, ${DOC_COUNT} docs\n`)
 		mkdirSync(src)
@@ -244,7 +255,7 @@ async function main(): Promise<void> {
 	if (eligibleObjects === 0) throw new Error("delta-probe has no repack-eligible objects")
 	const expectedOids = objects.map((object) => object.oid)
 	const byType = new Map<string, { count: number; raw: number; deflated: number }>()
-	const deflatedOf = new Map<string, number>()
+	const deflatedOf = new Map<Oid, number>()
 	for (const o of objects) {
 		const d = deflateSync(o.content).length
 		deflatedOf.set(o.oid, d)
@@ -312,32 +323,14 @@ async function main(): Promise<void> {
 		await flush()
 		const ingestMs = Date.now() - ingestStart
 
-		const seededRefs = await seedGitRefs(REPO_ID, src, refs)
-		const [census] = await db.sql<
-			{ objects: string; commits: string; tags: string; refs: string }[]
-		>`select
-			(select count(*) from git_object)::text as objects,
-			(select count(*) from git_commit)::text as commits,
-			(select count(*) from git_tag)::text as tags,
-			(select count(*) from git_ref)::text as refs`
-		if (census === undefined) throw new Error("ingest census returned no row")
-		const expectedCensus = {
-			commits: objects.filter((object) => object.type === "commit").length,
-			objects: objects.length,
-			refs: seededRefs.directRefs + 1,
-			tags: objects.filter((object) => object.type === "tag").length,
-		}
-		const actualCensus = {
-			commits: Number(census.commits),
-			objects: Number(census.objects),
-			refs: Number(census.refs),
-			tags: Number(census.tags),
-		}
-		if (JSON.stringify(actualCensus) !== JSON.stringify(expectedCensus)) {
-			throw new Error(
-				`ingest census mismatch: expected ${JSON.stringify(expectedCensus)}, got ${JSON.stringify(actualCensus)}`,
-			)
-		}
+		await seedGitRefs(REPO_ID, src, refs)
+		const expectedCommits = objects.filter((object) => object.type === "commit").length
+		const expectedTags = objects.filter((object) => object.type === "tag").length
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: [] },
+			objects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		console.log(`ingested ${objects.length} objects in ${secs(ingestMs)}`)
 
 		const [sizes] = await db.sql<{ total: string; heap: string; indexes: string }[]>`
@@ -368,24 +361,11 @@ async function main(): Promise<void> {
 				+ (select coalesce(sum(pg_total_relation_size(inhrelid)), 0)
 					from pg_inherits where inhparent = 'git_tag'::regclass)
 			)::text as total`
-		const [topoRows] = await db.sql<{ commits: string; tags: string }[]>`
-			select (select count(*) from git_commit)::text as commits,
-				(select count(*) from git_tag)::text as tags`
-		if (topoSizes === undefined || topoRows === undefined) {
-			throw new Error("topology size/census query returned no row")
-		}
-		if (
-			Number(topoRows.commits) !== expectedCensus.commits ||
-			Number(topoRows.tags) !== expectedCensus.tags
-		) {
-			throw new Error(
-				`topology census mismatch: expected ${expectedCensus.commits}/${expectedCensus.tags}, got ${topoRows.commits}/${topoRows.tags}`,
-			)
-		}
+		if (topoSizes === undefined) throw new Error("topology size query returned no row")
 		console.log(
 			`\ntopology rows (\`git_commit\` + \`git_tag\`) on disk: ` +
-				`**${mb(Number(topoSizes.total))}** — ${topoRows.commits} commit rows, ` +
-				`${topoRows.tags} tag rows (linear in history; the quadratic git_edge table is gone, S2)`,
+				`**${mb(Number(topoSizes.total))}** — ${expectedCommits} commit rows, ` +
+				`${expectedTags} tag rows (linear in history; the quadratic git_edge table is gone, S2)`,
 		)
 
 		await db.sql`create table probe_trees (content bytea compression lz4)`
@@ -435,15 +415,14 @@ async function main(): Promise<void> {
 		server = undefined
 		await verifyClone(dest, expectedOids)
 
-		const fetchRun = collectedRuns().find((r) => r.label === "fetch")
+		const fetchRun = requiredCollector([...collectedRuns()], "fetch", "unrepacked clone")
 		const closureMs = requiredPhase(fetchRun, "closure", "unrepacked clone")
 		const encodeMs = requiredPhase(fetchRun, "pack-encode", "unrepacked clone")
-		const packBytes = requiredMetric(fetchRun, "packBytes", "unrepacked clone", true)
-		const objectsServed = requiredMetric(
+		const packBytes = requiredPositiveCounter(fetchRun, "packBytes", "unrepacked clone")
+		const objectsServed = requiredPositiveCounter(
 			fetchRun,
 			"objectsServed",
 			"unrepacked clone",
-			true,
 		)
 		if (objectsServed !== objects.length) {
 			throw new Error(
@@ -494,6 +473,11 @@ async function main(): Promise<void> {
 				`encoding census mismatch: expected ${eligibleObjects}/${repackResult.deltas}, got ${encodingCensus.rows}/${encodingCensus.deltas}`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+			objects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		console.log(
 			`repack: ${repackResult.wholes} wholes + ${repackResult.deltas} deltas in ${secs(Date.now() - repackStart)}`,
 		)
@@ -517,14 +501,17 @@ async function main(): Promise<void> {
 		const cpu2 = process.cpuUsage(cpuBefore2)
 		await server2.close()
 		server2 = undefined
-		const fetchRun2 = collectedRuns().find((r) => r.label === "fetch")
-		const packBytes2 = requiredMetric(fetchRun2, "packBytes", "repacked clone", true)
-		const deltasServed = requiredMetric(fetchRun2, "deltasServed", "repacked clone", true)
-		const objectsServed2 = requiredMetric(
+		const fetchRun2 = requiredCollector([...collectedRuns()], "fetch", "repacked clone")
+		const packBytes2 = requiredPositiveCounter(fetchRun2, "packBytes", "repacked clone")
+		const deltasServed = requiredPositiveCounter(
+			fetchRun2,
+			"deltasServed",
+			"repacked clone",
+		)
+		const objectsServed2 = requiredPositiveCounter(
 			fetchRun2,
 			"objectsServed",
 			"repacked clone",
-			true,
 		)
 		if (objectsServed2 !== objects.length) {
 			throw new Error(
@@ -546,10 +533,10 @@ async function main(): Promise<void> {
 		console.log(`\n## D. does a CHEAP base heuristic match git?\n`)
 		const byOid = new Map(objects.map((o) => [o.oid, o]))
 		const pairs = await gitLogRawBasePairs(src)
-		const treePairs = new Map<string, string>()
+		const treePairs = new Map<Oid, Oid>()
 		for (const [targetOid, baseOid] of pairs) {
-			const target = byOid.get(parseOid(targetOid))
-			const base = byOid.get(parseOid(baseOid))
+			const target = byOid.get(targetOid)
+			const base = byOid.get(baseOid)
 			if (target?.type === "tree" && base?.type === "tree") {
 				treePairs.set(targetOid, baseOid)
 			}
@@ -557,7 +544,7 @@ async function main(): Promise<void> {
 		if (treePairs.size === 0) {
 			throw new Error("delta-probe fixture produced no reachable tree base/target pairs")
 		}
-		const deflatedBytes = (oid: string): number => {
+		const deflatedBytes = (oid: Oid): number => {
 			const bytes = deflatedOf.get(oid)
 			if (bytes === undefined)
 				throw new Error(`missing deflated-byte measurement for ${oid}`)
@@ -577,7 +564,7 @@ async function main(): Promise<void> {
 			let deltaBytes = 0
 			let wholeBytes = 0
 			let deltified = 0
-			const depthOf = new Map<string, number>()
+			const depthOf = new Map<Oid, number>()
 
 			// Oldest-first: a base's representation must be final before its dependents are
 			// considered, or a target recorded at depth 1 silently deepens later.
@@ -586,11 +573,15 @@ async function main(): Promise<void> {
 				depthOf.set(o.oid, 0)
 			}
 			for (const [targetOid, baseOid] of treePairs) {
-				const target = byOid.get(parseOid(targetOid))
-				const base = byOid.get(parseOid(baseOid))
+				const target = byOid.get(targetOid)
+				const base = byOid.get(baseOid)
 				if (!target || !base)
 					throw new Error(`tree pair vanished: ${baseOid} -> ${targetOid}`)
-				const candidate = (depthOf.get(baseOid) ?? 0) + 1
+				const baseDepth = depthOf.get(baseOid)
+				if (baseDepth === undefined) {
+					throw new Error(`tree base ${baseOid} has no representation depth`)
+				}
+				const candidate = baseDepth + 1
 				if (candidate > cap) continue // stays whole, depth 0
 				const whole = deflatedBytes(targetOid)
 				const delta = encodeDelta(base.content, target.content)
@@ -605,7 +596,12 @@ async function main(): Promise<void> {
 				depthOf.set(targetOid, candidate)
 			}
 			for (const o of objects) {
-				if (o.type === "tree" && (depthOf.get(o.oid) ?? 0) > 0) continue
+				if (o.type === "tree") {
+					const depth = depthOf.get(o.oid)
+					if (depth === undefined)
+						throw new Error(`tree ${o.oid} has no representation depth`)
+					if (depth > 0) continue
+				}
 				wholeBytes += deflatedBytes(o.oid)
 			}
 			if (deltified === 0) {
@@ -638,7 +634,7 @@ async function main(): Promise<void> {
 		// 1 while storing only 1/K whole trees. Depth and base distance are separable, and
 		// conflating them is what made the cap look expensive.
 		console.log(`\n## E. star topology — depth 1, anchor every K versions\n`)
-		const lineageNext = new Map<string, string[]>()
+		const lineageNext = new Map<Oid, Oid[]>()
 		for (const [target, base] of treePairs) {
 			const children = lineageNext.get(base) ?? []
 			children.push(target)
@@ -653,16 +649,16 @@ async function main(): Promise<void> {
 		const anchorRows: string[] = []
 		for (const K of [4, 8, 16, 32, 64, 128]) {
 			let bytes = 0
-			const deltaOf = new Set<string>()
-			const visitedTargets = new Set<string>()
+			const deltaOf = new Set<Oid>()
+			const visitedTargets = new Set<Oid>()
 			const pending = lineageHeads.map((oid) => ({ anchor: oid, distance: 0, oid }))
 			while (pending.length > 0) {
 				const current = pending.pop()
 				if (current === undefined) throw new Error("star traversal lost pending entry")
 				for (const childOid of lineageNext.get(current.oid) ?? []) {
 					visitedTargets.add(childOid)
-					const child = byOid.get(parseOid(childOid))
-					const anchor = byOid.get(parseOid(current.anchor))
+					const child = byOid.get(childOid)
+					const anchor = byOid.get(current.anchor)
 					if (child?.type !== "tree" || anchor?.type !== "tree") {
 						throw new Error(
 							`tree lineage object vanished: ${current.anchor} -> ${childOid}`,

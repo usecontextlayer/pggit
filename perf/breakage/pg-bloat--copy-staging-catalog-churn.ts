@@ -36,28 +36,33 @@
  *   npx tsx perf/breakage/pg-bloat--copy-staging-catalog-churn.ts --commits=600
  */
 import postgres from "postgres"
+import { z } from "zod"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	parseRevListObjectOids,
+	repackEligibleObjects,
+	requiredAt,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	backendWal,
 	COMMITTER,
 	catalogSizes,
-	DEFAULT_PG_URL,
 	filler,
-	flag,
 	flushStats,
 	kb,
 	mb,
 	objectsBetween,
 	pad,
 	padr,
-	positiveIntegerFlag,
 	runDirName,
 	scratchRoot,
 	taggedPool,
@@ -71,9 +76,19 @@ const PUSH_APP = "pgbloat-staging-push"
 /** iterations in the isolated per-flush cost loop */
 const LOOP = 200
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-const COMMITS = positiveIntegerFlag("commits", 600)
-const PUSH_BATCH = positiveIntegerFlag("batch", 10)
+const {
+	batch: PUSH_BATCH,
+	commits: COMMITS,
+	pg: PG_URL,
+} = parseArgs(
+	z
+		.object({
+			batch: positiveIntegerArg.default(10),
+			commits: positiveIntegerArg.default(600),
+			pg: pgUrlArg,
+		})
+		.strict(),
+)
 const REPO_ID = "workspace/slate/staging"
 
 function buildStream(): string {
@@ -108,16 +123,6 @@ function buildStream(): string {
 }
 
 async function main(): Promise<void> {
-	if (
-		!Number.isInteger(COMMITS) ||
-		COMMITS < 1 ||
-		!Number.isInteger(PUSH_BATCH) ||
-		PUSH_BATCH < 1
-	) {
-		throw new Error(
-			`commits and batch must be positive integers: ${COMMITS}, ${PUSH_BATCH}`,
-		)
-	}
 	const scratch = scratchRoot("stg")
 	const db = await createIsolatedSchema(PG_URL)
 	const stg = taggedPool(PG_URL, db.schema, STG_APP, 1)
@@ -229,7 +234,7 @@ async function main(): Promise<void> {
 		const pushWal0 = await backendWal(db.sql, PUSH_APP)
 		stagingCreates.clear()
 
-		let prev = commits[0] as string
+		let prev = requiredAt(commits, 0, "initial staging-workload commit")
 		await store.putPack(
 			REPO_ID,
 			(await objectsBetween(src, prev)).map((o) => ({
@@ -238,10 +243,15 @@ async function main(): Promise<void> {
 			})),
 		)
 		await refs.setRef(REPO_ID, "refs/heads/main", prev)
+		await refs.setSymref(REPO_ID, "HEAD", "refs/heads/main")
 		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", prev)
 
 		for (let i = 1; i < commits.length; i += PUSH_BATCH) {
-			const tip = commits[Math.min(i + PUSH_BATCH - 1, commits.length - 1)] as string
+			const tip = requiredAt(
+				commits,
+				Math.min(i + PUSH_BATCH - 1, commits.length - 1),
+				"staging-workload batch tip",
+			)
 			await store.putPack(
 				REPO_ID,
 				(await objectsBetween(src, tip, prev)).map((o) => ({
@@ -254,9 +264,10 @@ async function main(): Promise<void> {
 			prev = tip
 		}
 		const repackRes = await createRepack(app).repack(REPO_ID)
-		const finalTip = commits.at(-1) as string
+		const finalTip = requiredAt(commits, commits.length - 1, "staging-workload final tip")
 		const canonicalObjects = await objectsBetween(src, finalTip)
 		const expectedObjects = canonicalObjects.length
+		const expectedEncodings = repackEligibleObjects(canonicalObjects).length
 		const [census] = await db.sql<
 			{
 				objects: string
@@ -275,27 +286,20 @@ async function main(): Promise<void> {
 			!census ||
 			Number(census.objects) !== expectedObjects ||
 			Number(census.commits) !== commits.length ||
-			Number(census.encodings) !== expectedObjects ||
+			Number(census.encodings) !== expectedEncodings ||
 			Number(census.files) !== 40 + COMMITS ||
 			census.tip !== finalTip ||
-			repackRes.wholes + repackRes.deltas !== expectedObjects
+			repackRes.wholes + repackRes.deltas !== expectedEncodings
 		) {
 			throw new Error(
-				`workload prerequisite mismatch: ${JSON.stringify(census)}, expected objects/encodings=${expectedObjects}, commits=${commits.length}, files=${40 + COMMITS}, tip=${finalTip}`,
+				`workload prerequisite mismatch: ${JSON.stringify(census)}, expected objects=${expectedObjects}, eligible encodings=${expectedEncodings}, commits=${commits.length}, files=${40 + COMMITS}, tip=${finalTip}`,
 			)
 		}
-		const expectedOids = canonicalObjects.map((object) => object.oid).sort()
-		const actualOids = (
-			await db.sql<
-				{ oid: string }[]
-			>`select encode(oid, 'hex') as oid from git_object order by oid`
-		).map((row) => row.oid)
-		if (
-			actualOids.length !== expectedOids.length ||
-			actualOids.some((oid, i) => oid !== expectedOids[i])
-		) {
-			throw new Error("workload Postgres OIDs do not match canonical git")
-		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(canonicalObjects) },
+			objects: canonicalObjects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		const requiredTargets = ["git_object", "git_pack_encoding", "repo_file"] as const
 		for (const target of requiredTargets) {
 			const observed = stagingCreates.get(target)
@@ -355,8 +359,8 @@ async function main(): Promise<void> {
 		console.log(
 			`\nreading: at ${perFlush.toFixed(0)} bytes of WAL per staging table this is a real but SMALL\n` +
 				`cost against a push that writes megabytes — it is a "document it" item, not a defect,\n` +
-				`until flush counts rise (a backfill repack of a 5k-commit repo is ~14 flushes, a GC pass\n` +
-				`over a 100k-object repo is ~10). The part worth watching is not WAL but that the rows\n` +
+				`until flush counts rise (a backfill repack of a 5k-commit repo is ~14 flushes; a first\n` +
+				`repack over 100k objects is ~100). The part worth watching is not WAL but that the rows\n` +
 				`land in DATABASE-WIDE catalogs running the default autovacuum policy.`,
 		)
 		if ((perFlush * observedFlushes) / pushWal > SHARE_LIMIT) process.exitCode = 1

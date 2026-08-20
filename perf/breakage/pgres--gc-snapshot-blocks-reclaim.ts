@@ -30,22 +30,31 @@
  *
  * FAILURE BOUND (non-zero exit): a GC pass holds its snapshot for more than 50% of
  * its own wall time (so the drain's snapshot duty cycle approaches 1 as soon as
- * passes are back to back), OR part 2 shows dead tuples surviving a VACUUM taken
- * under a held snapshot while a clear-horizon VACUUM removes them — confirming the
- * mechanism.
+ * passes are back to back). Part 2 is the causal prerequisite for interpreting that
+ * score: it must prove the held snapshot blocked reclaim and the clear-horizon
+ * VACUUM removed the same churn, but confirmation of the documented MVCC mechanism
+ * is evidence, not a second performance failure.
  *
  *   npx tsx perf/breakage/pgres--gc-snapshot-blocks-reclaim.ts
  */
 import postgres, { type Sql } from "postgres"
+import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
+import {
+	assertCanonicalStoreFixture,
+	repackEligibleObjects,
+	requiredAt,
+	requireGitOid,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import { parseArgs, pgUrlArg } from "../args"
 import {
 	cleanupTmp,
 	fastImport,
 	initRepo,
+	type Obj,
 	objectsBetween,
-	PG_URL,
 	revParse,
 	runCommits,
 	schemaStats,
@@ -57,6 +66,7 @@ import {
 } from "./_pgres-util"
 
 const APP = "pgres-snapshot-probe"
+const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
 /** Append-only history: tree bytes grow QUADRATICALLY, so 2400 commits is already
  * ~180 MB of object content. Past that the fixture harness (`spawnGit` buffers
  * `cat-file --batch` output as one JS string) hits V8's 512 MB string cap — a
@@ -72,6 +82,36 @@ type Sample = {
 	othersLagS: number
 }
 
+function requireNonnegativeInteger(value: string, context: string): number {
+	const parsed = Number(value)
+	if (!Number.isSafeInteger(parsed) || parsed < 0) {
+		throw new Error(
+			`${context}: expected a nonnegative integer, got ${JSON.stringify(value)}`,
+		)
+	}
+	return parsed
+}
+
+async function requireRepoCensus(
+	pg: Sql,
+	repo: string,
+	objects: readonly Obj[],
+	tip: string,
+): Promise<void> {
+	await assertCanonicalStoreFixture(pg, repo, {
+		encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+		objects,
+		refs: [
+			{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			{
+				kind: "direct",
+				name: "refs/heads/main",
+				oid: requireGitOid(tip, `${repo} main tip`),
+			},
+		],
+	})
+}
+
 /** Longest-held snapshot age (ms) among backends with this harness's app name. */
 async function ownSnapshotAge(watch: Sql): Promise<number> {
 	const [r] = await watch<{ ms: string }[]>`
@@ -79,7 +119,7 @@ async function ownSnapshotAge(watch: Sql): Promise<number> {
 		from pg_stat_activity
 		where application_name = ${APP} and backend_xmin is not null`
 	if (!r) throw new Error("own-snapshot census returned no row")
-	return Number(r.ms)
+	return requireNonnegativeInteger(r.ms, "own-snapshot age")
 }
 
 /** Longest-held snapshot age (s) among OTHER backends — the sibling agents. */
@@ -90,7 +130,7 @@ async function othersLag(watch: Sql): Promise<number> {
 		where application_name <> ${APP} and backend_type = 'client backend'
 			and backend_xmin is not null`
 	if (!r) throw new Error("other-snapshot census returned no row")
-	return Number(r.s)
+	return requireNonnegativeInteger(r.s, "other-snapshot age")
 }
 
 async function main(): Promise<void> {
@@ -131,9 +171,14 @@ async function main(): Promise<void> {
 			await seedObjects(gcPg, repo, objects)
 			await setMain(gcPg, repo, tip)
 			const encoded = await repack.repack(repo)
-			if (encoded.wholes + encoded.deltas !== objects.length) {
+			const eligibleObjects = repackEligibleObjects(objects)
+			if (
+				eligibleObjects.length === 0 ||
+				encoded.wholes + encoded.deltas !== eligibleObjects.length
+			) {
 				throw new Error(`${repo}: repack covered incomplete object set`)
 			}
+			await requireRepoCensus(gcPg, repo, objects, tip)
 
 			let holdMs = 0
 			let sampling = true
@@ -161,6 +206,7 @@ async function main(): Promise<void> {
 					`${repo}: invalid GC measurement deleted=${result.deletedObjects}, observed=${observed}, hold=${holdMs}, wall=${gcMs}`,
 				)
 			}
+			await requireRepoCensus(gcPg, repo, objects, tip)
 			samples.push({
 				commits,
 				dutyCycle: holdMs / gcMs,
@@ -193,9 +239,10 @@ async function main(): Promise<void> {
 			),
 		)
 		const worst = Math.max(...samples.map((s) => s.dutyCycle))
-		const biggest = samples[samples.length - 1] as Sample
+		const smallest = requiredAt(samples, 0, "smallest snapshot sample")
+		const biggest = requiredAt(samples, samples.length - 1, "largest snapshot sample")
 		console.log(
-			`\nsnapshot hold scales with the closure walk: ${(biggest.holdMs / (samples[0] as Sample).holdMs).toFixed(1)}× from ${(samples[0] as Sample).objects} to ${biggest.objects} objects.`,
+			`\nsnapshot hold scales with the closure walk: ${(biggest.holdMs / smallest.holdMs).toFixed(1)}× from ${smallest.objects} to ${biggest.objects} objects.`,
 		)
 		console.log(
 			`worst duty cycle ${(worst * 100).toFixed(0)}% — with the drain running passes back to back over a fleet, the DATABASE-WIDE xmin horizon is held ~that fraction of the time.`,
@@ -234,12 +281,15 @@ async function main(): Promise<void> {
 		await seedObjects(gcPg, repo, allObjects)
 		await setMain(gcPg, repo, tip)
 		const demoRepack = await repack.repack(repo)
+		const eligibleDemoObjects = repackEligibleObjects(allObjects)
 		if (
-			demoRepack.wholes + demoRepack.deltas !== allObjects.length ||
+			eligibleDemoObjects.length === 0 ||
+			demoRepack.wholes + demoRepack.deltas !== eligibleDemoObjects.length ||
 			tailObjects.length === 0
 		) {
 			throw new Error("snapshot demo did not establish a complete nonempty churn tier")
 		}
+		await requireRepoCensus(gcPg, repo, allObjects, tip)
 
 		const deadNow = async (): Promise<{ enc: number; obj: number }> => {
 			await sleep(1200)
@@ -265,19 +315,12 @@ async function main(): Promise<void> {
 			//    both tiers.
 			await setMain(gcPg, repo, baseTip)
 			const g = await gc.gc(repo, { graceSeconds: 0, maintain: false })
-			const [postGc] = await gcPg<{ objects: string; encodings: string }[]>`
-			select (select count(*) from git_object)::text as objects,
-				(select count(*) from git_pack_encoding)::text as encodings`
-			if (
-				!postGc ||
-				g.deletedObjects !== tailObjects.length ||
-				Number(postGc.objects) !== baseObjects.length ||
-				Number(postGc.encodings) !== baseObjects.length
-			) {
+			if (g.deletedObjects !== tailObjects.length) {
 				throw new Error(
-					`snapshot demo GC mismatch: deleted=${g.deletedObjects}/${tailObjects.length}, rows=${JSON.stringify(postGc)}`,
+					`snapshot demo GC mismatch: deleted=${g.deletedObjects}/${tailObjects.length}`,
 				)
 			}
+			await requireRepoCensus(gcPg, repo, baseObjects, baseTip)
 
 			// 3. VACUUM under the held snapshot, capturing Postgres's own verdict. VACUUM
 			// VERBOSE emits one INFO per relation; porsager surfaces them through
@@ -303,11 +346,25 @@ async function main(): Promise<void> {
 					)
 					const x = m.match(/which was (\d+) XIDs old/)
 					if (t) {
-						acc.removed += Number(t[1])
-						acc.notRemovable += Number(t[2])
+						acc.removed += requireNonnegativeInteger(
+							requiredAt(t, 1, "VACUUM removed-tuples notice"),
+							"VACUUM removed tuples",
+						)
+						acc.notRemovable += requireNonnegativeInteger(
+							requiredAt(t, 2, "VACUUM not-removable-tuples notice"),
+							"VACUUM not-removable tuples",
+						)
 						acc.rels++
 					}
-					if (x) acc.xidsOld = Math.max(acc.xidsOld, Number(x[1]))
+					if (x) {
+						acc.xidsOld = Math.max(
+							acc.xidsOld,
+							requireNonnegativeInteger(
+								requiredAt(x, 1, "VACUUM XID-age notice"),
+								"VACUUM XID age",
+							),
+						)
+					}
 				},
 			})
 			verbose = vacuum

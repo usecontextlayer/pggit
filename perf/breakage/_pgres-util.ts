@@ -4,8 +4,9 @@
  *
  * Everything here is either a public pggit surface (`createObjectStore`,
  * `createRepack`, `createGc`, `createRefStore`, the wire server) or a READ of the
- * Postgres catalog scoped to the harness's OWN schema. No harness asserts on
- * implementation-internal row contents; they measure bytes, counts, and time.
+ * Postgres catalog scoped to the harness's OWN schema. Scores measure resource
+ * boundaries (bytes, counts, and time); exact internal censuses are prerequisite
+ * integrity proofs that run before those measurements can be scored.
  *
  * NOT a test: a helper module, like `perf/fast-import.ts`. It is imported by the
  * harnesses beside it and never run on its own.
@@ -15,26 +16,20 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Sql } from "postgres"
+import type { Oid } from "@/oid"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import {
 	branchAndTagRefsOf,
+	type GitObjectWithOid,
 	gitReachableOids,
 	loadReachableObjects,
+	requiredAt,
 } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
-export { flag } from "../args"
-
-import { flag, positiveIntegerFlag } from "../args"
-
-// ── flags (the house perf shape: standalone tsx, `--name=value`) ─────────────
-
-export function numFlag(name: string, fallback: number): number {
-	return positiveIntegerFlag(name, fallback)
-}
-
-export const PG_URL = flag("pg", "postgres://postgres:postgres@localhost:6489/postgres")
+export { revParse } from "@/testing/git-fixtures"
+export { table } from "../table"
 
 export const mb = (bytes: number): string => (bytes / 1_000_000).toFixed(2)
 
@@ -259,7 +254,7 @@ export async function fastImport(dir: string, stream: string): Promise<void> {
 	await spawnGit(["fast-import", "--quiet", "--force"], { cwd: dir, input: stream })
 }
 
-export type Obj = { oid: string; type: string; content: Buffer }
+export type Obj = GitObjectWithOid
 
 /** Objects reachable from `tip` but not from any of `notTips`, via one cat-file batch. */
 export async function objectsBetween(
@@ -277,13 +272,7 @@ export async function seedObjects(pg: Sql, repo: string, objs: Obj[]): Promise<v
 	let bytes = 0
 	const flush = async (): Promise<void> => {
 		if (batch.length === 0) return
-		await store.putPack(
-			repo,
-			batch.map((o) => ({
-				content: o.content,
-				type: o.type as "blob" | "commit" | "tag" | "tree",
-			})),
-		)
+		await store.putPack(repo, batch)
 		batch = []
 		bytes = 0
 	}
@@ -295,12 +284,8 @@ export async function seedObjects(pg: Sql, repo: string, objs: Obj[]): Promise<v
 	await flush()
 }
 
-export async function setMain(pg: Sql, repo: string, oid: string): Promise<void> {
+export async function setMain(pg: Sql, repo: string, oid: Oid): Promise<void> {
 	await createRefStore(pg).setRef(repo, "refs/heads/main", oid)
-}
-
-export async function revParse(dir: string, rev: string): Promise<string> {
-	return (await spawnGit(["rev-parse", rev], { cwd: dir })).stdout.trim()
 }
 
 // ── correctness judge: real git ──────────────────────────────────────────────
@@ -309,7 +294,7 @@ export async function revParse(dir: string, rev: string): Promise<string> {
 export async function cloneAndVerify(
 	url: string,
 	dest: string,
-): Promise<{ objects: string[]; refs: string[]; fsck: string }> {
+): Promise<{ objects: Oid[]; refs: string[]; fsck: string }> {
 	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 	const refs = (await branchAndTagRefsOf(dest)).map(({ name, oid }) => `${oid} ${name}`)
@@ -353,21 +338,11 @@ export function raceClone(
 
 // ── output ───────────────────────────────────────────────────────────────────
 
-export function table(headers: string[], rows: (string | number)[][]): string {
-	const all = [headers, ...rows.map((r) => r.map(String))]
-	const w = headers.map((_, i) => Math.max(...all.map((r) => (r[i] ?? "").length)))
-	const line = (r: string[]): string =>
-		`| ${r.map((c, i) => c.padEnd(w[i] as number)).join(" | ")} |`
-	return [
-		line(headers),
-		`|${w.map((n) => "-".repeat(n + 2)).join("|")}|`,
-		...all.slice(1).map(line),
-	].join("\n")
-}
-
 export function median(xs: number[]): number {
 	if (xs.length === 0) throw new Error("cannot take median of an empty sample")
 	const s = [...xs].sort((a, b) => a - b)
 	const m = Math.floor(s.length / 2)
-	return s.length % 2 ? (s[m] as number) : ((s[m - 1] as number) + (s[m] as number)) / 2
+	const middle = requiredAt(s, m, "median")
+	if (s.length % 2 === 1) return middle
+	return (requiredAt(s, m - 1, "median") + middle) / 2
 }

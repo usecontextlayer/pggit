@@ -1,7 +1,9 @@
 import { writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import type { Collector } from "@/instrument"
+import { requiredCollector, requiredPositiveCounter } from "./collector-evidence"
 import type { MemoryReport } from "./memory"
+import type { RttEvidence, RttMode } from "./pg-latency"
 import type { ProcessMetrics } from "./process-metrics"
 import type { Hotspot } from "./profile"
 import type { Scenario } from "./scenarios"
@@ -32,13 +34,13 @@ export type MemorySummary = Omit<MemoryReport, "rssSeries">
 export type Report = {
 	scenario: Scenario
 	objectsInRepo: number
-	env: { node: string; git: string; repeat: number; rttMs: number | null }
+	env: { node: string; git: string; repeat: number; rtt: RttMode }
 	contract: {
-		/** Clone wall time: best-of-N at 0ms, plus the 0-vs-rtt sweep. */
+		/** Clone wall time: best-of-N at 0ms, plus optional 0-vs-rtt evidence. */
 		wall: {
 			ms0Min: number
 			runs: number[]
-			rttSweep: { rttMs: number; wallMs: number }[]
+			rtt: RttEvidence
 		}
 		/** Postgres round-trips per clone — measured at the driver boundary, blind to
 		 *  table shape. The single number that most directly tracks the RTT problem. */
@@ -77,7 +79,7 @@ export type AssembleInput = {
 	objectsInRepo: number
 	gitVersion: string
 	repeat: number
-	rttMs: number | null
+	rtt: RttEvidence
 	wallMsRuns: number[]
 	serverUserMs: number
 	serverSystemMs: number
@@ -85,7 +87,6 @@ export type AssembleInput = {
 	process: ProcessMetrics
 	memory: MemoryReport
 	hotspots: Hotspot[]
-	rttSweep: { rttMs: number; wallMs: number }[]
 	outDir: string
 }
 
@@ -115,46 +116,36 @@ export function assembleReport(input: AssembleInput): Report {
 			throw new Error(`perf report received invalid CPU metric ${name}=${value}`)
 		}
 	}
-	const fetchCollectors = input.collectors.filter(
-		(collector) => collector.label === "fetch",
+	const fetchCollector = requiredCollector(input.collectors, "fetch", "perf report")
+	const objectsServed = requiredPositiveCounter(
+		fetchCollector,
+		"objectsServed",
+		"perf report",
 	)
-	if (fetchCollectors.length !== 1) {
+	const wireBytes = requiredPositiveCounter(fetchCollector, "wireBytes", "perf report")
+	requiredPositiveCounter(fetchCollector, "packBytes", "perf report")
+	if (objectsServed !== input.objectsInRepo) {
 		throw new Error(
-			`perf report requires exactly one fetch collector, got ${fetchCollectors.length}`,
+			`fetch collector served ${objectsServed} objects for a ${input.objectsInRepo}-object canonical clone`,
 		)
 	}
-	const fetchCollector = fetchCollectors[0] as Collector
-	for (const metric of ["objectsServed", "wireBytes", "packBytes"] as const) {
-		const value = fetchCollector.counters.get(metric)
-		if (value === undefined || !Number.isFinite(value) || value <= 0) {
-			throw new Error(`fetch collector is missing required positive ${metric}`)
-		}
-	}
-	if (fetchCollector.counters.get("objectsServed") !== input.objectsInRepo) {
-		throw new Error(
-			`fetch collector served ${fetchCollector.counters.get("objectsServed")} objects for a ${input.objectsInRepo}-object canonical clone`,
-		)
-	}
-	if (input.rttMs === null) {
-		if (input.rttSweep.length !== 0) {
-			throw new Error("perf report received an RTT sweep without --rtt")
-		}
-	} else if (
-		!Number.isFinite(input.rttMs) ||
-		input.rttMs <= 0 ||
-		input.rttSweep.length !== 2 ||
-		input.rttSweep[0]?.rttMs !== 0 ||
-		input.rttSweep[1]?.rttMs !== input.rttMs
-	) {
-		throw new Error(
-			`perf report requires complete 0/${input.rttMs}ms RTT samples, got ${JSON.stringify(input.rttSweep)}`,
-		)
-	}
-	for (const [index, sample] of input.rttSweep.entries()) {
-		if (!Number.isFinite(sample.wallMs) || sample.wallMs <= 0) {
+	if (input.rtt.kind === "sweep") {
+		if (
+			!Number.isFinite(input.rtt.requestedMs) ||
+			input.rtt.requestedMs <= 0 ||
+			input.rtt.samples[0].rttMs !== 0 ||
+			input.rtt.samples[1].rttMs !== input.rtt.requestedMs
+		) {
 			throw new Error(
-				`perf report RTT sample ${index} has invalid wallMs=${sample.wallMs}`,
+				`perf report received invalid RTT evidence: ${JSON.stringify(input.rtt)}`,
 			)
+		}
+		for (const [index, sample] of input.rtt.samples.entries()) {
+			if (!Number.isFinite(sample.wallMs) || sample.wallMs <= 0) {
+				throw new Error(
+					`perf report RTT sample ${index} has invalid wallMs=${sample.wallMs}`,
+				)
+			}
 		}
 	}
 	if (
@@ -222,19 +213,6 @@ export function assembleReport(input: AssembleInput): Report {
 	)
 
 	const wallMsMin = Math.min(...input.wallMsRuns)
-	const objectsServed = counters.objectsServed
-	const wireBytes = counters.wireBytes
-	if (objectsServed === undefined || objectsServed < 1) {
-		throw new Error("perf report is missing the required nonzero objectsServed counter")
-	}
-	if (wireBytes === undefined || wireBytes < 1) {
-		throw new Error("perf report is missing the required nonzero wireBytes counter")
-	}
-	if (objectsServed !== input.objectsInRepo) {
-		throw new Error(
-			`instrumentation served ${objectsServed} objects for a ${input.objectsInRepo}-object canonical clone`,
-		)
-	}
 
 	// Contract DB metric: sum every recorded query, ignoring its phase tag (the
 	// per-phase split is the Layer-2 view). This stays valid across a restructure.
@@ -266,7 +244,7 @@ export function assembleReport(input: AssembleInput): Report {
 			throughput: {
 				objectsPerSec: objectsServed / (wallMsMin / 1000),
 			},
-			wall: { ms0Min: wallMsMin, rttSweep: input.rttSweep, runs: input.wallMsRuns },
+			wall: { ms0Min: wallMsMin, rtt: input.rtt, runs: input.wallMsRuns },
 			wire: { bytes: wireBytes, objectsServed },
 		},
 		diagnostics: {
@@ -278,13 +256,16 @@ export function assembleReport(input: AssembleInput): Report {
 			git: input.gitVersion,
 			node: process.version,
 			repeat: input.repeat,
-			rttMs: input.rttMs,
+			rtt:
+				input.rtt.kind === "loopback"
+					? { kind: "loopback" }
+					: { kind: "sweep", requestedMs: input.rtt.requestedMs },
 		},
 		notes: [
 			"contract = Layer-1, implementation-agnostic. Survives a code/schema restructure; claim gains HERE.",
 			"diagnostics = Layer-2, coupled to the current design (phase split and implementation counters). Use them to explain a contract result, never as the result itself.",
 			"contract.db.queryCount is measured at the Postgres driver boundary, so it is blind to table shape and is the cleanest single readout of the per-object round-trip cost the rtt sweep exposes.",
-			"memory.peakRssBytes is sampled off-thread, so it captures peaks during the main-thread sync blocks (deflateSync + SHA-1) a main-thread timer would miss.",
+			"memory.peakRssBytes is sampled off-thread, so it captures peaks during synchronous main-thread pack work that a main-thread timer would miss.",
 			"memory.peakRssBytes is the WARM-process RSS ceiling: the harness serves several clones in one process and RSS is sticky (the allocator reuses/holds pages), so it is cumulative — representative of a warm long-running server, NOT one clone's footprint.",
 			"memory.peakByField is the absolute warm-process peak of heapUsed/external/arrayBuffers during the measured clone. It is main-thread sampled and may understate a peak inside a synchronous block; it is composition evidence, not a per-clone delta.",
 			"memory.retainedAfterGcBytes is the absolute process live set after the measured clone and two forced collections. RSS remains sticky; heapUsed/external/arrayBuffers are the useful retained-allocation fields.",
@@ -320,8 +301,12 @@ export function printSummary(report: Report): void {
 	lines.push(
 		`  clone wall (min of ${report.env.repeat})   ${ms(c.wall.ms0Min)}   cpu user ${ms(c.cpu.userMs)} sys ${ms(c.cpu.systemMs)}`,
 	)
-	for (const s of c.wall.rttSweep) {
-		lines.push(`    ${String(s.rttMs).padStart(4)}ms pg rtt → ${ms(s.wallMs)}`)
+	if (c.wall.rtt.kind === "sweep") {
+		for (const sample of c.wall.rtt.samples) {
+			lines.push(
+				`    ${String(sample.rttMs).padStart(4)}ms pg rtt → ${ms(sample.wallMs)}`,
+			)
+		}
 	}
 	lines.push(
 		`  postgres              ${c.db.queryCount} queries / clone   ${ms(c.db.dbMs)} db`,

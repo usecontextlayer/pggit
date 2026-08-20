@@ -12,15 +12,21 @@
  *   NODE_OPTIONS=--expose-gc npx tsx perf/breakage/perf--repack-history-scaling.ts [--sizes=250,500,1000,2000]
  */
 import { rmSync } from "node:fs"
+import { z } from "zod"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	repackEligibleObjects,
+	requiredAt,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
 import {
 	cleanupTmp,
 	gitRepack,
-	increasingIntegerListFlag,
 	mb,
-	PG_URL,
 	reachableObjects,
 	secs,
 	seedRepo,
@@ -28,7 +34,14 @@ import {
 	withPeakRss,
 } from "./_perf-util"
 
-const SIZES = increasingIntegerListFlag("sizes", [250, 500, 1000, 2000])
+const { pg: PG_URL, sizes: SIZES } = parseArgs(
+	z
+		.object({
+			pg: pgUrlArg,
+			sizes: increasingIntegerListArg([250, 500, 1000, 2000]),
+		})
+		.strict(),
+)
 
 /** Ratio at which pggit's repack is declared divergent from git's. */
 const WALL_RATIO_LIMIT = 10
@@ -66,19 +79,24 @@ async function measure(n: number): Promise<Row> {
 		}
 		const db = await createIsolatedSchema(PG_URL)
 		try {
-			await seedRepo(db.sql, "probe/scale", dir, objects)
+			const seeded = await seedRepo(db.sql, "probe/scale", dir, objects)
 			const repack = createRepack(db.sql)
 			const r = await withPeakRss(() => repack.repack("probe/scale"))
 			if (
 				r.ms <= 0 ||
 				r.peakRss <= r.baseRss ||
-				r.value.wholes + r.value.deltas !== objects.length ||
+				r.value.wholes + r.value.deltas !== seeded.eligibleObjects ||
 				r.value.deltas === 0
 			) {
 				throw new Error(
-					`repack produced ${r.value.wholes} wholes + ${r.value.deltas} deltas for ${objects.length} objects`,
+					`repack produced ${r.value.wholes} wholes + ${r.value.deltas} deltas for ${seeded.eligibleObjects} eligible objects`,
 				)
 			}
+			await assertCanonicalStoreFixture(db.sql, "probe/scale", {
+				encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+				objects,
+				refs: await canonicalStoreRefsOf(dir),
+			})
 			return {
 				deltas: r.value.deltas,
 				gitMs: git.ms,
@@ -136,8 +154,8 @@ async function main(): Promise<void> {
 	console.log("\n## scaling exponents (log2 of the ratio between successive doublings)\n")
 	const exps: (string | number)[][] = []
 	for (let i = 1; i < rows.length; i++) {
-		const a = rows[i - 1] as Row
-		const b = rows[i] as Row
+		const a = requiredAt(rows, i - 1, "previous repack-scaling measurement")
+		const b = requiredAt(rows, i, "current repack-scaling measurement")
 		const k = Math.log2(b.n / a.n)
 		exps.push([
 			`${a.n}→${b.n}`,
@@ -162,7 +180,7 @@ async function main(): Promise<void> {
 		),
 	)
 
-	const last = rows[rows.length - 1] as Row
+	const last = requiredAt(rows, rows.length - 1, "largest repack-scaling measurement")
 	const ratio = last.pggitMs / last.gitMs
 	const worstGrowth = Math.max(...exps.map((e) => Number(e[5])))
 	console.log(

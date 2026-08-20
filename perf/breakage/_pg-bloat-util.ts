@@ -17,20 +17,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import postgresFactory, { type Sql } from "postgres"
 import {
+	type GitObjectWithOid,
 	gitReachableOids,
 	loadGitObjects,
 	loadReachableObjects,
 } from "@/testing/git-fixtures"
-
-export {
-	flag,
-	increasingIntegerListFlag,
-	positiveIntegerFlag,
-	positiveNumberFlag,
-} from "../args"
-
-/** Default target for `--pg=`; every harness takes the flag and falls back here. */
-export const DEFAULT_PG_URL = "postgres://postgres:postgres@localhost:6489/postgres"
 export const WHEN = "1700000000 +0000"
 export const COMMITTER = `pggit oracle <oracle@pggit.test> ${WHEN}`
 
@@ -438,11 +429,7 @@ export async function duBytes(dir: string): Promise<number> {
 }
 
 /** Every reachable object in a repo, in one `cat-file --batch`. */
-export type Obj = {
-	oid: string
-	type: "blob" | "commit" | "tag" | "tree"
-	content: Buffer
-}
+export type Obj = GitObjectWithOid
 
 export async function reachableObjects(dir: string): Promise<Obj[]> {
 	return loadGitObjects(dir, await gitReachableOids(dir))
@@ -459,110 +446,4 @@ export async function objectsBetween(
 	exclude?: string,
 ): Promise<Obj[]> {
 	return loadReachableObjects(dir, [rev, ...(exclude ? [`^${exclude}`] : [])])
-}
-
-// ---------------------------------------------------------------------------
-// Operator diagnostics — UTILITIES, not harnesses. Neither measures pggit; both
-// answer "is this instance in a state where a bloat number means anything?", and
-// they are read-only against `pg_stat_activity`. Call them from a scratch script
-// or a REPL when a harness reports a pinned horizon.
-// ---------------------------------------------------------------------------
-
-/**
- * UTILITY (was `breakage/_bloat_horizon_gate.ts`). True when the cluster vacuum
- * horizon is free; false while a long transaction pins it. Run this BEFORE a bloat
- * harness: under a pinned horizon every reclaim number is a lower bound.
- */
-export async function horizonGate(baseUrl = DEFAULT_PG_URL): Promise<boolean> {
-	const pg = postgresFactory(baseUrl, { max: 1, onnotice: () => {} })
-	try {
-		const h = await horizon(pg)
-		console.log(
-			`horizon lag ${h.ageXids} xids, oldest open client xact ${h.oldestXactSeconds.toFixed(0)}s, ` +
-				`${h.blockers.length} blocker(s)`,
-		)
-		return h.ageXids <= 5000
-	} finally {
-		await pg.end()
-	}
-}
-
-/**
- * UTILITY (was `breakage/_bloat_who_holds_xmin.ts`). Identify the cluster-wide
- * xmin holder — which pid, in which database, running what, for how long.
- * Read-only.
- */
-export async function whoHoldsXmin(baseUrl = DEFAULT_PG_URL): Promise<void> {
-	const pg = postgresFactory(baseUrl, { max: 1, onnotice: () => {} })
-	try {
-		const rows = await pg<
-			{
-				pid: number
-				datname: string | null
-				usename: string | null
-				app: string | null
-				state: string | null
-				xmin: string | null
-				xid: string | null
-				xact_age: string | null
-				state_age: string | null
-				q: string | null
-			}[]
-		>`
-			select pid, datname, usename, application_name as app, state,
-				backend_xmin::text as xmin, backend_xid::text as xid,
-				(now() - xact_start)::text as xact_age,
-				(now() - state_change)::text as state_age,
-				left(query, 80) as q
-			from pg_stat_activity
-			where backend_type = 'client backend'
-			order by xact_start nulls last, pid`
-		for (const r of rows) {
-			console.log(
-				`pid=${String(r.pid).padEnd(6)} db=${(r.datname ?? "-").padEnd(26)} state=${(r.state ?? "-").padEnd(20)} ` +
-					`xmin=${(r.xmin ?? "-").padEnd(8)} xid=${(r.xid ?? "-").padEnd(8)} xact=${(r.xact_age ?? "-").padEnd(18)} ` +
-					`app=${(r.app ?? "-").slice(0, 20)}`,
-			)
-			if (r.xact_age && !r.xact_age.startsWith("00:00:0")) {
-				console.log(`        q: ${r.q}`)
-			}
-		}
-
-		const [h] = await pg<
-			{
-				snap: string
-				oldest: string | null
-				slots: string
-				prep: string
-				frozen: string
-			}[]
-		>`
-			select pg_snapshot_xmin(pg_current_snapshot())::text as snap,
-				(select min(age(backend_xmin))::text from pg_stat_activity where backend_xmin is not null) as oldest,
-				(select count(*)::text from pg_replication_slots) as slots,
-				(select count(*)::text from pg_prepared_xacts) as prep,
-				(select max(age(datfrozenxid))::text from pg_database) as frozen`
-		if (!h) throw new Error("xmin-holder summary query returned no row")
-		console.log(
-			"\nsnapshot xmin:",
-			h.snap,
-			"| min backend_xmin age:",
-			h.oldest,
-			"| slots:",
-			h.slots,
-			"| prepared:",
-			h.prep,
-			"| max datfrozenxid age:",
-			h.frozen,
-		)
-
-		const maxAge = await pg<
-			{ pid: number; datname: string | null; age: string; state: string | null }[]
-		>`
-			select pid, datname, age(backend_xmin)::text as age, state from pg_stat_activity
-			where backend_xmin is not null order by age(backend_xmin) desc limit 5`
-		console.log("\nlargest backend_xmin ages:", maxAge)
-	} finally {
-		await pg.end()
-	}
 }

@@ -1,19 +1,16 @@
 /**
  * WIRE-LEVEL DIFFERENTIAL on REAL repositories, against real git as the oracle.
  *
- * Black-box only: the pggit surface exercised is the HTTP wire
+ * Scored verdicts are black-box: the pggit surface exercised is the HTTP wire
  * (`serveOnPort(createGitApp(createGitDeps(sql)), 0)` + real `git push` /
  * `git clone` / `git fetch`), plus the two offline verbs `createRepack().repack()`
  * and `createGc().gc()`. Every verdict is a git-observable outcome — object bytes,
- * ref listings, `git fsck --strict`, transfer sizes. NO database assertions.
+ * ref listings, `git fsck --strict`, transfer sizes. Exact database censuses prove
+ * the named unencoded/repacked fixture states before those outcomes are scored.
  *
  * The oracle is a plain `file://` bare remote replaying the same sequence.
  *
- * A perf harness rather than a vitest e2e test because its corpus is a REAL local
- * repository handed in at run time (`--repo=`), which no committed fixture can stand
- * in for — the same reason `perf/delta-corpus.ts` lives here. The serve-size phase
- * additionally scores a MEASURED ratio (`> 4.0x` is a finding), so the file carries
- * both kinds of verdict into the one exit code, as the source script did.
+ * A perf harness rather than a vitest e2e test because its corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for — the same reason `perf/delta-corpus.ts` lives here. The serve-size phase additionally scores a MEASURED ratio (`> 4.0x` is a finding), so the file carries both kinds of verdict into the one exit code, as the source script did.
  *
  *   npx tsx perf/breakage/realrepo--differential.ts --repo=/path/to/checkout --slug=<name> \
  *     [--phases=full,shapes,size,replay] [--step=50]
@@ -23,24 +20,33 @@
 import { createHash } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createGitApp, createGitDeps } from "@/index"
-import { type Collector, collectedRuns, resetCollected } from "@/instrument"
+import { collectedRuns, resetCollected } from "@/instrument"
+import type { Oid } from "@/oid"
 import { readPack } from "@/pack/read-pack"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { parseRevListObjectOids, typedRefsOf } from "@/testing/git-fixtures"
+import {
+	parseRevListObjectOids,
+	requiredAt,
+	requireGitOid,
+	typedRefsOf,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
+import { nonemptyStringArg, parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
 import {
+	assertCanonicalRealRepoStore,
 	canonicalV2Pack,
 	createScratch,
-	DEFAULT_PG_URL,
-	flag,
+	type GitOutcome,
 	mb,
-	positiveIntegerFlag,
+	mirrorSourceFromArgs,
 	postPggitV2Pack,
 	prepareMirror,
 	secs,
@@ -48,29 +54,57 @@ import {
 } from "./_realrepo-util"
 
 // ── args ────────────────────────────────────────────────────────────────────
-const SLUG = flag("slug", "repo")
+const args = parseArgs(
+	z
+		.object({
+			mirror: nonemptyStringArg.optional(),
+			pg: pgUrlArg,
+			phases: nonemptyStringArg.default("full,shapes,size,replay"),
+			repo: nonemptyStringArg.optional(),
+			slug: nonemptyStringArg.default("repo"),
+			step: positiveIntegerArg.default(50),
+		})
+		.strict()
+		.transform(({ mirror, repo, ...values }) => ({
+			...values,
+			source: mirrorSourceFromArgs({ mirror, repo }),
+		})),
+)
+const SLUG = args.slug
 const PHASE_NAMES = ["full", "orphan", "replay", "shapes", "size"] as const
 type PhaseName = (typeof PHASE_NAMES)[number]
-const requestedPhases = flag("phases", "full,shapes,size,replay").split(",")
-const unknownPhases = requestedPhases.filter(
-	(phase) => !PHASE_NAMES.includes(phase as PhaseName),
-)
+function requirePhaseName(value: string): PhaseName {
+	switch (value) {
+		case "full":
+		case "orphan":
+		case "replay":
+		case "shapes":
+		case "size":
+			return value
+		default:
+			throw new Error(`--phases contains unknown value: ${value}`)
+	}
+}
+const requestedPhases = args.phases.split(",")
 if (requestedPhases.length === 0 || requestedPhases.some((phase) => phase.length === 0)) {
 	throw new Error("--phases must name at least one phase")
 }
-if (unknownPhases.length > 0) {
-	throw new Error(`--phases contains unknown values: ${unknownPhases.join(", ")}`)
+const PHASES = new Set<PhaseName>()
+for (const value of requestedPhases) {
+	const phase = requirePhaseName(value)
+	if (PHASES.has(phase)) throw new Error(`--phases contains duplicate: ${phase}`)
+	PHASES.add(phase)
 }
-if (new Set(requestedPhases).size !== requestedPhases.length) {
-	throw new Error("--phases must not contain duplicates")
-}
-const PHASES = new Set(requestedPhases as PhaseName[])
-const STEP = positiveIntegerFlag("step", 50)
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-if (SLUG.length === 0) throw new Error("--slug must not be empty")
+const STEP = args.step
+const PG_URL = args.pg
 
 const scratch = createScratch(`realrepo-${SLUG}`)
-/** The private mirror clone of `--repo=`; set by `prepareMirror` in `main`. */
+const UPLOAD_PACK_CONFIG = [
+	["uploadpack.allowFilter", "true"],
+	["uploadpack.allowAnySHA1InWant", "true"],
+	["uploadpack.allowReachableSHA1InWant", "true"],
+] as const
+/** The private mirror clone of the selected source; set by `prepareMirror` in `main`. */
 let MIRROR = ""
 
 // ── findings ledger ─────────────────────────────────────────────────────────
@@ -82,24 +116,23 @@ const fail = (phase: string, what: string, detail: string): void => {
 }
 const summary: string[] = []
 
-function requireSinglePackRun(label: string): Collector {
-	const runs = collectedRuns().filter((run) => run.label === "fetch")
-	if (runs.length !== 1) {
-		throw new Error(`${label}: expected one fetch collector, got ${runs.length}`)
+function requireSinglePackRun(label: string): {
+	collector: ReturnType<typeof requiredCollector>
+	objectsServed: number
+	packBytes: number
+	wireBytes: number
+} {
+	const collector = requiredCollector(collectedRuns(), "fetch", label)
+	return {
+		collector,
+		objectsServed: requiredPositiveCounter(collector, "objectsServed", label),
+		packBytes: requiredPositiveCounter(collector, "packBytes", label),
+		wireBytes: requiredPositiveCounter(collector, "wireBytes", label),
 	}
-	const run = runs[0]
-	if (!run) throw new Error(`${label}: fetch collector disappeared`)
-	for (const counter of ["objectsServed", "packBytes", "wireBytes"]) {
-		const value = run.counters.get(counter)
-		if (value === undefined || value <= 0) {
-			throw new Error(`${label}: fetch ${counter} is missing or nonpositive`)
-		}
-	}
-	return run
 }
 
 // ── git helpers ─────────────────────────────────────────────────────────────
-type Inventory = Map<string, { type: string; size: number }>
+type Inventory = Map<Oid, { type: string; size: number }>
 async function inventory(dir: string): Promise<Inventory> {
 	const out = await spawnGit(
 		[
@@ -113,7 +146,12 @@ async function inventory(dir: string): Promise<Inventory> {
 	for (const line of out.stdout.split("\n").filter(Boolean)) {
 		const match = line.match(/^([0-9a-f]{40}) (blob|commit|tag|tree) ([0-9]+)$/)
 		if (!match) throw new Error(`cat-file: malformed inventory row in ${dir}: ${line}`)
-		const [, oid, type, rawSize] = match as [string, string, string, string]
+		const oid = requireGitOid(
+			requiredAt(match, 1, "cat-file inventory oid"),
+			"cat-file inventory oid",
+		)
+		const type = requiredAt(match, 2, "cat-file inventory type")
+		const rawSize = requiredAt(match, 3, "cat-file inventory size")
 		const size = Number(rawSize)
 		if (!Number.isSafeInteger(size)) {
 			throw new Error(`cat-file: invalid size in ${dir}: ${line}`)
@@ -127,8 +165,8 @@ async function inventory(dir: string): Promise<Inventory> {
 
 /** SHA-256 over `<type> <size>\0<content>` for each oid — the object's real bytes
  * as git hands them back, independent of how they were stored or transferred. */
-async function digests(dir: string, inv: Inventory): Promise<Map<string, string>> {
-	const out = new Map<string, string>()
+async function digests(dir: string, inv: Inventory): Promise<Map<Oid, string>> {
+	const out = new Map<Oid, string>()
 	let batch: string[] = []
 	let bytes = 0
 	const flush = async (): Promise<void> => {
@@ -140,14 +178,17 @@ async function digests(dir: string, inv: Inventory): Promise<Map<string, string>
 		})
 		const buf = res.stdoutBytes
 		let pos = 0
-		const seen = new Set<string>()
+		const seen = new Set<Oid>()
 		while (pos < buf.length) {
 			const nl = buf.indexOf(0x0a, pos)
 			if (nl < 0) throw new Error(`cat-file: truncated header in ${dir}`)
-			const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-			if (!oid || !type || !sizeStr || !requested.includes(oid)) {
+			const [rawOid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
+			if (!rawOid || !type || !sizeStr) {
 				throw new Error(`cat-file: bad header in ${dir}`)
 			}
+			const oid = requireGitOid(rawOid, `cat-file digest header in ${dir}`)
+			if (!requested.includes(oid))
+				throw new Error(`cat-file: unexpected oid ${oid} in ${dir}`)
 			const size = Number(sizeStr)
 			if (!Number.isSafeInteger(size) || size < 0) {
 				throw new Error(`cat-file: invalid size ${JSON.stringify(sizeStr)} in ${dir}`)
@@ -225,7 +266,7 @@ async function compareRepos(
 		)
 	}
 	const [ad, ed] = [await digests(actualDir, ai), await digests(expectDir, ei)]
-	const diverged: string[] = []
+	const diverged: Oid[] = []
 	for (const [oid, d] of ed) {
 		const got = ad.get(oid)
 		if (got !== undefined && got !== d) diverged.push(oid)
@@ -255,7 +296,7 @@ async function compareRepos(
 		}
 	}
 	const fsck = await tryGit(["fsck", "--strict"], actualDir)
-	if (!fsck.ok) {
+	if (fsck.status === "failure") {
 		equal = false
 		fail(
 			phase,
@@ -270,40 +311,48 @@ async function compareRepos(
 let srcInv: Inventory = new Map()
 
 /**
- * The ORACLE remote: a plain `file://` bare repo that received the SAME
- * `git push --mirror` the pggit server did. It must be built by replaying the push,
- * not by cloning the mirror — `git push --mirror` does not carry every ref a mirror
- * clone holds (`refs/stash` is excluded), so a cloned "reference" would charge pggit
- * for git's own push policy. Set by `buildOracleRemote`.
+ * The ORACLE remote: a plain `file://` bare repo that received the SAME push plan
+ * the pggit server did. It must be built by replaying the plan, not by cloning the
+ * mirror — push policy can exclude refs a mirror clone holds, so a cloned
+ * "reference" would charge pggit for git's own policy. Set by `buildOracleRemote`.
  */
 let ORACLE = ""
 
-async function buildOracleRemote(pushArgs: string[]): Promise<void> {
+type PushPlan = {
+	commands: readonly [readonly string[], ...(readonly string[][])]
+	label: "--all then --tags" | "--mirror"
+}
+
+async function runPushPlan(remote: string, plan: PushPlan): Promise<GitOutcome> {
+	let outcome: GitOutcome | undefined
+	for (const args of plan.commands) {
+		outcome = await tryGit(["push", remote, ...args], MIRROR)
+		if (outcome.status === "failure") return outcome
+	}
+	if (outcome === undefined) throw new Error(`${plan.label}: push plan has no commands`)
+	return outcome
+}
+
+async function buildOracleRemote(plan: PushPlan): Promise<GitOutcome> {
 	ORACLE = join(scratch.mk("oracleremote"), "oracle.git")
 	mkdirSync(ORACLE, { recursive: true })
-	await spawnGit(["init", "-q", "--bare", ORACLE])
-	await spawnGit(["push", `file://${ORACLE}`, ...pushArgs], { cwd: MIRROR })
-	for (const [k, v] of [
-		["uploadpack.allowFilter", "true"],
-		["uploadpack.allowAnySHA1InWant", "true"],
-		["uploadpack.allowReachableSHA1InWant", "true"],
-	]) {
-		await spawnGit(["config", k as string, v as string], { cwd: ORACLE })
+	await spawnGit(["init", "-q", "-b", "main", "--bare", ORACLE])
+	const push = await runPushPlan(`file://${ORACLE}`, plan)
+	if (push.status === "failure") return push
+	for (const [key, value] of UPLOAD_PACK_CONFIG) {
+		await spawnGit(["config", key, value], { cwd: ORACLE })
 	}
+	return push
 }
 
 async function main(): Promise<void> {
-	MIRROR = await prepareMirror(scratch)
+	MIRROR = await prepareMirror(scratch, args.source)
 	console.log(`# realrepo differential — ${SLUG}  (mirror ${MIRROR})`)
 	// The file:// ORACLE must be allowed to answer the same shapes pggit does —
 	// otherwise git refuses the filter / exact-OID want and the "reference" is a
 	// different request, not a reference. Config only; objects and refs untouched.
-	for (const [k, v] of [
-		["uploadpack.allowFilter", "true"],
-		["uploadpack.allowAnySHA1InWant", "true"],
-		["uploadpack.allowReachableSHA1InWant", "true"],
-	]) {
-		await spawnGit(["config", k as string, v as string], { cwd: MIRROR })
+	for (const [key, value] of UPLOAD_PACK_CONFIG) {
+		await spawnGit(["config", key, value], { cwd: MIRROR })
 	}
 	srcInv = await inventory(MIRROR)
 	const commits = Number(
@@ -352,25 +401,35 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 	try {
 		// --- push the whole mirror over the real wire ---------------------------
 		console.log(`\n## full round-trip`)
-		let pushMode = "--mirror"
-		const t0 = Date.now()
-		let push = await tryGit(["push", url, "--mirror"], MIRROR)
-		if (!push.ok) {
+		let pushPlan: PushPlan = { commands: [["--mirror"]], label: "--mirror" }
+		let oraclePush = await buildOracleRemote(pushPlan)
+		if (oraclePush.status === "failure") {
 			console.log(
-				`  push --mirror rejected (exit ${push.code}): ${push.stderr.trim().split("\n").slice(0, 3).join(" / ")}`,
+				`  canonical push --mirror rejected (exit ${oraclePush.code}): ${oraclePush.stderr.trim().split("\n").slice(0, 3).join(" / ")}`,
 			)
-			pushMode = "--all --tags"
-			push = await tryGit(["push", url, "--all", "--tags"], MIRROR)
-			if (!push.ok) {
-				fail("full", "push --all --tags FAILED", push.stderr.trim().slice(0, 900))
-				return
+			pushPlan = { commands: [["--all"], ["--tags"]], label: "--all then --tags" }
+			oraclePush = await buildOracleRemote(pushPlan)
+			if (oraclePush.status === "failure") {
+				throw new Error(
+					`canonical git rejected both full-push fixtures: ${oraclePush.stderr.trim().slice(0, 900)}`,
+				)
 			}
 		}
+		const t0 = Date.now()
+		const push = await runPushPlan(url, pushPlan)
+		if (push.status === "failure") {
+			fail(
+				"full",
+				`pggit rejected canonical ${pushPlan.label} push plan (exit ${push.code})`,
+				push.stderr.trim().slice(0, 900),
+			)
+			return
+		}
 		const pushMs = Date.now() - t0
-		summary.push(`| full | push (${pushMode}) | ${secs(pushMs)} |`)
-		// The oracle receives the IDENTICAL push, so any ref git's own push policy
-		// drops is dropped on both sides.
-		await buildOracleRemote(pushMode === "--mirror" ? ["--mirror"] : ["--all", "--tags"])
+		summary.push(`| full | push (${pushPlan.label}) | ${secs(pushMs)} |`)
+		// The oracle chose and accepted this exact push before pggit was touched, so
+		// a pggit rejection cannot silently downgrade the fixture to a smaller shape.
+		await assertCanonicalRealRepoStore(db.sql, repoId, ORACLE, { kind: "unencoded" })
 
 		// --- clone BEFORE repack (the un-encoded baseline) ----------------------
 		resetCollected()
@@ -384,12 +443,12 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 			url,
 			preDir,
 		])
-		if (!pre.ok) {
+		if (pre.status === "failure") {
 			fail("full", "pre-repack mirror clone FAILED", pre.stderr.trim().slice(0, 900))
 			return
 		}
 		const preRun = requireSinglePackRun("pre-repack clone")
-		const prePack = preRun.counters.get("packBytes") as number
+		const prePack = preRun.packBytes
 
 		// --- repack ------------------------------------------------------------
 		const rt = Date.now()
@@ -401,6 +460,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 		summary.push(
 			`| full | repack | ${rp.wholes} wholes + ${rp.deltas} deltas in ${secs(repackMs)} |`,
 		)
+		await assertCanonicalRealRepoStore(db.sql, repoId, ORACLE, { kind: "repacked" })
 
 		// a second pass MUST be a no-op (design D4: frozen policy)
 		const rp2 = await createRepack(db.sql).repack(repoId)
@@ -439,13 +499,12 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 			postDir,
 		])
 		const cloneMs = Date.now() - ct
-		if (!post.ok) {
+		if (post.status === "failure") {
 			fail("full", "post-repack mirror clone FAILED", post.stderr.trim().slice(0, 900))
 			return
 		}
 		const run = requireSinglePackRun("post-repack clone")
-		const postPack = run.counters.get("packBytes") as number
-		const deltasServed = run.counters.get("deltasServed")
+		const postPack = run.packBytes
 
 		const cmp = await compareRepos(
 			"full",
@@ -465,13 +524,13 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 			preDir,
 			refDir,
 		)
-		for (const [label, collector, objects] of [
+		for (const [label, evidence, objects] of [
 			["pre-repack", preRun, cmpPre.objects],
 			["post-repack", run, cmp.objects],
 		] as const) {
-			if (collector.counters.get("objectsServed") !== objects) {
+			if (evidence.objectsServed !== objects) {
 				throw new Error(
-					`${label} collector served ${collector.counters.get("objectsServed")}/${objects} canonical objects`,
+					`${label} collector served ${evidence.objectsServed}/${objects} canonical objects`,
 				)
 			}
 		}
@@ -486,9 +545,10 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 					"size phase is not scoreable because a prerequisite clone diverged",
 				)
 			}
-			if (rp.deltas === 0 || deltasServed === undefined || deltasServed === 0) {
+			requiredPositiveCounter(run.collector, "deltasServed", "post-repack clone")
+			if (rp.deltas === 0) {
 				throw new Error(
-					`size fixture did not exercise served deltas (repack=${rp.deltas}, served=${String(deltasServed)})`,
+					`size fixture did not establish stored deltas (repack=${rp.deltas})`,
 				)
 			}
 			const gcDir = join(scratch.mk("gc"), "gc.git")
@@ -512,10 +572,11 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				canonicalV2Pack(gcDir, request),
 			])
 			const rawRun = requireSinglePackRun("raw size request")
-			const rawServedDeltas = rawRun.counters.get("deltasServed")
-			if (rawServedDeltas === undefined || rawServedDeltas === 0) {
-				throw new Error("raw size request served zero deltas")
-			}
+			const rawServedDeltas = requiredPositiveCounter(
+				rawRun.collector,
+				"deltasServed",
+				"raw size request",
+			)
 			const [pggitObjects, gitObjects] = await Promise.all([
 				readPack(pggitRaw),
 				readPack(gitRaw),
@@ -578,7 +639,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				url,
 				sbDir,
 			])
-			if (!sb.ok)
+			if (sb.status === "failure")
 				fail("shapes", "single-branch clone FAILED", sb.stderr.trim().slice(0, 700))
 			else {
 				const sbRefDir = join(scratch.mk("sbref"), "sb.git")
@@ -622,7 +683,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 					],
 					tagDir,
 				)
-				if (!tf.ok)
+				if (tf.status === "failure")
 					fail("shapes", "tag-only fetch FAILED", tf.stderr.trim().slice(0, 700))
 				else {
 					const tagRefDir = join(scratch.mk("tagref"), "t.git")
@@ -656,7 +717,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				url,
 				pcDir,
 			])
-			if (!pc.ok)
+			if (pc.status === "failure")
 				fail("shapes", "--filter=blob:none clone FAILED", pc.stderr.trim().slice(0, 700))
 			else {
 				const pcRefDir = join(scratch.mk("pcref"), "p.git")
@@ -699,12 +760,12 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 					)
 				const lazy = await tryGit(["cat-file", "blob", someBlob], pcDir)
 				const lazyRef = await tryGit(["cat-file", "blob", someBlob], pcRefDir)
-				if (!lazyRef.ok) {
+				if (lazyRef.status === "failure") {
 					throw new Error(
 						`canonical lazy promisor fixture failed for ${someBlob}: ${lazyRef.stderr.trim().slice(0, 500)}`,
 					)
 				}
-				if (!lazy.ok) {
+				if (lazy.status === "failure") {
 					fail(
 						"shapes",
 						`lazy promisor blob backfill FAILED (exit ${lazy.code})`,
@@ -718,7 +779,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 					)
 				}
 				summary.push(
-					`| shapes | lazy promisor blob backfill | ${lazy.ok ? "OK, bytes match git" : `FAILED (exit ${lazy.code})`} |`,
+					`| shapes | lazy promisor blob backfill | ${lazy.status === "success" ? "OK, bytes match git" : `FAILED (exit ${lazy.code})`} |`,
 				)
 			}
 
@@ -727,11 +788,11 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				(await spawnGit(["rev-list", "--first-parent", "HEAD"], { cwd: MIRROR })).stdout,
 			)
 			const picks = [
-				hist[Math.floor(hist.length * 0.25)],
-				hist[Math.floor(hist.length * 0.5)],
-				hist[Math.floor(hist.length * 0.9)],
-			].filter((x): x is string => typeof x === "string")
-			if (picks.length !== 3 || new Set(picks).size !== 3) {
+				requiredAt(hist, Math.floor(hist.length * 0.25), "quarter-history commit"),
+				requiredAt(hist, Math.floor(hist.length * 0.5), "mid-history commit"),
+				requiredAt(hist, Math.floor(hist.length * 0.9), "late-history commit"),
+			]
+			if (new Set(picks).size !== picks.length) {
 				throw new Error(
 					`exact-OID fixture needs three distinct historical commits, got ${picks.join(", ") || "none"}`,
 				)
@@ -743,14 +804,14 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				mkdirSync(d, { recursive: true })
 				await spawnGit(["init", "-q", "--bare", d])
 				const f = await tryGit(["-c", "protocol.version=2", "fetch", "-q", url, oid], d)
-				if (!f.ok) {
+				if (f.status === "failure") {
 					// A canonical success makes this a pggit finding. A canonical rejection
 					// means the named fixture was never established and is not scoreable.
 					const cd = join(scratch.mk("oidcanon"), "o.git")
 					mkdirSync(cd, { recursive: true })
 					await spawnGit(["init", "-q", "--bare", cd])
 					const canon = await tryGit(["fetch", "-q", `file://${ORACLE}`, oid], cd)
-					if (canon.ok) {
+					if (canon.status === "success") {
 						fail(
 							"shapes",
 							`exact-OID fetch ${oid.slice(0, 8)} rejected`,
@@ -796,7 +857,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				shDir,
 			])
 			const shMs = Date.now() - st
-			if (sh.ok) {
+			if (sh.status === "success") {
 				fail(
 					"shapes",
 					"shallow clone SUCCEEDED — pggit rejects shallow by design",
@@ -838,7 +899,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				url,
 				afterGcDir,
 			])
-			if (!ag.ok)
+			if (ag.status === "failure")
 				fail("shapes", "mirror clone AFTER gc FAILED", ag.stderr.trim().slice(0, 700))
 			else {
 				const c = await compareRepos(
@@ -863,7 +924,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 				url,
 				afterRepackDir,
 			])
-			if (!ar.ok)
+			if (ar.status === "failure")
 				fail(
 					"shapes",
 					"mirror clone AFTER gc+repack FAILED",
@@ -903,24 +964,24 @@ async function phaseOrphan(db: IsolatedDb): Promise<void> {
 	try {
 		const head = (await spawnGit(["rev-parse", "HEAD"], { cwd: MIRROR })).stdout.trim()
 		// A tip that is NOT an ancestor of HEAD — its push will be denied.
-		let divergent: string | null = null
-		for (const [name] of await refMap(MIRROR)) {
-			if (name === "HEAD") continue
-			const peeled = await tryGit(["rev-parse", `${name}^{commit}`], MIRROR)
-			if (!peeled.ok) continue
-			const oid = peeled.stdout.trim()
-			if (oid === head) continue
-			const anc = await tryGit(["merge-base", "--is-ancestor", oid, head], MIRROR)
-			if (!anc.ok) {
-				divergent = oid
-				break
+		const divergent = await (async (): Promise<string> => {
+			for (const [name] of await refMap(MIRROR)) {
+				if (name === "HEAD") continue
+				const peeled = await tryGit(["rev-parse", `${name}^{commit}`], MIRROR)
+				if (peeled.status === "failure") continue
+				const oid = peeled.stdout.trim()
+				if (oid === head) continue
+				const anc = await tryGit(["merge-base", "--is-ancestor", oid, head], MIRROR)
+				if (anc.status === "success") continue
+				if (anc.code === 1) return oid
+				throw new Error(
+					`canonical merge-base failed for ${oid}: ${anc.stderr.trim().slice(0, 500)}`,
+				)
 			}
-		}
-		if (divergent === null) {
 			throw new Error(
 				"orphan phase requires a divergent commit ref, but the source has none",
 			)
-		}
+		})()
 
 		await spawnGit(["push", url, `${head}:refs/heads/main`], { cwd: MIRROR })
 		const r1 = await createRepack(db.sql).repack(repoId)
@@ -930,7 +991,7 @@ async function phaseOrphan(db: IsolatedDb): Promise<void> {
 
 		// The denied push: refs must NOT move, objects DO land.
 		const denied = await tryGit(["push", url, `+${divergent}:refs/heads/main`], MIRROR)
-		if (denied.ok) {
+		if (denied.status === "success") {
 			fail(
 				"orphan",
 				"a non-fast-forward force push was ACCEPTED — refs must only advance",
@@ -963,7 +1024,7 @@ async function phaseOrphan(db: IsolatedDb): Promise<void> {
 				url,
 				d,
 			])
-			if (!c.ok) {
+			if (c.status === "failure") {
 				fail("orphan", `${label}: mirror clone FAILED`, c.stderr.trim().slice(0, 700))
 				return false
 			}
@@ -1036,9 +1097,10 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 			).stdout,
 		)
 		const checkpoints: string[] = []
-		for (let i = STEP - 1; i < chain.length; i += STEP)
-			checkpoints.push(chain[i] as string)
-		const last = chain[chain.length - 1] as string
+		for (let i = STEP - 1; i < chain.length; i += STEP) {
+			checkpoints.push(requiredAt(chain, i, "replay checkpoint"))
+		}
+		const last = requiredAt(chain, chain.length - 1, "replay head commit")
 		if (checkpoints[checkpoints.length - 1] !== last) checkpoints.push(last)
 		if (checkpoints.length < 3) {
 			throw new Error(
@@ -1047,16 +1109,18 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 		}
 		console.log(`  ${chain.length} first-parent commits → ${checkpoints.length} rounds`)
 
-		let tracking: string | null = null
-		let oracleTracking: string | null = null
+		type TrackingState =
+			| { state: "empty" }
+			| { state: "ready"; oracle: string; pggit: string }
+		let tracking: TrackingState = { state: "empty" }
 		const repackedRounds: number[] = []
 		const skippedRounds: number[] = []
 		let totalRepack = { deltas: 0, wholes: 0 }
 
 		for (let round = 0; round < checkpoints.length; round++) {
-			const rev = checkpoints[round] as string
+			const rev = requiredAt(checkpoints, round, "replay round checkpoint")
 			const p = await tryGit(["push", url, `${rev}:refs/heads/main`], MIRROR)
-			if (!p.ok) {
+			if (p.status === "failure") {
 				fail(
 					"replay",
 					`round ${round}: push of ${rev.slice(0, 8)} FAILED`,
@@ -1080,8 +1144,8 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 				repackedRounds.push(round)
 			}
 
-			if (tracking === null) {
-				tracking = join(scratch.mk("track"), "t.git")
+			if (tracking.state === "empty") {
+				const pggitTracking = join(scratch.mk("track"), "t.git")
 				const c = await tryGit([
 					"-c",
 					"protocol.version=2",
@@ -1089,9 +1153,9 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 					"--bare",
 					"-q",
 					url,
-					tracking,
+					pggitTracking,
 				])
-				if (!c.ok) {
+				if (c.status === "failure") {
 					fail(
 						"replay",
 						`round ${round}: initial tracking clone FAILED`,
@@ -1099,7 +1163,7 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 					)
 					return
 				}
-				oracleTracking = join(scratch.mk("otrack"), "t.git")
+				const oracleTracking = join(scratch.mk("otrack"), "t.git")
 				await spawnGit([
 					"clone",
 					"--bare",
@@ -1107,6 +1171,7 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 					`file://${oracleRemote}`,
 					oracleTracking,
 				])
+				tracking = { oracle: oracleTracking, pggit: pggitTracking, state: "ready" }
 			} else {
 				const f = await tryGit(
 					[
@@ -1117,9 +1182,9 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 						"origin",
 						"+refs/heads/main:refs/heads/main",
 					],
-					tracking,
+					tracking.pggit,
 				)
-				if (!f.ok) {
+				if (f.status === "failure") {
 					fail(
 						"replay",
 						`round ${round}: incremental fetch FAILED`,
@@ -1128,12 +1193,15 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 					return
 				}
 				await spawnGit(["fetch", "-q", "origin", "+refs/heads/main:refs/heads/main"], {
-					cwd: oracleTracking as string,
+					cwd: tracking.oracle,
 				})
+			}
+			if (tracking.state !== "ready") {
+				throw new Error(`round ${round}: tracking clients were not established`)
 			}
 
 			const tip = (
-				await spawnGit(["rev-parse", "refs/heads/main"], { cwd: tracking })
+				await spawnGit(["rev-parse", "refs/heads/main"], { cwd: tracking.pggit })
 			).stdout.trim()
 			if (tip !== rev) {
 				fail(
@@ -1142,8 +1210,8 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 					`expected ${rev}, got ${tip}`,
 				)
 			}
-			const fsck = await tryGit(["fsck", "--strict"], tracking)
-			if (!fsck.ok) {
+			const fsck = await tryGit(["fsck", "--strict"], tracking.pggit)
+			if (fsck.status === "failure") {
 				fail(
 					"replay",
 					`round ${round}: git fsck --strict FAILED after fetch`,
@@ -1153,8 +1221,8 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 			await compareRepos(
 				"replay",
 				`round ${round} (${rev.slice(0, 8)})`,
-				tracking,
-				oracleTracking as string,
+				tracking.pggit,
+				tracking.oracle,
 			)
 			process.stdout.write(
 				`  round ${round} @ ${rev.slice(0, 8)}${round % 3 === 2 ? " (repack skipped)" : ""}\n`,
@@ -1169,6 +1237,9 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 				`replay fixture was vacuous (${totalRepack.deltas} deltas, ${repackedRounds.length} repacked, ${skippedRounds.length} skipped rounds)`,
 			)
 		}
+		if (tracking.state !== "ready") {
+			throw new Error("replay produced no tracking client")
+		}
 
 		// final: the tracking clone must equal a fresh file:// clone of the same tip
 		const finalRef = join(scratch.mk("finalref"), "f.git")
@@ -1176,7 +1247,7 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 		const c = await compareRepos(
 			"replay",
 			"FINAL tracking clone vs file:// oracle",
-			tracking as string,
+			tracking.pggit,
 			finalRef,
 		)
 		summary.push(
@@ -1200,7 +1271,7 @@ async function phaseReplay(db: IsolatedDb): Promise<void> {
 			url,
 			freshDir,
 		])
-		if (!fr.ok)
+		if (fr.status === "failure")
 			fail(
 				"replay",
 				"fresh clone of the replayed repo FAILED",

@@ -14,16 +14,21 @@
  *
  *   npx tsx perf/breakage/pg-bloat--topology-growth.ts --lengths=100,200,400,800,1600
  */
+import { z } from "zod"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	requiredAt,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
 import {
 	COMMITTER,
-	DEFAULT_PG_URL,
 	filler,
-	flag,
-	increasingIntegerListFlag,
 	mb,
 	pad,
 	padr,
@@ -36,8 +41,14 @@ import {
 /** growth exponent (log-log slope) above which the surface is super-linear */
 const EXPONENT_LIMIT = 1.35
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-const LENGTHS = increasingIntegerListFlag("lengths", [100, 200, 400, 800, 1600])
+const { lengths: LENGTHS, pg: PG_URL } = parseArgs(
+	z
+		.object({
+			lengths: increasingIntegerListArg([100, 200, 400, 800, 1600]),
+			pg: pgUrlArg,
+		})
+		.strict(),
+)
 
 function buildStream(commits: number): string {
 	const out: string[] = []
@@ -58,7 +69,7 @@ function buildStream(commits: number): string {
 		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
 	)
 	for (let i = 0; i < commits; i++) {
-		const dir = runDirName("edge", i)
+		const dir = runDirName("topology", i)
 		const record = blob(`{"run":"${dir}","p":"${filler(`rec-${i}`, 700)}"}\n`)
 		const stderr = blob(`${filler(`err-${i}`, 200)}\n`)
 		const cm = next()
@@ -110,7 +121,7 @@ async function measure(
 		const flush = async () => {
 			if (batch.length === 0) return
 			await store.putPack(
-				"r/edge",
+				"r/topology",
 				batch.map((o) => ({ content: o.content, type: o.type })),
 			)
 			batch = []
@@ -122,10 +133,9 @@ async function measure(
 			if (bytes >= 16_000_000) await flush()
 		}
 		await flush()
-		const tip = (
-			await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })
-		).stdout.trim()
-		await refs.setRef("r/edge", "refs/heads/main", tip)
+		const tip = await revParse(src, "refs/heads/main")
+		await refs.setRef("r/topology", "refs/heads/main", tip)
+		await refs.setSymref("r/topology", "HEAD", "refs/heads/main")
 
 		const commitSize = await sizeOf(db.sql, "git_commit")
 		const tagSize = await sizeOf(db.sql, "git_tag")
@@ -146,6 +156,11 @@ async function measure(
 				`topology prerequisite mismatch: commits=${c.n}/${commits + 1}, objects=${o.n}/${objects.length}, tags=${t.n}/0`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, "r/topology", {
+			encodings: { kind: "unchecked" },
+			objects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		return {
 			commitRows: Number(c.n),
 			commits,
@@ -171,7 +186,7 @@ function exponent(a: Point, b: Point, pick: (p: Point) => number): number {
 }
 
 async function main(): Promise<void> {
-	const scratch = scratchRoot("edge")
+	const scratch = scratchRoot("topology")
 	try {
 		console.log(`# topology-surface growth against the packfile for the same history\n`)
 		console.log(
@@ -198,8 +213,8 @@ async function main(): Promise<void> {
 			)
 		}
 
-		const last = points[points.length - 1] as Point
-		const prev = points[points.length - 2] as Point
+		const last = requiredAt(points, points.length - 1, "largest topology measurement")
+		const prev = requiredAt(points, points.length - 2, "previous topology measurement")
 		const expRows = exponent(prev, last, (p) => p.commitRows)
 		const expBytes = exponent(prev, last, (p) => p.topoTotal)
 		const expPack = exponent(prev, last, (p) => p.packBytes)

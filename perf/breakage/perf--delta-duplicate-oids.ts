@@ -18,21 +18,29 @@
  */
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
-import { allObjectOids, revParse } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
+	repackEligibleObjects,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
 import {
 	cleanupTmp,
 	gitRepack,
 	importRepo,
 	mb,
 	mkTmp,
-	PG_URL,
-	positiveIntegerFlag,
 	secs,
 	seedRepo,
 	table,
@@ -40,8 +48,19 @@ import {
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const WIDTH = positiveIntegerFlag("width", 20_000)
-const COMMITS = positiveIntegerFlag("commits", 50)
+const {
+	commits: COMMITS,
+	pg: PG_URL,
+	width: WIDTH,
+} = parseArgs(
+	z
+		.object({
+			commits: positiveIntegerArg.default(50),
+			pg: pgUrlArg,
+			width: positiveIntegerArg.min(65).max(0x1_0000).default(20_000),
+		})
+		.strict(),
+)
 /** Slowdown/size ratio between the two arms at which this is called broken. */
 const ARM_RATIO_LIMIT = 3
 
@@ -49,14 +68,16 @@ const ARM_RATIO_LIMIT = 3
  * tail lands on a 16-byte-aligned block — the encoder's index key. */
 const name = (i: number): string => i.toString(16).padStart(4, "0")
 
-function stream(distinct: boolean): string {
+type ArmKind = "distinct-blobs" | "shared-blob"
+
+function stream(kind: ArmKind): string {
 	const out: string[] = []
 	let mark = 0
 	const changes: string[] = []
 	const shared = ++mark
-	if (!distinct) out.push(`blob\nmark :${shared}\ndata 6\nstub\n\n`)
+	if (kind === "shared-blob") out.push(`blob\nmark :${shared}\ndata 6\nstub\n\n`)
 	for (let i = 0; i < WIDTH; i++) {
-		if (distinct) {
+		if (kind === "distinct-blobs") {
 			const m = ++mark
 			const body = `stub ${i}\n`
 			out.push(`blob\nmark :${m}\ndata ${body.length}\n${body}\n`)
@@ -76,7 +97,7 @@ function stream(distinct: boolean): string {
 		out.push(`blob\nmark :${m}\ndata ${body.length}\n${body}\n`)
 		const cm = ++mark
 		const msg = `c${c}`
-		const target = (c * 977) % WIDTH
+		const target = 64 + ((c * 977) % (WIDTH - 64))
 		out.push(
 			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
 				`M 100644 :${m} w/${name(target)}\n`,
@@ -98,44 +119,57 @@ type Arm = {
 	gitPack: number
 }
 
-async function arm(distinct: boolean): Promise<Arm> {
+async function arm(kind: ArmKind): Promise<Arm> {
+	const distinct = kind === "distinct-blobs"
 	const label = distinct ? "distinct blobs" : "one shared blob"
-	const dir = await importRepo(distinct ? "dup-distinct" : "dup-shared", stream(distinct))
+	const dir = await importRepo(distinct ? "dup-distinct" : "dup-shared", stream(kind))
 	try {
 		const git = await gitRepack(dir, distinct ? "dup-git-d" : "dup-git-s")
 		const db = await createIsolatedSchema(PG_URL)
 		try {
 			const objs = await seedRepo(db.sql, "probe/dup", dir)
 			const expectedOids = await allObjectOids(dir)
+			const expectedObjects = await loadGitObjects(dir, expectedOids)
 			const expectedTip = await revParse(dir, "refs/heads/main")
 			if (objs.objects !== expectedOids.length) {
 				throw new Error(`seeded ${objs.objects} objects, expected ${expectedOids.length}`)
 			}
 			const t0 = Date.now()
 			const r = await createRepack(db.sql).repack("probe/dup")
-			if (r.wholes + r.deltas !== objs.objects || r.deltas === 0) {
+			if (r.wholes + r.deltas !== objs.eligibleObjects || r.deltas === 0) {
 				throw new Error(
-					`delta fixture produced ${r.wholes} wholes + ${r.deltas} deltas for ${objs.objects} objects`,
+					`delta fixture produced ${r.wholes} wholes + ${r.deltas} deltas for ${objs.eligibleObjects} eligible objects`,
 				)
 			}
+			await assertCanonicalStoreFixture(db.sql, "probe/dup", {
+				encodings: {
+					kind: "exact",
+					objects: repackEligibleObjects(expectedObjects),
+				},
+				objects: expectedObjects,
+				refs: await canonicalStoreRefsOf(dir),
+			})
 			const repackMs = Date.now() - t0
 			const server = await serveOnPort(
 				createGitApp(createGitDeps(db.sql), { instrument: true }),
 				0,
 			)
-			resetCollected()
 			const dest = join(mkTmp("dup-clone"), "c")
 			mkdirSync(dest, { recursive: true })
-			await spawnGit([
-				"-c",
-				"protocol.version=2",
-				"clone",
-				"-q",
-				"--bare",
-				`http://127.0.0.1:${server.port}/probe/dup`,
-				dest,
-			])
-			await server.close()
+			try {
+				resetCollected()
+				await spawnGit([
+					"-c",
+					"protocol.version=2",
+					"clone",
+					"-q",
+					"--bare",
+					`http://127.0.0.1:${server.port}/probe/dup`,
+					dest,
+				])
+			} finally {
+				await server.close()
+			}
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 			const cloneOids = await allObjectOids(dest)
 			const cloneTip = await revParse(dest, "refs/heads/main")
@@ -146,21 +180,14 @@ async function arm(distinct: boolean): Promise<Arm> {
 			) {
 				throw new Error(`${label} clone diverged from canonical refs/object set`)
 			}
-			const run = collectedRuns().find((r2) => r2.label === "fetch")
-			if (!run) throw new Error(`${label}: missing fetch instrumentation run`)
-			const packBytes = run.counters.get("packBytes")
-			const objectsServed = run.counters.get("objectsServed")
-			const deltasServed = run.counters.get("deltasServed")
-			if (packBytes === undefined || packBytes <= 0) {
-				throw new Error(`${label}: missing/nonpositive packBytes counter`)
-			}
+			const run = requiredCollector(collectedRuns(), "fetch", label)
+			const packBytes = requiredPositiveCounter(run, "packBytes", label)
+			const objectsServed = requiredPositiveCounter(run, "objectsServed", label)
+			requiredPositiveCounter(run, "deltasServed", label)
 			if (objectsServed !== expectedOids.length) {
 				throw new Error(
 					`${label}: served ${String(objectsServed)}/${expectedOids.length} canonical objects`,
 				)
-			}
-			if (deltasServed === undefined || deltasServed <= 0) {
-				throw new Error(`${label}: served no deltas`)
 			}
 			const [treeRow] = await db.sql<{ n: string }[]>`
 				select coalesce(sum(size),0)::text as n from git_object where type = 2`
@@ -187,8 +214,8 @@ async function arm(distinct: boolean): Promise<Arm> {
 }
 
 async function main(): Promise<void> {
-	const a = await arm(true)
-	const b = await arm(false)
+	const a = await arm("distinct-blobs")
+	const b = await arm("shared-blob")
 	if (a.treeMb !== b.treeMb) {
 		throw new Error(`tree-byte precondition failed: ${a.treeMb} != ${b.treeMb}`)
 	}

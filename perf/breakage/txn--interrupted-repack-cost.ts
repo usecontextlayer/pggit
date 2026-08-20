@@ -12,6 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Sql } from "postgres"
+import { z } from "zod"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createGitApp } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
@@ -21,15 +22,23 @@ import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
 	branchAndTagRefsOf,
+	canonicalStoreRefsOf,
 	gitReachableOids,
+	loadGitObjects,
+	repackEligibleObjects,
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { PG_URL, table } from "./_txn-util"
+import { parseArgs, pgUrlArg } from "../args"
+import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
+import { table } from "./_txn-util"
 
 const REPO = "r"
+const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
 const RUNS = 400
 
 /** A client whose `begin()` throws on the Nth call — the pass dies with N-1
@@ -77,20 +86,16 @@ async function stats(db: IsolatedDb): Promise<TierStats> {
 	return row
 }
 
-function requireRawPackBytes(label: string): number {
-	const runs = collectedRuns().filter((run) => run.label === "fetch")
-	if (runs.length !== 1) {
-		throw new Error(`${label}: expected one fetch collector, got ${runs.length}`)
+function requireRawPackBytes(label: string, expectedObjects: number): number {
+	const collector = requiredCollector(collectedRuns(), "fetch", label)
+	const objectsServed = requiredPositiveCounter(collector, "objectsServed", label)
+	if (objectsServed !== expectedObjects) {
+		throw new Error(
+			`${label}: collector served ${objectsServed}/${expectedObjects} canonical objects`,
+		)
 	}
-	const run = runs[0]
-	if (!run) throw new Error(`${label}: fetch collector disappeared`)
-	for (const counter of ["objectsServed", "packBytes", "wireBytes"]) {
-		const value = run.counters.get(counter)
-		if (value === undefined || value <= 0) {
-			throw new Error(`${label}: ${counter} is missing or nonpositive`)
-		}
-	}
-	return run.counters.get("packBytes") as number
+	requiredPositiveCounter(collector, "wireBytes", label)
+	return requiredPositiveCounter(collector, "packBytes", label)
 }
 
 type Run = { label: string; packBytes: number; tier: TierStats }
@@ -108,6 +113,8 @@ async function run(
 		mkdirSync(scratchDir, { recursive: true })
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
+		const canonicalObjects = await loadGitObjects(src, await allObjectOids(src))
+		const canonicalRefs = await canonicalStoreRefsOf(src)
 		await seedRepoIntoStore(REPO, src, { objects, refs })
 		for (const at of crashes) {
 			const fault = dieAtFlush(db.sql, at)
@@ -147,6 +154,11 @@ async function run(
 				`${label}: incomplete or vacuous tier (${tier.rows}/${tier.eligibleObjects} rows, ${tier.ineligibleRows} ineligible, ${tier.bytes} bytes, ${tier.deltas} deltas)`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(canonicalObjects) },
+			objects: canonicalObjects,
+			refs: canonicalRefs,
+		})
 
 		server = await serveOnPort(createGitApp({ objects, refs }, { instrument: true }), 0)
 		const dest = join(scratchDir, "c")
@@ -185,7 +197,11 @@ async function run(
 				`${label}: clone HEAD ${actualTip.stdout.trim()} != source ${expectedTip.stdout.trim()}`,
 			)
 		}
-		return { label, packBytes: requireRawPackBytes(label), tier }
+		return {
+			label,
+			packBytes: requireRawPackBytes(label, canonicalObjects.length),
+			tier,
+		}
 	} finally {
 		await server?.close()
 		await db.drop()

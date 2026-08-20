@@ -37,17 +37,24 @@
  *   npx tsx perf/breakage/pgres--gc-pass-overhead.ts --passes=120 --repos=12
  */
 import type { Sql } from "postgres"
+import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
+import {
+	assertCanonicalStoreFixture,
+	repackEligibleObjects,
+	requiredAt,
+	requireGitOid,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	cleanupTmp,
 	fastImport,
 	initRepo,
 	median,
-	numFlag,
+	type Obj,
 	objectsBetween,
-	PG_URL,
 	revParse,
 	runCommits,
 	seedObjects,
@@ -56,11 +63,43 @@ import {
 	table,
 } from "./_pgres-util"
 
-const PASSES = numFlag("passes", 120)
-const REPOS = numFlag("repos", 12)
-const COMMITS = numFlag("commits", 40)
+const args = parseArgs(
+	z
+		.object({
+			commits: positiveIntegerArg.default(40),
+			passes: positiveIntegerArg.default(120),
+			pg: pgUrlArg,
+			repos: positiveIntegerArg.default(12),
+		})
+		.strict(),
+)
+const PASSES = args.passes
+const REPOS = args.repos
+const COMMITS = args.commits
+const PG_URL = args.pg
 
 type Catalog = { size: number; ins: number; del: number; upd: number }
+
+async function requireFixture(
+	pg: Sql,
+	repo: string,
+	objects: readonly Obj[],
+	tip: string,
+	encodings: readonly Obj[],
+): Promise<void> {
+	await assertCanonicalStoreFixture(pg, repo, {
+		encodings: { kind: "exact", objects: encodings },
+		objects,
+		refs: [
+			{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			{
+				kind: "direct",
+				name: "refs/heads/main",
+				oid: requireGitOid(tip, `${repo} main tip`),
+			},
+		],
+	})
+}
 
 /** Database-wide system-catalog churn counters. NOISY (shared instance). */
 async function catalogState(pg: Sql): Promise<Catalog> {
@@ -115,6 +154,7 @@ async function main(): Promise<void> {
 		for (const n of names) {
 			await seedObjects(pg, n, objects)
 			await setMain(pg, n, tip)
+			await requireFixture(pg, n, objects, tip, [])
 		}
 
 		// ── C2: the cost of a NO-OP pass, tier absent vs tier present ───────────
@@ -123,7 +163,7 @@ async function main(): Promise<void> {
 		const noop = async (rounds: number): Promise<number[]> => {
 			const out: number[] = []
 			for (let i = 0; i < rounds; i++) {
-				const name = names[i % names.length] as string
+				const name = requiredAt(names, i % names.length, "fleet repository")
 				const t = Date.now()
 				const result = await gc.gc(name, { graceSeconds: 3600, maintain: false })
 				if (result.deletedObjects !== 0) {
@@ -151,18 +191,20 @@ async function main(): Promise<void> {
 		const c2 = await catalogState(pg)
 
 		// Now build the tier on every repo and repeat the identical loop.
+		const fleetEligible = repackEligibleObjects(objects)
 		for (const n of names) {
 			const result = await repack.repack(n)
-			if (result.wholes + result.deltas !== objects.length) {
+			if (result.wholes + result.deltas !== fleetEligible.length) {
 				throw new Error(`${n}: repack covered incomplete object set`)
 			}
+			await requireFixture(pg, n, objects, tip, fleetEligible)
 		}
 		const [fleetTier] = await pg<
 			{ n: string }[]
 		>`select count(*)::text as n from git_pack_encoding`
-		if (!fleetTier || Number(fleetTier.n) !== names.length * objects.length) {
+		if (!fleetTier || Number(fleetTier.n) !== names.length * fleetEligible.length) {
 			throw new Error(
-				`fleet tier has ${fleetTier?.n ?? "no count"}/${names.length * objects.length} rows`,
+				`fleet tier has ${fleetTier?.n ?? "no count"}/${names.length * fleetEligible.length} rows`,
 			)
 		}
 		await noop(REPOS)
@@ -192,6 +234,16 @@ async function main(): Promise<void> {
 		console.log(
 			`${REPOS} repos × ${objects.length} objects each · ${PASSES} no-op passes per arm\n`,
 		)
+		const bareP95 = requiredAt(
+			[...bare].sort((a, b) => a - b),
+			Math.floor(bare.length * 0.95),
+			"tier-absent p95",
+		)
+		const withTierP95 = requiredAt(
+			[...withTier].sort((a, b) => a - b),
+			Math.floor(withTier.length * 0.95),
+			"tier-present p95",
+		)
 		console.log(
 			table(
 				["arm", "passes", "p50 ms", "p95 ms", "total ms", "ms/pass"],
@@ -200,7 +252,7 @@ async function main(): Promise<void> {
 						"tier ABSENT (never repacked)",
 						bare.length,
 						bareMedian.toFixed(1),
-						[...bare].sort((a, b) => a - b)[Math.floor(bare.length * 0.95)] as number,
+						bareP95,
 						bareMs,
 						(bareMs / bare.length).toFixed(1),
 					],
@@ -208,9 +260,7 @@ async function main(): Promise<void> {
 						"tier PRESENT (repacked)",
 						withTier.length,
 						withTierMedian.toFixed(1),
-						[...withTier].sort((a, b) => a - b)[
-							Math.floor(withTier.length * 0.95)
-						] as number,
+						withTierP95,
 						withMs,
 						(withMs / withTier.length).toFixed(1),
 					],
@@ -258,7 +308,8 @@ async function main(): Promise<void> {
 
 		// ── does the no-op sweep cost scale with the tier's SIZE? ───────────────
 		console.log("\n## does the fixed per-pass cost scale with the tier?\n")
-		const scale: (string | number)[][] = []
+		type ScaleMeasurement = { bareMs: number; objects: number; tierMs: number }
+		const scale: ScaleMeasurement[] = []
 		let worstPairedOverhead = Number.NEGATIVE_INFINITY
 		// Append-only history: tree bytes grow quadratically and so does the GC closure
 		// walk, so these stay small enough that ~14 passes per size fit the budget.
@@ -280,6 +331,7 @@ async function main(): Promise<void> {
 			if (sobjs.length === 0) throw new Error(`${repo}: fixture produced no objects`)
 			await seedObjects(pg, repo, sobjs)
 			await setMain(pg, repo, stip)
+			await requireFixture(pg, repo, sobjs, stip, [])
 
 			const timeNoop = async (n: number): Promise<number> => {
 				if (!Number.isFinite(n) || n <= 0) {
@@ -307,26 +359,22 @@ async function main(): Promise<void> {
 			await timeNoop(2)
 			const bareMed = await timeNoop(5)
 			const scaled = await repack.repack(repo)
-			if (scaled.wholes + scaled.deltas !== sobjs.length) {
+			const eligible = repackEligibleObjects(sobjs)
+			if (scaled.wholes + scaled.deltas !== eligible.length) {
 				throw new Error(`${repo}: repack covered incomplete object set`)
 			}
+			await requireFixture(pg, repo, sobjs, stip, eligible)
 			const [tierRows] = await pg<{ n: string }[]>`
 				select count(*)::text as n from git_pack_encoding e
 				join repos r on r.id = e.repo_id where r.name = ${repo}`
-			if (!tierRows || Number(tierRows.n) !== sobjs.length) {
+			if (!tierRows || Number(tierRows.n) !== eligible.length) {
 				throw new Error(
-					`${repo}: tier has ${tierRows?.n ?? "no count"}/${sobjs.length} rows`,
+					`${repo}: tier has ${tierRows?.n ?? "no count"}/${eligible.length} rows`,
 				)
 			}
 			await timeNoop(2)
 			const tierMed = await timeNoop(5)
-			scale.push([
-				sobjs.length,
-				bareMed.toFixed(1),
-				tierMed.toFixed(1),
-				(tierMed - bareMed).toFixed(1),
-				`${(((tierMed - bareMed) / bareMed) * 100).toFixed(0)}%`,
-			])
+			scale.push({ bareMs: bareMed, objects: sobjs.length, tierMs: tierMed })
 			worstPairedOverhead = Math.max(worstPairedOverhead, (tierMed - bareMed) / bareMed)
 		}
 		if (!Number.isFinite(worstPairedOverhead)) {
@@ -341,13 +389,19 @@ async function main(): Promise<void> {
 					"added by tier presence (ms)",
 					"overhead",
 				],
-				scale,
+				scale.map(({ bareMs, objects, tierMs }) => [
+					objects,
+					bareMs.toFixed(1),
+					tierMs.toFixed(1),
+					(tierMs - bareMs).toFixed(1),
+					`${(((tierMs - bareMs) / bareMs) * 100).toFixed(0)}%`,
+				]),
 			),
 		)
-		const first = scale[0] as (string | number)[]
-		const last = scale[scale.length - 1] as (string | number)[]
+		const first = requiredAt(scale, 0, "smallest scale measurement")
+		const last = requiredAt(scale, scale.length - 1, "largest scale measurement")
 		console.log(
-			`\nadded cost went ${Number(first[3]).toFixed(0)} ms → ${Number(last[3]).toFixed(0)} ms while the tier grew ${(Number(last[0]) / Number(first[0])).toFixed(1)}×. No GC query should scan that tier; this is the regression signal the 15% bound protects.`,
+			`\nadded cost went ${(first.tierMs - first.bareMs).toFixed(0)} ms → ${(last.tierMs - last.bareMs).toFixed(0)} ms while the tier grew ${(last.objects / first.objects).toFixed(1)}×. No GC query should scan that tier; this is the regression signal the 15% bound protects.`,
 		)
 
 		// Query after the scale passes too: every GC invocation above is in scope.

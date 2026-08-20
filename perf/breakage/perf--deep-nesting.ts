@@ -19,20 +19,27 @@
  */
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
-import { allObjectOids, revParse } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
+	repackEligibleObjects,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
 import {
 	cleanupTmp,
 	gitRepack,
 	importRepo,
-	increasingIntegerListFlag,
 	mb,
 	mkTmp,
-	PG_URL,
 	secs,
 	seedRepo,
 	table,
@@ -41,7 +48,14 @@ import {
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const DEPTHS = increasingIntegerListFlag("depths", [125, 250, 500, 1000, 2000])
+const { depths: DEPTHS, pg: PG_URL } = parseArgs(
+	z
+		.object({
+			depths: increasingIntegerListArg([125, 250, 500, 1000, 2000]),
+			pg: pgUrlArg,
+		})
+		.strict(),
+)
 const COMMITS = 16
 const RATIO_LIMIT = 20
 
@@ -49,7 +63,8 @@ function stream(depth: number): string {
 	const path = `${Array.from({ length: depth }, (_, i) => `d${i % 10}${i}`).join("/")}/leaf.txt`
 	const out: string[] = []
 	let mark = 0
-	let prev: number | null = null
+	type CommitParent = { kind: "root" } | { kind: "child"; mark: number }
+	let parent: CommitParent = { kind: "root" }
 	for (let c = 0; c < COMMITS; c++) {
 		const body = `version ${c}\n`
 		const bm = ++mark
@@ -58,10 +73,10 @@ function stream(depth: number): string {
 		const msg = `c${c}`
 		out.push(
 			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n` +
-				(prev === null ? "" : `from :${prev}\n`) +
+				(parent.kind === "root" ? "" : `from :${parent.mark}\n`) +
 				`M 100644 :${bm} ${path}\n`,
 		)
-		prev = cm
+		parent = { kind: "child", mark: cm }
 	}
 	return out.join("")
 }
@@ -76,6 +91,7 @@ async function main(): Promise<void> {
 		const dir = await importRepo(`deep-${depth}`, stream(depth))
 		try {
 			const expectedOids = await allObjectOids(dir)
+			const expectedObjects = await loadGitObjects(dir, expectedOids)
 			const expectedTip = await revParse(dir, "refs/heads/main")
 			const git = await gitRepack(dir, `deep-git-${depth}`)
 			if (git.ms <= 0)
@@ -83,14 +99,23 @@ async function main(): Promise<void> {
 			const db = await createIsolatedSchema(PG_URL)
 			try {
 				const seeded = await seedRepo(db.sql, "probe/deep", dir)
+				if (seeded.objects !== expectedOids.length) {
+					throw new Error(
+						`depth ${depth}: seeded ${seeded.objects}/${expectedOids.length} canonical objects`,
+					)
+				}
 				let outcome = ""
 				let ms = 0
 				let rss = 0
+				let caseCrashed = false
 				try {
 					const r = await withPeakRss(() => createRepack(db.sql).repack("probe/deep"))
-					if (r.value.wholes + r.value.deltas !== seeded.objects) {
+					if (
+						r.value.wholes + r.value.deltas !== seeded.eligibleObjects ||
+						r.value.deltas <= 0
+					) {
 						throw new Error(
-							`repack covered ${r.value.wholes + r.value.deltas}/${seeded.objects} objects`,
+							`repack covered ${r.value.wholes + r.value.deltas}/${seeded.eligibleObjects} eligible objects with ${r.value.deltas} deltas`,
 						)
 					}
 					ms = r.ms
@@ -98,9 +123,19 @@ async function main(): Promise<void> {
 						throw new Error(`depth ${depth}: pggit repack timer was nonpositive`)
 					rss = r.peakRss - r.baseRss
 					outcome = `${r.value.wholes}w+${r.value.deltas}d`
+					await assertCanonicalStoreFixture(db.sql, "probe/deep", {
+						encodings: {
+							kind: "exact",
+							objects: repackEligibleObjects(expectedObjects),
+						},
+						objects: expectedObjects,
+						refs: await canonicalStoreRefsOf(dir),
+					})
 					worstRatio = Math.max(worstRatio, ms / git.ms)
 				} catch (e) {
-					outcome = `THREW: ${(e as Error).message.slice(0, 50)}`
+					const message = e instanceof Error ? e.message : String(e)
+					outcome = `THREW: ${message.slice(0, 50)}`
+					caseCrashed = true
 					crashed = true
 				}
 				rows.push([
@@ -110,12 +145,12 @@ async function main(): Promise<void> {
 					secs(ms),
 					mb(rss),
 					secs(git.ms),
-					crashed ? "—" : `${(ms / git.ms).toFixed(1)}×`,
+					caseCrashed ? "—" : `${(ms / git.ms).toFixed(1)}×`,
 					outcome,
 				])
 
 				// Deepest case: a real clone must round-trip through canonical git.
-				if (depth === DEPTHS[DEPTHS.length - 1] && !crashed) {
+				if (depth === DEPTHS[DEPTHS.length - 1] && !caseCrashed) {
 					const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 					const dest = join(mkTmp("deep-clone"), "c")
 					mkdirSync(dest, { recursive: true })
@@ -141,10 +176,12 @@ async function main(): Promise<void> {
 						}
 						fsckNote = "clone + fsck --strict clean"
 					} catch (e) {
-						fsckNote = `CLONE/FSCK FAILED: ${(e as Error).message.slice(0, 120)}`
+						const message = e instanceof Error ? e.message : String(e)
+						fsckNote = `CLONE/FSCK FAILED: ${message.slice(0, 120)}`
 						crashed = true
+					} finally {
+						await server.close()
 					}
-					await server.close()
 				}
 			} finally {
 				await db.drop()

@@ -10,17 +10,30 @@
  */
 import { rmSync } from "node:fs"
 import type { Sql } from "postgres"
+import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { parseRevListObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
+	parseRevListObjectOids,
+	repackEligibleObjects,
+	requireGitOid,
+	seedRepoIntoStore,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { PG_URL, table } from "./_txn-util"
+import { parseArgs, pgUrlArg } from "../args"
+import { requiredPositiveMeasurement } from "../collector-evidence"
+import { table } from "./_txn-util"
 
 const REPO = "r"
+const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
 const RUNS = 300
 /** Where main is rewound to before the sweep — leaves ~270 commits of garbage. */
 const REWIND_TO = 30
@@ -67,6 +80,7 @@ async function main(): Promise<void> {
 	try {
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
+		const canonicalObjects = await loadGitObjects(src, await allObjectOids(src))
 		await seedRepoIntoStore(REPO, src, { objects, refs })
 		const repack = await createRepack(db.sql).repack(REPO)
 		if (repack.wholes + repack.deltas === 0 || repack.deltas === 0) {
@@ -74,6 +88,11 @@ async function main(): Promise<void> {
 				`gc timing fixture did not establish a delta tier (${repack.wholes} wholes, ${repack.deltas} deltas)`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(canonicalObjects) },
+			objects: canonicalObjects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		const sourceOids = new Set(
 			parseRevListObjectOids(
 				(await spawnGit(["rev-list", "--objects", "HEAD"], { cwd: src })).stdout,
@@ -84,6 +103,7 @@ async function main(): Promise<void> {
 				(await spawnGit(["rev-list", "--objects", rewindTo], { cwd: src })).stdout,
 			),
 		)
+		const expectedLiveObjects = await loadGitObjects(src, [...expectedLiveOids])
 		const [beforeCensus] = await db.sql<{ objects: number }[]>`
 			select count(*)::int as objects from git_object`
 		if (!beforeCensus || beforeCensus.objects !== sourceOids.size) {
@@ -114,18 +134,27 @@ async function main(): Promise<void> {
 				`gc fixture census mismatch: deleted ${res.deletedObjects}/${expectedDeleted}, live ${afterCensus?.objects ?? "missing"}/${expectedLiveOids.size}`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(expectedLiveObjects) },
+			objects: expectedLiveObjects,
+			refs: [
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+				{
+					kind: "direct",
+					name: "refs/heads/main",
+					oid: requireGitOid(rewindTo, "GC sweep rewind tip"),
+				},
+			],
+		})
 		console.log(
 			`reclaimed: ${res.deletedObjects} objects ` +
 				`(encodings + commit/tag rows cascade with the object sweep, 0008/0009)\n`,
 		)
 
 		const total = [...perSweep.values()].reduce((a, b) => a + b, 0)
-		const objectMs = perSweep.get("objects") ?? 0
-		if (objectMs === 0 || total === 0) {
-			throw new Error(
-				`gc timing wrapper missed the object sweep (object=${objectMs}ms, total=${total}ms)`,
-			)
-		}
+		const objectMs = requiredPositiveMeasurement(perSweep, "objects", "GC SQL timing")
+		if (!Number.isFinite(total) || total <= 0)
+			throw new Error("GC SQL timing total is invalid")
 		console.log(
 			table(
 				["sweep", "ms", "share"],

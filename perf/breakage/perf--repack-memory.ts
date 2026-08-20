@@ -20,17 +20,30 @@
  */
 import { rmSync } from "node:fs"
 import postgres from "postgres"
+import { z } from "zod"
+import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createRepack } from "@/store/repack"
+import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	repackEligibleObjects,
+	requiredAt,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import {
+	increasingIntegerListArg,
+	nonemptyStringArg,
+	parseArgs,
+	pgUrlArg,
+	positiveIntegerArg,
+} from "../args"
 import {
 	cleanupTmp,
 	gitRepack,
 	importRepo,
-	increasingIntegerListFlag,
 	mb,
-	PG_URL,
-	positiveIntegerFlag,
+	reachableObjects,
 	secs,
 	seedRepo,
 	table,
@@ -39,50 +52,91 @@ import {
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const WIDTH = positiveIntegerFlag("width", 20_000)
-const COMMITS = increasingIntegerListFlag("commits", [100, 200, 400])
 const REPO_ID = "probe/mem"
 /** Peak RSS above git's at which this is called broken. */
 const RSS_RATIO_LIMIT = 2
+const DEFAULT_WIDTH = 20_000
+const DEFAULT_COMMITS = [100, 200, 400]
+
+const parentArgs = z
+	.object({
+		commits: increasingIntegerListArg(DEFAULT_COMMITS),
+		pg: pgUrlArg,
+		width: positiveIntegerArg.default(DEFAULT_WIDTH),
+	})
+	.strict()
+	.transform(({ commits, pg, width }) => ({
+		commits,
+		mode: "parent" as const,
+		pg,
+		width,
+	}))
+
+const childArgs = z
+	.object({
+		"child-mode": z.enum(["noop", "repack"]),
+		"child-schema": nonemptyStringArg,
+		pg: pgUrlArg,
+	})
+	.strict()
+	.transform((raw) => ({
+		childMode: raw["child-mode"],
+		mode: "child" as const,
+		pg: raw.pg,
+		schema: raw["child-schema"],
+	}))
+
+const args = parseArgs(z.union([childArgs, parentArgs]))
+type ChildArgs = Extract<typeof args, { mode: "child" }>
+type ParentArgs = Extract<typeof args, { mode: "parent" }>
 
 // ── child mode: connect to one schema, repack once, print the numbers ────────
-const childSchema = process.argv.find((a) => a.startsWith("--child="))?.slice(8)
-if (childSchema !== undefined) {
-	if (childSchema === "") throw new Error("--child requires a schema name")
-	const sql = postgres(PG_URL, {
-		connection: { search_path: childSchema },
+async function runChild({ childMode, pg, schema }: ChildArgs): Promise<void> {
+	const sql = postgres(pg, {
+		connection: { search_path: schema },
 		max: 4,
 		onnotice: () => {},
 	})
-	if (!process.argv.includes("--noop")) {
-		const t0 = Date.now()
-		const r = await createRepack(sql).repack(REPO_ID)
-		const [objects, encodings] = await Promise.all([
-			sql<{ n: string }[]>`select count(*)::text as n from git_object`,
-			sql<{ n: string }[]>`select count(*)::text as n from git_pack_encoding`,
-		])
-		const objectCount = Number(objects[0]?.n)
-		const encodingCount = Number(encodings[0]?.n)
-		if (
-			objectCount <= 0 ||
-			r.wholes + r.deltas !== objectCount ||
-			encodingCount !== objectCount
-		) {
-			throw new Error(
-				`repack coverage: receipt=${r.wholes + r.deltas}, rows=${encodingCount}, objects=${objectCount}`,
-			)
+	try {
+		if (childMode === "repack") {
+			const t0 = Date.now()
+			const r = await createRepack(sql).repack(REPO_ID)
+			const [objects, eligible, encodings] = await Promise.all([
+				sql<{ n: string }[]>`select count(*)::text as n from git_object`,
+				sql<{ n: string }[]>`
+					select count(*)::text as n from git_object where size < ${MAX_INLINE_BYTEA_BYTES}`,
+				sql<{ n: string }[]>`select count(*)::text as n from git_pack_encoding`,
+			])
+			const objectCount = Number(requiredAt(objects, 0, "child object census").n)
+			const eligibleCount = Number(requiredAt(eligible, 0, "child eligibility census").n)
+			const encodingCount = Number(requiredAt(encodings, 0, "child encoding census").n)
+			if (
+				!Number.isSafeInteger(objectCount) ||
+				objectCount <= 0 ||
+				!Number.isSafeInteger(eligibleCount) ||
+				eligibleCount <= 0 ||
+				!Number.isSafeInteger(encodingCount) ||
+				encodingCount <= 0 ||
+				r.wholes + r.deltas !== eligibleCount ||
+				r.deltas <= 0 ||
+				encodingCount !== eligibleCount
+			) {
+				throw new Error(
+					`repack coverage: receipt=${r.wholes} wholes + ${r.deltas} deltas, rows=${encodingCount}, eligible=${eligibleCount}, objects=${objectCount}`,
+				)
+			}
+			console.log(`child: ${r.wholes}w+${r.deltas}d in ${Date.now() - t0}ms`)
 		}
-		console.log(`child: ${r.wholes}w+${r.deltas}d in ${Date.now() - t0}ms`)
+	} finally {
+		await sql.end()
 	}
-	await sql.end()
-	process.exit(0)
 }
 
-function stream(commits: number): string {
+function stream(commits: number, width: number): string {
 	const out: string[] = []
 	let mark = 0
 	const changes: string[] = []
-	for (let i = 0; i < WIDTH; i++) {
+	for (let i = 0; i < width; i++) {
 		const m = ++mark
 		const body = `v0-${i}\n`
 		out.push(`blob\nmark :${m}\ndata ${body.length}\n${body}\n`)
@@ -100,7 +154,7 @@ function stream(commits: number): string {
 		const msg = `c${c}`
 		out.push(
 			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
-				`M 100644 :${m} wide/f${String(c % WIDTH).padStart(6, "0")}.txt\n`,
+				`M 100644 :${m} wide/f${String(c % width).padStart(6, "0")}.txt\n`,
 		)
 		prev = cm
 	}
@@ -135,47 +189,93 @@ async function bytesByType(dir: string): Promise<Map<string, number>> {
 const SELF = "perf/breakage/perf--repack-memory.ts"
 const ROOT = process.cwd()
 
-async function main(): Promise<void> {
+async function main({ commits: commitCounts, pg, width }: ParentArgs): Promise<void> {
 	// The interpreter floor: same child, same imports, no repack.
-	const floorDb = await createIsolatedSchema(PG_URL)
-	const floor = await timedSpawn(
-		"npx",
-		["tsx", SELF, `--child=${floorDb.schema}`, `--pg=${PG_URL}`, "--noop"],
-		ROOT,
-	)
-	if (floor.peakRss <= 0)
-		throw new Error("interpreter-floor peak RSS measurement missing")
-	await floorDb.drop()
+	const floorDb = await createIsolatedSchema(pg)
+	let floor: Awaited<ReturnType<typeof timedSpawn>>
+	try {
+		floor = await timedSpawn(
+			"npx",
+			[
+				"tsx",
+				SELF,
+				`--child-schema=${floorDb.schema}`,
+				"--child-mode=noop",
+				`--pg=${pg}`,
+			],
+			ROOT,
+		)
+	} finally {
+		await floorDb.drop()
+	}
+	if (floor.ms <= 0 || floor.peakRss <= 0) {
+		throw new Error(
+			`interpreter-floor measurement invalid: ms=${floor.ms}, peak=${floor.peakRss}`,
+		)
+	}
 
 	const rows: (string | number)[][] = []
 	let worst = 0
 	let worstShare = 0
 
-	for (const commits of COMMITS) {
-		const dir = await importRepo(`mem-${commits}`, stream(commits))
+	for (const commits of commitCounts) {
+		const dir = await importRepo(`mem-${commits}`, stream(commits, width))
 		try {
+			const commitCount = Number(
+				(
+					await spawnGit(["rev-list", "--count", "refs/heads/main"], { cwd: dir })
+				).stdout.trim(),
+			)
+			const fileCount = (
+				await spawnGit(["ls-tree", "-r", "--name-only", "refs/heads/main"], { cwd: dir })
+			).stdout
+				.trim()
+				.split("\n")
+				.filter(Boolean).length
+			if (commitCount !== commits + 1 || fileCount !== width) {
+				throw new Error(
+					`canonical fixture shape mismatch: commits=${commitCount}/${commits + 1}, files=${fileCount}/${width}`,
+				)
+			}
 			const totals = await bytesByType(dir)
 			const treeBytes = totals.get("tree")
 			if (treeBytes === undefined || treeBytes <= 0) {
 				throw new Error("canonical fixture contains no tree bytes")
 			}
 			const git = await gitRepack(dir, `mem-git-${commits}`)
-			if (git.peakRss <= 0) throw new Error("git peak-RSS measurement missing")
-			const db = await createIsolatedSchema(PG_URL)
+			if (git.ms <= 0 || git.peakRss <= 0) {
+				throw new Error("git repack wall/peak-RSS measurement missing")
+			}
+			const db = await createIsolatedSchema(pg)
 			try {
 				const seeded = await seedRepo(db.sql, REPO_ID, dir)
 				if (seeded.objects <= 0) throw new Error("fixture seeded no objects")
 				const child = await timedSpawn(
 					"npx",
-					["tsx", SELF, `--child=${db.schema}`, `--pg=${PG_URL}`],
+					[
+						"tsx",
+						SELF,
+						`--child-schema=${db.schema}`,
+						"--child-mode=repack",
+						`--pg=${pg}`,
+					],
 					ROOT,
 				)
-				if (child.code !== 0) throw new Error(`child repack exited ${child.code}`)
+				if (child.ms <= 0) throw new Error(`child repack took ${child.ms}ms`)
 				if (child.peakRss <= floor.peakRss) {
 					throw new Error(
 						`repack child peak ${child.peakRss} did not exceed interpreter floor ${floor.peakRss}`,
 					)
 				}
+				const canonicalObjects = await reachableObjects(dir)
+				await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+					encodings: {
+						kind: "exact",
+						objects: repackEligibleObjects(canonicalObjects),
+					},
+					objects: canonicalObjects,
+					refs: await canonicalStoreRefsOf(dir),
+				})
 				const rss = child.peakRss - floor.peakRss
 				const ratio = rss / git.peakRss
 				const share = rss / treeBytes
@@ -201,7 +301,7 @@ async function main(): Promise<void> {
 		}
 	}
 
-	console.log(`# repack memory — one ${WIDTH}-entry flat directory, M commits\n`)
+	console.log(`# repack memory — one ${width}-entry flat directory, M commits\n`)
 	console.log(
 		`interpreter floor (same child, no repack): ${mb(floor.peakRss)} MB peak RSS\n`,
 	)
@@ -231,7 +331,8 @@ async function main(): Promise<void> {
 	if (worst > RSS_RATIO_LIMIT) process.exitCode = 1
 }
 
-main()
+const run = args.mode === "child" ? runChild(args) : main(args)
+run
 	.catch((err) => {
 		console.error(err)
 		process.exitCode = 1

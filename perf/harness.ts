@@ -4,11 +4,14 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createGitApp } from "@/index"
 import { type Collector, collectedRuns, resetCollected } from "@/instrument"
-import type { PackInputObject } from "@/pack/write-pack"
+import type { Oid } from "@/oid"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	type GitObjectWithOid,
 	gitReachableOids,
 	loadGitObjects,
 	requireGitOid,
@@ -18,7 +21,13 @@ import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { generateRepo } from "./fast-import"
 import { type MemoryReport, startMemorySampler } from "./memory"
-import { type PgHandle, startLatencyPg, startPlainPg } from "./pg-latency"
+import {
+	type PgHandle,
+	type RttEvidence,
+	type RttMode,
+	startLatencyPg,
+	startPlainPg,
+} from "./pg-latency"
 import { collectProcessMetrics, type ProcessMetrics } from "./process-metrics"
 import { type ProfileResult, startProfile, stopProfile } from "./profile"
 import { assembleReport, type Report } from "./report"
@@ -26,17 +35,47 @@ import type { Scenario } from "./scenarios"
 
 const REPO_ID = "perf"
 
+type Outcome<T> = { status: "success"; value: T } | { status: "failure"; error: unknown }
+
+async function outcomeOf<T>(work: () => Promise<T>): Promise<Outcome<T>> {
+	try {
+		return { status: "success", value: await work() }
+	} catch (error) {
+		return { error, status: "failure" }
+	}
+}
+
+function outcomeOfSync<T>(work: () => T): Outcome<T> {
+	try {
+		return { status: "success", value: work() }
+	} catch (error) {
+		return { error, status: "failure" }
+	}
+}
+
+function outcomeValue<T>(outcome: Outcome<T>): T {
+	if (outcome.status === "failure") throw outcome.error
+	return outcome.value
+}
+
 export type RunOptions = {
 	scenario: Scenario
 	seed: number
 	repeat: number
 	outDir: string
-	/** When set, route Postgres through Toxiproxy and sweep clone wall at 0ms vs this. */
-	rttMs: number | null
+	rtt: RttMode
 }
 
+type PgRuntime =
+	| { kind: "loopback"; pg: Awaited<ReturnType<typeof startPlainPg>> }
+	| {
+			kind: "sweep"
+			pg: Awaited<ReturnType<typeof startLatencyPg>>
+			requestedMs: number
+	  }
+
 /** Load every object from a real repo (the m0 seeding path: real git, real store). */
-async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
+async function loadAllObjects(dir: string): Promise<GitObjectWithOid[]> {
 	return loadGitObjects(dir, await gitReachableOids(dir))
 }
 
@@ -50,38 +89,16 @@ async function seedStore(
 	if (allObjects.length === 0)
 		throw new Error("generated perf fixture has no reachable objects")
 	await objects.putPack(REPO_ID, allObjects)
-	const seededRefs = await seedGitRefs(REPO_ID, srcRepo, refs)
-	const [stored] = await db.sql<
-		{ objects: string; commits: string; tags: string; refs: string }[]
-	>`select
-		(select count(*) from git_object)::text as objects,
-		(select count(*) from git_commit)::text as commits,
-		(select count(*) from git_tag)::text as tags,
-		(select count(*) from git_ref)::text as refs`
-	if (stored === undefined) throw new Error("seed census returned no row")
-	const expectedCommits = allObjects.filter((object) => object.type === "commit").length
-	const expectedTags = allObjects.filter((object) => object.type === "tag").length
-	const expected = {
-		commits: expectedCommits,
-		objects: allObjects.length,
-		refs: seededRefs.directRefs + 1,
-		tags: expectedTags,
-	}
-	const actual = {
-		commits: Number(stored.commits),
-		objects: Number(stored.objects),
-		refs: Number(stored.refs),
-		tags: Number(stored.tags),
-	}
-	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-		throw new Error(
-			`seed census mismatch: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
-		)
-	}
+	await seedGitRefs(REPO_ID, srcRepo, refs)
+	await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+		encodings: { kind: "exact", objects: [] },
+		objects: allObjects,
+		refs: await canonicalStoreRefsOf(srcRepo),
+	})
 	return { objectCount: allObjects.length, objects, refs }
 }
 
-async function verifyClone(dir: string, expectedOids: readonly string[]): Promise<void> {
+async function verifyClone(dir: string, expectedOids: readonly Oid[]): Promise<void> {
 	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dir })
 	const actual = await gitReachableOids(dir)
 	const expected = [...expectedOids].sort()
@@ -98,18 +115,24 @@ function normalizedLsRemote(stdout: string, source: string): string[] {
 	return rows
 		.map((line) => {
 			const fields = line.split("\t")
-			if (fields.length !== 2 || fields[1]?.length === 0) {
+			const [oid, name] = fields
+			if (
+				fields.length !== 2 ||
+				oid === undefined ||
+				name === undefined ||
+				name.length === 0
+			) {
 				throw new Error(
 					`${source} emitted malformed ls-remote row ${JSON.stringify(line)}`,
 				)
 			}
-			return `${requireGitOid(fields[0] as string, `${source} ls-remote row`)}\t${fields[1]}`
+			return `${requireGitOid(oid, `${source} ls-remote row`)}\t${name}`
 		})
 		.sort()
 }
 
 /** One `git clone` over loopback; returns its wall time in ms. */
-async function cloneOnce(port: number, expectedOids: readonly string[]): Promise<number> {
+async function cloneOnce(port: number, expectedOids: readonly Oid[]): Promise<number> {
 	const dest = mkdtempSync(join(tmpdir(), "pggit-perf-clone-"))
 	try {
 		const t0 = process.hrtime.bigint()
@@ -130,7 +153,15 @@ async function cloneOnce(port: number, expectedOids: readonly string[]): Promise
 }
 
 export async function runScenario(opts: RunOptions): Promise<Report> {
-	const pg: PgHandle = opts.rttMs === null ? await startPlainPg() : await startLatencyPg()
+	const runtime: PgRuntime =
+		opts.rtt.kind === "loopback"
+			? { kind: "loopback", pg: await startPlainPg() }
+			: {
+					kind: "sweep",
+					pg: await startLatencyPg(),
+					requestedMs: opts.rtt.requestedMs,
+				}
+	const pg: PgHandle = runtime.pg
 	const db = await createIsolatedSchema(pg.baseUrl)
 	let server: GitServer | undefined
 	let srcRepo: string | undefined
@@ -171,26 +202,20 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 		const profDest = mkdtempSync(join(tmpdir(), "pggit-perf-prof-"))
 		resetCollected()
 		const cpu0 = process.cpuUsage()
-		let profile!: ProfileResult
 		startProfile()
-		let profileStopError: { error: unknown } | undefined
-		try {
-			await spawnGit([
+		const profileClone = await outcomeOf(() =>
+			spawnGit([
 				"clone",
 				"-c",
 				"protocol.version=2",
 				"--quiet",
 				`http://127.0.0.1:${port}/${REPO_ID}`,
 				profDest,
-			])
-		} finally {
-			try {
-				profile = await stopProfile(opts.outDir)
-			} catch (error) {
-				profileStopError = { error }
-			}
-		}
-		if (profileStopError) throw profileStopError.error
+			]),
+		)
+		const profileStop = await outcomeOf(() => stopProfile(opts.outDir))
+		outcomeValue(profileClone)
+		const profile: ProfileResult = outcomeValue(profileStop)
 		const cpu = process.cpuUsage(cpu0)
 		const collectors: readonly Collector[] = [...collectedRuns()]
 		await verifyClone(profDest, expectedOids)
@@ -199,33 +224,24 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 		const memDest = mkdtempSync(join(tmpdir(), "pggit-perf-mem-"))
 		const proc = collectProcessMetrics()
 		const memory = startMemorySampler()
-		let processMetrics!: ProcessMetrics
-		let memoryReport!: MemoryReport
-		let stopError: { error: unknown } | undefined
-		try {
-			await spawnGit([
+		const memoryClone = await outcomeOf(() =>
+			spawnGit([
 				"clone",
 				"-c",
 				"protocol.version=2",
 				"--quiet",
 				`http://127.0.0.1:${port}/${REPO_ID}`,
 				memDest,
-			])
-		} finally {
-			// Stop the GC observer BEFORE the memory sampler forces a GC for its
-			// retained-set read, so the forced collection never pollutes the GC counts.
-			try {
-				processMetrics = proc.stop()
-			} catch (error) {
-				stopError = { error }
-			}
-			try {
-				memoryReport = await memory.stop()
-			} catch (error) {
-				stopError ??= { error }
-			}
-		}
-		if (stopError) throw stopError.error
+			]),
+		)
+		// Stop the GC observer BEFORE the memory sampler forces a GC for its retained-set
+		// read, so the forced collection never pollutes the GC counts. Capture both
+		// outcomes so one failed stop never prevents the other sampler from stopping.
+		const processStop = outcomeOfSync(() => proc.stop())
+		const memoryStop = await outcomeOf(() => memory.stop())
+		outcomeValue(memoryClone)
+		const processMetrics: ProcessMetrics = outcomeValue(processStop)
+		const memoryReport: MemoryReport = outcomeValue(memoryStop)
 		await writeFile(
 			join(opts.outDir, "memory.json"),
 			JSON.stringify({
@@ -237,13 +253,21 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 		rmSync(memDest, { force: true, recursive: true })
 
 		// RTT sweep: clone wall at 0ms vs the requested latency (same repo, via proxy).
-		const rttSweep: { rttMs: number; wallMs: number }[] = []
-		if (opts.rttMs !== null) {
-			for (const rtt of [0, opts.rttMs]) {
-				await pg.setLatencyMs(rtt)
-				rttSweep.push({ rttMs: rtt, wallMs: await cloneOnce(port, expectedOids) })
+		let rtt: RttEvidence = { kind: "loopback" }
+		if (runtime.kind === "sweep") {
+			await runtime.pg.setLatencyMs(0)
+			const loopback = { rttMs: 0, wallMs: await cloneOnce(port, expectedOids) }
+			await runtime.pg.setLatencyMs(runtime.requestedMs)
+			const delayed = {
+				rttMs: runtime.requestedMs,
+				wallMs: await cloneOnce(port, expectedOids),
 			}
-			await pg.setLatencyMs(0)
+			await runtime.pg.setLatencyMs(0)
+			rtt = {
+				kind: "sweep",
+				requestedMs: runtime.requestedMs,
+				samples: [loopback, delayed],
+			}
 		}
 
 		return assembleReport({
@@ -255,8 +279,7 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 			outDir: opts.outDir,
 			process: processMetrics,
 			repeat: opts.repeat,
-			rttMs: opts.rttMs,
-			rttSweep,
+			rtt,
 			scenario: opts.scenario,
 			serverSystemMs: cpu.system / 1000,
 			serverUserMs: cpu.user / 1000,

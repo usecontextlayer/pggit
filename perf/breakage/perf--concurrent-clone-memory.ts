@@ -15,76 +15,57 @@
  *   NODE_OPTIONS=--expose-gc npx tsx perf/breakage/perf--concurrent-clone-memory.ts [--conc=1,2,4]
  */
 import { execSync } from "node:child_process"
-import { createHash } from "node:crypto"
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
-import { allObjectOids, revParse } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	loadGitObjects,
+	repackEligibleObjects,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
+import {
+	increasingIntegerListArg,
+	parseArgs,
+	pgUrlArg,
+	positiveIntegerArg,
+} from "../args"
 import {
 	cleanupTmp,
-	increasingIntegerListFlag,
 	mb,
 	mkTmp,
-	PG_URL,
-	positiveIntegerFlag,
+	rewrittenArtifactStream,
 	secs,
 	seedRepo,
 	table,
 	withPeakRss,
 } from "./_perf-util"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const CONC = increasingIntegerListFlag("conc", [1, 2, 4])
-const VERSIONS = positiveIntegerFlag("versions", 15)
 const BLOB_BYTES = 4_000_000
+const MAX_VERSIONS = Math.floor((BLOB_BYTES - 200) / 1000) + 1
+const {
+	conc: CONC,
+	pg: PG_URL,
+	versions: VERSIONS,
+} = parseArgs(
+	z
+		.object({
+			conc: increasingIntegerListArg([1, 2, 4]),
+			pg: pgUrlArg,
+			versions: positiveIntegerArg.min(2).max(MAX_VERSIONS).default(15),
+		})
+		.strict(),
+)
 const REPO_ID = "probe/conc"
 /** MB of server RSS per concurrent clone above which this is called broken. */
 const PER_CLONE_MB_LIMIT = 40
-
-function noise(salt: string, len: number): Buffer {
-	const parts: Buffer[] = []
-	let total = 0
-	let i = 0
-	while (total < len) {
-		const b = createHash("sha256").update(`${salt}-${i++}`).digest()
-		parts.push(b)
-		total += b.length
-	}
-	return Buffer.concat(parts).subarray(0, len)
-}
-
-function stream(): Buffer {
-	const parts: Buffer[] = []
-	const base = noise("artifact", BLOB_BYTES)
-	let prev: number | null = null
-	let mark = 0
-	for (let v = 0; v < VERSIONS; v++) {
-		const body = Buffer.from(base)
-		noise(`edit-${v}`, 200).copy(body, v * 1000)
-		const bm = ++mark
-		parts.push(
-			Buffer.from(`blob\nmark :${bm}\ndata ${body.length}\n`),
-			body,
-			Buffer.from("\n"),
-		)
-		const cm = ++mark
-		const msg = `v${v}`
-		parts.push(
-			Buffer.from(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n` +
-					(prev === null ? "" : `from :${prev}\n`) +
-					`M 100644 :${bm} data/artifact.bin\n`,
-			),
-		)
-		prev = cm
-	}
-	return Buffer.concat(parts)
-}
 
 type ProcessRow = { pid: number; parentPid: number; rssKb: number; command: string }
 
@@ -97,11 +78,15 @@ function gitServerRss(bareDir: string): number {
 		if (line.trim() === "") continue
 		const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/)
 		if (!match) throw new Error(`unexpected ps row: ${line}`)
+		const [, pid, parentPid, rssKb, command] = match
+		if (!pid || !parentPid || !rssKb || command === undefined) {
+			throw new Error(`incomplete ps row: ${line}`)
+		}
 		rows.push({
-			command: match[4] as string,
-			parentPid: Number(match[2]),
-			pid: Number(match[1]),
-			rssKb: Number(match[3]),
+			command,
+			parentPid: Number(parentPid),
+			pid: Number(pid),
+			rssKb: Number(rssKb),
 		})
 	}
 	const fixturePids = new Set(
@@ -132,12 +117,23 @@ async function main(): Promise<void> {
 	const src = join(mkTmp("conc"), "repo")
 	mkdirSync(src, { recursive: true })
 	await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
-	await spawnGit(["fast-import", "--quiet"], { cwd: src, input: stream() })
+	await spawnGit(["fast-import", "--quiet"], {
+		cwd: src,
+		input: rewrittenArtifactStream({ blobBytes: BLOB_BYTES, versions: VERSIONS }),
+	})
 	const bare = join(mkTmp("conc-bare"), "remote.git")
 	await spawnGit(["clone", "--bare", "-q", src, bare], { cwd: "/tmp" })
 	await spawnGit(["repack", "-adf", "-q"], { cwd: bare })
 	const expectedOids = await allObjectOids(src)
 	const expectedTip = await revParse(src, "refs/heads/main")
+	const expectedObjects = await loadGitObjects(src, expectedOids)
+	const blobCount = expectedObjects.filter((object) => object.type === "blob").length
+	const commitCount = expectedObjects.filter((object) => object.type === "commit").length
+	if (blobCount !== VERSIONS || commitCount !== VERSIONS) {
+		throw new Error(
+			`fixture produced ${blobCount} blobs and ${commitCount} commits for ${VERSIONS} versions`,
+		)
+	}
 	const verify = async (dest: string): Promise<void> => {
 		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 		const oids = await allObjectOids(dest)
@@ -160,11 +156,19 @@ async function main(): Promise<void> {
 			throw new Error(`seeded ${seeded.objects} objects, expected ${expectedOids.length}`)
 		}
 		const repacked = await createRepack(db.sql).repack(REPO_ID)
-		if (repacked.wholes + repacked.deltas !== seeded.objects) {
+		if (
+			repacked.wholes + repacked.deltas !== seeded.eligibleObjects ||
+			repacked.deltas <= 0
+		) {
 			throw new Error(
-				`repack covered ${repacked.wholes + repacked.deltas}/${seeded.objects} objects`,
+				`repack covered ${repacked.wholes} wholes + ${repacked.deltas} deltas/${seeded.eligibleObjects} eligible objects`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(expectedObjects) },
+			objects: expectedObjects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 		const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 		try {
 			for (const conc of CONC) {

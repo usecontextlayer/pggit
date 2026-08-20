@@ -29,31 +29,37 @@
  * with the amplification ratios.
  *
  * EXIT NON-ZERO when the `repo_file` rows written by a one-file commit exceed
- * `AMP_LIMIT`× the number of files the commit actually changed — the projection's
- * rewrite-everything contract turning an O(F) push into an O(N) write.
+ * `AMP_LIMIT`× the number of files the commit actually changed — evidence that
+ * the retired rewrite-everything behavior has returned and turned an O(F) push into an O(N) write.
  *
  *   npx tsx perf/breakage/pg-bloat--push-amplification.ts
  */
+import { z } from "zod"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
-import { branchAndTagRefsOf } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	repackEligibleObjects,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg } from "../args"
 import {
 	backendWal,
 	COMMITTER,
-	DEFAULT_PG_URL,
 	duBytes,
 	filler,
-	flag,
 	flushStats,
 	kb,
 	objectsBetween,
 	pad,
 	padr,
+	type Sizes,
 	scratchRoot,
 	sizesAll,
 	TABLES,
@@ -72,9 +78,25 @@ const PUSH_APP = "pgbloat-push-under-test"
 /** rows the projection may write per file actually changed, before it is a defect */
 const AMP_LIMIT = 50
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
+const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
 
 type Shape = { name: string; files: number; depth: number; width: number }
+
+function requiredSize(sizes: Record<string, Sizes>, table: string, phase: string): Sizes {
+	const value = sizes[table]
+	if (!value) throw new Error(`${phase}: size census omitted ${table}`)
+	return value
+}
+
+function requiredCount(
+	counts: ReadonlyMap<string, number>,
+	table: string,
+	phase: string,
+): number {
+	const value = counts.get(table)
+	if (value === undefined) throw new Error(`${phase}: row census omitted ${table}`)
+	return value
+}
 
 const SHAPES: Shape[] = [
 	{ depth: 0, files: 4096, name: "wide-flat", width: 4096 },
@@ -174,15 +196,11 @@ async function main(): Promise<void> {
 			})
 			await spawnGit(["gc", "-q", "--prune=now"], { cwd: bare })
 			const gitBefore = await duBytes(bare)
-			const baseTip = (
-				await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })
-			).stdout.trim()
+			const baseTip = await revParse(src, "refs/heads/main")
 
 			const touch = touchStream(s, F, idx + 1)
 			await spawnGit(["fast-import", "--quiet"], { cwd: src, input: touch.stream })
-			const newTip = (
-				await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })
-			).stdout.trim()
+			const newTip = await revParse(src, "refs/heads/main")
 			await spawnGit(["push", "-q", bare, "refs/heads/main:refs/heads/main"], {
 				cwd: src,
 			})
@@ -201,28 +219,36 @@ async function main(): Promise<void> {
 
 				const baseObjs = await objectsBetween(src, baseTip)
 				if (baseObjs.length === 0) throw new Error(`${s.name} F=${F}: empty base fixture`)
+				const eligibleBaseObjs = repackEligibleObjects(baseObjs)
 				await store.putPack(
 					repoId,
 					baseObjs.map((o) => ({ content: o.content, type: o.type })),
 				)
 				await refs.setRef(repoId, "refs/heads/main", baseTip)
+				await refs.setSymref(repoId, "HEAD", "refs/heads/main")
 				await syncRefSnapshot(deps, repoId, "refs/heads/main", baseTip)
 				const baseRepack = await createRepack(app).repack(repoId)
-				if (baseRepack.wholes + baseRepack.deltas !== baseObjs.length) {
+				if (baseRepack.wholes + baseRepack.deltas !== eligibleBaseObjs.length) {
 					throw new Error(`${s.name} F=${F}: incomplete base repack`)
 				}
+				await assertCanonicalStoreFixture(app, repoId, {
+					encodings: { kind: "exact", objects: eligibleBaseObjs },
+					objects: baseObjs,
+					refs: [
+						{ kind: "direct", name: "refs/heads/main", oid: baseTip },
+						{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+					],
+				})
 
 				const before = await sizesAll(db.sql)
-				for (const t of TABLES) {
-					if (!before[t]) throw new Error(`missing before size for ${t}`)
-				}
-				const rowsBefore: Record<string, number> = {}
+				for (const t of TABLES) requiredSize(before, t, "before push")
+				const rowsBefore = new Map<string, number>()
 				for (const t of TABLES) {
 					const [c] = await db.sql.unsafe<{ n: string }[]>(
 						`select count(*)::text as n from ${t}`,
 					)
 					if (!c) throw new Error(`missing before count for ${t}`)
-					rowsBefore[t] = Number(c.n)
+					rowsBefore.set(t, Number(c.n))
 				}
 				await flushStats(app)
 				const [insBefore] = await db.sql<{ n: string }[]>`
@@ -235,6 +261,7 @@ async function main(): Promise<void> {
 				if (pushObjs.length === 0 || gitBytes <= 0) {
 					throw new Error(`${s.name} F=${F}: missing pushed objects/git byte delta`)
 				}
+				const eligiblePushObjs = repackEligibleObjects(pushObjs)
 				await store.putPack(
 					repoId,
 					pushObjs.map((o) => ({ content: o.content, type: o.type })),
@@ -247,19 +274,17 @@ async function main(): Promise<void> {
 				const wal = (await walBytes(db.sql)) - wal0
 				const bwal = (await backendWal(db.sql, PUSH_APP)) - bwal0
 				const after = await sizesAll(db.sql)
-				for (const t of TABLES) {
-					if (!after[t]) throw new Error(`missing after size for ${t}`)
-				}
-				const rowsAfter: Record<string, number> = {}
+				for (const t of TABLES) requiredSize(after, t, "after push")
+				const rowsAfter = new Map<string, number>()
 				for (const t of TABLES) {
 					const [c] = await db.sql.unsafe<{ n: string }[]>(
 						`select count(*)::text as n from ${t}`,
 					)
 					if (!c) throw new Error(`missing after count for ${t}`)
-					rowsAfter[t] = Number(c.n)
+					rowsAfter.set(t, Number(c.n))
 				}
-				// repo_file NET row count barely moves (delete-all + insert-all), so the
-				// honest number is tuples WRITTEN, from the activity counters.
+				// Net row counts barely move for updates, so the honest number is tuples
+				// WRITTEN, from the activity counters.
 				const [insAfter] = await db.sql<{ n: string }[]>`
 					select coalesce(sum(n_tup_ins + n_tup_del + n_tup_upd),0)::text as n
 					from pg_stat_user_tables where schemaname = ${db.schema} and relname like 'repo\\_file%'`
@@ -268,8 +293,8 @@ async function main(): Promise<void> {
 				const fileTouched = Number(insAfter.n) - Number(insBefore.n)
 
 				const delta = (t: string): number =>
-					(after[t] as (typeof after)[string]).total -
-					(before[t] as (typeof before)[string]).total
+					requiredSize(after, t, "after push").total -
+					requiredSize(before, t, "before push").total
 				const pgBytes = TABLES.reduce((n, t) => n + delta(t), 0)
 				breakdown.push(
 					`${padr(`${s.name} F=${F}`, 20)} ${pad(kb(delta("git_object")), 10)} ${pad(kb(delta("git_commit")), 10)} ` +
@@ -277,45 +302,31 @@ async function main(): Promise<void> {
 						`${pad(kb(delta("git_ref") + delta("repos")), 10)} ${pad(kb(pgBytes), 10)}`,
 				)
 				const objRows =
-					(rowsAfter.git_object as number) - (rowsBefore.git_object as number)
+					requiredCount(rowsAfter, "git_object", "after push") -
+					requiredCount(rowsBefore, "git_object", "before push")
 				const commitRows =
-					(rowsAfter.git_commit as number) - (rowsBefore.git_commit as number)
+					requiredCount(rowsAfter, "git_commit", "after push") -
+					requiredCount(rowsBefore, "git_commit", "before push")
 				const encRows = encRes.wholes + encRes.deltas
 				const expectedFinalObjects = await objectsBetween(src, newTip)
-				const expectedFinalOids = expectedFinalObjects.map((object) => object.oid).sort()
-				const actualObjectOids = (
-					await db.sql<
-						{ oid: string }[]
-					>`select encode(oid, 'hex') as oid from git_object order by oid`
-				).map((row) => row.oid)
-				const actualEncodingOids = (
-					await db.sql<
-						{ oid: string }[]
-					>`select encode(oid, 'hex') as oid from git_pack_encoding order by oid`
-				).map((row) => row.oid)
-				const expectedRefs = await branchAndTagRefsOf(src)
-				const actualRefs = await db.sql<{ name: string; oid: string }[]>`
-					select name, encode(oid, 'hex') as oid from git_ref order by name`
-				const exactObjects =
-					actualObjectOids.length === expectedFinalOids.length &&
-					actualObjectOids.every((oid, i) => oid === expectedFinalOids[i])
-				const exactEncodings =
-					actualEncodingOids.length === expectedFinalOids.length &&
-					actualEncodingOids.every((oid, i) => oid === expectedFinalOids[i])
-				const exactRefs = JSON.stringify(actualRefs) === JSON.stringify(expectedRefs)
+				await assertCanonicalStoreFixture(app, repoId, {
+					encodings: {
+						kind: "exact",
+						objects: repackEligibleObjects(expectedFinalObjects),
+					},
+					objects: expectedFinalObjects,
+					refs: await canonicalStoreRefsOf(src),
+				})
 				if (
 					wal <= 0 ||
 					bwal <= 0 ||
 					objRows !== pushObjs.length ||
 					commitRows !== 1 ||
-					encRows !== pushObjs.length ||
-					fileTouched !== F ||
-					!exactObjects ||
-					!exactEncodings ||
-					!exactRefs
+					encRows !== eligiblePushObjs.length ||
+					fileTouched !== F
 				) {
 					throw new Error(
-						`${s.name} F=${F}: objects ${objRows}/${pushObjs.length} exact=${exactObjects}, commits ${commitRows}/1, encodings ${encRows}/${pushObjs.length} exact=${exactEncodings}, projection writes ${fileTouched}/${F}, refs exact=${exactRefs}`,
+						`${s.name} F=${F}: objects ${objRows}/${pushObjs.length}, commits ${commitRows}/1, encodings ${encRows}/${eligiblePushObjs.length} eligible, projection writes ${fileTouched}/${F}`,
 					)
 				}
 
@@ -338,7 +349,7 @@ async function main(): Promise<void> {
 	console.log(
 		`\nlegend: content = new blob bytes the commit introduces · git = bare-repo du delta after gc ·\n` +
 			`obj/commit rows = net new rows · file writes = repo_file inserts + deletes + updates ·\n` +
-			`enc rows = encoding rows the repack pass wrote · pg = on-disk delta across all five tables ·\n` +
+			`enc rows = encoding rows the repack pass wrote · pg = on-disk delta across all seven measured tables ·\n` +
 			`ownWAL = WAL charged to THESE backends (pg_stat_get_backend_wal) · clusWAL = cluster LSN\n` +
 			`delta over the same window, which includes every other tenant of this instance.\n` +
 			`Ratios use ownWAL. A large clusWAL/ownWAL gap is measurement noise, not pggit's cost.\n`,

@@ -14,9 +14,7 @@
  *
  * It also checks the design's central read-side invariant after the client has indexed the received pack: `git verify-pack -v` prints each delta entry's chain depth, so "depth <= 1, structurally" (D2/D9) is directly falsifiable. This is client-storage evidence, not a raw-wire byte measurement; thin-pack indexing may append external bases.
  *
- * A perf harness rather than a vitest e2e test because its corpus is a REAL local
- * repository handed in at run time (`--repo=`), which no committed fixture can stand
- * in for — the same reason `perf/delta-corpus.ts` lives here.
+ * A perf harness rather than a vitest e2e test because its corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for — the same reason `perf/delta-corpus.ts` lives here.
  *
  *   npx tsx perf/breakage/realrepo--branch-order.ts --repo=/path/to/checkout --slug=<name>
  *
@@ -25,31 +23,46 @@
  */
 import { mkdirSync, readdirSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
-import { allRefsOf, parseVerifyPackObjects } from "@/testing/git-fixtures"
+import { allRefsOf, parseVerifyPackObjects, requiredAt } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { nonemptyStringArg, parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
+	assertCanonicalRealRepoStore,
 	createLedger,
 	createScratch,
-	DEFAULT_PG_URL,
-	flag,
+	mirrorSourceFromArgs,
 	oidSet,
-	positiveIntegerFlag,
 	prepareMirror,
 	repackExactly,
 	tryGit,
 } from "./_realrepo-util"
 
-const SLUG = flag("slug", "repo")
-const MAX_DEPTH = positiveIntegerFlag("max-depth", 1)
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-if (SLUG.length === 0) throw new Error("--slug must not be empty")
+const args = parseArgs(
+	z
+		.object({
+			"max-depth": positiveIntegerArg.default(1),
+			mirror: nonemptyStringArg.optional(),
+			pg: pgUrlArg,
+			repo: nonemptyStringArg.optional(),
+			slug: nonemptyStringArg.default("repo"),
+		})
+		.strict()
+		.transform(({ mirror, repo, ...values }) => ({
+			...values,
+			source: mirrorSourceFromArgs({ mirror, repo }),
+		})),
+)
+const SLUG = args.slug
+const MAX_DEPTH = args["max-depth"]
+const PG_URL = args.pg
 
 const scratch = createScratch(`border-${SLUG}`)
 const { fail, findings, report } = createLedger(SLUG)
-/** The private mirror clone of `--repo=`; set by `prepareMirror` in `main`. */
+/** The private mirror clone of the selected source; set by `prepareMirror` in `main`. */
 let MIRROR = ""
 
 async function refList(dir: string): Promise<string> {
@@ -78,32 +91,36 @@ async function runOrder(
 	port: number,
 	label: string,
 	refs: string[],
-): Promise<{ dir: string; oids: Set<string> } | null> {
+): Promise<
+	| { state: "clone-failed" }
+	| { state: "push-failed" }
+	| { state: "complete"; oids: Set<string> }
+> {
 	const repoId = `border/${SLUG}-${label}`
 	const url = `http://127.0.0.1:${port}/${repoId}`
 	const oracle = join(scratch.mk(`oracle-${label}`), "o.git")
 	mkdirSync(oracle, { recursive: true })
-	await spawnGit(["init", "-q", "--bare", oracle])
+	await spawnGit(["init", "-q", "-b", "main", "--bare", oracle])
 
 	let totalW = 0
 	let totalD = 0
 	let accepted = 0
 	let postFirstObjects = 0
 	for (const ref of refs) {
-		const p = await tryGit(["push", url, `+${ref}:${ref}`], MIRROR)
 		const o = await tryGit(["push", `file://${oracle}`, `+${ref}:${ref}`], MIRROR)
-		if (p.ok !== o.ok) {
-			fail(
-				`${label}: push of ${ref} DIVERGES from git (pggit ${p.ok ? "accepted" : `rejected exit ${p.code}`}, git ${o.ok ? "accepted" : `rejected exit ${o.code}`})`,
-				(p.ok ? o : p).stderr.trim().slice(0, 500),
-			)
-		}
-		if (!o.ok) {
+		if (o.status === "failure") {
 			throw new Error(
 				`${label}: canonical git rejected fixture ref ${ref}: ${o.stderr.trim().slice(0, 500)}`,
 			)
 		}
-		if (!p.ok) continue
+		const p = await tryGit(["push", url, `+${ref}:${ref}`], MIRROR)
+		if (p.status === "failure") {
+			fail(
+				`${label}: pggit rejected canonical ref push ${ref} (exit ${p.code})`,
+				p.stderr.trim().slice(0, 500),
+			)
+			return { state: "push-failed" }
+		}
 		accepted++
 		// repack after EVERY ref: anchors freeze over a partial DAG, then the next
 		// ref extends it. This is the D4 stress.
@@ -117,6 +134,7 @@ async function runOrder(
 			`${label}: branch-order fixture exercised ${accepted} accepted refs, ${postFirstObjects} objects introduced after the first, and ${totalD} deltas`,
 		)
 	}
+	await assertCanonicalRealRepoStore(db.sql, repoId, oracle, { kind: "repacked" })
 	console.log(
 		`  ${label}: ${refs.length} refs pushed one at a time, repack totals ${totalW}w + ${totalD}d`,
 	)
@@ -131,18 +149,18 @@ async function runOrder(
 		url,
 		clone,
 	])
-	if (!c.ok) {
+	if (c.status === "failure") {
 		fail(
 			`${label}: mirror clone after per-ref pushes FAILED`,
 			c.stderr.trim().slice(0, 800),
 		)
-		return null
+		return { state: "clone-failed" }
 	}
 	const oracleClone = join(scratch.mk(`oclone-${label}`), "o.git")
 	await spawnGit(["clone", "--mirror", "-q", `file://${oracle}`, oracleClone])
 
 	const fsck = await tryGit(["fsck", "--strict"], clone)
-	if (!fsck.ok)
+	if (fsck.status === "failure")
 		fail(`${label}: git fsck --strict FAILED`, fsck.stderr.trim().slice(0, 800))
 
 	const [got, want] = [await oidSet(clone), await oidSet(oracleClone)]
@@ -166,8 +184,11 @@ async function runOrder(
 		throw new Error(`${label}: client-indexed clone contains zero delta entries`)
 	}
 	const depths = [...hist.entries()].sort((a, b) => a[0] - b[0])
-	const maxDepth =
-		depths.length > 0 ? (depths[depths.length - 1] as [number, number])[0] : 0
+	const [maxDepth] = requiredAt(
+		depths,
+		depths.length - 1,
+		`${label}: maximum delta depth`,
+	)
 	console.log(
 		`  ${label}: served delta depths ${depths.map(([d, n]) => `${d}:${n}`).join(" ") || "(none)"}`,
 	)
@@ -183,11 +204,11 @@ async function runOrder(
 	report.push(
 		`| ${label} | served delta depth | max ${maxDepth} (${depths.map(([d, n]) => `${d}:${n}`).join(" ") || "no deltas"}) |`,
 	)
-	return { dir: clone, oids: got }
+	return { oids: got, state: "complete" }
 }
 
 async function main(): Promise<void> {
-	MIRROR = await prepareMirror(scratch)
+	MIRROR = await prepareMirror(scratch, args.source)
 	console.log(`# branch-order stress — ${SLUG}\n  mirror ${MIRROR}`)
 	const fixtureRefs = (await allRefsOf(MIRROR)).filter(
 		({ name }) =>
@@ -210,7 +231,7 @@ async function main(): Promise<void> {
 	try {
 		const forward = await runOrder(db, server.port, "forward", [...refs].sort())
 		const reverse = await runOrder(db, server.port, "reverse", [...refs].sort().reverse())
-		if (forward && reverse) {
+		if (forward.state === "complete" && reverse.state === "complete") {
 			const only1 = [...forward.oids].filter((o) => !reverse.oids.has(o))
 			const only2 = [...reverse.oids].filter((o) => !forward.oids.has(o))
 			if (only1.length > 0 || only2.length > 0) {

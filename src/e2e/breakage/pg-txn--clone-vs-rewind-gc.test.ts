@@ -26,8 +26,14 @@
  *
  * The source script exits non-zero when the claim is falsified; the assertions
  * below encode the CORRECT contract, so a reproduction shows up as a red test.
- * The fixture scale (1200 append-only runs) and the 12-iteration randomized-delay
- * loop are the source's — the race lives in that timing spread.
+ * The fixture scale (1200 append-only runs) and the 12-iteration loop are the
+ * source's. The delays are NOT: the source froze absolute milliseconds, which tie
+ * the race to one machine's serve speed — measured here, the want-presence check
+ * lands seconds into the serve, so a fixed sub-second spread can lose all 12
+ * races and starve the anti-vacuousness floor below. Each run instead times one
+ * un-raced calibration clone and sweeps the rewind across FRACTIONS of that
+ * measured wall (2%–150%): the early arms keep hunting the mid-serve window, and
+ * the tail arms land after the serve so complete clones stay reachable on any box.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -115,6 +121,38 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 		const early = commits[3]
 		if (!tip || !early) throw new Error("fixture too short to rewind")
 
+		// Calibrate: one un-raced clone of the same fixture, timed wall-to-wall.
+		// The raced delays are fractions of this measurement, so the sweep tracks
+		// the box's actual serve speed instead of a frozen machine's.
+		const calRepo = "txn/clonerace-cal"
+		const calPush = await attemptGit(
+			[
+				"push",
+				"-q",
+				`http://127.0.0.1:${server.port}/${calRepo}`,
+				`${tip}:refs/heads/main`,
+			],
+			src,
+		)
+		if (!calPush.ok) throw new Error(`calibration push failed: ${calPush.stderr}`)
+		const calDest = join(root, "c-cal")
+		const calStart = Date.now()
+		const calClone = await attemptGit([
+			"-c",
+			"protocol.version=2",
+			"clone",
+			"-q",
+			"--mirror",
+			`http://127.0.0.1:${server.port}/${calRepo}`,
+			calDest,
+		])
+		const serveMs = Date.now() - calStart
+		if (!calClone.ok) throw new Error(`calibration clone failed: ${calClone.stderr}`)
+		rmSync(calDest, { force: true, recursive: true })
+
+		const DELAY_FRACTIONS = [
+			0.02, 0.08, 0.15, 0.25, 0.35, 0.45, 0.55, 0.7, 0.85, 1.0, 1.2, 1.5,
+		]
 		for (let i = 0; i < ITERS; i++) {
 			const repo = `txn/clonerace-${i}`
 			const url = `http://127.0.0.1:${server.port}/${repo}`
@@ -126,7 +164,9 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 			const gc = createGc(admin)
 
 			const dest = join(root, `c-${i}`)
-			const delayMs = 40 + ((i * 97) % 900)
+			const fraction = DELAY_FRACTIONS[i]
+			if (fraction === undefined) throw new Error(`no delay fraction for iter ${i}`)
+			const delayMs = Math.max(10, Math.round(fraction * serveMs))
 			const clone = attemptGit([
 				"-c",
 				"protocol.version=2",

@@ -12,6 +12,7 @@ import {
 	packFiles,
 	packObjectOids,
 	parseLsTree,
+	requireGitOid,
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
@@ -109,7 +110,10 @@ describe("M1 — blobless partial clone (real git)", () => {
 				.filter((o) => o.type === "blob")
 				.map((o) => o.oid)
 			expect(srcBlobs.length).toBeGreaterThan(0)
-			const tip = (await spawnGit(["rev-parse", "HEAD"], { cwd: dest })).stdout.trim()
+			const tip = requireGitOid(
+				(await spawnGit(["rev-parse", "HEAD"], { cwd: dest })).stdout.trim(),
+				"partial-clone HEAD",
+			)
 			const packs = await Promise.all(
 				packFiles(dest).map(async (pack) => ({
 					oids: await packObjectOids(dest, pack),

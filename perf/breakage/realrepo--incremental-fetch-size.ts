@@ -16,36 +16,58 @@
  */
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
+import type { Oid } from "@/oid"
 import { serveOnPort } from "@/server"
 import {
 	branchAndTagRefsOf,
 	gitReachableOids,
 	parseRevListObjectOids,
+	requiredAt,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 import {
+	nonemptyStringArg,
+	parseArgs,
+	pgUrlArg,
+	positiveIntegerArg,
+	positiveNumberArg,
+} from "../args"
+import {
+	assertCanonicalRealRepoStore,
 	canonicalV2Pack,
 	createScratch,
-	DEFAULT_PG_URL,
-	flag,
 	kb,
-	positiveIntegerFlag,
-	positiveNumberFlag,
+	mirrorSourceFromArgs,
 	postPggitV2Pack,
 	prepareMirror,
 	rawPackObjectOids,
 	repackExactly,
 } from "./_realrepo-util"
 
-const SLUG = flag("slug", "repo")
-const STEP = positiveIntegerFlag("step", 50)
-const MAX_RATIO = positiveNumberFlag("max-ratio", 3)
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-
-if (SLUG.length === 0) throw new Error("--slug must not be empty")
+const args = parseArgs(
+	z
+		.object({
+			"max-ratio": positiveNumberArg.default(3),
+			mirror: nonemptyStringArg.optional(),
+			pg: pgUrlArg,
+			repo: nonemptyStringArg.optional(),
+			slug: nonemptyStringArg.default("repo"),
+			step: positiveIntegerArg.default(50),
+		})
+		.strict()
+		.transform(({ mirror, repo, ...values }) => ({
+			...values,
+			source: mirrorSourceFromArgs({ mirror, repo }),
+		})),
+)
+const SLUG = args.slug
+const STEP = args.step
+const MAX_RATIO = args["max-ratio"]
+const PG_URL = args.pg
 
 const scratch = createScratch(`warm-${SLUG}`)
 
@@ -75,7 +97,7 @@ async function requireTrackingClientsEqual(pgDir: string, gitDir: string): Promi
 }
 
 async function main(): Promise<void> {
-	const mirror = await prepareMirror(scratch)
+	const mirror = await prepareMirror(scratch, args.source)
 	console.log(`# incremental (warm) raw fetch size — ${SLUG}\n  mirror ${mirror}`)
 	const chain = parseRevListObjectOids(
 		(
@@ -85,10 +107,13 @@ async function main(): Promise<void> {
 		).stdout,
 	)
 	if (chain.length < 2) throw new Error("fixture needs at least two first-parent commits")
-	const checkpoints: string[] = []
-	for (let i = STEP - 1; i < chain.length; i += STEP) checkpoints.push(chain[i] as string)
-	if (checkpoints[checkpoints.length - 1] !== chain[chain.length - 1]) {
-		checkpoints.push(chain[chain.length - 1] as string)
+	const checkpoints: Oid[] = []
+	for (let i = STEP - 1; i < chain.length; i += STEP) {
+		checkpoints.push(requiredAt(chain, i, "incremental checkpoint"))
+	}
+	const head = requiredAt(chain, chain.length - 1, "incremental head commit")
+	if (checkpoints[checkpoints.length - 1] !== head) {
+		checkpoints.push(head)
 	}
 	if (checkpoints.length < 2) {
 		throw new Error(
@@ -103,16 +128,16 @@ async function main(): Promise<void> {
 	const url = `http://127.0.0.1:${server.port}/${repoId}`
 	const oracle = join(scratch.mk("oracle"), "o.git")
 	mkdirSync(oracle, { recursive: true })
-	await spawnGit(["init", "-q", "--bare", oracle])
+	await spawnGit(["init", "-q", "-b", "main", "--bare", oracle])
 	const pgTrack = join(scratch.mk("pgtrack"), "t.git")
 	const gitTrack = join(scratch.mk("gittrack"), "t.git")
-	const rows: { round: number; rev: string; pggit: number; git: number }[] = []
+	const rows: { round: number; rev: Oid; pggit: number; git: number }[] = []
 	let appendedPggitBases = 0
 	let storedDeltas = 0
 
 	try {
 		for (let round = 0; round < checkpoints.length; round++) {
-			const rev = checkpoints[round] as string
+			const rev = requiredAt(checkpoints, round, "incremental round checkpoint")
 			await spawnGit(["push", url, `${rev}:refs/heads/main`], { cwd: mirror })
 			await spawnGit(["push", `file://${oracle}`, `${rev}:refs/heads/main`], {
 				cwd: mirror,
@@ -123,6 +148,7 @@ async function main(): Promise<void> {
 			}
 			storedDeltas += repack.deltas
 			await spawnGit(["gc", "--prune=now", "-q"], { cwd: oracle })
+			await assertCanonicalRealRepoStore(db.sql, repoId, oracle, { kind: "repacked" })
 
 			if (round === 0) {
 				await spawnGit([
@@ -169,11 +195,18 @@ async function main(): Promise<void> {
 			}
 			await requireTrackingClientsEqual(pgTrack, gitTrack)
 
-			const previous = round === 0 ? undefined : checkpoints[round - 1]
+			type FetchState = { kind: "cold" } | { kind: "warm"; previous: Oid }
+			const fetchState: FetchState =
+				round === 0
+					? { kind: "cold" }
+					: {
+							kind: "warm",
+							previous: requiredAt(checkpoints, round - 1, "previous warm checkpoint"),
+						}
 			const request = fetchRequest({
 				done: true,
-				haves: previous ? [previous] : [],
-				thinPack: previous !== undefined,
+				haves: fetchState.kind === "warm" ? [fetchState.previous] : [],
+				thinPack: fetchState.kind === "warm",
 				wants: [rev],
 			})
 			const [pggitPack, gitPack] = await Promise.all([
@@ -181,8 +214,16 @@ async function main(): Promise<void> {
 				canonicalV2Pack(oracle, request),
 			])
 			const [pggitObjects, gitObjects] = await Promise.all([
-				rawPackObjectOids(pgTrack, pggitPack, previous !== undefined),
-				rawPackObjectOids(gitTrack, gitPack, previous !== undefined),
+				rawPackObjectOids(
+					pgTrack,
+					pggitPack,
+					fetchState.kind === "warm" ? "thin" : "complete",
+				),
+				rawPackObjectOids(
+					gitTrack,
+					gitPack,
+					fetchState.kind === "warm" ? "thin" : "complete",
+				),
 			])
 			requireEqual(`round ${round} transmitted OIDs`, pggitObjects.oids, gitObjects.oids)
 			appendedPggitBases += pggitObjects.appendedBases

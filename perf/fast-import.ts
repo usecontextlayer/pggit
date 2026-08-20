@@ -41,9 +41,10 @@ function buildStream(s: Scenario, rnd: () => number): string {
 		out.push(`blob\nmark :${m}\ndata ${content.length}\n${content}\n`)
 		return m
 	}
-	const emitCommit = (msg: string, parent: number | null, changed: number[]): number => {
+	type CommitParent = { kind: "root" } | { kind: "child"; mark: number }
+	const emitCommit = (msg: string, parent: CommitParent, changed: number[]): number => {
 		const cm = nextMark()
-		const from = parent === null ? "" : `from :${parent}\n`
+		const from = parent.kind === "root" ? "" : `from :${parent.mark}\n`
 		let body = `commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n${from}`
 		for (const i of changed) body += `M 100644 :${blobMark[i]} ${filePath(i, s)}\n`
 		out.push(body)
@@ -56,7 +57,7 @@ function buildStream(s: Scenario, rnd: () => number): string {
 		blobMark[i] = emitBlob(blobContent(`f${i}-v0`, s, rnd))
 		all.push(i)
 	}
-	let prev = emitCommit("c0", null, all)
+	let prev = emitCommit("c0", { kind: "root" }, all)
 
 	// Commits 1..historyLen-1: churn a deterministic subset (new blob versions).
 	for (let c = 1; c < s.historyLen; c++) {
@@ -67,7 +68,7 @@ function buildStream(s: Scenario, rnd: () => number): string {
 			blobMark[i] = emitBlob(blobContent(`f${i}-v${c}`, s, rnd))
 			changed.add(i)
 		}
-		prev = emitCommit(`c${c}`, prev, [...changed])
+		prev = emitCommit(`c${c}`, { kind: "child", mark: prev }, [...changed])
 	}
 
 	// Extra branch aliases exercise advertisement/ref cardinality; identical tips are one negotiation want.

@@ -46,13 +46,22 @@
 import { readdirSync, rmSync, statSync } from "node:fs"
 import { join } from "node:path"
 import type { Sql } from "postgres"
+import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { branchAndTagRefsOf, parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	branchAndTagRefsOf,
+	parseRevListObjectOids,
+	repackEligibleObjects,
+	requiredAt,
+	requireGitOid,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	cleanupTmp,
 	cloneAndVerify,
@@ -61,9 +70,7 @@ import {
 	initRepo,
 	mb,
 	mkTmp,
-	numFlag,
 	objectsBetween,
-	PG_URL,
 	revParse,
 	runCommits,
 	schemaStats,
@@ -75,13 +82,27 @@ import {
 	total,
 } from "./_pgres-util"
 
-const ROUNDS = numFlag("rounds", 14)
-const PER_ROUND = numFlag("commits", 60)
-const BASE_RUNS = numFlag("base", 100)
+const args = parseArgs(
+	z
+		.object({
+			base: positiveIntegerArg.default(100),
+			commits: positiveIntegerArg.default(60),
+			pg: pgUrlArg,
+			rounds: positiveIntegerArg.default(14),
+		})
+		.strict(),
+)
+const ROUNDS = args.rounds
+const PER_ROUND = args.commits
+const BASE_RUNS = args.base
+const PG_URL = args.pg
 const BLOB_CHARS = 1200
 const REPO = "churn"
 
-type Mode = { key: string; label: string; maintain: boolean; repack: boolean }
+type Mode =
+	| { key: "A"; label: string; maintain: true; repack: true }
+	| { key: "B"; label: string; maintain: false; repack: true }
+	| { key: "C"; label: string; maintain: false; repack: false }
 const MODES: Mode[] = [
 	{
 		key: "A",
@@ -127,12 +148,22 @@ type Row = {
 	ms: number
 }
 
+type CorrectnessResult =
+	| { status: "passed"; verdict: string }
+	| { status: "failed"; verdict: string }
+
 type ModeResult = {
 	mode: Mode
 	rows: Row[]
-	verdict: string
-	failed: boolean
+	correctness: CorrectnessResult
 	reclaim: { enc: [number, number]; obj: [number, number] }
+}
+
+function appendEvidence(result: CorrectnessResult, evidence: string): CorrectnessResult {
+	const verdict = `${result.verdict} | ${evidence}`
+	return result.status === "passed"
+		? { status: "passed", verdict }
+		: { status: "failed", verdict }
 }
 
 /** Mean per-round growth of the encoding tier's physical footprint over the LAST
@@ -140,8 +171,8 @@ type ModeResult = {
 function tailGrowthPerLiveByte(rows: Row[]): number {
 	if (rows.length < 3) throw new Error("growth measurement requires at least 3 rounds")
 	const half = Math.floor(rows.length / 2)
-	const z = rows[rows.length - 1] as Row
-	const m = rows[half] as Row
+	const z = requiredAt(rows, rows.length - 1, "growth final round")
+	const m = requiredAt(rows, half, "growth midpoint round")
 	const span = rows.length - 1 - half
 	if (z.encLogical <= 0)
 		throw new Error("growth measurement requires live encoding bytes")
@@ -150,7 +181,7 @@ function tailGrowthPerLiveByte(rows: Row[]): number {
 
 const phys = (r: Row): number => r.encHeap + r.encToast + r.encIdx
 
-function dirBytes(dir: string): number {
+function fileContentBytes(dir: string): number {
 	const walk = (p: string): number => {
 		const st = statSync(p)
 		if (!st.isDirectory()) return st.size
@@ -180,8 +211,6 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 	const iso = await createIsolatedSchema(PG_URL)
 	const pg: Sql = iso.sql
 	const rows: Row[] = []
-	let failed = false
-	let verdict = ""
 	let reclaim: { enc: [number, number]; obj: [number, number] } = {
 		enc: [0, 0],
 		obj: [0, 0],
@@ -203,7 +232,7 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 		const repack = createRepack(pg)
 		if (mode.repack) {
 			const seeded = await repack.repack(REPO)
-			if (seeded.wholes + seeded.deltas !== baseObjects.length) {
+			if (seeded.wholes + seeded.deltas !== repackEligibleObjects(baseObjects).length) {
 				throw new Error(`${mode.key}: base repack covered incomplete object set`)
 			}
 		}
@@ -240,30 +269,38 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			// The current production scheduler stops after GC.
 			const g = await gc.gc(REPO, { graceSeconds: 0, maintain: mode.maintain })
 			const p = mode.repack ? await repack.repack(REPO) : { deltas: 0, wholes: 0 }
-			const canonical = parseRevListObjectOids(
-				(await spawnGit(["rev-list", "--objects", "refs/heads/main"], { cwd: dir }))
-					.stdout,
-			)
-			const [live] = await pg<
-				{ objects: string; commits: string; encodings: string; tip: string }[]
-			>`select
-				(select count(*) from git_object)::text as objects,
-				(select count(*) from git_commit)::text as commits,
-				(select count(*) from git_pack_encoding)::text as encodings,
-				(select encode(oid, 'hex') from git_ref where name = 'refs/heads/main') as tip`
-			const expectedDeleted = Number(beforeGc.n) - canonical.length
-			const expectedEncodings = mode.repack ? canonical.length : 0
+			const liveObjects = [...baseObjects, ...roundObjects]
+			const eligibleLiveObjects = repackEligibleObjects(liveObjects)
+			const eligibleRoundObjects = repackEligibleObjects(roundObjects)
+			const beforeCount = Number(beforeGc.n)
+			if (!Number.isSafeInteger(beforeCount) || beforeCount < liveObjects.length) {
+				throw new Error(`${mode.key} round ${r}: invalid pre-GC count ${beforeGc.n}`)
+			}
+			const expectedDeleted = beforeCount - liveObjects.length
+			await assertCanonicalStoreFixture(pg, REPO, {
+				encodings: {
+					kind: "exact",
+					objects: mode.repack ? eligibleLiveObjects : [],
+				},
+				objects: liveObjects,
+				refs: [
+					{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+					{
+						kind: "direct",
+						name: "refs/heads/main",
+						oid: requireGitOid(tip, `${mode.key} round ${r} main tip`),
+					},
+				],
+			})
+			const expectedEncodings = mode.repack ? eligibleLiveObjects.length : 0
 			if (
-				!live ||
-				live.tip !== tip ||
-				Number(live.objects) !== canonical.length ||
-				Number(live.commits) !== BASE_RUNS + PER_ROUND ||
-				Number(live.encodings) !== expectedEncodings ||
+				liveObjects.filter(({ type }) => type === "commit").length !==
+					BASE_RUNS + PER_ROUND ||
 				g.deletedObjects !== expectedDeleted ||
-				(mode.repack && p.wholes + p.deltas !== roundObjects.length)
+				(mode.repack && p.wholes + p.deltas !== eligibleRoundObjects.length)
 			) {
 				throw new Error(
-					`${mode.key} round ${r} prerequisite mismatch: ${JSON.stringify({ beforeGc, deleted: g.deletedObjects, live, repack: p })}`,
+					`${mode.key} round ${r} prerequisite mismatch: ${JSON.stringify({ beforeGc, deleted: g.deletedObjects, expectedDeleted, repack: p })}`,
 				)
 			}
 
@@ -300,7 +337,7 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 				encToast: e.toast,
 				encVac: e.vac,
 				gcObjects: g.deletedObjects,
-				gitDirBytes: dirBytes(join(dir, ".git")),
+				gitDirBytes: fileContentBytes(join(dir, ".git")),
 				ms: Date.now() - t0,
 				objAutovac: o.autovac,
 				objDead: o.dead,
@@ -315,78 +352,95 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 		}
 
 		// ── correctness judge: real git ─────────────────────────────────────────
-		const server = await serveOnPort(createGitApp(createGitDeps(pg)), 0)
-		try {
-			const url = `http://127.0.0.1:${server.port}/${REPO}`
-			const clone = join(mkTmp(`clone-${mode.key}`), "c.git")
-			const got = await cloneAndVerify(url, clone)
-			const want = parseRevListObjectOids(
-				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
-			).sort()
-			const wantRefs = (await branchAndTagRefsOf(dir)).map(
-				({ name, oid }) => `${oid} ${name}`,
-			)
-			const same =
-				got.objects.length === want.length &&
-				got.objects.every((x, i) => x === want[i]) &&
-				JSON.stringify(got.refs) === JSON.stringify(wantRefs) &&
-				got.fsck === ""
-			verdict = same
-				? `clone fsck-clean, ${got.objects.length} objects, identical to local git`
-				: `MISMATCH: clone ${got.objects.length} objs / local ${want.length} objs / fsck=${got.fsck || "clean"}`
-			if (!same) failed = true
-
-			const extra = runCommits({
-				blobChars: BLOB_CHARS,
-				branch: "refs/heads/main",
-				count: 5,
-				from: tip,
-				markStart: 0,
-				salt: "incr",
-			})
-			await fastImport(dir, extra.stream)
-			const tip2 = await revParse(dir, "refs/heads/main")
-			const extraObjects = await objectsBetween(dir, tip2, [tip])
-			await seedObjects(pg, REPO, extraObjects)
-			await setMain(pg, REPO, tip2)
-			if (mode.repack) {
-				const extraRepack = await repack.repack(REPO)
-				if (extraRepack.wholes + extraRepack.deltas !== extraObjects.length) {
-					throw new Error(`${mode.key}: incremental repack coverage mismatch`)
-				}
-			}
-			await spawnGit(["fetch", "-q", "origin", "+refs/*:refs/*"], { cwd: clone })
-			const after = (
-				await spawnGit(["rev-parse", "refs/heads/main"], { cwd: clone })
-			).stdout.trim()
-			if (after !== tip2) {
-				failed = true
-				verdict += ` | INCREMENTAL FETCH MISMATCH ${after} != ${tip2}`
-			} else {
-				const f = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: clone })
-				const gotAfter = parseRevListObjectOids(
-					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: clone })).stdout,
-				).sort()
-				const wantAfter = parseRevListObjectOids(
+		const correctness = await (async (): Promise<CorrectnessResult> => {
+			const server = await serveOnPort(createGitApp(createGitDeps(pg)), 0)
+			try {
+				const url = `http://127.0.0.1:${server.port}/${REPO}`
+				const clone = join(mkTmp(`clone-${mode.key}`), "c.git")
+				const got = await cloneAndVerify(url, clone)
+				const want = parseRevListObjectOids(
 					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
 				).sort()
-				const [gotRefsAfter, wantRefsAfter] = await Promise.all([
-					branchAndTagRefsOf(clone),
-					branchAndTagRefsOf(dir),
-				])
-				if (
-					gotAfter.length !== wantAfter.length ||
-					gotAfter.some((oid, i) => oid !== wantAfter[i]) ||
-					JSON.stringify(gotRefsAfter) !== JSON.stringify(wantRefsAfter)
-				) {
-					throw new Error(`${mode.key}: incremental clone refs/objects diverged from git`)
+				const wantRefs = (await branchAndTagRefsOf(dir)).map(
+					({ name, oid }) => `${oid} ${name}`,
+				)
+				const same =
+					got.objects.length === want.length &&
+					got.objects.every((x, i) => x === want[i]) &&
+					JSON.stringify(got.refs) === JSON.stringify(wantRefs) &&
+					got.fsck === ""
+				let result: CorrectnessResult = same
+					? {
+							status: "passed",
+							verdict: `clone fsck-clean, ${got.objects.length} objects, identical to local git`,
+						}
+					: {
+							status: "failed",
+							verdict: `MISMATCH: clone ${got.objects.length} objs / local ${want.length} objs / fsck=${got.fsck || "clean"}`,
+						}
+
+				const extra = runCommits({
+					blobChars: BLOB_CHARS,
+					branch: "refs/heads/main",
+					count: 5,
+					from: tip,
+					markStart: 0,
+					salt: "incr",
+				})
+				await fastImport(dir, extra.stream)
+				const tip2 = await revParse(dir, "refs/heads/main")
+				const extraObjects = await objectsBetween(dir, tip2, [tip])
+				await seedObjects(pg, REPO, extraObjects)
+				await setMain(pg, REPO, tip2)
+				if (mode.repack) {
+					const extraRepack = await repack.repack(REPO)
+					if (extraRepack.wholes + extraRepack.deltas !== extraObjects.length) {
+						throw new Error(`${mode.key}: incremental repack coverage mismatch`)
+					}
 				}
-				verdict += ` | incremental fetch ok (fsck ${`${f.stdout}${f.stderr}`.trim() || "clean"})`
+				await spawnGit(["fetch", "-q", "origin", "+refs/*:refs/*"], { cwd: clone })
+				const after = (
+					await spawnGit(["rev-parse", "refs/heads/main"], { cwd: clone })
+				).stdout.trim()
+				if (after !== tip2) {
+					result = {
+						status: "failed",
+						verdict: `${result.verdict} | INCREMENTAL FETCH MISMATCH ${after} != ${tip2}`,
+					}
+				} else {
+					const f = await spawnGit(["fsck", "--strict", "--no-dangling"], {
+						cwd: clone,
+					})
+					const gotAfter = parseRevListObjectOids(
+						(await spawnGit(["rev-list", "--objects", "--all"], { cwd: clone })).stdout,
+					).sort()
+					const wantAfter = parseRevListObjectOids(
+						(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
+					).sort()
+					const [gotRefsAfter, wantRefsAfter] = await Promise.all([
+						branchAndTagRefsOf(clone),
+						branchAndTagRefsOf(dir),
+					])
+					if (
+						gotAfter.length !== wantAfter.length ||
+						gotAfter.some((oid, i) => oid !== wantAfter[i]) ||
+						JSON.stringify(gotRefsAfter) !== JSON.stringify(wantRefsAfter)
+					) {
+						throw new Error(
+							`${mode.key}: incremental clone refs/objects diverged from git`,
+						)
+					}
+					result = appendEvidence(
+						result,
+						`incremental fetch ok (fsck ${`${f.stdout}${f.stderr}`.trim() || "clean"})`,
+					)
+				}
+				rmSync(clone, { force: true, recursive: true })
+				return result
+			} finally {
+				await server.close()
 			}
-			rmSync(clone, { force: true, recursive: true })
-		} finally {
-			await server.close()
-		}
+		})()
 
 		// ── how much of the footprint is DEAD SPACE? ────────────────────────────
 		// VACUUM reclaims space for REUSE but never returns it to the OS, so relation
@@ -405,10 +459,10 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			],
 			obj: [total(stat(before, "git_object")), total(stat(after, "git_object"))],
 		}
+		return { correctness, mode, reclaim, rows }
 	} finally {
 		await iso.drop()
 	}
-	return { failed, mode, reclaim, rows, verdict }
 }
 
 function report(res: ModeResult): void {
@@ -458,8 +512,8 @@ function report(res: ModeResult): void {
 			]),
 		),
 	)
-	const a = rows[1] as Row
-	const z = rows[rows.length - 1] as Row
+	const a = requiredAt(rows, 1, `${mode.key} report baseline round`)
+	const z = requiredAt(rows, rows.length - 1, `${mode.key} report final round`)
 	if (a.objTotal <= 0 || a.schemaTotal <= 0 || a.gitDirBytes <= 0) {
 		throw new Error(`${mode.key}: bloat baseline has an empty denominator`)
 	}
@@ -472,9 +526,10 @@ function report(res: ModeResult): void {
 	}
 	const half = Math.floor(rows.length / 2)
 	const span = rows.length - 1 - half
-	const tailEnc = (phys(z) - phys(rows[half] as Row)) / span
-	const tailObj = (z.objTotal - (rows[half] as Row).objTotal) / span
-	const tailSchema = (z.schemaTotal - (rows[half] as Row).schemaTotal) / span
+	const midpoint = requiredAt(rows, half, `${mode.key} report midpoint round`)
+	const tailEnc = (phys(z) - phys(midpoint)) / span
+	const tailObj = (z.objTotal - midpoint.objTotal) / span
+	const tailSchema = (z.schemaTotal - midpoint.schemaTotal) / span
 	console.log(
 		mode.repack
 			? `\nround 2 → ${rows.length}:  git_pack_encoding ×${(phys(z) / phys(a)).toFixed(2)} (${mb(phys(a))} → ${mb(phys(z))} MB) while its LIVE content stayed ×${(z.encLogical / a.encLogical).toFixed(2)} (${mb(a.encLogical)} MB)`
@@ -491,7 +546,7 @@ function report(res: ModeResult): void {
 	console.log(
 		`  VACUUM FULL reclaim: git_pack_encoding ${mb(encB)} → ${mb(encA)} MB (${encB ? ((1 - encA / encB) * 100).toFixed(0) : "0"}% dead space) · git_object ${mb(objB)} → ${mb(objA)} MB (${objB ? ((1 - objA / objB) * 100).toFixed(0) : "0"}% dead space)`,
 	)
-	console.log(`  correctness: ${res.verdict}`)
+	console.log(`  correctness: ${res.correctness.verdict}`)
 }
 
 async function main(): Promise<void> {
@@ -514,11 +569,25 @@ async function main(): Promise<void> {
 		const res = await runMode(mode)
 		report(res)
 		all.push(res)
-		if (res.failed) failed = true
+		if (res.correctness.status === "failed") failed = true
 	}
 
 	console.log("\n## what the tier costs (final round of each mode)\n")
-	const ctrl = all[all.length - 1]?.rows.at(-1) as Row
+	if (all.length !== MODES.length) {
+		throw new Error(`mode run produced ${all.length}/${MODES.length} results`)
+	}
+	const control = requiredAt(all, MODES.length - 1, "tier-absent control result")
+	if (control.mode.key !== "C") {
+		throw new Error(`final mode must be control C, got ${control.mode.key}`)
+	}
+	const ctrl = requiredAt(
+		control.rows,
+		control.rows.length - 1,
+		"tier-absent control final round",
+	)
+	if (ctrl.schemaTotal <= 0) {
+		throw new Error("tier-absent control has no schema bytes")
+	}
 	console.log(
 		table(
 			[
@@ -530,7 +599,11 @@ async function main(): Promise<void> {
 				"schema vs control C",
 			],
 			all.map((r) => {
-				const z = r.rows[r.rows.length - 1] as Row
+				const z = requiredAt(
+					r.rows,
+					r.rows.length - 1,
+					`${r.mode.key} final comparison round`,
+				)
 				return [
 					r.mode.key,
 					mb(z.schemaTotal),
@@ -554,7 +627,11 @@ async function main(): Promise<void> {
 				"git_pack_encoding autovacuums",
 			],
 			all.map((r) => {
-				const z = r.rows[r.rows.length - 1] as Row
+				const z = requiredAt(
+					r.rows,
+					r.rows.length - 1,
+					`${r.mode.key} final reclamation round`,
+				)
 				return [r.mode.key, z.objVac, z.objAutovac, z.encVac, z.encAutovac]
 			}),
 		),

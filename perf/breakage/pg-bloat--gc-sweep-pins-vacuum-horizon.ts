@@ -33,21 +33,21 @@
  */
 import { setTimeout as sleep } from "node:timers/promises"
 import postgres from "postgres"
+import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { assertCanonicalStoreFixture, revParse } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	COMMITTER,
-	DEFAULT_PG_URL,
 	filler,
-	flag,
 	horizon,
 	objectsBetween,
 	pad,
 	padr,
-	positiveIntegerFlag,
 	runDirName,
 	scratchRoot,
 	sizeOf,
@@ -59,9 +59,19 @@ const GC_APP = "pgbloat-gc-under-test"
 /** a single GC transaction longer than this pins the horizon past a naptime */
 const PIN_LIMIT_MS = 60_000
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-const BASE = positiveIntegerFlag("base", 400)
-const ADVANCE = positiveIntegerFlag("advance", 400)
+const {
+	advance: ADVANCE,
+	base: BASE,
+	pg: PG_URL,
+} = parseArgs(
+	z
+		.object({
+			advance: positiveIntegerArg.default(400),
+			base: positiveIntegerArg.default(400),
+			pg: pgUrlArg,
+		})
+		.strict(),
+)
 
 function buildStream(): string {
 	const out: string[] = []
@@ -121,12 +131,8 @@ async function main(): Promise<void> {
 		const src = scratch.dir("src")
 		await spawnGit(["init", "-q", "-b", "main", src])
 		await spawnGit(["fast-import", "--quiet"], { cwd: src, input: buildStream() })
-		const baseTip = (
-			await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })
-		).stdout.trim()
-		const advTip = (
-			await spawnGit(["rev-parse", "refs/heads/adv"], { cwd: src })
-		).stdout.trim()
+		const baseTip = await revParse(src, "refs/heads/main")
+		const advTip = await revParse(src, "refs/heads/adv")
 
 		const store = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
@@ -150,29 +156,25 @@ async function main(): Promise<void> {
 			})),
 		)
 		await refs.setRef(REPO_ID, "refs/heads/main", advTip)
+		await refs.setSymref(REPO_ID, "HEAD", "refs/heads/main")
 		await refs.setRef(REPO_ID, "refs/heads/main", baseTip) // the force push
 
 		const objSize = await sizeOf(db.sql, "git_object")
 		const [oc] = await db.sql<{ n: string }[]>`select count(*)::text as n from git_object`
-		const expectedBeforeOids = [...baseObjects, ...advanceObjects]
-			.map((object) => object.oid)
-			.sort()
-		const beforeOids = (
-			await db.sql<
-				{ oid: string }[]
-			>`select encode(oid, 'hex') as oid from git_object order by oid`
-		).map((row) => row.oid)
-		if (
-			!oc ||
-			Number(oc.n) !== expectedBeforeOids.length ||
-			objSize.total <= 0 ||
-			beforeOids.length !== expectedBeforeOids.length ||
-			beforeOids.some((oid, i) => oid !== expectedBeforeOids[i])
-		) {
+		const expectedBeforeObjects = [...baseObjects, ...advanceObjects]
+		if (!oc || Number(oc.n) !== expectedBeforeObjects.length || objSize.total <= 0) {
 			throw new Error(
-				`pre-GC fixture census mismatch: rows=${oc?.n ?? "missing"}/${expectedBeforeOids.length}, bytes=${objSize.total}`,
+				`pre-GC fixture census mismatch: rows=${oc?.n ?? "missing"}/${expectedBeforeObjects.length}, bytes=${objSize.total}`,
 			)
 		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "unchecked" },
+			objects: expectedBeforeObjects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: baseTip },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
 		console.log(
 			`\ngit_object before the sweep: ${oc.n} rows, ${(objSize.total / 1_000_000).toFixed(2)} MB\n`,
 		)
@@ -251,18 +253,14 @@ async function main(): Promise<void> {
 				`post-GC state mismatch: ${JSON.stringify(remaining)}, expected ${baseObjects.length}/${baseTip}`,
 			)
 		}
-		const expectedAfterOids = baseObjects.map((object) => object.oid).sort()
-		const afterOids = (
-			await db.sql<
-				{ oid: string }[]
-			>`select encode(oid, 'hex') as oid from git_object order by oid`
-		).map((row) => row.oid)
-		if (
-			afterOids.length !== expectedAfterOids.length ||
-			afterOids.some((oid, i) => oid !== expectedAfterOids[i])
-		) {
-			throw new Error("post-GC Postgres OIDs do not match canonical base history")
-		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "unchecked" },
+			objects: baseObjects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: baseTip },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
 
 		console.log(
 			`gc() reclaimed ${gcRes.deletedObjects} objects in ${(gcMs / 1000).toFixed(2)}s\n`,

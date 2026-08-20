@@ -27,20 +27,24 @@
  *
  *   npx tsx perf/breakage/pg-bloat--repo-file-projection.ts --files=4000 --pushes=60
  */
+import { z } from "zod"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	canonicalStoreRefsOf,
+	revParse,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	aggregate,
 	backendWal,
 	COMMITTER,
-	DEFAULT_PG_URL,
 	filler,
-	flag,
 	flushStats,
 	horizon,
 	kb,
@@ -48,7 +52,6 @@ import {
 	objectsBetween,
 	pad,
 	padr,
-	positiveIntegerFlag,
 	scratchRoot,
 	sizeOf,
 	stats,
@@ -64,9 +67,19 @@ const PUSH_APP = "pgbloat-projection-under-test"
 const REPO_ID = "workspace/slate/projection"
 const BLOAT_LIMIT = 2.0
 
-const PG_URL = flag("pg", DEFAULT_PG_URL)
-const FILES = positiveIntegerFlag("files", 4000)
-const PUSHES = positiveIntegerFlag("pushes", 60)
+const {
+	files: FILES,
+	pg: PG_URL,
+	pushes: PUSHES,
+} = parseArgs(
+	z
+		.object({
+			files: positiveIntegerArg.default(4000),
+			pg: pgUrlArg,
+			pushes: positiveIntegerArg.default(60),
+		})
+		.strict(),
+)
 
 function baseStream(): string {
 	const out: string[] = []
@@ -122,9 +135,7 @@ async function main(): Promise<void> {
 		const snapshots = createRepoFileProjection(app)
 		const deps = { objects: store, snapshots }
 
-		let tip = (
-			await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })
-		).stdout.trim()
+		let tip = await revParse(src, "refs/heads/main")
 		const baseObjs = await objectsBetween(src, tip)
 		if (baseObjs.length === 0)
 			throw new Error("base projection fixture produced no objects")
@@ -133,28 +144,18 @@ async function main(): Promise<void> {
 			baseObjs.map((o) => ({ content: o.content, type: o.type })),
 		)
 		await refs.setRef(REPO_ID, "refs/heads/main", tip)
+		await refs.setSymref(REPO_ID, "HEAD", "refs/heads/main")
 		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", tip)
 		const [baseCount] = await db.sql<{ n: string }[]>`
 			select count(*)::text as n from repo_file`
 		if (!baseCount || Number(baseCount.n) !== FILES) {
 			throw new Error(`base projection has ${baseCount?.n ?? "no count"}/${FILES} rows`)
 		}
-		const expectedBaseOids = baseObjs.map((object) => object.oid).sort()
-		const actualBaseOids = (
-			await db.sql<
-				{ oid: string }[]
-			>`select encode(oid, 'hex') as oid from git_object order by oid`
-		).map((row) => row.oid)
-		const [baseRef] = await db.sql<{ oid: string }[]>`
-			select encode(oid, 'hex') as oid from git_ref where name = 'refs/heads/main'`
-		if (
-			!baseRef ||
-			baseRef.oid !== tip ||
-			actualBaseOids.length !== expectedBaseOids.length ||
-			actualBaseOids.some((oid, i) => oid !== expectedBaseOids[i])
-		) {
-			throw new Error("base Postgres refs/OIDs do not match canonical git")
-		}
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "unchecked" },
+			objects: baseObjs,
+			refs: await canonicalStoreRefsOf(src),
+		})
 
 		const seedSize = await sizeOf(db.sql, "repo_file")
 		if (seedSize.total <= 0) throw new Error("base projection has no physical size")
@@ -179,12 +180,11 @@ async function main(): Promise<void> {
 		let lastIns = baseAgg.ins
 		let lastDel = baseAgg.del
 		let lastUpd = baseAgg.upd
+		let lastHot = baseAgg.hot
 		const walPerPush: number[] = []
 		for (let p = 0; p < PUSHES; p++) {
 			await spawnGit(["fast-import", "--quiet"], { cwd: src, input: touchStream(p + 1) })
-			const newTip = (
-				await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })
-			).stdout.trim()
+			const newTip = await revParse(src, "refs/heads/main")
 			const objs = await objectsBetween(src, newTip, tip)
 			if (objs.length === 0)
 				throw new Error(`push ${p}: canonical fixture produced no objects`)
@@ -221,12 +221,13 @@ async function main(): Promise<void> {
 				console.log(
 					`${padr(p, 6)} ${pad(kb(s.heap), 9)} ${pad(kb(s.indexes), 9)} ${pad(kb(s.total), 9)} ` +
 						`${pad(agg.live, 7)} ${pad(agg.dead, 7)} ${pad(agg.ins - lastIns, 8)} ` +
-						`${pad(agg.del - lastDel, 8)} ${pad(agg.upd - lastUpd, 6)} ${pad(agg.hot, 6)} ` +
+						`${pad(agg.del - lastDel, 8)} ${pad(agg.upd - lastUpd, 6)} ${pad(agg.hot - lastHot, 6)} ` +
 						`${pad(agg.autovac, 8)} ${pad(kb(perPush), 15)} ${pad(hz.ageXids, 8)}`,
 				)
 				lastIns = agg.ins
 				lastDel = agg.del
 				lastUpd = agg.upd
+				lastHot = agg.hot
 			}
 		}
 
@@ -287,24 +288,12 @@ async function main(): Promise<void> {
 		if (projectedFiles !== canonicalFiles) {
 			throw new Error("repo_file rows diverged from canonical git ls-tree")
 		}
-		const expectedFinalOids = parseRevListObjectOids(
-			(await spawnGit(["rev-list", "--objects", "--all"], { cwd: src })).stdout,
-		).sort()
-		const actualFinalOids = (
-			await db.sql<
-				{ oid: string }[]
-			>`select encode(oid, 'hex') as oid from git_object order by oid`
-		).map((row) => row.oid)
-		const [finalRef] = await db.sql<{ oid: string }[]>`
-			select encode(oid, 'hex') as oid from git_ref where name = 'refs/heads/main'`
-		if (
-			!finalRef ||
-			finalRef.oid !== tip ||
-			actualFinalOids.length !== expectedFinalOids.length ||
-			actualFinalOids.some((oid, i) => oid !== expectedFinalOids[i])
-		) {
-			throw new Error("final Postgres refs/OIDs do not match canonical git")
-		}
+		const expectedFinalObjects = await objectsBetween(src, tip)
+		await assertCanonicalStoreFixture(db.sql, REPO_ID, {
+			encodings: { kind: "unchecked" },
+			objects: expectedFinalObjects,
+			refs: await canonicalStoreRefsOf(src),
+		})
 
 		console.log(`\n## steady state after ${PUSHES} pushes\n`)
 		console.log(

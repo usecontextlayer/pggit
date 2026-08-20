@@ -15,6 +15,7 @@ import { createHash } from "node:crypto"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { Oid } from "@/oid"
 import { parseRevListObjectOids, requireGitOid } from "@/testing/git-fixtures"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -219,10 +220,7 @@ export async function runsTreeAt(dir: string, rev: string): Promise<string> {
 }
 
 /** Commit OIDs for one revision, oldest-first. */
-export async function commitsOldestFirst(
-	dir: string,
-	revision = "HEAD",
-): Promise<string[]> {
+export async function commitsOldestFirst(dir: string, revision = "HEAD"): Promise<Oid[]> {
 	const out = await spawnGit(["rev-list", "--reverse", revision], { cwd: dir })
 	return parseRevListObjectOids(out.stdout)
 }

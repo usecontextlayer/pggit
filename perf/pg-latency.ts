@@ -6,25 +6,36 @@ import { startPostgres } from "@/testing/pg"
 const PG_IMAGE = "postgres:18-alpine"
 const TOXIPROXY_IMAGE = "ghcr.io/shopify/toxiproxy:2.12.0"
 
-/**
- * A Postgres endpoint for the harness. `setLatencyMs` injects a per-response
- * round-trip delay so the per-object query COUNT becomes visible wall-time;
- * the plain (loopback) handle rejects latency injection.
- */
-export type PgHandle = {
+export type RttMode = { kind: "loopback" } | { kind: "sweep"; requestedMs: number }
+
+export type RttSample = { rttMs: number; wallMs: number }
+
+export type RttEvidence =
+	| { kind: "loopback" }
+	| { kind: "sweep"; requestedMs: number; samples: [RttSample, RttSample] }
+
+type PgHandleBase = {
 	baseUrl: string
-	setLatencyMs: (ms: number, jitter?: number) => Promise<void>
 	stop: () => Promise<void>
 }
 
+/** A direct loopback endpoint has no latency-injection operation. */
+export type PlainPgHandle = PgHandleBase & { kind: "plain" }
+
+/** A proxied endpoint can inject a per-response round-trip delay. */
+export type LatencyPgHandle = PgHandleBase & {
+	kind: "latency"
+	setLatencyMs: (ms: number, jitter?: number) => Promise<void>
+}
+
+export type PgHandle = PlainPgHandle | LatencyPgHandle
+
 /** Plain Postgres testcontainer — loopback, ~0ms latency, no proxy. */
-export async function startPlainPg(): Promise<PgHandle> {
+export async function startPlainPg(): Promise<PlainPgHandle> {
 	const container = await startPostgres()
 	return {
 		baseUrl: container.getConnectionUri(),
-		setLatencyMs: async () => {
-			throw new Error("cannot inject latency into a plain Postgres handle")
-		},
+		kind: "plain",
 		stop: async () => {
 			await container.stop()
 		},
@@ -36,7 +47,7 @@ export async function startPlainPg(): Promise<PgHandle> {
  * through the proxy, so a `latency` toxic adds RTT to every query — exposing the
  * per-object round-trip cost the loopback hides.
  */
-export async function startLatencyPg(): Promise<PgHandle> {
+export async function startLatencyPg(): Promise<LatencyPgHandle> {
 	const network = await new Network().start()
 	const pg = await new PostgreSqlContainer(PG_IMAGE)
 		.withNetwork(network)
@@ -49,6 +60,7 @@ export async function startLatencyPg(): Promise<PgHandle> {
 	let toxic: Awaited<ReturnType<typeof proxy.instance.addToxic>> | undefined
 	return {
 		baseUrl,
+		kind: "latency",
 		setLatencyMs: async (ms, jitter = 0) => {
 			if (!Number.isFinite(ms) || ms < 0 || !Number.isFinite(jitter) || jitter < 0) {
 				throw new Error(
