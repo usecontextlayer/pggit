@@ -32,9 +32,9 @@ function receiveBody(lines: string[]): Buffer {
  * unsupported command rejects with GitProtocolError — not internal call ordering.) */
 const stubBackend: RepoBackend = {
 	buildPack: async () => Buffer.alloc(0),
-	commonHaves: async () => [],
 	getSymref: async () => null,
 	listRefs: async () => [],
+	processHaves: async () => ({ acks: [], common: [] }),
 	readyToGiveUp: async () => false,
 }
 

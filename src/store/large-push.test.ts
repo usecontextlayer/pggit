@@ -58,7 +58,7 @@ describe("M2 — large push exceeding the bind-parameter ceiling", () => {
 
 		// Every expected object is actually present, with no extra rows: a receipt of
 		// the requested length must not be able to hide a truncated or duplicated write.
-		expect((await objects.commonHaves("big", expected)).sort()).toEqual(expected)
+		expect((await objects.processHaves("big", expected)).common.sort()).toEqual(expected)
 		const rows = await db.sql<{ n: number }[]>`
 			select count(*)::int as n
 			from git_object o join repos r on r.id = o.repo_id

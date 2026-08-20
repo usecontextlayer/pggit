@@ -19,9 +19,9 @@ const Z = "0".repeat(40)
 /** A benign read-only upload backend (no mutating methods to guard). */
 const stubUpload: RepoBackend = {
 	buildPack: async () => writePack([]),
-	commonHaves: async () => [],
 	getSymref: async () => null,
 	listRefs: async () => [],
+	processHaves: async () => ({ acks: [], common: [] }),
 	readyToGiveUp: async () => false,
 }
 
@@ -87,9 +87,9 @@ describe("fetch with zero wants is a no-op (matches git's oracle)", () => {
 		// diverge from the oracle by rejecting it.
 		const backend: RepoBackend = {
 			buildPack: async () => writePack([]),
-			commonHaves: async () => [],
 			getSymref: async () => null,
 			listRefs: async () => [],
+			processHaves: async () => ({ acks: [], common: [] }),
 			readyToGiveUp: async () => false,
 		}
 		const body = Buffer.concat([

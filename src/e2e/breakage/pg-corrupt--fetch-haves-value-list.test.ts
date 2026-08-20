@@ -6,7 +6,7 @@
  * The original `commonHaves` query expanded the CLIENT'S entire have list into one
  * bind parameter per oid. PostgreSQL's Bind message caps a statement at 65,535
  * parameters (one was already spent on the repo id), so 65,534+ haves produced an
- * internal 500. `commonHaves` now uses the same bounded lookup batches as the rest
+ * internal 500. `processHaves` now uses the same bounded lookup batches as the rest
  * of the store, and `parseFetch` validates haves like wants.
  *
  * Part A drives well-formed raw requests on both sides of the old wall and parses

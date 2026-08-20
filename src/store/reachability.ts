@@ -754,7 +754,10 @@ export async function frontier(
 
 	// ── Phase 2: trees + blobs per new commit, n-way against parents' roots. ──
 	const treeCache = new Map<string, IndexedTree | null>()
-	const readTree = async (oid: string): Promise<IndexedTree | null> => {
+	const readTree = async (
+		oid: string,
+		side: "want" | "have" = "want",
+	): Promise<IndexedTree | null> => {
 		const hit = treeCache.get(oid)
 		if (hit !== undefined) return hit
 		const [row] = (
@@ -766,7 +769,10 @@ export async function frontier(
 		).rows
 		const tree = row === undefined ? null : indexTreeEntries(row.content)
 		treeCache.set(oid, tree)
-		if (tree === null) missing.add(oid)
+		// Only a WANT-side gap is the serve's failure to report; the have side is
+		// the CLIENT's history, and a hole there (a GC race on an orphaned have)
+		// must not turn into a refused want.
+		if (tree === null && side === "want") missing.add(oid)
 		return tree
 	}
 	const blobCandidates = new Set<string>()
@@ -863,6 +869,35 @@ export async function frontier(
 			}
 		}
 		await diffForServe(row.tree, boundaryTrees, interestingTrees)
+	}
+
+	// ── Client-held content over the walked window (R16's priced upgrade). ──
+	// Name-paired diffing prunes same-PATH content, but the client also holds
+	// content at OTHER paths — an object moved or resurrected anywhere under an
+	// uninteresting commit's tree (the empty blob is the degenerate case: any
+	// two empty files are one object). git marks every uninteresting commit's
+	// whole tree; we do the same, bounded to the commits this walk actually
+	// visited, and subtract before serving. Everything expanded here is
+	// reachable from a stated have, so it is also thin-pack provable (D8′).
+	const expandClientHeld = async (treeOid: string): Promise<void> => {
+		if (clientHas.has(treeOid)) return
+		clientHas.add(treeOid)
+		const tree = await readTree(treeOid, "have")
+		if (tree === null) return
+		for (const e of tree.entries) {
+			if (isTreeEntryMode(e.mode)) await expandClientHeld(e.oid)
+			else if (e.mode !== GITLINK_MODE) clientHas.add(e.oid)
+		}
+	}
+	for (const [oid, m] of marks) {
+		if (m.uninterestingBits === 0n) continue
+		const row = rows.get(oid)
+		if (row === null || row === undefined) continue
+		await expandClientHeld(row.tree)
+	}
+	for (const oid of clientHas) {
+		served.delete(oid)
+		blobCandidates.delete(oid)
 	}
 
 	// ── Blob presence, batched (also the connectivity probe for blobs). ──

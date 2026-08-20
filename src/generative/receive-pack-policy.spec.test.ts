@@ -582,27 +582,19 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 	}, 600_000)
 
 	/**
-	 * OPEN DIVERGENCE (found by this differential, 2026-08-19 — NOT a sanctioned one).
-	 *
 	 * Two NEW directory/file-conflicting refs in ONE batch: canonical git keeps the
 	 * DEEPEST name and `ng`s every shorter one, independent of the order the client
 	 * sent them (measured on git 2.55 for `[a, a/b]`, `[a/b, a]`, and
-	 * `[a, a/b, a/b/c]` — the deepest survived in all three). pggit's D/F pass walks
-	 * commands in wire order and lets the FIRST eligible one occupy the name, so it
-	 * keeps the SHORTER name for `[a, a/b]` — the opposite ref lands, and the client
-	 * is told the opposite two things. `handleReceivePack`'s comment claims this pass
-	 * runs "in git's sequential lock order", so the intent is to match; the behaviour
-	 * does not.
+	 * `[a, a/b, a/b/c]` — the deepest survived in all three). This differential
+	 * found pggit keeping the FIRST eligible name in wire order instead; pggit's
+	 * D/F pass now implements deepest-wins and this test asserts the agreement.
+	 * (Folding a `dfPairNew` shape into the generator above remains open — the
+	 * position-keyed destinations currently keep it out.)
 	 *
-	 * The D/F case where the conflicting side ALREADY EXISTS is not affected and both
+	 * The D/F case where the conflicting side ALREADY EXISTS is unchanged and both
 	 * sides agree — that one is fuzzed by the property above (`dfExisting`).
-	 *
-	 * This test pins BOTH observed behaviours so the divergence is measured rather
-	 * than remembered. When pggit is changed to match canonical git, this test must
-	 * be rewritten to assert agreement (and the `dfPairNew` shape folded into the
-	 * generator above, where the position-keyed destinations currently keep it out).
 	 */
-	it("OPEN DIVERGENCE: two new D/F-conflicting refs in one batch — git keeps the deepest, pggit keeps the first", async () => {
+	it("two new D/F-conflicting refs in one batch — both remotes keep the deepest, in every order", async () => {
 		const bare = mkdtempSync(join(tmpdir(), "pggit-rppolicy-df-"))
 		const repoId = "policy/df-pair"
 		try {
@@ -627,25 +619,24 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 			const canonical = parsePorcelain(control.stdout)
 			const observed = parsePorcelain(pggit.stdout)
 
-			// Canonical git: the deeper name wins even though it was sent SECOND.
-			expect(canonical.get("refs/heads/pair/sub")).toEqual({ klass: "ok", ok: true })
-			expect(canonical.get("refs/heads/pair")).toEqual({
-				klass: "df-conflict",
-				ok: false,
-			})
-			expect(await controlRefs(bare)).toEqual(
-				[`refs/heads/base ${fx.b}`, `refs/heads/pair/sub ${fx.c}`].sort(),
-			)
-
-			// pggit: the first command in wire order wins instead.
-			expect(observed.get("refs/heads/pair")).toEqual({ klass: "ok", ok: true })
-			expect(observed.get("refs/heads/pair/sub")).toEqual({
-				klass: "df-conflict",
-				ok: false,
-			})
-			expect(await pggitRefs(refs, repoId)).toEqual(
-				[`refs/heads/base ${fx.b}`, `refs/heads/pair ${fx.c}`].sort(),
-			)
+			// Both remotes: the deeper name wins even though it was sent SECOND
+			// (git 2.55 measured; pggit's D/F pass implements the same rule).
+			for (const [name, report] of [
+				["canonical", canonical],
+				["pggit", observed],
+			] as const) {
+				expect(report.get("refs/heads/pair/sub"), name).toEqual({
+					klass: "ok",
+					ok: true,
+				})
+				expect(report.get("refs/heads/pair"), name).toEqual({
+					klass: "df-conflict",
+					ok: false,
+				})
+			}
+			const survivors = [`refs/heads/base ${fx.b}`, `refs/heads/pair/sub ${fx.c}`].sort()
+			expect(await controlRefs(bare)).toEqual(survivors)
+			expect(await pggitRefs(refs, repoId)).toEqual(survivors)
 		} finally {
 			rmSync(bare, { force: true, recursive: true })
 		}

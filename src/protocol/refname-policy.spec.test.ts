@@ -109,7 +109,10 @@ describe("handleReceivePack — funny names get per-ref ng, never a ref", () => 
 		expect(applied.flat()).toEqual([])
 	})
 
-	it("within one batch, the EARLIER name wins the directory/file conflict", async () => {
+	it("within one batch, the DEEPEST name wins the directory/file conflict", async () => {
+		// Canonical git keeps the deepest conflicting new name and ngs every
+		// shorter one, in any wire order (measured on git 2.55; the receive-pack
+		// policy differential pins the agreement end-to-end).
 		const { applied, backend } = recordingReceive()
 		const report = pktLineUnpack(
 			await handleReceivePack(
@@ -117,10 +120,8 @@ describe("handleReceivePack — funny names get per-ref ng, never a ref", () => 
 				backend,
 			),
 		)
-		expect(report).toContain("ok refs/heads/main")
-		expect(report).toContain(
-			"ng refs/heads/main/sub funny refname (directory/file conflict)",
-		)
-		expect(applied.flat()).toEqual(["refs/heads/main"])
+		expect(report).toContain("ng refs/heads/main funny refname (directory/file conflict)")
+		expect(report).toContain("ok refs/heads/main/sub")
+		expect(applied.flat()).toEqual(["refs/heads/main/sub"])
 	})
 })

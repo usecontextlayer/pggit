@@ -52,9 +52,9 @@ describe("include-tag augmentation", () => {
 		await seedRepoIntoStore("repo", dir, { objects, refs })
 		backend = {
 			buildPack: (w, h, o, t) => objects.buildPack("repo", w, h, o, t),
-			commonHaves: (h) => objects.commonHaves("repo", h),
 			getSymref: (n) => refs.getSymref("repo", n),
 			listRefs: () => refs.listRefs("repo"),
+			processHaves: (h) => objects.processHaves("repo", h),
 			readyToGiveUp: (w, c) => objects.readyToGiveUp("repo", w, c),
 		}
 	}, 180_000)

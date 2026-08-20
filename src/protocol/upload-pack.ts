@@ -28,8 +28,9 @@ export type AdvertisedRef = { name: string; oid: string; peeled?: string }
 export type RepoBackend = {
 	listRefs: () => Promise<AdvertisedRef[]>
 	getSymref: (name: string) => Promise<string | null>
-	/** The subset of `haves` the repo has — the negotiation common set. */
-	commonHaves: (haves: Oid[]) => Promise<Oid[]>
+	/** One round's have processing: `common` (every have the repo holds — the
+	 * negotiation state) and `acks` (the got_oid-suppressed ACK lines). */
+	processHaves: (haves: Oid[]) => Promise<{ common: Oid[]; acks: Oid[] }>
 	/** git's ok_to_give_up: does every want reach a common have by ancestry? */
 	readyToGiveUp: (wants: Oid[], common: Oid[]) => Promise<boolean>
 	/** Pack the served set selected by the reachability router (and, when
@@ -119,18 +120,27 @@ async function handleFetch(req: V2Request, backend: RepoBackend): Promise<Buffer
 	// (upload-pack.c) and returns an empty pack — buildPack produces one, so we let
 	// it fall through rather than rejecting.
 	const omitBlobs = filterOmitsBlobs(filter)
-	const common = await backend.commonHaves(haves)
+	const { common, acks } = await backend.processHaves(haves)
 
 	try {
 		if (!done) {
+			// A have-less request is not a negotiation: git's v2 state machine goes
+			// straight from "wants, no haves" to the packfile and sends NO
+			// acknowledgments section, with or without `done` (measured on git 2.55;
+			// the negotiation differential pins it).
+			if (haves.length === 0) {
+				return encodePackfileResponse(
+					await backend.buildPack(wants, common, omitBlobs, includeTag, thinPack),
+				)
+			}
 			// Negotiation round (spec §4 shape b): until the haves cut every want we
 			// ACK/NAK and flush, no pack — the client sends more haves. Once ready, git
 			// requires the pack in this same response, after the `ready` line.
 			if (!(await backend.readyToGiveUp(wants, common))) {
-				return encodeAcknowledgments(common)
+				return encodeAcknowledgments(acks)
 			}
 			return encodeReadyWithPack(
-				common,
+				acks,
 				await backend.buildPack(wants, common, omitBlobs, includeTag, thinPack),
 			)
 		}

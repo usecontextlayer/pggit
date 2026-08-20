@@ -32,26 +32,18 @@
  *     enforce that both branches are actually reached.
  *   - Wants are always commits: a tag-object want takes `readyToGiveUp`'s
  *     non-commit skip, which is its own surface with its own tests.
- *   - A generated `have` is dropped when an EARLIER have in the same list already
- *     marked it common. Measured on git 2.55: upload-pack marks each have it holds
- *     — and that have's DIRECT PARENTS — as known, and ACKs a have only if it was
- *     not already marked, so `have c4, have c3` over `c3←c4` ACKs c4 alone while
- *     `have c3, have c4` ACKs both. pggit ACKs every have it holds, so it emits the
- *     suppressed ACK too. That is a STANDING divergence (a duplicated true fact:
- *     the client's negotiator already marks an ACKed commit's whole ancestry
- *     common, so the extra line changes no client's behaviour) reported for
- *     adjudication, and the reason this list is filtered rather than the assertion
- *     weakened. When the ACK rule is settled, delete the filter — the property
- *     already covers every other ordering.
- *   - Every generated round carries at least ONE have, because the zero-have round
- *     is not a negotiation at all: canonical upload-pack's v2 state machine goes
- *     straight from "wants, no haves" to the packfile and sends NO acknowledgments
- *     section, with or without `done` (measured on git 2.55), while pggit answers
- *     `acknowledgments`+`NAK` and no pack. Real clients never produce the shape —
- *     fetch-pack appends `done` whenever it has no have to send — so it is a
- *     STANDING divergence on an unreachable corner, reported for adjudication
- *     rather than pinned here: asserting either side would freeze one of them as
- *     canonical before that call is made.
+ *   - Have lists are sent RAW — duplicates and suppressible orderings included.
+ *     Measured on git 2.55: upload-pack marks each have it holds — and that
+ *     have's DIRECT PARENTS — as known, and ACKs a have only if it was not
+ *     already marked, so `have c4, have c3` over `c3←c4` ACKs c4 alone while
+ *     `have c3, have c4` ACKs both. pggit implements the same `got_oid` rule in
+ *     `processHaves`, and the transcript equality below is what pins it.
+ *   - One fixed zero-have probe runs per candidate: canonical upload-pack's v2
+ *     state machine goes straight from "wants, no haves" to the packfile and
+ *     sends NO acknowledgments section, with or without `done` (measured on git
+ *     2.55); pggit implements the same short-circuit, asserted by pack-count
+ *     equality (the ack comparison is skipped there — a pack response has no
+ *     delim, so the section helper would eat compression-dependent pack bytes).
  *   - One generated have kind is an oid the repo does NOT hold. It is what keeps
  *     the NAK branch of the acknowledgments contract in the corpus once the
  *     zero-have round is excluded, and both engines must skip it identically.
@@ -177,24 +169,6 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 						await spawnGit(["update-ref", "refs/heads/island", island], { cwd: src })
 
 						const commits = await gitOids(["rev-list", "--all"], src)
-						// `<child> <parent>…` per commit — the direct-parent marking that
-						// decides which haves canonical git ACKs (see the header).
-						const parentsOf = new Map<string, string[]>()
-						for (const line of (
-							await spawnGit(["rev-list", "--all", "--parents"], { cwd: src })
-						).stdout
-							.trim()
-							.split("\n")
-							.filter(Boolean)) {
-							const [child, ...parents] = line.trim().split(" ")
-							if (child === undefined) {
-								throw new Error(`unexpected rev-list --parents line: ${line}`)
-							}
-							parentsOf.set(
-								requireGitOid(child, "rev-list --parents"),
-								parents.map((p) => requireGitOid(p, "rev-list --parents")),
-							)
-						}
 						// One spawn, every commit advertised (see the header).
 						await spawnGit(["update-ref", "--stdin"], {
 							cwd: src,
@@ -211,9 +185,9 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 							const backend: RepoBackend = {
 								buildPack: (wants, haves, omitBlobs, includeTag, thinPack) =>
 									objects.buildPack(REPO, wants, haves, omitBlobs, includeTag, thinPack),
-								commonHaves: (haves) => objects.commonHaves(REPO, haves),
 								getSymref: (name) => refs.getSymref(REPO, name),
 								listRefs: () => refs.listRefs(REPO),
+								processHaves: (haves) => objects.processHaves(REPO, haves),
 								readyToGiveUp: (wants, common) =>
 									objects.readyToGiveUp(REPO, wants, common),
 							}
@@ -256,23 +230,23 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 								wantFromTip: true,
 								wantIdx: 0,
 							}
-							for (const spec of [nakProbe, ...pairs]) {
+							// One fixed zero-have probe: both engines must skip negotiation
+							// entirely and answer the packfile with no acknowledgments
+							// section (git's FETCH_SEND_PACK — see the header).
+							const packProbe: PairSpec = {
+								haves: [],
+								wantFromTip: true,
+								wantIdx: 0,
+							}
+							for (const spec of [nakProbe, packProbe, ...pairs]) {
 								const want = pick(spec.wantFromTip ? tips : commits, spec.wantIdx)
 								const ancestors = await ancestorsOf(want)
 								const ancestorSet = new Set(ancestors)
 								const siblings = commits.filter((c) => !ancestorSet.has(c))
-								const haves: string[] = []
-								// Mirror upload-pack's marking exactly: a have marks itself and its
-								// direct parents, and an already-marked have is not sent (see the
-								// header — that suppression is the one shape held out).
-								const marked = new Set<string>()
-								for (const h of spec.haves) {
-									const oid = resolveHave(h, ancestors, siblings)
-									if (marked.has(oid)) continue
-									haves.push(oid)
-									marked.add(oid)
-									for (const parent of parentsOf.get(oid) ?? []) marked.add(parent)
-								}
+								// RAW have lists — duplicates and suppressible orderings included;
+								// the ACK-suppression rule is the SERVER's (see the header), and
+								// the transcript equality below is what pins it.
+								const haves = spec.haves.map((h) => resolveHave(h, ancestors, siblings))
 
 								// ONE request body, both engines. `done: false` is what makes this a
 								// negotiation ROUND: the server must decide by itself whether it is
@@ -285,12 +259,22 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 								})
 								const out = await handleUploadPack(body, backend)
 								const oracle = await spawnUploadPack(src, body)
-								const transcript = ackSection(oracle)
 								const where = `want=${want} haves=[${haves.join(",")}]`
-								expect(ackSection(out), where).toBe(transcript)
-								expect(packObjectCount(out) === null, `pack presence: ${where}`).toBe(
-									packObjectCount(oracle) === null,
+								// Pack counts must agree in BOTH directions: null===null pins
+								// "no pack", equal counts pin the served set's size.
+								expect(packObjectCount(out), `pack count: ${where}`).toBe(
+									packObjectCount(oracle),
 								)
+								if (haves.length === 0) {
+									// Zero-have: a pack response with no delim — the ack helper
+									// would eat pack bytes, and there is no section to compare.
+									expect(packObjectCount(oracle), where).not.toBeNull()
+									shape.pairs++
+									shape.withPack++
+									continue
+								}
+								const transcript = ackSection(oracle)
+								expect(ackSection(out), where).toBe(transcript)
 
 								shape.pairs++
 								if (transcript.includes("ready\n")) shape.ready++
@@ -322,8 +306,9 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 				`not-ready=${shape.notReady} nak=${shape.nak} multi-ack=${shape.multiAck} ` +
 				`with-pack=${shape.withPack}`,
 		)
-		// 8 candidates × (1 NAK probe + ≥3 generated rounds) is the structural floor.
-		expect(shape.pairs, "the property sampled nothing").toBeGreaterThanOrEqual(32)
+		// 8 candidates × (NAK probe + pack probe + ≥3 generated rounds) is the
+		// structural floor.
+		expect(shape.pairs, "the property sampled nothing").toBeGreaterThanOrEqual(40)
 		expect(shape.ready, "no transcript ever readied").toBeGreaterThanOrEqual(12)
 		expect(shape.notReady, "every transcript readied").toBeGreaterThanOrEqual(12)
 		expect(shape.nak, "no transcript ever NAK'd").toBeGreaterThanOrEqual(8)

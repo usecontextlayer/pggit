@@ -124,9 +124,9 @@ function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
 	return {
 		buildPack: (wants, haves, omitBlobs, includeTag, thinPack) =>
 			deps.objects.buildPack(repoId, wants, haves, omitBlobs, includeTag, thinPack),
-		commonHaves: (haves) => deps.objects.commonHaves(repoId, haves),
 		getSymref: (name) => deps.refs.getSymref(repoId, name),
 		listRefs: () => deps.refs.listRefs(repoId),
+		processHaves: (haves) => deps.objects.processHaves(repoId, haves),
 		readyToGiveUp: (wants, common) => deps.objects.readyToGiveUp(repoId, wants, common),
 	}
 }

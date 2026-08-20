@@ -19,9 +19,9 @@ const V1 = "c".repeat(40)
 function backend(refs: { name: string; oid: string }[], head?: string): RepoBackend {
 	return {
 		buildPack: async () => Buffer.alloc(0),
-		commonHaves: async () => [],
 		getSymref: async (name) => (name === "HEAD" && head ? head : null),
 		listRefs: async () => refs,
+		processHaves: async () => ({ acks: [], common: [] }),
 		readyToGiveUp: async () => false,
 	}
 }

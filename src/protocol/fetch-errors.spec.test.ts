@@ -34,9 +34,9 @@ function failingServe(message: string): RepoBackend {
 		buildPack: async () => {
 			throw new Error(message)
 		},
-		commonHaves: async () => [],
 		getSymref: async () => null,
 		listRefs: async () => [],
+		processHaves: async () => ({ acks: [], common: [] }),
 		readyToGiveUp: async () => false,
 	}
 }

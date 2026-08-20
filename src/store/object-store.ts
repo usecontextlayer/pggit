@@ -353,36 +353,6 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 				return pack
 			})
 		},
-
-		/** The subset of `haves` this repo actually has — the negotiation common set,
-		 * in one indexed lookup rather than a per-have probe. */
-		async commonHaves(repoId: string, haves: string[]): Promise<Oid[]> {
-			const validatedHaves = haves.map(parseOid)
-			if (validatedHaves.length === 0) return []
-			const id = await repos.resolveRepoId(repoId)
-			if (id === null) return []
-			// Batched: the have list is CLIENT-sized, one bind per oid,
-			// and the wire caps a statement at 65,534 binds — this was the store's last
-			// unbatched client-sized value list, and it 500'd exactly at the wall
-			// (pg-corrupt--fetch-haves-value-list).
-			const present = new Set<string>()
-			for (const batch of batches(validatedHaves, PACK_BATCH)) {
-				const rows = await db
-					.selectFrom("git_object")
-					.select("oid")
-					.where("repo_id", "=", id)
-					.where(
-						"oid",
-						"in",
-						batch.map((h) => Buffer.from(h, "hex")),
-					)
-					.execute()
-				for (const r of rows) present.add(r.oid.toString("hex"))
-			}
-			// Preserve the client's `have` order (the ACK lines echo it) — the `in`
-			// query returns rows in arbitrary order.
-			return validatedHaves.filter((h) => present.has(h))
-		},
 		async getObject(repoId: string, oid: string): Promise<StoredObject | null> {
 			count("getObjectCalls")
 			const oidBytes = toOidBuffer(oid)
@@ -505,6 +475,69 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 				.where("oid", "=", oidBytes)
 				.executeTakeFirst()
 			return row === undefined ? null : objectTypeFromCode(row.type)
+		},
+
+		/** One negotiation round's have processing — git upload-pack's `got_oid`
+		 * semantics (measured on git 2.55, pinned by the negotiation
+		 * differential). `common` is every have the repo holds, client order —
+		 * the negotiation STATE that seeds `readyToGiveUp` and `buildPack`'s
+		 * subtraction. `acks` is the WIRE PRESENTATION: a present have is ACKed
+		 * unless an earlier have in the same list already marked it, where each
+		 * ACKed have marks itself plus its DIRECT parents. Presentation only —
+		 * feeding `acks` to the serve side under-subtracts merge parents. */
+		async processHaves(
+			repoId: string,
+			haves: string[],
+		): Promise<{ common: Oid[]; acks: Oid[] }> {
+			const validatedHaves = haves.map(parseOid)
+			if (validatedHaves.length === 0) return { acks: [], common: [] }
+			const id = await repos.resolveRepoId(repoId)
+			if (id === null) return { acks: [], common: [] }
+			// Batched: the have list is CLIENT-sized, one bind per oid,
+			// and the wire caps a statement at 65,534 binds — this was the store's last
+			// unbatched client-sized value list, and it 500'd exactly at the wall
+			// (pg-corrupt--fetch-haves-value-list).
+			const present = new Set<string>()
+			for (const batch of batches(validatedHaves, PACK_BATCH)) {
+				const rows = await db
+					.selectFrom("git_object")
+					.select("oid")
+					.where("repo_id", "=", id)
+					.where(
+						"oid",
+						"in",
+						batch.map((h) => Buffer.from(h, "hex")),
+					)
+					.execute()
+				for (const r of rows) present.add(r.oid.toString("hex"))
+			}
+			// Direct parents of every present COMMIT have, one batched read — the
+			// marking data. A non-commit have has no row and marks only itself.
+			const parents = new Map<string, string[]>()
+			const presentList = validatedHaves.filter((h) => present.has(h))
+			for (const batch of batches(presentList, PACK_BATCH)) {
+				const rows = await sql<{ oid: string; parents: string[] }>`
+					select encode(c.oid, 'hex') as oid,
+						(select coalesce(array_agg(encode(p.h, 'hex')), '{}')
+							from unnest(c.parents) as p(h)) as parents
+					from git_commit c
+					where c.repo_id = ${id}::bigint
+						and c.oid in (${sql.join(batch.map((h) => sql`${Buffer.from(h, "hex")}`))})
+				`.execute(db)
+				for (const r of rows.rows) parents.set(r.oid, r.parents)
+			}
+			// Client order preserved (the ACK lines echo it); an already-marked
+			// have is dropped from the ACKS whole — like git's got_oid early
+			// return, it neither ACKs nor marks its own parents.
+			const marked = new Set<string>()
+			const acks: Oid[] = []
+			for (const h of presentList) {
+				if (marked.has(h)) continue
+				acks.push(h)
+				marked.add(h)
+				for (const p of parents.get(h) ?? []) marked.add(p)
+			}
+			return { acks, common: presentList }
 		},
 
 		/** Seed objects directly (the differential harness + perf bench path): insert

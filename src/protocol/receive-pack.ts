@@ -303,17 +303,29 @@ export async function handleReceivePack(
 	// `refs/remotes/origin/HEAD` blocks `refs/remotes/origin/HEAD/x` exactly
 	// like a value ref would.
 	const existingNames = await backend.listRefNames()
-	const acceptedNames: string[] = []
+	const eligibleNames = commands
+		.filter(
+			(c, i) =>
+				nameProblem[i] === null && connected[i] && validTip[i] && c.newOid !== ZERO_OID,
+		)
+		.map((c) => c.ref)
 	for (const [i, c] of commands.entries()) {
 		const otherwiseEligible =
 			nameProblem[i] === null && connected[i] && validTip[i] && c.newOid !== ZERO_OID
 		if (!otherwiseEligible) continue
-		const clashes = (other: string): boolean =>
-			other !== c.ref && (other.startsWith(`${c.ref}/`) || c.ref.startsWith(`${other}/`))
-		if (existingNames.some(clashes) || acceptedNames.some(clashes)) {
+		const clashesExisting = existingNames.some(
+			(other) =>
+				other !== c.ref &&
+				(other.startsWith(`${c.ref}/`) || c.ref.startsWith(`${other}/`)),
+		)
+		// In-batch D/F between NEW names: git keeps the DEEPEST and `ng`s every
+		// shorter one, independent of wire order (measured on git 2.55; the policy
+		// differential pins it) — so a command loses only to a deeper sibling.
+		const losesToDeeper = eligibleNames.some(
+			(other) => other !== c.ref && other.startsWith(`${c.ref}/`),
+		)
+		if (clashesExisting || losesToDeeper) {
 			nameProblem[i] = "funny refname (directory/file conflict)"
-		} else {
-			acceptedNames.push(c.ref)
 		}
 	}
 	// Per-command decision: a too-long name fails the storage boundary, a

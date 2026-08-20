@@ -172,9 +172,9 @@ describe("thin-pack serve — external bases only when negotiated", () => {
 		// consulted exactly once per REF_DELTA whose base is not in the pack.
 		const backend: RepoBackend = {
 			buildPack: (w, h, o, i, t) => deps.objects.buildPack(REPO, w, h, o, i, t),
-			commonHaves: (h) => deps.objects.commonHaves(REPO, h),
 			getSymref: (n) => deps.refs.getSymref(REPO, n),
 			listRefs: () => deps.refs.listRefs(REPO),
+			processHaves: (h) => deps.objects.processHaves(REPO, h),
 			readyToGiveUp: (w, c) => deps.objects.readyToGiveUp(REPO, w, c),
 		}
 		for (const thin of [true, false]) {
