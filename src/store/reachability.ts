@@ -877,15 +877,17 @@ export async function frontier(
 	// Name-paired diffing prunes same-PATH content, but the client also holds
 	// content at OTHER paths — an object moved or resurrected anywhere under an
 	// edge tree (the empty blob is the degenerate case: any two empty files are
-	// one object). The edge set is exactly canonical git's
-	// mark_edges_uninteresting: the HAVE TIPS plus every boundary parent of a
-	// served commit — never the whole visited uninteresting region (expanding
-	// every visited commit's tree re-reads a near-identical wide root per
-	// negotiated have and measured +54% on the warm-fetch harness, while a
-	// resurrection from BELOW the edge is over-sent by git too, so edge-only is
-	// both the cheap form and the git-matching one; the negotiation and
-	// served-set differentials are the arbiters). Everything expanded here is
-	// reachable from a stated have, so it is also thin-pack provable (D8′).
+	// one object). The edge set is canonical git's `--objects-edge`: the
+	// uninteresting commits that BORDER the served region (boundary parents of
+	// served commits) — never every have tip, and never the whole visited
+	// uninteresting region. fetch-pack sends ~16-32 haves per round walking
+	// history backward, so either wider set expands dozens of near-identical
+	// wide roots per fetch (measured +54% on the warm-fetch harness); git
+	// over-sends content resurrected from below its edge exactly as we do, so
+	// boundary-only is both the cheap form and the git-matching one — the
+	// negotiation and served-set differentials are the arbiters. Everything
+	// expanded here is reachable from a stated have (a boundary parent sits in
+	// its serving child's have-side ancestry), so it is thin-pack provable (D8′).
 	const expandClientHeld = async (treeOid: string): Promise<void> => {
 		if (clientHas.has(treeOid)) return
 		clientHas.add(treeOid)
@@ -895,10 +897,6 @@ export async function frontier(
 			if (isTreeEntryMode(e.mode)) await expandClientHeld(e.oid)
 			else if (e.mode !== GITLINK_MODE) clientHas.add(e.oid)
 		}
-	}
-	for (const h of haves) {
-		const row = rows.get(h)
-		if (row !== null && row !== undefined) edgeTrees.add(row.tree)
 	}
 	for (const treeOid of edgeTrees) {
 		await expandClientHeld(treeOid)
