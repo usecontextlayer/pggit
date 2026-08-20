@@ -29,9 +29,14 @@ import {
  * mount comparison — the absence of any reclamation. Nothing probes scheduler
  * internals (timer mechanics, the candidate SQL, concurrency choreography); the
  * orphan set is computed from the `git` reachable closures `pushFile` returns.
- * Determinism: orphan age is set by `ageObjects` + `graceSeconds: 0`, never a
- * wall-clock grace wait. SCH-10's self-GC is the ONE place a real timer is
- * exercised, so it POLLS (bounded) for the observable reclamation effect.
+ * Determinism: orphan eligibility is set by `ageObjects` backdating rows PAST a
+ * real grace window, never a wall-clock grace wait. The enabled scheduler runs
+ * with a NONZERO grace on purpose: grace is what shields in-flight pushes and
+ * fetches from a drain tick's stale-refs scan, and with `graceSeconds: 0` the
+ * 50 ms cadence can reclaim a just-pushed closure mid-fetch (observed: a fetch
+ * refused with "not our ref" on its own freshly pushed tip). SCH-10's self-GC is
+ * the ONE place a real timer is exercised, so it POLLS (bounded) for the
+ * observable reclamation effect.
  *
  * The PUBLIC schema on the shared `globalSetup` container: `startServer` builds its
  * own porsager client from `databaseUrl` and sets no per-connection `search_path`, so
@@ -140,9 +145,12 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		// the `public` schema with them, so a still-running drain would reclaim their
 		// repos and pollute the later no-reclamation assertions. Closing it here also
 		// implicitly pins that close() halts the drain.
+		// Nonzero grace: the drain ticks every 50 ms while the pushes and closure
+		// fetches below are in flight, and grace is the only thing keeping their
+		// fresh rows out of a stale-refs scan's reclaim set.
 		const enabled = await startServer({
 			databaseUrl: baseUrl,
-			gc: { enabled: true, graceSeconds: 0, intervalMs: 50 },
+			gc: { enabled: true, graceSeconds: 3600, intervalMs: 50 },
 			port: 0,
 		})
 		try {
@@ -150,9 +158,9 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 			const { head, orphans } = await pushThenRewindOrphan(enabled, repo)
 			expect(orphans.length).toBeGreaterThan(0)
 
-			// Age every row past the grace=0 cutoff so the drain is free to reclaim the
+			// Age every row past the grace cutoff so the drain is free to reclaim the
 			// orphans without any wall-clock grace wait.
-			await ageObjects(sqlDb(), repo, "1 hour")
+			await ageObjects(sqlDb(), repo, "2 hours")
 
 			// The server's own interval must drive a drain that removes the orphans —
 			// poll the Postgres survivor set until none of the orphans remain.
