@@ -27,6 +27,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -46,8 +47,6 @@ import { spawnGit } from "@/testing/spawn-git"
 const ITERS = 30
 const RUNS = 1200
 const MODES = ["clone", "half", "fetch"] as const
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 describe("race — repack committing mid-clone / mid-fetch", () => {
 	let db: IsolatedDb

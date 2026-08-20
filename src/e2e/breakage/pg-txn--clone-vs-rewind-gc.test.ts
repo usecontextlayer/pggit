@@ -2,9 +2,9 @@
  * BREAKAGE (pg-txn) — a clone raced by a ref rewind + gc(0).
  * Converted from `breakage/pg-txn--clone-vs-rewind-gc.ts`; its rationale verbatim:
  *
- * HUNT: a clone's closure computation is NOT under one snapshot — the recursive
- * edge CTE, the tree-content reads, the blob-presence probes, and the per-batch
- * content/encoding reads are all separate statements on different connections. So
+ * HUNT: a clone's closure computation is NOT under one snapshot — the reachability
+ * walk's batched derived-row, tree-content, and blob-presence reads, followed by
+ * the content/encoding reads, are separate statements on the pool. So
  * race a ref REWIND plus `gc(graceSeconds: 0)` into the middle of a clone of the
  * old tip and try to falsify the claim:
  *
@@ -32,6 +32,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
@@ -39,9 +40,9 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
-import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { attemptGit } from "@/testing/spawn-git"
 
 const ITERS = 12
 const RUNS = 1200
@@ -68,8 +69,6 @@ const CLEAN = [
 	"remote error",
 	"rpc failed",
 ]
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 type Verdict =
 	| "complete"
@@ -111,11 +110,7 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 		})
 		server = await serveOnPort(createGitApp(createGitDeps(appSql)), 0)
 
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "main"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		const commits = await commitsOldestFirst(src, "main")
 		const tip = commits[commits.length - 1]
 		const early = commits[3]
 		if (!tip || !early) throw new Error("fixture too short to rewind")

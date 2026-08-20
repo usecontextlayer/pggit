@@ -28,6 +28,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -50,8 +51,6 @@ const RUNS = 400
  * the gap between a pass's `pending` read and its `existing` read, and pool
  * contention (the isolated schema's porsager pool is max:4) is what widens it. */
 const PASSES = 6
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
-
 describe("race — concurrent repack passes on one repo", () => {
 	let db: IsolatedDb
 	let server: GitServer

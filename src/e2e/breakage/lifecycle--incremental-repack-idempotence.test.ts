@@ -23,7 +23,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack, type RepackResult } from "@/store/repack"
 import { buildLifecycleSource, commitsOldestFirst } from "@/testing/append-only-repo"
-import { listDifferences, mirrorClone, requiredAt } from "@/testing/git-fixtures"
+import {
+	compareMirrorClones,
+	type MirrorComparison,
+	requiredAt,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -31,20 +35,16 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { captureTestResult, type TestResult } from "@/testing/test-result"
 
 const REPO = "workspace/slate/probe"
 /** Commit counts of each successive push — the last one is the whole history. */
 const SLICES = [40, 80, 120, 160, 201]
 
-type RoundResult = {
+type RoundResult = TestResult<MirrorComparison> & {
 	commits: number
 	first: RepackResult
 	second: RepackResult
-	objectsOnlyPg: number
-	objectsOnlyRef: number
-	refsPg: string[]
-	refsRef: string[]
-	fsck: string
 }
 
 describe("lifecycle breakage — incremental repack idempotence", () => {
@@ -79,21 +79,19 @@ describe("lifecycle breakage — incremental repack idempotence", () => {
 
 			const a = dir(`pg-${round}`)
 			const b = dir(`ref-${round}`)
-			const pgc = await mirrorClone(url, a)
-			const refc = await mirrorClone(`file://${ref}`, b)
-			const objDiff = listDifferences(pgc.objects, refc.objects)
+			const comparison = await captureTestResult(() =>
+				compareMirrorClones({ dest: a, url }, { dest: b, url: `file://${ref}` }),
+			)
 			rounds.push({
+				...comparison,
 				commits: upto,
 				first,
-				fsck: pgc.fsck,
-				objectsOnlyPg: objDiff.onlyLeft.length,
-				objectsOnlyRef: objDiff.onlyRight.length,
-				refsPg: pgc.refs,
-				refsRef: refc.refs,
 				second,
 			})
-			rmSync(a, { force: true, recursive: true })
-			rmSync(b, { force: true, recursive: true })
+			if (comparison.kind === "succeeded") {
+				rmSync(a, { force: true, recursive: true })
+				rmSync(b, { force: true, recursive: true })
+			}
 		}
 	}, 900_000)
 
@@ -122,28 +120,46 @@ describe("lifecycle breakage — incremental repack idempotence", () => {
 		).toEqual([])
 	})
 
+	it("serves a clonable repo in every incremental round", () => {
+		expect(
+			rounds.flatMap((r) =>
+				r.kind === "failed" ? [`${r.commits} commits: ${String(r.error)}`] : [],
+			),
+		).toEqual([])
+	})
+
 	it("hands the client exactly the oracle's object set", () => {
 		expect(
-			rounds
-				.filter((r) => r.objectsOnlyPg > 0 || r.objectsOnlyRef > 0)
-				.map(
-					(r) =>
-						`${r.commits} commits: onlyPG=${r.objectsOnlyPg} onlyREF=${r.objectsOnlyRef}`,
-				),
+			rounds.flatMap((r) =>
+				r.kind === "succeeded" &&
+				(r.value.objects.onlyServed.length > 0 || r.value.objects.onlyOracle.length > 0)
+					? [
+							`${r.commits} commits: onlyServed=${r.value.objects.onlyServed.length} onlyOracle=${r.value.objects.onlyOracle.length}`,
+						]
+					: [],
+			),
 		).toEqual([])
 	})
 
 	it("hands the client exactly the oracle's refs", () => {
-		expect(rounds.map((r) => ({ commits: r.commits, refs: r.refsPg }))).toEqual(
-			rounds.map((r) => ({ commits: r.commits, refs: r.refsRef })),
+		expect(
+			rounds.flatMap((r) =>
+				r.kind === "succeeded" ? [{ commits: r.commits, refs: r.value.served.refs }] : [],
+			),
+		).toEqual(
+			rounds.flatMap((r) =>
+				r.kind === "succeeded" ? [{ commits: r.commits, refs: r.value.oracle.refs }] : [],
+			),
 		)
 	})
 
 	it("every clone passes git fsck --strict", () => {
 		expect(
-			rounds
-				.filter((r) => r.fsck.length > 0)
-				.map((r) => `${r.commits} commits: ${r.fsck}`),
+			rounds.flatMap((r) =>
+				r.kind === "succeeded" && r.value.served.fsck.length > 0
+					? [`${r.commits} commits: ${r.value.served.fsck}`]
+					: [],
+			),
 		).toEqual([])
 	})
 })

@@ -17,6 +17,7 @@ import { applyDelta } from "@/pack/delta"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
+import { lookupRepoId } from "@/store/repo-resolver"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { loadAllObjects, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
@@ -53,11 +54,10 @@ describe("repack — derivation of the encoding tier", () => {
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 
-	async function repoId(): Promise<string> {
-		const [row] = await db.sql<{ id: string }[]>`
-			select id::text as id from repos where name = ${REPO}`
-		if (!row) throw new Error(`repo ${REPO} not found`)
-		return row.id
+	async function repoId() {
+		const id = await lookupRepoId(db.db, REPO)
+		if (id === null) throw new Error(`repo ${REPO} not found`)
+		return id
 	}
 
 	async function encodingRows(): Promise<EncodingRow[]> {

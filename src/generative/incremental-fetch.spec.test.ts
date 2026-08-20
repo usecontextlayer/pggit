@@ -61,9 +61,8 @@ describe("§8.4 generative — incremental fetch (M1) differential", () => {
 							const packsAfterClone = new Set(packFiles(dest))
 
 							// Server advances: replay more commands onto src. EXCLUDE new tags —
-							// pggit does not advertise include-tag, so git would auto-follow a new
-							// annotated tag in a SEPARATE request/pack, splitting the transfer. Tags
-							// are covered by the clone + push specs.
+							// git may auto-follow a newly advertised tag in a SEPARATE request/pack,
+							// splitting the transfer. Tags are covered by the clone + push specs.
 							await extendRepoFromCommands(
 								model,
 								divergeCommands.filter((c) => c.kind !== "tag"),

@@ -22,9 +22,10 @@ import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { buildLifecycleSource, commitsOldestFirst } from "@/testing/append-only-repo"
 import {
+	compareMirrorClones,
+	gitReachableOids,
 	listDifferences,
-	mirrorClone,
-	parseRevListObjectOids,
+	type MirrorComparison,
 	requiredAt,
 } from "@/testing/git-fixtures"
 import {
@@ -34,27 +35,25 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { captureTestResult, type TestResult } from "@/testing/test-result"
 
 const REPO = "workspace/slate/incr"
 const ROUNDS = 50
 const REWIND_ROUNDS = 8
 
-type RoundResult =
-	| { kind: "failed"; label: string; error: unknown }
-	| {
-			kind: "succeeded"
-			label: string
-			objectsOnlyPg: number
-			objectsOnlyRef: number
-			fsck: string
-	  }
+type IncrementalComparison = {
+	served: { fsck: string }
+	objects: MirrorComparison["objects"]
+}
+
+type RoundResult<T> = TestResult<T> & { label: string }
 
 describe("lifecycle breakage — long-lived clone chain", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""
-	const incremental: RoundResult[] = []
-	const rewinds: RoundResult[] = []
+	const incremental: RoundResult<IncrementalComparison>[] = []
+	const rewinds: RoundResult<MirrorComparison>[] = []
 
 	beforeAll(async () => {
 		const fixture = await setupGitServerFixture()
@@ -113,28 +112,23 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 			if (r % 7 === 0) await gc.gc(REPO, { graceSeconds: 0 })
 
 			const label = `round ${r} (repack=${didRepack})`
-			try {
+			const result = await captureTestResult(async (): Promise<IncrementalComparison> => {
 				await spawnGit(["fetch", "-q", "--prune", "origin"], { cwd: live })
-			} catch (error) {
-				incremental.push({ error, kind: "failed", label })
-				continue
-			}
-			await spawnGit(["fetch", "-q", "--prune", "origin"], { cwd: liveRef })
-			const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: live })
-			const liveObjects = parseRevListObjectOids(
-				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: live })).stdout,
-			).sort()
-			const referenceObjects = parseRevListObjectOids(
-				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: liveRef })).stdout,
-			).sort()
-			const d = listDifferences(liveObjects, referenceObjects)
-			incremental.push({
-				fsck: `${fsck.stdout}${fsck.stderr}`.trim(),
-				kind: "succeeded",
-				label,
-				objectsOnlyPg: d.onlyLeft.length,
-				objectsOnlyRef: d.onlyRight.length,
+				await spawnGit(["fetch", "-q", "--prune", "origin"], { cwd: liveRef })
+				const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: live })
+				const difference = listDifferences(
+					await gitReachableOids(live),
+					await gitReachableOids(liveRef),
+				)
+				return {
+					objects: {
+						onlyOracle: difference.onlyRight,
+						onlyServed: difference.onlyLeft,
+					},
+					served: { fsck: `${fsck.stdout}${fsck.stderr}`.trim() },
+				}
 			})
+			incremental.push({ ...result, label })
 		}
 
 		// now the same chain but with force-moves interleaved
@@ -155,30 +149,24 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 			await repack.repack(REPO)
 
 			const label = `rewind round ${r}`
-			try {
+			const fresh = dir(`fresh-${r}`)
+			const freshRef = dir(`freshref-${r}`)
+			const result = await captureTestResult(async () => {
 				await spawnGit(
 					["fetch", "-q", "--prune", "--force", "origin", "+refs/heads/*:refs/heads/*"],
 					{ cwd: live },
 				)
-			} catch (error) {
-				rewinds.push({ error, kind: "failed", label })
-				continue
-			}
-			// a fresh clone is the real oracle for the SERVED state
-			const fresh = dir(`fresh-${r}`)
-			const freshRef = dir(`freshref-${r}`)
-			const served = await mirrorClone(url, fresh)
-			const oracle = await mirrorClone(`file://${ref}`, freshRef)
-			const d = listDifferences(served.objects, oracle.objects)
-			rewinds.push({
-				fsck: served.fsck,
-				kind: "succeeded",
-				label,
-				objectsOnlyPg: d.onlyLeft.length,
-				objectsOnlyRef: d.onlyRight.length,
+				// A fresh clone is the real oracle for the served state.
+				return compareMirrorClones(
+					{ dest: fresh, url },
+					{ dest: freshRef, url: `file://${ref}` },
+				)
 			})
-			rmSync(fresh, { force: true, recursive: true })
-			rmSync(freshRef, { force: true, recursive: true })
+			rewinds.push({ ...result, label })
+			if (result.kind === "succeeded") {
+				rmSync(fresh, { force: true, recursive: true })
+				rmSync(freshRef, { force: true, recursive: true })
+			}
 		}
 	}, 1_800_000)
 
@@ -198,8 +186,11 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 	it("keeps the long-lived clone object-identical to the oracle", () => {
 		expect(
 			incremental.flatMap((r) =>
-				r.kind === "succeeded" && (r.objectsOnlyPg > 0 || r.objectsOnlyRef > 0)
-					? [`${r.label}: onlyPG=${r.objectsOnlyPg} onlyREF=${r.objectsOnlyRef}`]
+				r.kind === "succeeded" &&
+				(r.value.objects.onlyServed.length > 0 || r.value.objects.onlyOracle.length > 0)
+					? [
+							`${r.label}: onlyServed=${r.value.objects.onlyServed.length} onlyOracle=${r.value.objects.onlyOracle.length}`,
+						]
 					: [],
 			),
 		).toEqual([])
@@ -208,7 +199,9 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 	it("keeps the long-lived clone fsck --strict clean", () => {
 		expect(
 			incremental.flatMap((r) =>
-				r.kind === "succeeded" && r.fsck.length > 0 ? [`${r.label}: ${r.fsck}`] : [],
+				r.kind === "succeeded" && r.value.served.fsck.length > 0
+					? [`${r.label}: ${r.value.served.fsck}`]
+					: [],
 			),
 		).toEqual([])
 	})
@@ -224,8 +217,11 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 	it("serves a rewound state a fresh clone finds identical to the oracle", () => {
 		expect(
 			rewinds.flatMap((r) =>
-				r.kind === "succeeded" && (r.objectsOnlyPg > 0 || r.objectsOnlyRef > 0)
-					? [`${r.label}: onlyPG=${r.objectsOnlyPg} onlyREF=${r.objectsOnlyRef}`]
+				r.kind === "succeeded" &&
+				(r.value.objects.onlyServed.length > 0 || r.value.objects.onlyOracle.length > 0)
+					? [
+							`${r.label}: onlyServed=${r.value.objects.onlyServed.length} onlyOracle=${r.value.objects.onlyOracle.length}`,
+						]
 					: [],
 			),
 		).toEqual([])
@@ -234,7 +230,9 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 	it("serves a rewound state that clones fsck --strict clean", () => {
 		expect(
 			rewinds.flatMap((r) =>
-				r.kind === "succeeded" && r.fsck.length > 0 ? [`${r.label}: ${r.fsck}`] : [],
+				r.kind === "succeeded" && r.value.served.fsck.length > 0
+					? [`${r.label}: ${r.value.served.fsck}`]
+					: [],
 			),
 		).toEqual([])
 	})

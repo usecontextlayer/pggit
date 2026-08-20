@@ -1,14 +1,3 @@
-/**
- * M0 — the empty (unborn) repo: the literal first state of every repo the
- * engine/Slate creates. A real `git clone` of an empty served repo must succeed
- * with no objects, and — because we advertise + honor `ls-refs=unborn` — must
- * propagate the server's default branch (HEAD → refs/heads/main) instead of the
- * client's own `init.defaultBranch`. Also pins the receive-pack info/refs HTTP
- * framing (the synthetic `capabilities^{}` advert a first push reads).
- */
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
@@ -16,8 +5,9 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { allObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { pktLineUnpack } from "@/testing/pkt-oracle"
+import { pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("M0 — empty (unborn) repo", () => {
 	let db: IsolatedDb
@@ -41,8 +31,7 @@ describe("M0 — empty (unborn) repo", () => {
 	})
 
 	it("clones an empty repo successfully, with no objects and the server's default branch", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-empty-dest-"))
-		try {
+		await withTempDir("pggit-empty-dest-", async (dest) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -59,9 +48,7 @@ describe("M0 — empty (unborn) repo", () => {
 				await spawnGit(["symbolic-ref", "--short", "HEAD"], { cwd: dest })
 			).stdout.trim()
 			expect(head).toBe("main")
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 
 	it("serves the receive-pack info/refs advert with the synthetic capabilities^{} line", async () => {
@@ -72,7 +59,7 @@ describe("M0 — empty (unborn) repo", () => {
 		)
 		const unpacked = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
 		expect(unpacked.startsWith("# service=git-receive-pack\n0000\n")).toBe(true)
-		expect(unpacked).toContain(`${"0".repeat(40)} capabilities^{}`)
+		expect(unpacked).toContain(`${ZERO_OID} capabilities^{}`)
 		expect(unpacked).toContain("report-status")
 		expect(unpacked).toContain("delete-refs")
 	})

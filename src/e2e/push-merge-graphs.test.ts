@@ -2,22 +2,22 @@
  * §8.4 — multi-merge-base graph shapes (testing #13). The command generator's
  * merges are binary and shallow, so the deepest correctness net mostly walks
  * near-linear graphs. Octopus (3-parent) and criss-cross (two merge bases) DAGs
- * are exactly where ancestry walks (graphWalk closure, readyToGiveUp's cut) and
+ * are exactly where reachability walks (closure, readyToGiveUp's cut) and
  * incremental delta computation are most error-prone — git has dedicated t-files
  * for them. These push such shapes through the full serve path and clone back
  * differentially.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { parseRevListObjectOids, refsOf } from "@/testing/git-fixtures"
+import { gitReachableOids, refsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 async function commitFile(
 	dir: string,
@@ -28,17 +28,6 @@ async function commitFile(
 	writeFileSync(join(dir, path), body)
 	await spawnGit(["add", "."], { cwd: dir })
 	await spawnGit(["commit", "-q", "-m", msg], { cwd: dir })
-}
-
-/**
- * Objects REACHABLE from all refs (not `--batch-all-objects`): git's octopus
- * merge strategy writes an unreachable intermediate tree into the local object
- * DB, which a clone correctly omits — so the serve invariant is reachable-set
- * equality, not raw object-DB equality.
- */
-async function reachableObjectOids(dir: string): Promise<string[]> {
-	const out = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	return [...new Set(parseRevListObjectOids(out.stdout))].sort()
 }
 
 describe("merge graph shapes — octopus + criss-cross differential", () => {
@@ -64,8 +53,7 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 	async function pushAndVerify(src: string, repoId: string): Promise<void> {
 		const repo = `${url}/${repoId}`
 		await spawnGit(["push", repo, "refs/heads/*:refs/heads/*"], { cwd: src })
-		const back = mkdtempSync(join(tmpdir(), `pggit-merge-back-${repoId}-`))
-		try {
+		await withTempDir(`pggit-merge-back-${repoId}-`, async (back) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -76,19 +64,18 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 				back,
 			])
 			await spawnGit(["fsck", "--full"], { cwd: back })
-			expect(await reachableObjectOids(back)).toEqual(await reachableObjectOids(src))
+			// Git's merge strategy leaves an unreachable intermediate tree in the source,
+			// so parity is over the ref-reachable closure, not the raw object database.
+			expect(await gitReachableOids(back)).toEqual(await gitReachableOids(src))
 			const stored = (await createRefStore(db.sql).listRefs(repoId)).sort((a, b) =>
 				a.name.localeCompare(b.name),
 			)
 			expect(stored).toEqual(await refsOf(src))
-		} finally {
-			rmSync(back, { force: true, recursive: true })
-		}
+		})
 	}
 
 	it("serves an octopus (3-parent) merge", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-octopus-"))
-		try {
+		await withTempDir("pggit-octopus-", async (src) => {
 			await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 			await commitFile(src, "base.txt", "base\n", "base")
 			await spawnGit(["branch", "b1"], { cwd: src })
@@ -109,14 +96,11 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 			expect(parents.length).toBe(4) // the commit itself + 3 parents
 
 			await pushAndVerify(src, "octopus")
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 
 	it("serves a criss-cross (two-merge-base) history", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-crisscross-"))
-		try {
+		await withTempDir("pggit-crisscross-", async (src) => {
 			await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 			await commitFile(src, "base.txt", "base\n", "base")
 			await spawnGit(["checkout", "-q", "-b", "x"], { cwd: src })
@@ -140,8 +124,6 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 			expect(bases.length).toBe(2)
 
 			await pushAndVerify(src, "crisscross")
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 })

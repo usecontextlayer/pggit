@@ -6,16 +6,13 @@ import {
 	countObjects,
 	derivedRows,
 	type GcFixture,
-	gitReachableOids,
 	objectOids,
 	pushFile,
 	repoGcState,
-	repoUrl,
+	servedMainReachableOids,
 	setupGcFixture,
 	teardownGcFixture,
-	withTempDir,
 } from "@/testing/gc-helpers"
-import { spawnGit } from "@/testing/spawn-git"
 
 /**
  * GC-scheduler end-to-end reclamation THROUGH the drain loop —
@@ -55,25 +52,6 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 	afterAll(async () => {
 		await teardownGcFixture(fx)
 	})
-
-	/**
-	 * The real-git reachable closure (sorted hex OIDs) of `repo`'s current
-	 * `refs/heads/main` tip, computed from a throwaway fetch — independent of any
-	 * `pushFile` return value, so it remains a valid survivor oracle even after the
-	 * scheduler mutates Postgres. (Mirrors the `reachableOfTip` oracle the GC
-	 * primitive suite uses for GC-1/GC-2.)
-	 */
-	async function reachableOfTip(repo: string): Promise<string[]> {
-		return withTempDir("pggit-sch-tip-", async (dir) => {
-			await spawnGit(["init", "-q"], { cwd: dir })
-			await spawnGit(
-				["-c", "protocol.version=2", "fetch", repoUrl(fx, repo), "refs/heads/main"],
-				{ cwd: dir },
-			)
-			await spawnGit(["update-ref", "refs/heads/main", "FETCH_HEAD"], { cwd: dir })
-			return gitReachableOids(dir)
-		})
-	}
 
 	// SCH-6 — End-to-end reclamation + storage bound THROUGH the loop. A push then a
 	// rewind orphans the prior tip; after ageing the orphans past the cutoff,
@@ -150,7 +128,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		expect(second.head).not.toBe(first.head)
 
 		// Independent survivor oracle: the current tip's real-git reachable closure.
-		const liveOids = await reachableOfTip(repo)
+		const liveOids = await servedMainReachableOids(fx, repo)
 		const orphaned = first.reachable.filter((oid) => !second.reachable.includes(oid))
 		expect(orphaned.length).toBeGreaterThan(0)
 
@@ -278,7 +256,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		const summary2 = await scheduler.drainOnce()
 		expect(summary2.filter((entry) => entry.repo === repo)).toHaveLength(1)
 
-		const liveOids = await reachableOfTip(repo)
+		const liveOids = await servedMainReachableOids(fx, repo)
 		const after = await objectOids(fx.db, repo)
 		expect(after).toEqual([...liveOids].sort())
 		for (const oid of newOrphans) expect(after).not.toContain(oid)

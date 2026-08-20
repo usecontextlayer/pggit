@@ -56,10 +56,11 @@ import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
 import { assertNever } from "@/assert-never"
 import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
-import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
+import { bindRepoBackend } from "@/protocol/repo-backend"
+import { handleUploadPack } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { requireGitOid, seedRepoIntoStore } from "@/testing/git-fixtures"
+import { cyclicAt, requireGitOid, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { packObjectCount } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
@@ -102,13 +103,6 @@ const pairArb: fc.Arbitrary<PairSpec> = fc.record({
  * out of reach of any real object, and it is NOT the all-zero null oid). */
 function absentOid(idx: number): string {
 	return "f".repeat(32) + (idx % 0x1000_0000).toString(16).padStart(8, "0")
-}
-
-/** Wraparound index into a non-empty list (throws loudly on an empty pool). */
-function pick<T>(arr: readonly T[], idx: number): T {
-	const value = arr[idx % arr.length]
-	if (value === undefined) throw new Error("pick: empty array")
-	return value
 }
 
 async function gitOids(args: string[], dir: string): Promise<string[]> {
@@ -183,15 +177,7 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 							const objects = createObjectStore(isolated.sql)
 							const refs = createRefStore(isolated.sql)
 							await seedRepoIntoStore(REPO, src, { objects, refs })
-							const backend: RepoBackend = {
-								buildPack: (wants, haves, omitBlobs, includeTag, thinPack) =>
-									objects.buildPack(REPO, wants, haves, omitBlobs, includeTag, thinPack),
-								getSymref: (name) => refs.getSymref(REPO, name),
-								listRefs: () => refs.listRefs(REPO),
-								processHaves: (haves) => objects.processHaves(REPO, haves),
-								readyToGiveUp: (wants, common) =>
-									objects.readyToGiveUp(REPO, wants, common),
-							}
+							const backend = bindRepoBackend({ objects, refs }, REPO)
 
 							const ancestorCache = new Map<string, string[]>()
 							const ancestorsOf = async (commit: string): Promise<string[]> => {
@@ -209,15 +195,15 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 							): string => {
 								switch (h.kind) {
 									case "ancestor":
-										return pick(ancestors, h.idx)
+										return cyclicAt(ancestors, h.idx)
 									case "sibling":
-										return pick(siblings, h.idx)
+										return cyclicAt(siblings, h.idx)
 									case "unrelated":
 										return island
 									case "absent":
 										return absentOid(h.idx)
 									case "any":
-										return pick(commits, h.idx)
+										return cyclicAt(commits, h.idx)
 								}
 								return assertNever(h.kind)
 							}
@@ -241,7 +227,7 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 								wantIdx: 0,
 							}
 							for (const spec of [nakProbe, packProbe, ...pairs]) {
-								const want = pick(spec.wantFromTip ? tips : commits, spec.wantIdx)
+								const want = cyclicAt(spec.wantFromTip ? tips : commits, spec.wantIdx)
 								const ancestors = await ancestorsOf(want)
 								const ancestorSet = new Set(ancestors)
 								const siblings = commits.filter((c) => !ancestorSet.has(c))

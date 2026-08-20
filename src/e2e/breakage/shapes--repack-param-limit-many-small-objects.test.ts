@@ -47,6 +47,8 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack, type Repack } from "@/store/repack"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
+import { objectsByType } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -55,19 +57,16 @@ import {
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-const WHO = "A U Thor <author@example.com> 1700000000 +0000"
-
 /** The fixture's object count. THE BUG LIVES AT THIS BOUNDARY (porsager's 65534
  * bind-parameter ceiling, minus the one parameter spent on `repo_id`) — shrinking
  * this makes both tests vacuously green while the defect stands. */
 const N = 66_000
 
 async function objectList(dir: string): Promise<string> {
-	const r = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-		{ cwd: dir },
-	)
-	return r.stdout.trim().split("\n").filter(Boolean).sort().join("\n")
+	return (await objectsByType(dir))
+		.map(({ oid, type }) => `${oid} ${type}`)
+		.sort()
+		.join("\n")
 }
 
 async function rawBytes(dir: string): Promise<{ objects: number; bytes: number }> {
@@ -90,7 +89,7 @@ function streamManyFiles(): string {
 		changes.push(`M 100644 :${i + 1} f/${i}.txt`)
 	}
 	out.push(
-		`commit refs/heads/main\nmark :${N + 1}\ncommitter ${WHO}\ndata 4\nseed\n${changes.join("\n")}\n\ndone\n`,
+		`commit refs/heads/main\nmark :${N + 1}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${changes.join("\n")}\n\ndone\n`,
 	)
 	return out.join("")
 }
@@ -103,7 +102,7 @@ function streamManyCommits(): string {
 	for (let i = 0; i < N; i++) {
 		const cm = ++mark
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${i % 10}\n` +
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nc${i % 10}\n` +
 				(prev ? `from :${prev}\n` : "") +
 				"M 100644 :1 f\n\n",
 		)

@@ -134,7 +134,7 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 		if (!forkBase) throw new Error(`fixture too short: no commit #${FORK_AT}`)
 
 		// A divergent history branched at commit #40, built in a CLONE so `src` stays
-		// the pristine seed. Pointing the repo's main at this tip is a force push that
+		// the pristine seed. Rewinding the repo's main to this tip is a store move that
 		// both orphans ~110 commits (GC work) and adds ~60 new ones (repack work).
 		const fork = join(root, "fork")
 		await spawnGit(["clone", "-q", "--no-local", src, fork])
@@ -199,7 +199,7 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 		}
 	}
 
-	/** The force push, applied to the store: new objects land, main jumps to the fork. */
+	/** The store rewind: new objects land, then main jumps to the fork. */
 	async function rewindAndExtend(db: IsolatedDb, refs: RefStore): Promise<void> {
 		await createObjectStore(db.sql).putPack(REPO, forkOnly)
 		await refs.setRef(REPO, "refs/heads/main", forkTip)
@@ -231,7 +231,7 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 		expectSound("S1 repack || repack", outcome)
 	}, 600_000)
 
-	it("S2 repack || gc on a force-pushed repo — the tier stays sound and the repo still clones", async () => {
+	it("S2 repack || gc on a rewound repo — the tier stays sound and the repo still clones", async () => {
 		const outcome = await scenario(async ({ db, port, refs }) => {
 			await createRepack(db.sql).repack(REPO)
 			await rewindAndExtend(db, refs)

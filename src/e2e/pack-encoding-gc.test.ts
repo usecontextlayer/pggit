@@ -5,8 +5,8 @@
  *
  *   1. A reclaimed object's encoding row goes with it — nothing about a dead
  *      object survives.
- *   2. No surviving delta encoding may reference a base that GC removed. A force
- *      push can orphan an ANCHOR while a delta against it stays reachable (the
+ *   2. No surviving delta encoding may reference a base that GC removed. A
+ *      store-level rewind can orphan an ANCHOR while a delta against it stays reachable (the
  *      anchor's commits become unreachable, the delta's do not) — the one shape
  *      where the two sweeps disagree. The dangling delta must be removed by the
  *      sweep (the object then serves via the raw path) and the next repack pass
@@ -22,7 +22,8 @@ import { createGc, type Gc } from "@/store/gc"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
-import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { lookupRepoId } from "@/store/repo-resolver"
+import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
@@ -58,11 +59,7 @@ describe("repack × GC — the derived tier follows the inventory", () => {
 		// commit 10, and commit 40's trees stay reachable while their mid-segment
 		// anchors (reachable only through commits 32..39) die — exactly a surviving
 		// delta whose base GC removes.
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		const commits = await commitsOldestFirst(src, "HEAD")
 		const early = commits[10]
 		const reused = commits[40]
 		if (!early || !reused) throw new Error("fixture too short to orphan")
@@ -90,11 +87,10 @@ describe("repack × GC — the derived tier follows the inventory", () => {
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 
-	async function repoId(): Promise<string> {
-		const [row] = await db.sql<{ id: string }[]>`
-			select id::text as id from repos where name = ${REPO}`
-		if (!row) throw new Error(`repo ${REPO} not found`)
-		return row.id
+	async function repoId() {
+		const id = await lookupRepoId(db.db, REPO)
+		if (id === null) throw new Error(`repo ${REPO} not found`)
+		return id
 	}
 
 	it("GC removed the encodings of reclaimed objects", async () => {

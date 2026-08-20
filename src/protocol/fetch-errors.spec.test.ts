@@ -2,13 +2,14 @@
  * §10 serve-failure contract. pggit's serve path MATERIALIZES the whole pack
  * (`handleFetch` returns `encodePackfileResponse(await backend.buildPack(...))` — a
  * complete Buffer) BEFORE the HTTP layer sends a byte, so the no-partial-stream
- * property is structural (the `Promise<Buffer>` return type). The graph logic now
- * lives in the store's `buildPack` (set-based SQL over the row+edge model), so a
- * serve failure surfaces as a `buildPack` rejection. What this asserts is the
+ * property is structural (the `Promise<Buffer>` return type). The graph walk lives
+ * behind the store's `buildPack` in `store/reachability.ts`, so a serve failure
+ * surfaces as a `buildPack` rejection. What this asserts is the
  * observable consequence: such a failure REJECTS (no Buffer is returned) rather
  * than being swallowed into an empty/partial pack — so it reaches the HTTP
- * boundary's 500. The store's own rejection of a missing want is pinned against a
- * real store in m1-multiround; here we pin that `handleFetch` propagates it. (band-3
+ * boundary's 500. Missing-want rejection is pinned against a real store in
+ * `object-store.test.ts` and over the wire in `fetch-missing-want.test.ts`; here we
+ * pin that `handleFetch` propagates it. (band-3
  * stays deferred until serving becomes streaming — there is no mid-stream window to
  * signal on today.)
  */

@@ -1,6 +1,6 @@
 /**
- * Lifecycle breakage — force-push storm: N rounds of
- *   advance → repack → force-move main back onto a divergent lineage (setRef)
+ * Lifecycle breakage — store-rewind storm: N rounds of
+ *   advance → repack → rewind main onto a divergent lineage (`setRef`)
  *   → delete staging ref → gc(0) → repack → clone/fsck/compare.
  * Half the rounds invert the gc/repack order.
  *
@@ -27,9 +27,8 @@ import {
 	commitsOldestFirst,
 } from "@/testing/append-only-repo"
 import {
-	listDifferences,
-	type MirrorState,
-	mirrorClone,
+	compareMirrorClones,
+	type MirrorComparison,
 	requiredAt,
 } from "@/testing/git-fixtures"
 import {
@@ -39,6 +38,7 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { captureTestResult, type TestResult } from "@/testing/test-result"
 
 const REPO = "workspace/slate/storm"
 const ROUNDS = 6
@@ -55,22 +55,11 @@ type RoundResultBase = {
 	stagingDeleteAccepted: boolean
 }
 
-type RoundResult = RoundResultBase &
-	(
-		| { kind: "failed"; error: unknown }
-		| {
-				kind: "succeeded"
-				objectsOnlyPg: number
-				objectsOnlyRef: number
-				refsPg: string[]
-				refsRef: string[]
-				fsck: string
-				bytesMatch: boolean
-				converged: RepackResult
-		  }
-	)
+type RoundObservation = MirrorComparison & { converged: RepackResult }
 
-describe("lifecycle breakage — force-push storm", () => {
+type RoundResult = RoundResultBase & TestResult<RoundObservation>
+
+describe("lifecycle breakage — store-rewind storm", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""
@@ -93,7 +82,7 @@ describe("lifecycle breakage — force-push storm", () => {
 				`alt${r}`,
 				requiredAt(
 					commits,
-					requiredAt(BRANCH_POINTS, r, "force-push branch points"),
+					requiredAt(BRANCH_POINTS, r, "rewind branch points"),
 					"main commit history",
 				),
 				`alt${r}`,
@@ -151,30 +140,18 @@ describe("lifecycle breakage — force-push storm", () => {
 				round: r,
 				stagingDeleteAccepted: requiredAt(okDel, 0, "staging ref delete results"),
 			}
-			let pgc: MirrorState
-			try {
-				pgc = await mirrorClone(url, a)
-			} catch (error) {
-				rounds.push({
-					...base,
-					error,
-					kind: "failed",
-				})
+			const comparison = await captureTestResult(() =>
+				compareMirrorClones({ dest: a, url }, { dest: b, url: `file://${ref}` }),
+			)
+			if (comparison.kind === "failed") {
+				rounds.push({ ...base, ...comparison })
 				continue
 			}
-			const refc = await mirrorClone(`file://${ref}`, b)
-			const objDiff = listDifferences(pgc.objects, refc.objects)
 			// a second repack must be a no-op after convergence
 			rounds.push({
 				...base,
-				bytesMatch: pgc.digest === refc.digest,
-				converged: await repack.repack(REPO),
-				fsck: pgc.fsck,
 				kind: "succeeded",
-				objectsOnlyPg: objDiff.onlyLeft.length,
-				objectsOnlyRef: objDiff.onlyRight.length,
-				refsPg: pgc.refs,
-				refsRef: refc.refs,
+				value: { ...comparison.value, converged: await repack.repack(REPO) },
 			})
 			rmSync(a, { force: true, recursive: true })
 			rmSync(b, { force: true, recursive: true })
@@ -192,7 +169,7 @@ describe("lifecycle breakage — force-push storm", () => {
 		).toEqual([])
 	})
 
-	it("serves a clonable repo after every force-push round", () => {
+	it("serves a clonable repo after every store-rewind round", () => {
 		expect(
 			rounds.flatMap((r) =>
 				r.kind === "failed"
@@ -205,8 +182,11 @@ describe("lifecycle breakage — force-push storm", () => {
 	it("hands the client exactly the oracle's object set", () => {
 		expect(
 			rounds.flatMap((r) =>
-				r.kind === "succeeded" && (r.objectsOnlyPg > 0 || r.objectsOnlyRef > 0)
-					? [`round ${r.round}: onlyPG=${r.objectsOnlyPg} onlyREF=${r.objectsOnlyRef}`]
+				r.kind === "succeeded" &&
+				(r.value.objects.onlyServed.length > 0 || r.value.objects.onlyOracle.length > 0)
+					? [
+							`round ${r.round}: onlyServed=${r.value.objects.onlyServed.length} onlyOracle=${r.value.objects.onlyOracle.length}`,
+						]
 					: [],
 			),
 		).toEqual([])
@@ -215,11 +195,11 @@ describe("lifecycle breakage — force-push storm", () => {
 	it("hands the client exactly the oracle's refs", () => {
 		expect(
 			rounds.flatMap((r) =>
-				r.kind === "succeeded" ? [{ refs: r.refsPg, round: r.round }] : [],
+				r.kind === "succeeded" ? [{ refs: r.value.served.refs, round: r.round }] : [],
 			),
 		).toEqual(
 			rounds.flatMap((r) =>
-				r.kind === "succeeded" ? [{ refs: r.refsRef, round: r.round }] : [],
+				r.kind === "succeeded" ? [{ refs: r.value.oracle.refs, round: r.round }] : [],
 			),
 		)
 	})
@@ -227,7 +207,9 @@ describe("lifecycle breakage — force-push storm", () => {
 	it("serves byte-identical objects to the oracle", () => {
 		expect(
 			rounds.flatMap((r) =>
-				r.kind === "succeeded" && !r.bytesMatch ? [`round ${r.round}`] : [],
+				r.kind === "succeeded" && r.value.served.digest !== r.value.oracle.digest
+					? [`round ${r.round}`]
+					: [],
 			),
 		).toEqual([])
 	})
@@ -235,8 +217,8 @@ describe("lifecycle breakage — force-push storm", () => {
 	it("every clone passes git fsck --strict", () => {
 		expect(
 			rounds.flatMap((r) =>
-				r.kind === "succeeded" && r.fsck.length > 0
-					? [`round ${r.round}: ${r.fsck}`]
+				r.kind === "succeeded" && r.value.served.fsck.length > 0
+					? [`round ${r.round}: ${r.value.served.fsck}`]
 					: [],
 			),
 		).toEqual([])
@@ -245,8 +227,9 @@ describe("lifecycle breakage — force-push storm", () => {
 	it("converges the repack in every round, in either gc/repack order", () => {
 		expect(
 			rounds.flatMap((r) =>
-				r.kind === "succeeded" && (r.converged.deltas !== 0 || r.converged.wholes !== 0)
-					? [`round ${r.round} (${r.order}): ${JSON.stringify(r.converged)}`]
+				r.kind === "succeeded" &&
+				(r.value.converged.deltas !== 0 || r.value.converged.wholes !== 0)
+					? [`round ${r.round} (${r.order}): ${JSON.stringify(r.value.converged)}`]
 					: [],
 			),
 		).toEqual([])

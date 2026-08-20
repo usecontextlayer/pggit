@@ -4,7 +4,7 @@
  *
  * The rewind (`setRef` backwards — the public way the platform moves refs)
  * orphans a whole span of history. A client that still names the old tip drives
- * `buildPack` to compute a closure that GC is concurrently deleting out from
+ * the store's `routeServeSet` reachability query while GC concurrently deletes out from
  * under it, batch by batch. The delta tier makes this sharper: the 0008 FK
  * cascades (design D7) take any delta whose ANCHOR the object sweep reclaims,
  * so the encoding tier is mutating mid-serve too.
@@ -30,6 +30,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -37,7 +38,7 @@ import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
-import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { loadReachableObjects } from "@/testing/git-fixtures"
 import {
 	repoUrl,
@@ -53,8 +54,6 @@ const RUNS = 150
 const REWIND = 60
 /** Oracle rounds against the plain `file://` bare remote. */
 const ORACLE_ROUNDS = 6
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 type Verdict = "OK" | "PROTO" | "HTTP500" | "CORRUPT" | "OTHER"
 
@@ -104,11 +103,7 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		scratch.push(src)
 		objects = await loadReachableObjects(src, ["--all"])
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		const commits = await commitsOldestFirst(src, "HEAD")
 		tip = commits[commits.length - 1] as string
 		rewindTo = commits[commits.length - 1 - REWIND] as string
 

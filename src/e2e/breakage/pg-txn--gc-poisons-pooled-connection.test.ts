@@ -68,6 +68,7 @@ import { randomUUID } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
@@ -183,7 +184,7 @@ describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () =
 			await tx`lock table git_ref in access exclusive mode`
 			await held
 		})
-		await new Promise((r) => setTimeout(r, 200))
+		await sleep(200)
 		try {
 			await createGc(shared).gc(REPO, { graceSeconds: 0, maintain: false })
 		} catch (e) {

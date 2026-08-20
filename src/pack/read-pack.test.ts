@@ -1,12 +1,12 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { computeOid } from "@/object/object"
 import { readPack } from "@/pack/read-pack"
 import { writePack } from "@/pack/write-pack"
-import { parseVerifyPackObjects } from "@/testing/git-fixtures"
+import { allObjectOids, parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("readPack", () => {
 	it("round-trips objects written by writePack (all base types)", async () => {
@@ -25,8 +25,7 @@ describe("readPack", () => {
 	})
 
 	it("reads a real git-produced (undeltified) pack matching the repo's objects", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-rp-"))
-		try {
+		await withTempDir("pggit-rp-", async (dir) => {
 			await spawnGit(["init", "-q"], { cwd: dir })
 			writeFileSync(join(dir, "a.txt"), "hello\n")
 			writeFileSync(join(dir, "b.txt"), "world\n".repeat(50))
@@ -41,15 +40,9 @@ describe("readPack", () => {
 			if (!packName) throw new Error("no pack produced")
 			const parsed = await readPack(readFileSync(join(packDir, packName)))
 
-			const list = await spawnGit(
-				["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-				{ cwd: dir },
-			)
-			const expected = list.stdout.trim().split("\n").sort()
+			const expected = await allObjectOids(dir)
 			expect(parsed.map((p) => p.oid).sort()).toEqual(expected)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
+		})
 	})
 
 	// Both delta wire forms, each read from a REAL git pack. The form is PINNED by
@@ -66,8 +59,7 @@ describe("readPack", () => {
 		{ embedsBaseOid: true, name: "REF", useDeltaBaseOffset: false },
 	]) {
 		it(`reads a real git pack containing ${form.name} deltas, recovering all objects`, async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pggit-rp-delta-"))
-			try {
+			await withTempDir("pggit-rp-delta-", async (dir) => {
 				await spawnGit(["init", "-q"], { cwd: dir })
 				const big = "lorem ipsum dolor sit amet\n".repeat(400)
 				writeFileSync(join(dir, "big.txt"), big)
@@ -108,15 +100,9 @@ describe("readPack", () => {
 				}
 
 				const parsed = await readPack(packBytes)
-				const list = await spawnGit(
-					["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-					{ cwd: dir },
-				)
-				const expected = list.stdout.trim().split("\n").sort()
+				const expected = await allObjectOids(dir)
 				expect(parsed.map((p) => p.oid).sort()).toEqual(expected)
-			} finally {
-				rmSync(dir, { force: true, recursive: true })
-			}
+			})
 		})
 	}
 })

@@ -1,5 +1,5 @@
 /**
- * Thin-pack serving (spine S5, D8′/R9): under a NEGOTIATED `thin-pack`, a served
+ * Thin-pack serving (D8′/R9): under a NEGOTIATED `thin-pack`, a served
  * delta's base may live on the client — provably, via the frontier's
  * `clientHas` — and a freshly-pushed tree deltas at SERVE TIME against its
  * same-path boundary predecessor (the warm delta, R9). Without the negotiation,
@@ -18,7 +18,8 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps, type GitDeps } from "@/index"
 import { readPack } from "@/pack/read-pack"
-import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
+import { bindRepoBackend } from "@/protocol/repo-backend"
+import { handleUploadPack } from "@/protocol/upload-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import {
 	allObjectOids,
@@ -173,13 +174,7 @@ describe("thin-pack serve — external bases only when negotiated", () => {
 		// the store-level cases above force the boolean and cannot see that.
 		// readPack's base resolver doubles as the external-base detector: it is
 		// consulted exactly once per REF_DELTA whose base is not in the pack.
-		const backend: RepoBackend = {
-			buildPack: (w, h, o, i, t) => deps.objects.buildPack(REPO, w, h, o, i, t),
-			getSymref: (n) => deps.refs.getSymref(REPO, n),
-			listRefs: () => deps.refs.listRefs(REPO),
-			processHaves: (h) => deps.objects.processHaves(REPO, h),
-			readyToGiveUp: (w, c) => deps.objects.readyToGiveUp(REPO, w, c),
-		}
+		const backend = bindRepoBackend(deps, REPO)
 		for (const thin of [true, false]) {
 			const out = await handleUploadPack(
 				fetchRequest({ done: true, haves: [oldTip], thinPack: thin, wants: [newTip] }),

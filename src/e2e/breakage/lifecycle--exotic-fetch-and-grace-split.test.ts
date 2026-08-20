@@ -21,6 +21,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGc } from "@/store/gc"
 import { createRepack, type RepackResult } from "@/store/repack"
@@ -262,7 +263,7 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 				},
 			)
 			await repack.repack(REPO)
-			await new Promise((r) => setTimeout(r, 2500))
+			await sleep(2500)
 			await spawnGit(
 				[
 					"push",

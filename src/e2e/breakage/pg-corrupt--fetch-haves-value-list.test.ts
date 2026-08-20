@@ -33,7 +33,8 @@ import { Hono } from "hono"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids, requireGitOid } from "@/testing/git-fixtures"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
+import { allObjectOids, parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
@@ -67,7 +68,6 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 	/** A linear history of `n` commits over an empty tree, built with fast-import. */
 	async function buildHistory(dir: string, n: number): Promise<void> {
 		await spawnGit(["init", "-q", "-b", "main", dir])
-		const who = "pggit oracle <oracle@pggit.test> 1700000000 +0000"
 		const lines: string[] = []
 		let mark = 0
 		let prev = 0
@@ -77,7 +77,7 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 			const commitMark = ++mark
 			lines.push(
 				`blob\nmark :${blobMark}\ndata ${body.length}\n${body}\n` +
-					`commit refs/heads/main\nmark :${commitMark}\ncommitter ${who}\ndata ${body.length}\n${body}\n` +
+					`commit refs/heads/main\nmark :${commitMark}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${body.length}\n${body}\n` +
 					(prev === 0 ? "" : `from :${prev}\n`) +
 					`M 100644 :${blobMark} f.txt\n`,
 			)
@@ -89,7 +89,6 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 	/** `n` mutually-unreachable single-commit branches — a mirror-of-many-branches shape. */
 	async function buildWide(dir: string, n: number): Promise<void> {
 		await spawnGit(["init", "-q", "-b", "main", dir])
-		const who = "pggit oracle <oracle@pggit.test> 1700000000 +0000"
 		const lines: string[] = []
 		let mark = 0
 		for (let i = 0; i < n; i++) {
@@ -98,7 +97,7 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 			const commitMark = ++mark
 			lines.push(
 				`blob\nmark :${blobMark}\ndata ${body.length}\n${body}\n` +
-					`commit refs/heads/t${i}\nmark :${commitMark}\ncommitter ${who}\ndata ${body.length}\n${body}\n` +
+					`commit refs/heads/t${i}\nmark :${commitMark}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${body.length}\n${body}\n` +
 					`M 100644 :${blobMark} f.txt\n`,
 			)
 		}
@@ -133,15 +132,9 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 		console.log(`building a ${DEPTH}-commit history…`)
 		await buildHistory(src, DEPTH)
 		tip = (await spawnGit(["rev-parse", "refs/heads/main"], { cwd: src })).stdout.trim()
-		expectedOids = (await spawnGit(["rev-list", "--objects", tip], { cwd: src })).stdout
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => {
-				const split = line.indexOf(" ")
-				const oid = split < 0 ? line : line.slice(0, split)
-				return requireGitOid(oid, `rev-list line ${JSON.stringify(line)}`)
-			})
-			.sort()
+		expectedOids = parseRevListObjectOids(
+			(await spawnGit(["rev-list", "--objects", tip], { cwd: src })).stdout,
+		).sort()
 		await spawnGit(["push", "-q", url, "refs/heads/main:refs/heads/main"], { cwd: src })
 		console.log(`pushed ${DEPTH} commits; tip ${tip}`)
 	}, 900_000)

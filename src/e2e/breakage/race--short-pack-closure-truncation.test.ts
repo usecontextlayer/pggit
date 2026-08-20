@@ -37,6 +37,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -67,7 +68,6 @@ const REWIND = 120
 // its literal and flags the other two branches as dead (TS2367).
 const RESURRECT = "trees" as "trees" | "all" | "none"
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 type Verdict = "OK" | "PROTO" | "HTTP500" | "SHORTPACK" | "CORRUPT" | "OTHER"

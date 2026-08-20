@@ -20,23 +20,14 @@
  * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
  * A failure here is a real codec bug.
  */
-import { createHash } from "node:crypto"
-import { deflateSync } from "node:zlib"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import { assertNever } from "@/assert-never"
 import { computeOid, type GitObjectType } from "@/object/object"
 import { applyDelta } from "@/pack/delta"
-import { encodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
-
-const PACK_TYPE_CODE: Record<GitObjectType, number> = {
-	blob: PACK_OBJ_TYPE.BLOB,
-	commit: PACK_OBJ_TYPE.COMMIT,
-	tag: PACK_OBJ_TYPE.TAG,
-	tree: PACK_OBJ_TYPE.TREE,
-}
+import { buildRefDeltaPack } from "@/testing/ref-delta-pack"
 
 const typeArb = fc.constantFrom<GitObjectType>("blob", "commit", "tag", "tree")
 
@@ -131,35 +122,6 @@ function buildDelta(base: Buffer, ops: EditOp[]): { delta: Buffer; target: Buffe
 	return { delta, target }
 }
 
-// ── test-only pack writer (emits the deltified packs writePack never produces) ──
-
-type PackEntry =
-	| { content: Buffer; kind: "base"; type: GitObjectType }
-	| { baseOid: string; delta: Buffer; kind: "ref" }
-
-function buildPack(entries: PackEntry[]): Buffer {
-	const header = Buffer.alloc(12)
-	header.write("PACK", 0, "latin1")
-	header.writeUInt32BE(2, 4)
-	header.writeUInt32BE(entries.length, 8)
-	const parts: Buffer[] = [header]
-	for (const e of entries) {
-		if (e.kind === "base") {
-			parts.push(encodeObjectHeader(PACK_TYPE_CODE[e.type], e.content.length))
-			parts.push(deflateSync(e.content))
-		} else if (e.kind === "ref") {
-			parts.push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, e.delta.length))
-			parts.push(Buffer.from(e.baseOid, "hex"))
-			parts.push(deflateSync(e.delta))
-		} else {
-			assertNever(e)
-		}
-	}
-	const body = Buffer.concat(parts)
-	const trailer = createHash("sha1").update(body).digest()
-	return Buffer.concat([body, trailer])
-}
-
 // ── properties ──────────────────────────────────────────────────────────────
 
 describe("§8.4 codec round-trips (pure)", () => {
@@ -223,7 +185,7 @@ describe("§8.4 codec round-trips (pure)", () => {
 					// (1) base IN pack → readPack resolves it with no external resolver.
 					// Pack order is preserved, so the ref-delta result is the 2nd object.
 					const parsedIn = await readPack(
-						buildPack([
+						buildRefDeltaPack([
 							{ content: base, kind: "base", type: baseType },
 							{ baseOid, delta, kind: "ref" },
 						]),
@@ -241,7 +203,7 @@ describe("§8.4 codec round-trips (pure)", () => {
 					expect(parsedTarget.type).toBe(baseType) // a delta inherits its base's type
 
 					// (2) base ABSENT (thin pack) → the external resolver supplies it.
-					const thin = buildPack([{ baseOid, delta, kind: "ref" }])
+					const thin = buildRefDeltaPack([{ baseOid, delta, kind: "ref" }])
 					const resolved = await readPack(thin, async (oid) =>
 						oid === baseOid ? { content: base, type: baseType } : null,
 					)

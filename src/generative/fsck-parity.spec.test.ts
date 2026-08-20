@@ -47,6 +47,7 @@ import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/derive"
 import { GitFormatError } from "@/object/format-error"
 import type { GitObjectType } from "@/object/object"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 const NUL = Buffer.from([0])
 const PINNED = { numRuns: 80, seed: 424_242 } as const
@@ -153,15 +154,12 @@ async function gitVerdict(
 	type: GitObjectType,
 	content: Buffer,
 ): Promise<GitVerdict> {
-	const dir = mkdtempSync(join(tmpdir(), "pggit-fsck-parity-"))
-	try {
+	return withTempDir("pggit-fsck-parity-", async (dir) => {
 		cpSync(fixture.dir, dir, { recursive: true })
 		await writeObject(dir, type, content)
 		const fsck = await attemptGit(["fsck", "--strict"], dir)
 		return parseFsck(`${fsck.stdout}${fsck.stderr}`)
-	} finally {
-		rmSync(dir, { force: true, recursive: true })
-	}
+	})
 }
 
 /** The two recorded divergence directions, keyed by what each side says:

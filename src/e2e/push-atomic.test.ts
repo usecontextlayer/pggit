@@ -1,5 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import type { Hono } from "hono"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
@@ -9,10 +8,11 @@ import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
+import { ZERO_OID } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
-const ZERO = "0".repeat(40)
 const WRONG = "f".repeat(40) // a deliberately stale advertised old-oid
 
 describe("M2 — atomic vs non-atomic ref updates", () => {
@@ -36,8 +36,7 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 	})
 
 	it("creates multiple branches in one --atomic push (real git)", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-atomic-src-"))
-		try {
+		await withTempDir("pggit-atomic-src-", async (src) => {
 			await spawnGit(["init", "-q"], { cwd: src })
 			writeFileSync(join(src, "a.txt"), "alpha\n")
 			await spawnGit(["add", "."], { cwd: src })
@@ -59,9 +58,7 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 				{ name: "refs/heads/one", oid: head },
 				{ name: "refs/heads/two", oid: head },
 			])
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 
 	// The atomic-rollback CAS semantics are pinned at the wire: a hand-built
@@ -70,8 +67,7 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 	// partial application, create/delete sentinels — is unit-covered in
 	// refs-store.test.ts; here we assert the observable push outcome end to end.)
 	it("atomic: a stale CAS in the batch ng's every ref and applies none", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-atomic-wire-"))
-		try {
+		await withTempDir("pggit-atomic-wire-", async (src) => {
 			await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 			writeFileSync(join(src, "a.txt"), "one\n")
 			await spawnGit(["add", "."], { cwd: src })
@@ -105,7 +101,7 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 			// is stale (main is c1, not WRONG). Caps (incl. `atomic`) ride the first line.
 			const body = receivePackRequest(
 				[
-					`${ZERO} ${c2} refs/heads/feature\0report-status atomic\n`,
+					`${ZERO_OID} ${c2} refs/heads/feature\0report-status atomic\n`,
 					`${WRONG} ${c2} refs/heads/main\n`,
 				],
 				pack,
@@ -121,9 +117,7 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 			expect(await refs.listRefs("repo-atomic-wire")).toEqual([
 				{ name: "refs/heads/main", oid: c1 },
 			])
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 
 	// The deny-non-FF policy composes with atomic (real git): ONE policy-denied
@@ -133,8 +127,7 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 	// atomic disqualification branch: a regression that applied the valid half
 	// would break the all-or-nothing contract `--atomic` promises.
 	it("atomic: a policy-denied non-FF in the batch ng's every ref and applies none", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-atomic-policy-"))
-		try {
+		await withTempDir("pggit-atomic-policy-", async (src) => {
 			const repo = `http://127.0.0.1:${server.port}/repo-atomic-policy`
 			await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 			writeFileSync(join(src, "a.txt"), "A\n")
@@ -164,8 +157,6 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 			expect(await refs.listRefs("repo-atomic-policy")).toEqual([
 				{ name: "refs/heads/main", oid: b },
 			])
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 })

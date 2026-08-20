@@ -15,6 +15,7 @@ import {
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("M1 — incremental fetch negotiation (real git)", () => {
 	let db: IsolatedDb
@@ -49,8 +50,7 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 	})
 
 	it("transfers only the delta on incremental fetch (have-closure subtracted)", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-m1neg-dest-"))
-		try {
+		await withTempDir("pggit-m1neg-dest-", async (dest) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -93,8 +93,6 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 			expect(wireNew).toEqual(delta)
 
 			await spawnGit(["fsck", "--full"], { cwd: dest })
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

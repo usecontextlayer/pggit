@@ -1,5 +1,5 @@
 /**
- * Chunk 3 — serving from the encoding tier (docs/2026-08-15-delta-pack-design.md D8).
+ * Serving from the encoding tier (docs/2026-08-15-delta-pack-design.md D8).
  *
  * The serve contract after repack, judged ONLY at observables a client owns:
  *
@@ -18,7 +18,7 @@
  * The first and third contracts hold for the raw path too, by design: they pin that
  * the encoding tier never regresses what already worked.
  */
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { deflateSync } from "node:zlib"
@@ -32,8 +32,7 @@ import { createAppendOnlyRepo, RUNS_DIR, runDirName } from "@/testing/append-onl
 import {
 	allObjectOids,
 	loadAllObjects,
-	PACK_DIR,
-	packFiles,
+	packFileBytes,
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
@@ -47,13 +46,6 @@ const REPO = "enc-serve"
 // on the 1,476-version production lineage) needs length ≫ K; 200 ≈ 6 segments is
 // the smallest shape where "under half of undeltified" holds with margin.
 const RUNS = 200
-
-/** Total bytes of a checkout's pack files — the transfer, measured client-side. */
-function clonePackBytes(dir: string): number {
-	return packFiles(dir)
-		.map((f) => statSync(join(dir, PACK_DIR, f)).size)
-		.reduce((a, b) => a + b, 0)
-}
 
 describe("serve — a repacked repo over the real wire", () => {
 	let db: IsolatedDb
@@ -110,7 +102,7 @@ describe("serve — a repacked repo over the real wire", () => {
 	it("transfers a fraction of the undeltified bytes — measured at the client", async () => {
 		const dest = await cloneInto("size")
 		try {
-			const transferred = clonePackBytes(dest)
+			const transferred = await packFileBytes(dest)
 			expect(transferred).toBeGreaterThan(0)
 			// The append-only fixture deltifies overwhelmingly (measured 3.5–9.6× on
 			// the real repo depending on K); half is a deliberately loose floor that

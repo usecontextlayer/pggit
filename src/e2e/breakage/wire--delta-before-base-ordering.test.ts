@@ -2,15 +2,12 @@
  * WIRE — the ORDER pggit emits deltas in, and the client-side resolver that order
  * stresses.
  *
- * `buildPack` emits in closure order, and the closure CTE seeds at the wants (the
- * ref tips) and expands outward — so newer objects come first and a star delta's
- * ANCHOR (an older version of the same path) always lands AFTER the delta that
- * references it. The originating probe measured that on the append-only shape
- * this work targets: 100% of served REF_DELTAs preceded their base in the pack,
- * where canonical git's own packs are 0%. Legal (REF_DELTA resolution is by OID,
- * not offset) but it is the worst case for both client-side resolvers, and it
- * means nothing in the stream can be resolved until the whole pack has arrived —
- * relevant to the streaming/TTFB question this work left open.
+ * Before the wholes-first fix, `buildPack` emitted in closure-discovery order, so
+ * newer deltas preceded the older anchors they referenced. The originating probe
+ * measured that on the append-only shape this work targets: 100% of served
+ * REF_DELTAs preceded their base, where canonical git's own packs were 0%. That
+ * ordering is legal (REF_DELTA resolution is by OID, not offset) but pathological
+ * for client-side resolution. This test pins the fixed emission order.
  *
  * So this file does two things:
  *   1. Measures the ratio and requires that NO majority of served deltas precede
@@ -25,21 +22,26 @@
  * Originated as breakage probe `wire--delta-before-base-ordering.ts`, which
  * measured the delta-ahead-of-base ratio; fixed.
  */
-import { createHash } from "node:crypto"
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { statSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { objectsByType, parseVerifyPackObjects } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	objectBytesDigest,
+	PACK_DIR,
+	packFiles,
+	parseVerifyPackObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -55,14 +57,13 @@ type Ordering = { deltas: number; ahead: number; bytes: number }
 
 /** Deltas in a clone's packs, and how many sit at a LOWER offset than their base. */
 async function ordering(dir: string): Promise<Ordering> {
-	const p = join(dir, ".git", "objects", "pack")
 	let deltas = 0
 	let ahead = 0
 	let bytes = 0
-	for (const f of readdirSync(p)) {
-		if (f.endsWith(".pack")) bytes += statSync(join(p, f)).size
-		if (!f.endsWith(".idx")) continue
-		const out = await spawnGit(["verify-pack", "-v", join(p, f)], { cwd: dir })
+	for (const file of packFiles(dir)) {
+		bytes += statSync(join(dir, PACK_DIR, file)).size
+		const index = join(dir, PACK_DIR, file.replace(/\.pack$/, ".idx"))
+		const out = await spawnGit(["verify-pack", "-v", index], { cwd: dir })
 		const objects = parseVerifyPackObjects(out.stdout)
 		const offsetOf = new Map(objects.map((object) => [object.oid, object.offset]))
 		for (const object of objects) {
@@ -82,23 +83,14 @@ async function ordering(dir: string): Promise<Ordering> {
 
 /** `<object count>:<sha256 over every local object's raw bytes, in oid order>`. */
 async function digest(dir: string): Promise<string> {
-	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	return `${oids.length}:${createHash("sha256").update(res.stdoutBytes).digest("hex")}`
+	const oids = await allObjectOids(dir)
+	return `${oids.length}:${await objectBytesDigest(dir, oids)}`
 }
 
 describe("wire — delta emission order and the client resolvers it stresses", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk, own: ownScratch } = createScratchArena()
 
 	let pggitOrder: Ordering
 	let gitOrder: Ordering
@@ -108,7 +100,7 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS })
-		scratch.push(src)
+		ownScratch(src)
 		const bare = join(mk("bare"), "oracle.git")
 		await spawnGit(["clone", "--bare", "-q", src, bare])
 		await spawnGit(["repack", "-a", "-d", "-q"], { cwd: bare })
@@ -159,7 +151,7 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 		// A SMALL incremental fetch — the shape a per-navigation pull actually is, and
 		// the one that goes through unpack-objects by DEFAULT (under 100 objects).
 		const grown = await createAppendOnlyRepo({ docs: 6, runs: RUNS + RUNS_2 })
-		scratch.push(grown)
+		ownScratch(grown)
 		await spawnGit(["push", "-q", url, "refs/heads/*:refs/heads/*"], { cwd: grown })
 		await spawnGit(["push", "-q", `file://${bare}`, "refs/heads/*:refs/heads/*"], {
 			cwd: grown,
@@ -203,7 +195,7 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("does not emit a MAJORITY of deltas ahead of their base in the pack", () => {

@@ -29,18 +29,19 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import { createRepack, type Repack } from "@/store/repack"
-import { parseVerifyPackObjects } from "@/testing/git-fixtures"
+import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	runDirName,
+} from "@/testing/append-only-repo"
+import { parseVerifyPackObjects, refsOf } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
-import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
-
-/** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
-const WHEN = "1700000000 +0000"
-const WHO = `pggit oracle <oracle@pggit.test> ${WHEN}`
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const PUSH_REFSPECS = ["refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"]
 
@@ -81,15 +82,7 @@ async function objectList(dir: string): Promise<string[]> {
 }
 
 async function refList(dir: string): Promise<string[]> {
-	// `show-ref` exits 1 on a repo with no refs at all (the `blob-edges` control
-	// before its first push) — that is "no refs", not a fault.
-	try {
-		const r = await spawnGit(["show-ref"], { cwd: dir })
-		return r.stdout.trim().split("\n").filter(Boolean).sort()
-	} catch (error) {
-		if (error instanceof GitCommandError && error.code === 1) return []
-		throw error
-	}
+	return (await refsOf(dir)).map(({ name, oid }) => `${oid} ${name}`)
 }
 
 /** Delta entries in the packs a bare clone actually retained, per canonical git. */
@@ -117,13 +110,6 @@ async function fastImport(dir: string, stream: string): Promise<void> {
 	})
 }
 
-function filler(salt: string, len: number): string {
-	let out = ""
-	while (out.length < len)
-		out += createHash("sha1").update(`${salt}${out.length}`).digest("hex")
-	return out.slice(0, len)
-}
-
 // ───────────────────────── the shapes ─────────────────────────
 
 // 1. Deep nesting: a/a/a/... N levels, changed across two commits.
@@ -133,11 +119,11 @@ shape("deep-nesting", {
 		const out: string[] = []
 		out.push(`blob\nmark :1\ndata 3\nv1\n\n`)
 		out.push(
-			`commit refs/heads/main\nmark :2\ncommitter ${WHO}\ndata 2\nc1\nM 100644 :1 ${path}\n\n`,
+			`commit refs/heads/main\nmark :2\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc1\nM 100644 :1 ${path}\n\n`,
 		)
 		out.push(`blob\nmark :3\ndata 3\nv2\n\n`)
 		out.push(
-			`commit refs/heads/main\nmark :4\ncommitter ${WHO}\ndata 2\nc2\nfrom :2\nM 100644 :3 ${path}\n\n`,
+			`commit refs/heads/main\nmark :4\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc2\nfrom :2\nM 100644 :3 ${path}\n\n`,
 		)
 		await fastImport(dir, out.join(""))
 	},
@@ -148,7 +134,7 @@ shape("deep-nesting", {
 		const path = `${Array.from({ length: DEPTH }, () => "a").join("/")}/f.txt`
 		await fastImport(
 			dir,
-			`blob\nmark :1\ndata 3\nv3\n\ncommit refs/heads/main\nmark :2\ncommitter ${WHO}\ndata 2\nc3\nfrom ${tip}\nM 100644 :1 ${path}\n\n`,
+			`blob\nmark :1\ndata 3\nv3\n\ncommit refs/heads/main\nmark :2\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc3\nfrom ${tip}\nM 100644 :1 ${path}\n\n`,
 		)
 	},
 })
@@ -166,7 +152,7 @@ shape("gitlinks", {
 		for (let i = 0; i < 80; i++) {
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 2\nc${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc${i % 10}\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`M 100644 :${blob} sub/keep${i}.txt\n` +
 					`M 160000 ${fake(i)} sub/mod\n` +
@@ -187,7 +173,7 @@ shape("mode-churn", {
 		const commit = (body: string): void => {
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 2\ncm\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\ncm\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`${body}\n\n`,
 			)
@@ -195,7 +181,9 @@ shape("mode-churn", {
 		}
 		for (let i = 0; i < 60; i++) {
 			const m = ++mark
-			out.push(`blob\nmark :${m}\ndata ${8 + (i % 3)}\n${filler(`b${i}`, 8 + (i % 3))}\n`)
+			out.push(
+				`blob\nmark :${m}\ndata ${8 + (i % 3)}\n${deterministicFiller(`b${i}`, 8 + (i % 3))}\n`,
+			)
 			const phase = i % 4
 			if (phase === 0) commit(`D p\nM 100644 :${m} p`)
 			else if (phase === 1) commit(`D p\nM 100755 :${m} p`)
@@ -240,7 +228,7 @@ shape("weird-names", {
 			}
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 2\ncm\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\ncm\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`${changes.join("\n")}\n\n`,
 			)
@@ -261,7 +249,7 @@ shape("toggle", {
 		for (let i = 0; i < 200; i++) {
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nt${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nt${i % 10}\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`M 100644 :${i % 2 === 0 ? 1 : 2} d/f.txt\nM 100644 :${i % 2 === 0 ? 2 : 1} d/g.txt\n\n`,
 			)
@@ -281,7 +269,7 @@ shape("toggle", {
 		for (let i = 200; i < 300; i++) {
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nt${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nt${i % 10}\n` +
 					(prev ? `from :${prev}\n` : `from ${tip}\n`) +
 					`M 100644 :${i % 2 === 0 ? 1 : 2} d/f.txt\nM 100644 :${i % 2 === 0 ? 2 : 1} d/g.txt\n\n`,
 			)
@@ -307,14 +295,14 @@ shape("merges", {
 			const b = blob(`root ${i}\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/r${i}\nmark :${cm}\ncommitter ${WHO}\ndata 2\nr${i}\nM 100644 :${b} shared/f${i}.txt\n\n`,
+				`commit refs/heads/r${i}\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nr${i}\nM 100644 :${b} shared/f${i}.txt\n\n`,
 			)
 			roots.push(cm)
 		}
 		// octopus merge of all eight
 		const oct = ++mark
 		out.push(
-			`commit refs/heads/main\nmark :${oct}\ncommitter ${WHO}\ndata 3\noct\nfrom :${roots[0]}\n` +
+			`commit refs/heads/main\nmark :${oct}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\noct\nfrom :${roots[0]}\n` +
 				roots
 					.slice(1)
 					.map((r) => `merge :${r}\n`)
@@ -324,23 +312,23 @@ shape("merges", {
 		// criss-cross
 		const a1 = ++mark
 		out.push(
-			`commit refs/heads/A\nmark :${a1}\ncommitter ${WHO}\ndata 2\na1\nfrom :${oct}\nM 100644 :${blob("a1\n")} shared/a.txt\n\n`,
+			`commit refs/heads/A\nmark :${a1}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\na1\nfrom :${oct}\nM 100644 :${blob("a1\n")} shared/a.txt\n\n`,
 		)
 		const b1 = ++mark
 		out.push(
-			`commit refs/heads/B\nmark :${b1}\ncommitter ${WHO}\ndata 2\nb1\nfrom :${oct}\nM 100644 :${blob("b1\n")} shared/b.txt\n\n`,
+			`commit refs/heads/B\nmark :${b1}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nb1\nfrom :${oct}\nM 100644 :${blob("b1\n")} shared/b.txt\n\n`,
 		)
 		const a2 = ++mark
 		out.push(
-			`commit refs/heads/A\nmark :${a2}\ncommitter ${WHO}\ndata 2\na2\nfrom :${a1}\nmerge :${b1}\nM 100644 :${blob("a2\n")} shared/a.txt\n\n`,
+			`commit refs/heads/A\nmark :${a2}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\na2\nfrom :${a1}\nmerge :${b1}\nM 100644 :${blob("a2\n")} shared/a.txt\n\n`,
 		)
 		const b2 = ++mark
 		out.push(
-			`commit refs/heads/B\nmark :${b2}\ncommitter ${WHO}\ndata 2\nb2\nfrom :${b1}\nmerge :${a1}\nM 100644 :${blob("b2\n")} shared/b.txt\n\n`,
+			`commit refs/heads/B\nmark :${b2}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nb2\nfrom :${b1}\nmerge :${a1}\nM 100644 :${blob("b2\n")} shared/b.txt\n\n`,
 		)
 		const fin = ++mark
 		out.push(
-			`commit refs/heads/main\nmark :${fin}\ncommitter ${WHO}\ndata 3\nfin\nfrom :${a2}\nmerge :${b2}\nM 100644 :${blob("fin\n")} shared/fin.txt\n\n`,
+			`commit refs/heads/main\nmark :${fin}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nfin\nfrom :${a2}\nmerge :${b2}\nM 100644 :${blob("fin\n")} shared/fin.txt\n\n`,
 		)
 		await fastImport(dir, out.join(""))
 	},
@@ -396,11 +384,11 @@ shape("blob-edges", {
 			raw(Buffer.from("same"), "dup/b"),
 		]
 		out.push(
-			`commit refs/heads/main\nmark :${++mark}\ncommitter ${WHO}\ndata 2\nc1\n${changes.join("\n")}\n\n`,
+			`commit refs/heads/main\nmark :${++mark}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc1\n${changes.join("\n")}\n\n`,
 		)
 		// empty tree + empty commit
 		out.push(
-			`commit refs/heads/empty\nmark :${++mark}\ncommitter ${WHO}\ndata 2\ne1\ndeleteall\n\n`,
+			`commit refs/heads/empty\nmark :${++mark}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\ne1\ndeleteall\n\n`,
 		)
 		await fastImport(dir, out.join(""))
 	},
@@ -414,19 +402,19 @@ shape("wide-tree", {
 		const seed: string[] = []
 		for (let i = 0; i < WIDE; i++) {
 			const m = ++mark
-			out.push(`blob\nmark :${m}\ndata 6\n${filler(`w${i}`, 5)}\n\n`)
+			out.push(`blob\nmark :${m}\ndata 6\n${deterministicFiller(`w${i}`, 5)}\n\n`)
 			seed.push(`M 100644 :${m} wide/${i}.txt`)
 		}
 		let prev = ++mark
 		out.push(
-			`commit refs/heads/main\nmark :${prev}\ncommitter ${WHO}\ndata 2\nc0\n${seed.join("\n")}\n\n`,
+			`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc0\n${seed.join("\n")}\n\n`,
 		)
 		for (let c = 0; c < 60; c++) {
 			const m = ++mark
-			out.push(`blob\nmark :${m}\ndata 6\n${filler(`u${c}`, 5)}\n\n`)
+			out.push(`blob\nmark :${m}\ndata 6\n${deterministicFiller(`u${c}`, 5)}\n\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${c % 10}\nfrom :${prev}\nM 100644 :${m} wide/${c}.txt\n\n`,
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nc${c % 10}\nfrom :${prev}\nM 100644 :${m} wide/${c}.txt\n\n`,
 			)
 			prev = cm
 		}
@@ -446,7 +434,7 @@ shape("orphan-shared-trees", {
 			for (let i = 0; i < 40; i++) {
 				const cm = ++mark
 				out.push(
-					`commit refs/heads/o${br}\nmark :${cm}\ncommitter ${WHO}\ndata 3\nm${i % 7}\n` +
+					`commit refs/heads/o${br}\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nm${i % 7}\n` +
 						(prev ? `from :${prev}\n` : "") +
 						`M 100644 :${b} d/${i}.txt\n\n`,
 				)
@@ -473,12 +461,12 @@ shape("mid-history-roots", {
 			const rb = blob(`root-${i}\n`)
 			const rc = ++mark
 			out.push(
-				`commit refs/heads/tmp\nmark :${rc}\ncommitter ${WHO}\ndata 2\nrt\nM 100644 :${rb} roots/${i}.txt\n\n`,
+				`commit refs/heads/tmp\nmark :${rc}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nrt\nM 100644 :${rb} roots/${i}.txt\n\n`,
 			)
 			const mb = blob(`main-${i}\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 2\nmn\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nmn\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`merge :${rc}\nM 100644 :${mb} main/${i}.txt\nM 100644 :${rb} roots/${i}.txt\n\n`,
 			)
@@ -513,7 +501,7 @@ function growing(opts: {
 			const changes = [opts.entry(i, blob), ...(opts.extraChanges?.(i, blob) ?? [])]
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nc${i % 10}\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`${changes.join("\n")}\n\n`,
 			)
@@ -523,17 +511,12 @@ function growing(opts: {
 	}
 }
 
-const uuidish = (i: number): string => {
-	const h = createHash("sha1").update(`run-${i}`).digest("hex")
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-}
-
 // A. append-only growing dir, plain — the design's own motivating shape (baseline).
 shape("growing-plain", {
 	build: growing({
 		commits: 300,
 		entry: (i, blob) =>
-			`M 100644 :${blob(filler(`e${i}`, 300))} runs/${uuidish(i)}/record.json`,
+			`M 100644 :${blob(deterministicFiller(`e${i}`, 300))} runs/${runDirName(i)}/record.json`,
 	}),
 	extend: async (dir) => {
 		const tip = (
@@ -544,13 +527,13 @@ shape("growing-plain", {
 		let prev = 0
 		for (let i = 300; i < 340; i++) {
 			const b = ++mark
-			const body = filler(`e${i}`, 300)
+			const body = deterministicFiller(`e${i}`, 300)
 			out.push(`blob\nmark :${b}\ndata ${Buffer.byteLength(body)}\n${body}\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nx${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nx${i % 10}\n` +
 					(prev ? `from :${prev}\n` : `from ${tip}\n`) +
-					`M 100644 :${b} runs/${uuidish(i)}/record.json\n\n`,
+					`M 100644 :${b} runs/${runDirName(i)}/record.json\n\n`,
 			)
 			prev = cm
 		}
@@ -564,9 +547,9 @@ shape("growing-gitlinks", {
 	build: growing({
 		commits: 300,
 		entry: (i) =>
-			`M 160000 ${createHash("sha1").update(`sub-${i}`).digest("hex")} mods/${uuidish(i)}`,
+			`M 160000 ${createHash("sha1").update(`sub-${i}`).digest("hex")} mods/${runDirName(i)}`,
 		extraChanges: (i, blob) => [
-			`M 100644 :${blob(filler(`g${i}`, 200))} mods/${uuidish(i)}/inner.txt`,
+			`M 100644 :${blob(deterministicFiller(`g${i}`, 200))} mods/${runDirName(i)}/inner.txt`,
 			// churn a gitlink that already exists, at a DEEP path
 			`M 160000 ${createHash("sha1").update(`churn-${i}`).digest("hex")} deep/a/b/c/mod`,
 		],
@@ -592,13 +575,13 @@ shape("growing-utf8-exotic", {
 			const changes: string[] = []
 			for (const [k, d] of dirs.entries()) {
 				const m = ++mark
-				const body = filler(`n${i}-${k}`, 120)
+				const body = deterministicFiller(`n${i}-${k}`, 120)
 				out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(body)}\n${body}\n`)
-				changes.push(`M 100644 :${m} "${d}/${uuidish(i)}.json"`)
+				changes.push(`M 100644 :${m} "${d}/${runDirName(i)}.json"`)
 			}
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nc${i % 10}\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`${changes.join("\n")}\n\n`,
 			)
@@ -613,9 +596,10 @@ shape("growing-utf8-exotic", {
 shape("growing-modeswap", {
 	build: growing({
 		commits: 300,
-		entry: (i, blob) => `M 100644 :${blob(filler(`m${i}`, 250))} runs/${uuidish(i)}/rec`,
+		entry: (i, blob) =>
+			`M 100644 :${blob(deterministicFiller(`m${i}`, 250))} runs/${runDirName(i)}/rec`,
 		extraChanges: (i, blob) => {
-			const m = blob(filler(`p${i}`, 30 + (i % 7)))
+			const m = blob(deterministicFiller(`p${i}`, 30 + (i % 7)))
 			const phase = i % 4
 			if (phase === 0) return [`D p`, `M 100644 :${m} p`]
 			if (phase === 1) return [`D p`, `M 100755 :${m} p`]
@@ -631,7 +615,7 @@ shape("deep-growing", {
 	build: growing({
 		commits: 300,
 		entry: (i, blob) =>
-			`M 100644 :${blob(filler(`d${i}`, 250))} ${Array.from({ length: 120 }, (_, k) => `l${k}`).join("/")}/${uuidish(i)}/rec`,
+			`M 100644 :${blob(deterministicFiller(`d${i}`, 250))} ${Array.from({ length: 120 }, (_, k) => `l${k}`).join("/")}/${runDirName(i)}/rec`,
 	}),
 	minDeltasServed: 1,
 })
@@ -641,7 +625,8 @@ shape("deep-growing", {
 shape("growing-toggle", {
 	build: growing({
 		commits: 300,
-		entry: (i, blob) => `M 100644 :${blob(filler(`t${i}`, 240))} runs/${uuidish(i)}/rec`,
+		entry: (i, blob) =>
+			`M 100644 :${blob(deterministicFiller(`t${i}`, 240))} runs/${runDirName(i)}/rec`,
 		extraChanges: (i, blob) => [
 			`M 100644 :${blob(i % 2 === 0 ? "A".repeat(500) : "B".repeat(500))} toggle/x`,
 			`M 100644 :${blob(i % 2 === 0 ? "B".repeat(500) : "A".repeat(500))} toggle/y`,
@@ -657,7 +642,8 @@ shape("growing-toggle", {
 shape("orphan-anchor-tree-reuse", {
 	build: growing({
 		commits: 300,
-		entry: (i, blob) => `M 100644 :${blob(filler(`o${i}`, 260))} runs/${uuidish(i)}/rec`,
+		entry: (i, blob) =>
+			`M 100644 :${blob(deterministicFiller(`o${i}`, 260))} runs/${runDirName(i)}/rec`,
 	}),
 	minDeltasServed: 1,
 	async mutate(dir, url, mirror, mk) {
@@ -688,13 +674,13 @@ shape("orphan-anchor-tree-reuse", {
 		const tip = (await spawnGit(["rev-parse", "HEAD"], { cwd: side })).stdout.trim()
 		for (let i = 0; i < 60; i++) {
 			const b = ++mark
-			const body = filler(`rw${i}`, 260)
+			const body = deterministicFiller(`rw${i}`, 260)
 			out.push(`blob\nmark :${b}\ndata ${Buffer.byteLength(body)}\n${body}\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nr${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nr${i % 10}\n` +
 					(prev ? `from :${prev}\n` : `from ${tip}\n`) +
-					`M 100644 :${b} rewritten/${uuidish(i)}/rec\n\n`,
+					`M 100644 :${b} rewritten/${runDirName(i)}/rec\n\n`,
 			)
 			prev = cm
 		}
@@ -726,25 +712,25 @@ shape("monster", {
 		let side = 0
 		for (let i = 0; i < 400; i++) {
 			const changes: string[] = [
-				`M 100644 :${blob(filler(`rec${i}`, 300))} runs/${uuidish(i)}/record.json`,
-				`M 100644 :${blob(filler(`err${i}`, 40))} runs/${uuidish(i)}/stderr`,
-				`M 160000 ${createHash("sha1").update(`sub${i}`).digest("hex")} runs/${uuidish(i)}/mod`,
-				`M 120000 :${blob(`../${uuidish(i % 7)}`)} links/l${i % 11}`,
-				`M 100755 :${blob(filler(`sh${i}`, 90))} bin/run${i % 13}.sh`,
-				`M 100644 :${blob(filler(`d${i}`, 120))} ${deep}/${uuidish(i)}.txt`,
-				`M 100644 :${blob(filler(`w${i}`, 60))} wide/${i % 500}.txt`,
-				`M 100644 :${blob(filler(`nu${i}`, 80))} "\\303\\251/${uuidish(i)}"`,
-				`M 100644 :${blob(filler(`nu2${i}`, 80))} "e\\314\\201/${uuidish(i)}"`,
+				`M 100644 :${blob(deterministicFiller(`rec${i}`, 300))} runs/${runDirName(i)}/record.json`,
+				`M 100644 :${blob(deterministicFiller(`err${i}`, 40))} runs/${runDirName(i)}/stderr`,
+				`M 160000 ${createHash("sha1").update(`sub${i}`).digest("hex")} runs/${runDirName(i)}/mod`,
+				`M 120000 :${blob(`../${runDirName(i % 7)}`)} links/l${i % 11}`,
+				`M 100755 :${blob(deterministicFiller(`sh${i}`, 90))} bin/run${i % 13}.sh`,
+				`M 100644 :${blob(deterministicFiller(`d${i}`, 120))} ${deep}/${runDirName(i)}.txt`,
+				`M 100644 :${blob(deterministicFiller(`w${i}`, 60))} wide/${i % 500}.txt`,
+				`M 100644 :${blob(deterministicFiller(`nu${i}`, 80))} "\\303\\251/${runDirName(i)}"`,
+				`M 100644 :${blob(deterministicFiller(`nu2${i}`, 80))} "e\\314\\201/${runDirName(i)}"`,
 			]
 			const phase = i % 4
-			const pm = blob(filler(`p${i}`, 25 + (i % 5)))
+			const pm = blob(deterministicFiller(`p${i}`, 25 + (i % 5)))
 			if (phase === 0) changes.push("D p", `M 100644 :${pm} p`)
 			else if (phase === 1) changes.push("D p", `M 100755 :${pm} p`)
 			else if (phase === 2) changes.push("D p", `M 120000 :${pm} p`)
 			else changes.push("D p", `M 100644 :${pm} p/inner`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nc${i % 10}\n` +
 					(prev ? `from :${prev}\n` : "") +
 					(i > 0 && i % 50 === 0 && side ? `merge :${side}\n` : "") +
 					`${changes.join("\n")}\n\n`,
@@ -754,13 +740,15 @@ shape("monster", {
 				// an independent side ROOT commit merged in 25 commits later
 				const sc = ++mark
 				out.push(
-					`commit refs/heads/side\nmark :${sc}\ncommitter ${WHO}\ndata 3\ns${i % 10}\n` +
-						`M 100644 :${blob(filler(`sd${i}`, 200))} side/${uuidish(i)}.txt\n\n`,
+					`commit refs/heads/side\nmark :${sc}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\ns${i % 10}\n` +
+						`M 100644 :${blob(deterministicFiller(`sd${i}`, 200))} side/${runDirName(i)}.txt\n\n`,
 				)
 				side = sc
 			}
 			if (i % 97 === 0) {
-				out.push(`tag v${i}\nfrom :${cm}\ntagger ${WHO}\ndata 3\nt${i % 10}\n\n`)
+				out.push(
+					`tag v${i}\nfrom :${cm}\ntagger ${FAST_IMPORT_COMMITTER}\ndata 3\nt${i % 10}\n\n`,
+				)
 			}
 		}
 		await fastImport(dir, out.join(""))
@@ -774,13 +762,13 @@ shape("monster", {
 		let prev = 0
 		for (let i = 400; i < 460; i++) {
 			const b = ++mark
-			const body = filler(`x${i}`, 300)
+			const body = deterministicFiller(`x${i}`, 300)
 			out.push(`blob\nmark :${b}\ndata ${Buffer.byteLength(body)}\n${body}\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\ny${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\ny${i % 10}\n` +
 					(prev ? `from :${prev}\n` : `from ${tip}\n`) +
-					`M 100644 :${b} runs/${uuidish(i)}/record.json\n\n`,
+					`M 100644 :${b} runs/${runDirName(i)}/record.json\n\n`,
 			)
 			prev = cm
 		}
@@ -793,14 +781,15 @@ shape("monster", {
 shape("linear-10k", {
 	build: growing({
 		commits: LINEAR,
-		entry: (i, blob) => `M 100644 :${blob(filler(`l${i}`, 400))} src/main.txt`,
+		entry: (i, blob) =>
+			`M 100644 :${blob(deterministicFiller(`l${i}`, 400))} src/main.txt`,
 	}),
 	minDeltasServed: 1,
 })
 
-// K. mergetag / gpgsig-style multi-line commit headers — repack parses parent
-//    ORDER out of commit CONTENT, so an embedded tag object inside a commit
-//    header is the adversarial input for that parser.
+// K. mergetag / gpgsig-style multi-line commit headers — ingest derives ordered
+//    parents from commit content, so an embedded tag object inside a commit
+//    header is the adversarial input for that parser; repack consumes the row.
 shape("mergetag", {
 	async build(dir) {
 		// (the sweep already `git init -q -b main`s `dir`, so this shape starts from a
@@ -810,13 +799,13 @@ shape("mergetag", {
 		let prev = 0
 		for (let i = 0; i < 40; i++) {
 			const b = ++mark
-			const body = filler(`mt${i}`, 200)
+			const body = deterministicFiller(`mt${i}`, 200)
 			out.push(`blob\nmark :${b}\ndata ${Buffer.byteLength(body)}\n${body}\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nc${i % 10}\n` +
 					(prev ? `from :${prev}\n` : "") +
-					`M 100644 :${b} runs/${uuidish(i)}/rec\n\n`,
+					`M 100644 :${b} runs/${runDirName(i)}/rec\n\n`,
 			)
 			prev = cm
 		}
@@ -854,9 +843,9 @@ shape("growing-repetitive-names", {
 	build: growing({
 		commits: 300,
 		entry: (i, blob) =>
-			`M 100644 :${blob(filler(`r${i}`, 200))} "${"a".repeat(64)}${String(i).padStart(6, "0")}"`,
+			`M 100644 :${blob(deterministicFiller(`r${i}`, 200))} "${"a".repeat(64)}${String(i).padStart(6, "0")}"`,
 		extraChanges: (i, blob) => {
-			const m = blob(filler(`s${i}`, 100))
+			const m = blob(deterministicFiller(`s${i}`, 100))
 			const n = i % 6
 			const name = ["x-y", "x.y", "x y", "x\\ty", 'x\\"y', String(i % 97)][n] as string
 			return [
@@ -874,11 +863,11 @@ shape("growing-repetitive-names", {
 		let prev = 0
 		for (let i = 300; i < 350; i++) {
 			const b = ++mark
-			const body = filler(`r${i}`, 200)
+			const body = deterministicFiller(`r${i}`, 200)
 			out.push(`blob\nmark :${b}\ndata ${Buffer.byteLength(body)}\n${body}\n`)
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nq${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nq${i % 10}\n` +
 					(prev ? `from :${prev}\n` : `from ${tip}\n`) +
 					`M 100644 :${b} "${"a".repeat(64)}${String(i).padStart(6, "0")}"\n\n`,
 			)

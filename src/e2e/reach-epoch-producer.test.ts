@@ -1,10 +1,10 @@
 /**
- * The epoch producer (spine chunk 5b, S6): GC's pass owns the reachability
- * epoch, and every path must produce EXACT per-tip bitmaps — each tip's bitmap
+ * The reachability-epoch producer: GC's pass owns the epoch, and every path must
+ * produce EXACT per-tip bitmaps — each tip's bitmap
  * names precisely `fullClosure(tip)`, the walk the bitmap will stand in for at
  * serve time. The sequence below is one repo's life: first drain (rebuilt),
  * quiet drain (unchanged — the write-cost guard), refs-only advance (the
- * steady-state delta), a force-push rewind (LOUD fallback to a rebuild that
+ * steady-state delta), a store-level rewind (LOUD fallback to a rebuild that
  * actually reclaims), a ref deletion (same), and finally an emptied repo
  * (cleared). Exactness is asserted against `fullClosure` at every stage, with each
  * source-resolvable commit tip also anchored to canonical `git rev-list`.
@@ -15,6 +15,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { type Database, initKysely } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
+import { ZERO_OID } from "@/oid"
 import { type Epoch, loadEpoch, oidsOfUnion, splitOids } from "@/store/reach-epoch"
 import { fullClosure } from "@/store/reachability"
 import {
@@ -28,7 +29,7 @@ import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "epoch/producer"
 
-describe("reach-epoch producer (chunk 5b)", () => {
+describe("reachability-epoch producer", () => {
 	let fx: GcFixture
 	let db: ReturnType<typeof initKysely<Database>>
 	let id: ReposId
@@ -188,7 +189,7 @@ describe("reach-epoch producer (chunk 5b)", () => {
 			REPO,
 			[
 				{ newOid: rewound, oldOid: current.oid, ref: "refs/heads/main" },
-				{ newOid: "0".repeat(40), oldOid: rewound, ref: tmpRef },
+				{ newOid: ZERO_OID, oldOid: rewound, ref: tmpRef },
 			],
 			false,
 		)

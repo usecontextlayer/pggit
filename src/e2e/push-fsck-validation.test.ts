@@ -13,9 +13,6 @@
  * the file's headline claim rests on recall, and an OVER-rejection — pggit refusing
  * something git accepts — would be invisible here.
  */
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { computeOid } from "@/object/object"
@@ -23,12 +20,10 @@ import { writePack } from "@/pack/write-pack"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { pktLineUnpack } from "@/testing/pkt-oracle"
+import { EMPTY_TREE, pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
-
-const ZERO = "0".repeat(40)
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 /** A receive-pack POST body that pushes `objects` and points `refs/heads/<branch>`
  * at `newOid` (a create, oldOid = zero). */
@@ -38,7 +33,7 @@ function pushBody(
 	objects: { type: "blob" | "commit" | "tag" | "tree"; content: Buffer }[],
 ): Buffer {
 	return receivePackRequest(
-		[`${ZERO} ${newOid} refs/heads/${branch}\0report-status`],
+		[`${ZERO_OID} ${newOid} refs/heads/${branch}\0report-status`],
 		writePack(objects),
 	)
 }
@@ -52,8 +47,7 @@ async function gitFsckVerdict(
 	malformed: { type: "commit" | "tag"; content: Buffer },
 	prerequisites: { type: "blob" | "tree"; content: Buffer }[] = [],
 ): Promise<{ code: number; oid: string; out: string }> {
-	const dir = mkdtempSync(join(tmpdir(), "pggit-fsck-oracle-"))
-	try {
+	return withTempDir("pggit-fsck-oracle-", async (dir) => {
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 		const write = async (type: string, content: Buffer): Promise<string> =>
 			(
@@ -66,9 +60,7 @@ async function gitFsckVerdict(
 		const oid = await write(malformed.type, malformed.content)
 		const fsck = await attemptGit(["fsck", "--strict"], dir)
 		return { code: fsck.code, oid, out: `${fsck.stdout}${fsck.stderr}` }
-	} finally {
-		rmSync(dir, { force: true, recursive: true })
-	}
+	})
 }
 
 /** git rejected these exact bytes too — the parity claim, per case. */

@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises"
 import type { Kysely } from "kysely"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
@@ -115,7 +116,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 					`pollUntil timed out after ${POLL_TIMEOUT_MS}ms waiting for: ${label}`,
 				)
 			}
-			await new Promise((resolve) => setTimeout(resolve, POLL_STEP_MS))
+			await sleep(POLL_STEP_MS)
 		}
 	}
 
@@ -123,7 +124,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	 * reclamation): there is no event to poll for, so we wait a window comfortably
 	 * larger than the scheduler interval and then assert nothing changed. */
 	async function waitForSchedulerObservationWindow(): Promise<void> {
-		await new Promise((resolve) => setTimeout(resolve, SCHEDULER_OBSERVATION_WINDOW_MS))
+		await sleep(SCHEDULER_OBSERVATION_WINDOW_MS)
 	}
 
 	// SCH-10 — Standalone server self-GCs on its cadence; the mounted path is

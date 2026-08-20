@@ -6,7 +6,7 @@
  *
  * Asks: does anything from a previous incarnation survive the cascade and attach
  * itself to the new repo? Same wire name, same object OIDs, new `repos.id` — an
- * encoding row (or edge, or ref) that outlived its repo would either FK-fail on
+ * encoding or ref row that outlived its repo would either FK-fail on
  * write or serve stale bytes. Each cycle ends with a clone compared byte-for-byte
  * against a file:// reference remote holding the same visible history.
  *
@@ -26,33 +26,22 @@ import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
 import { buildLifecycleSource, commitsOldestFirst } from "@/testing/append-only-repo"
 import {
-	listDifferences,
-	type MirrorState,
-	mirrorClone,
+	compareMirrorClones,
+	type MirrorComparison,
 	requiredAt,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { captureTestResult, type TestResult } from "@/testing/test-result"
 
 const REPO = "workspace/slate/cycled"
 const CYCLES = 5
 
-type CycleResult = {
+type CycleResult = TestResult<MirrorComparison> & {
 	cycle: number
 	first: RepackResult
 	converged: RepackResult
-} & (
-	| { kind: "failed"; error: unknown }
-	| {
-			kind: "succeeded"
-			objectsOnlyPg: number
-			objectsOnlyRef: number
-			refsPg: string[]
-			refsRef: string[]
-			fsck: string
-			bytesMatch: boolean
-	  }
-)
+}
 
 describe("lifecycle breakage — repo recreate cycles", () => {
 	let db: IsolatedDb
@@ -96,35 +85,15 @@ describe("lifecycle breakage — repo recreate cycles", () => {
 
 			const a = dir(`pg-${c}`)
 			const b = dir(`rf-${c}`)
-			let pgc: MirrorState
-			try {
-				pgc = await mirrorClone(url, a)
-			} catch (error) {
-				cycles.push({
-					converged,
-					cycle: c,
-					error,
-					first,
-					kind: "failed",
-				})
+			const comparison = await captureTestResult(() =>
+				compareMirrorClones({ dest: a, url }, { dest: b, url: `file://${ref}` }),
+			)
+			cycles.push({ ...comparison, converged, cycle: c, first })
+			if (comparison.kind === "failed") {
 				// No deleteRepo here: the source leaves a failed cycle's incarnation in
 				// place, so the next cycle runs against it rather than a fresh repo.
 				continue
 			}
-			const rfc = await mirrorClone(`file://${ref}`, b)
-			const od = listDifferences(pgc.objects, rfc.objects)
-			cycles.push({
-				bytesMatch: pgc.digest === rfc.digest,
-				converged,
-				cycle: c,
-				first,
-				fsck: pgc.fsck,
-				kind: "succeeded",
-				objectsOnlyPg: od.onlyLeft.length,
-				objectsOnlyRef: od.onlyRight.length,
-				refsPg: pgc.refs,
-				refsRef: rfc.refs,
-			})
 			rmSync(a, { force: true, recursive: true })
 			rmSync(b, { force: true, recursive: true })
 
@@ -166,8 +135,11 @@ describe("lifecycle breakage — repo recreate cycles", () => {
 	it("hands the client exactly the oracle's object set", () => {
 		expect(
 			cycles.flatMap((c) =>
-				c.kind === "succeeded" && (c.objectsOnlyPg > 0 || c.objectsOnlyRef > 0)
-					? [`cycle ${c.cycle}: onlyPG=${c.objectsOnlyPg} onlyREF=${c.objectsOnlyRef}`]
+				c.kind === "succeeded" &&
+				(c.value.objects.onlyServed.length > 0 || c.value.objects.onlyOracle.length > 0)
+					? [
+							`cycle ${c.cycle}: onlyServed=${c.value.objects.onlyServed.length} onlyOracle=${c.value.objects.onlyOracle.length}`,
+						]
 					: [],
 			),
 		).toEqual([])
@@ -176,11 +148,11 @@ describe("lifecycle breakage — repo recreate cycles", () => {
 	it("hands the client exactly the oracle's refs", () => {
 		expect(
 			cycles.flatMap((c) =>
-				c.kind === "succeeded" ? [{ cycle: c.cycle, refs: c.refsPg }] : [],
+				c.kind === "succeeded" ? [{ cycle: c.cycle, refs: c.value.served.refs }] : [],
 			),
 		).toEqual(
 			cycles.flatMap((c) =>
-				c.kind === "succeeded" ? [{ cycle: c.cycle, refs: c.refsRef }] : [],
+				c.kind === "succeeded" ? [{ cycle: c.cycle, refs: c.value.oracle.refs }] : [],
 			),
 		)
 	})
@@ -188,7 +160,9 @@ describe("lifecycle breakage — repo recreate cycles", () => {
 	it("serves byte-identical objects to the oracle", () => {
 		expect(
 			cycles.flatMap((c) =>
-				c.kind === "succeeded" && !c.bytesMatch ? [`cycle ${c.cycle}`] : [],
+				c.kind === "succeeded" && c.value.served.digest !== c.value.oracle.digest
+					? [`cycle ${c.cycle}`]
+					: [],
 			),
 		).toEqual([])
 	})
@@ -196,8 +170,8 @@ describe("lifecycle breakage — repo recreate cycles", () => {
 	it("every clone passes git fsck --strict", () => {
 		expect(
 			cycles.flatMap((c) =>
-				c.kind === "succeeded" && c.fsck.length > 0
-					? [`cycle ${c.cycle}: ${c.fsck}`]
+				c.kind === "succeeded" && c.value.served.fsck.length > 0
+					? [`cycle ${c.cycle}: ${c.value.served.fsck}`]
 					: [],
 			),
 		).toEqual([])

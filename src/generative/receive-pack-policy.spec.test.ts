@@ -55,6 +55,7 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /** Max commands per batch. Also the size of the seeded `pre<i>` / `dfbase<i>` pools:
  * a command's destination is keyed by its POSITION in the batch, so two commands can
@@ -484,9 +485,8 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 					commands.push(command)
 				}
 
-				const bare = mkdtempSync(join(tmpdir(), "pggit-rppolicy-ctl-"))
 				const repoId = `policy/batch${run++}`
-				try {
+				await withTempDir("pggit-rppolicy-ctl-", async (bare) => {
 					await spawnGit(["init", "-q", "--bare", bare])
 					const controlUrl = `file://${bare}`
 					const pggitUrl = `http://127.0.0.1:${server.port}/${repoId}`
@@ -596,9 +596,7 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 							(c) => expected.get(c.dest)?.kind === "accepted",
 						),
 					)
-				} finally {
-					rmSync(bare, { force: true, recursive: true })
-				}
+				})
 			}),
 			{ numRuns: 35, seed: 424_242 },
 		)
@@ -646,9 +644,8 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 	 * sides agree — that one is fuzzed by the property above (`dfExisting`).
 	 */
 	it("two new D/F-conflicting refs in one batch — both remotes keep the deepest, in every order", async () => {
-		const bare = mkdtempSync(join(tmpdir(), "pggit-rppolicy-df-"))
 		const repoId = "policy/df-pair"
-		try {
+		await withTempDir("pggit-rppolicy-df-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
 			const controlUrl = `file://${bare}`
 			const pggitUrl = `http://127.0.0.1:${server.port}/${repoId}`
@@ -687,8 +684,6 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 			const survivors = [`refs/heads/base ${fx.b}`, `refs/heads/pair/sub ${fx.c}`].sort()
 			expect(await controlRefs(bare)).toEqual(survivors)
 			expect(await pggitRefs(refs, repoId)).toEqual(survivors)
-		} finally {
-			rmSync(bare, { force: true, recursive: true })
-		}
+		})
 	}, 180_000)
 })

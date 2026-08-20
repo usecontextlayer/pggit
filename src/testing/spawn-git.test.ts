@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("spawnGit", () => {
 	it("runs git and captures stdout + exit code", async () => {
@@ -37,19 +37,15 @@ describe("spawnGit", () => {
 	})
 
 	it("produces a byte-identical commit OID across isolated runs (pinned clock + identity)", async () => {
-		const commitOnce = async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pggit-spawn-"))
-			try {
+		const commitOnce = async () =>
+			withTempDir("pggit-spawn-", async (dir) => {
 				await spawnGit(["init", "-q"], { cwd: dir })
 				writeFileSync(join(dir, "a.txt"), "hello\n")
 				await spawnGit(["add", "a.txt"], { cwd: dir })
 				await spawnGit(["commit", "-q", "-m", "seed"], { cwd: dir })
 				const { stdout } = await spawnGit(["rev-parse", "HEAD"], { cwd: dir })
 				return stdout.trim()
-			} finally {
-				rmSync(dir, { force: true, recursive: true })
-			}
-		}
+			})
 
 		const [oid1, oid2] = await Promise.all([commitOnce(), commitOnce()])
 		expect(oid1).toBe(oid2)
@@ -60,8 +56,7 @@ describe("spawnGit", () => {
 	})
 
 	it("captures raw stdout bytes faithfully (binary-safe)", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-spawn-bin-"))
-		try {
+		await withTempDir("pggit-spawn-bin-", async (dir) => {
 			const binary = Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x80, 0x0a, 0x7f])
 			const file = join(dir, "bin")
 			writeFileSync(file, binary)
@@ -71,8 +66,6 @@ describe("spawnGit", () => {
 			})
 			const res = await spawnGit(["cat-file", "blob", oid.trim()], { cwd: dir })
 			expect(res.stdoutBytes).toEqual(binary)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
+		})
 	})
 })

@@ -26,10 +26,9 @@ import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { ZERO_OID } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
-
-const ZERO = "0".repeat(40)
 
 describe("a13 — branch tip that is not a commit must not 500", () => {
 	let db: IsolatedDb
@@ -91,7 +90,9 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 				app,
 				repo,
 				receivePackRequest(
-					[`${ZERO} ${commitOid} refs/heads/main\0report-status object-format=sha1\n`],
+					[
+						`${ZERO_OID} ${commitOid} refs/heads/main\0report-status object-format=sha1\n`,
+					],
 					fullPack,
 				),
 			)
@@ -100,7 +101,7 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 				app,
 				repo,
 				receivePackRequest([
-					`${ZERO} ${tip()} refs/heads/bad-${name}\0report-status object-format=sha1\n`,
+					`${ZERO_OID} ${tip()} refs/heads/bad-${name}\0report-status object-format=sha1\n`,
 				]),
 			)
 			const report = res.body.toString("utf8")

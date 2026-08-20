@@ -39,31 +39,20 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { parseLsTree } from "@/testing/git-fixtures"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
+import { lsTreeSnapshot } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `pggit oracle <oracle@pggit.test> ${WHEN}`
 const DIRS = 3000
 const ATTEMPTS = 4
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-
-/** A revision's worktree as sorted `path\0mode\0oid` — the same shape `repo_file`
- * stores, so the projection and a real clone are directly comparable. */
-async function lsTree(dir: string, rev: string): Promise<string[]> {
-	const out = await spawnGit(["ls-tree", "-r", rev], { cwd: dir })
-	return parseLsTree(out.stdout)
-		.map((e) => `${e.path}\0${e.mode}\0${e.oid}`)
-		.sort()
-}
 
 /** c0 (a one-file seed), X (WIDE: `dirs` directories, so buildFileList costs
  * `dirs`+1 point reads), then Y (NARROW: drops the wide tree, so its rebuild is
@@ -80,7 +69,7 @@ function history(dirs: number): string {
 	const r0 = blob("readme v0\n")
 	const c0 = next()
 	out.push(
-		`commit refs/heads/main\nmark :${c0}\ncommitter ${COMMITTER}\ndata 2\nc0\nM 100644 :${r0} README.md\n`,
+		`commit refs/heads/main\nmark :${c0}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc0\nM 100644 :${r0} README.md\n`,
 	)
 	const adds: string[] = []
 	for (let i = 0; i < dirs; i++) {
@@ -89,12 +78,12 @@ function history(dirs: number): string {
 	}
 	const cx = next()
 	out.push(
-		`commit refs/heads/main\nmark :${cx}\ncommitter ${COMMITTER}\ndata 1\nX\nfrom :${c0}\n${adds.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${cx}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 1\nX\nfrom :${c0}\n${adds.join("\n")}\n`,
 	)
 	const r2 = blob("readme v2\n")
 	const cy = next()
 	out.push(
-		`commit refs/heads/main\nmark :${cy}\ncommitter ${COMMITTER}\ndata 1\nY\nfrom :${cx}\nD wide\nM 100644 :${r2} README.md\n`,
+		`commit refs/heads/main\nmark :${cy}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 1\nY\nfrom :${cx}\nD wide\nM 100644 :${r2} README.md\n`,
 	)
 	return out.join("")
 }
@@ -145,8 +134,8 @@ describe("breakage/pg-txn — repo_file must never describe a superseded tip", (
 		const y = await rev("main")
 		const x = await rev("main~1")
 		const c0 = await rev("main~2")
-		const treeX = await lsTree(src, x)
-		const treeY = await lsTree(src, y)
+		const treeX = await lsTreeSnapshot(src, x)
+		const treeY = await lsTreeSnapshot(src, y)
 
 		const tipOf = async (repo: string) => {
 			const [row] = await admin<{ oid: string | null }[]>`
@@ -213,7 +202,7 @@ describe("breakage/pg-txn — repo_file must never describe a superseded tip", (
 			const cl = await attemptGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
 			if (!cl.ok) throw new Error(`clone failed: ${cl.stderr}`)
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			const cloneTree = await lsTree(dest, "HEAD")
+			const cloneTree = await lsTreeSnapshot(dest, "HEAD")
 			const after = await projectionOf(reproduced.repo)
 			if (JSON.stringify(cloneTree) !== JSON.stringify(after)) {
 				convergenceGap = { clone: cloneTree.length, projection: after.length }

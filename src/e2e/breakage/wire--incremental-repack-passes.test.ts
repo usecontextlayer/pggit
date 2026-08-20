@@ -17,18 +17,18 @@
  *     LOSE to the whole form and the "delta only when it wins" branch dominates
  */
 import { createHash } from "node:crypto"
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
-import { parseVerifyPackObjects } from "@/testing/git-fixtures"
+import { PACK_DIR, packFiles, parseVerifyPackObjects } from "@/testing/git-fixtures"
 import {
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -50,11 +50,11 @@ type Checkpoint = {
 
 /** Max delta chain depth over every pack in a clone, plus the delta count. */
 async function depthOf(dir: string): Promise<{ maxDepth: number; deltas: number }> {
-	const p = join(dir, ".git", "objects", "pack")
 	let maxDepth = 0
 	let deltas = 0
-	for (const f of readdirSync(p).filter((x) => x.endsWith(".idx"))) {
-		const out = await spawnGit(["verify-pack", "-v", join(p, f)], { cwd: dir })
+	for (const file of packFiles(dir)) {
+		const index = join(dir, PACK_DIR, file.replace(/\.pack$/, ".idx"))
+		const out = await spawnGit(["verify-pack", "-v", index], { cwd: dir })
 		for (const object of parseVerifyPackObjects(out.stdout)) {
 			if (object.kind === "whole") continue
 			deltas++
@@ -77,12 +77,7 @@ async function inventory(dir: string): Promise<string> {
 describe("wire — depth ≤ 1 and exact object sets across every incremental pass", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk } = createScratchArena()
 
 	const appendOnly: Checkpoint[] = []
 	const churn: Checkpoint[] = []
@@ -175,7 +170,7 @@ describe("wire — depth ≤ 1 and exact object sets across every incremental pa
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	/** The three client-observable claims at one checkpoint of one scenario. */

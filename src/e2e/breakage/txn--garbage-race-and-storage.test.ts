@@ -4,7 +4,7 @@
  * S4: design D5 orders the drain GC-then-repack "so it encodes survivors, not
  * garbage". Repack's pending set is the whole inventory, NOT the reachable set —
  * so when the two overlap, repack is encoding rows for objects the sweep is
- * deleting underneath it. This drives that head-on: force-push FIRST (so the
+ * deleting underneath it. This drives that head-on: rewind FIRST (so the
  * garbage has no encoding rows yet), then run both at once. The race is
  * probabilistic, so it keeps the source probe's five trials rather than one.
  */
@@ -20,7 +20,7 @@ import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { withIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -30,7 +30,7 @@ import {
 
 const REPO = "r"
 const RUNS = 150
-/** Where main is force-pushed BEFORE any repack — ~110 commits of garbage that has
+/** Where main is rewound BEFORE any repack — ~110 commits of garbage that has
  * no encoding rows yet, so the pass and the sweep contend over the same objects. */
 const REWIND_TO = 40
 const TRIALS = [1, 2, 3, 4, 5]
@@ -63,23 +63,14 @@ describe("repack × GC over garbage — the race", () => {
 		const rewindTo = commits[REWIND_TO]
 		if (!rewindTo) throw new Error(`fixture too short: no commit #${REWIND_TO}`)
 
-		async function withSchema<T>(fn: (db: IsolatedDb) => Promise<T>): Promise<T> {
-			const db = await createIsolatedSchema(pgBaseUrl)
-			try {
-				return await fn(db)
-			} finally {
-				await db.drop()
-			}
-		}
-
 		for (const trial of TRIALS) {
-			const result = await withSchema(async (db) => {
+			const result = await withIsolatedSchema(pgBaseUrl, async (db) => {
 				let server: GitServer | undefined
 				try {
 					const objects = createObjectStore(db.sql)
 					const refs = createRefStore(db.sql)
 					await seedRepoIntoStore(REPO, src, { objects, refs })
-					// Force push BEFORE any repack: ~110 commits of garbage with no rows yet.
+					// Store rewind BEFORE any repack: ~110 commits of garbage with no rows yet.
 					await refs.setRef(REPO, "refs/heads/main", rewindTo)
 
 					const [a, b] = await Promise.allSettled([

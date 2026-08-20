@@ -3,31 +3,29 @@
  * differentially against a plain bare git remote.
  * (Converted from `breakage/wire--incremental-fetch-deltified.ts`.)
  *
- * The serve rule (design D8) emits a stored delta as REF_DELTA only when its base
- * is ALSO in the served set. On an incremental fetch the client's `have`s subtract
- * the base out of the served set, so every such delta MUST fall back to its whole
- * form. If that rule leaks — a delta emitted whose base the client was never sent —
- * git's index-pack cannot resolve it and the fetch dies.
+ * The serve rule (design D8') emits a stored delta when its base is in the served
+ * set or, for a thin pack, proven in the client's `have`s. Otherwise it falls back
+ * to the whole form. Incremental negotiation exercises both legal outcomes; a
+ * delta whose base is neither sent nor proven would leave index-pack unable to
+ * resolve it.
  *
  * Judged only at client-observable outcomes: fetch exit status, `fsck --strict`,
  * the exact object set, HEAD, and the object bytes — all diffed against the same
  * sequence run on a plain bare git remote.
  */
-import { createHash } from "node:crypto"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
+import { gitReachableOids, objectBytesDigest } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -55,8 +53,7 @@ type FetchRound = {
 
 /** Every reachable object's oid+type+size, as one comparable sorted blob. */
 async function objectInventory(dir: string): Promise<string> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [...new Set(parseRevListObjectOids(list.stdout))]
+	const oids = await gitReachableOids(dir)
 	const info = await spawnGit(["cat-file", "--batch-check"], {
 		cwd: dir,
 		input: `${oids.join("\n")}\n`,
@@ -66,24 +63,13 @@ async function objectInventory(dir: string): Promise<string> {
 
 /** A content fingerprint over every reachable object's raw bytes. */
 async function contentDigest(dir: string): Promise<string> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [...new Set(parseRevListObjectOids(list.stdout))].sort()
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	return createHash("sha256").update(res.stdoutBytes).digest("hex")
+	return objectBytesDigest(dir, await gitReachableOids(dir))
 }
 
 describe("wire — incremental fetch against the deltified serve path", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk, own: ownScratch } = createScratchArena()
 
 	let clonePggitInventory = ""
 	let cloneGitInventory = ""
@@ -91,7 +77,7 @@ describe("wire — incremental fetch against the deltified serve path", () => {
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS_1 })
-		scratch.push(src)
+		ownScratch(src)
 
 		// The oracle remote: a plain bare git repository served over file://.
 		const bare = join(mk("bare"), "oracle.git")
@@ -121,7 +107,7 @@ describe("wire — incremental fetch against the deltified serve path", () => {
 		// `grown` is the same deterministic fixture extended, so its first RUNS_1
 		// commits are byte-identical to `src`'s — a real fast-forward for both remotes.
 		const grown = await createAppendOnlyRepo({ docs: 6, runs: RUNS_1 + RUNS_2 })
-		scratch.push(grown)
+		ownScratch(grown)
 		await spawnGit(["push", "-q", pggitUrl, "--all"], { cwd: grown })
 		await spawnGit(["push", "-q", bareUrl, "--all"], { cwd: grown })
 		await createRepack(db.sql).repack(REPO)
@@ -175,7 +161,7 @@ describe("wire — incremental fetch against the deltified serve path", () => {
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("clones the same object inventory a plain git remote serves", () => {

@@ -25,6 +25,7 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("a10 — shallow clone (--depth=1) fails loudly, never a silent empty repo", () => {
 	let db: IsolatedDb
@@ -53,8 +54,7 @@ describe("a10 — shallow clone (--depth=1) fails loudly, never a silent empty r
 	})
 
 	it("rejects --depth=1 with a clear shallow error (no silent empty success)", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "a10-shallow-dest-"))
-		try {
+		await withTempDir("a10-shallow-dest-", async (dest) => {
 			const url = `http://127.0.0.1:${server.port}/repo`
 			const outcome = await attemptGit(["clone", "--depth=1", url, dest])
 
@@ -62,8 +62,6 @@ describe("a10 — shallow clone (--depth=1) fails loudly, never a silent empty r
 			expect(outcome.ok).toBe(false)
 			// And specifically because shallow is unsupported, not some unrelated error.
 			expect(outcome.stderr).toMatch(/shallow/i)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

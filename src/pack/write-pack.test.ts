@@ -1,17 +1,20 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import { computeOid } from "@/object/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
-import { parseVerifyPackObjectOids, requireGitObjectType } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	loadAllObjects,
+	parseVerifyPackObjectOids,
+} from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /** Index our pack with real git; return the OIDs git resolved from it (sorted). */
 async function oidsGitResolves(pack: Buffer): Promise<string[]> {
-	const dir = mkdtempSync(join(tmpdir(), "pggit-wp-"))
-	try {
+	return withTempDir("pggit-wp-", async (dir) => {
 		const packPath = join(dir, "test.pack")
 		writeFileSync(packPath, pack)
 		await spawnGit(["init", "-q"], { cwd: dir })
@@ -22,9 +25,7 @@ async function oidsGitResolves(pack: Buffer): Promise<string[]> {
 			cwd: dir,
 		})
 		return parseVerifyPackObjectOids(verify.stdout)
-	} finally {
-		rmSync(dir, { force: true, recursive: true })
-	}
+	})
 }
 
 describe("writePack", () => {
@@ -40,35 +41,18 @@ describe("writePack", () => {
 	})
 
 	it("writes a pack of all object types that git resolves identically", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-wp-src-"))
-		try {
+		await withTempDir("pggit-wp-src-", async (src) => {
 			await spawnGit(["init", "-q"], { cwd: src })
 			writeFileSync(join(src, "a.txt"), "hello\n")
 			await spawnGit(["add", "."], { cwd: src })
 			await spawnGit(["commit", "-q", "-m", "seed"], { cwd: src })
 			await spawnGit(["tag", "-a", "v1", "-m", "rel"], { cwd: src })
 
-			const list = await spawnGit(
-				["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-				{ cwd: src },
-			)
-			const objects: PackInputObject[] = []
-			const expected: string[] = []
-			for (const line of list.stdout.trim().split("\n")) {
-				const [oid, type] = line.split(" ")
-				if (!oid || !type) throw new Error(`bad batch line: ${line}`)
-				const raw = await spawnGit(["cat-file", type, oid], { cwd: src })
-				objects.push({
-					content: raw.stdoutBytes,
-					type: requireGitObjectType(type, `batch-check line ${JSON.stringify(line)}`),
-				})
-				expected.push(oid)
-			}
+			const objects = await loadAllObjects(src)
+			const expected = await allObjectOids(src)
 
 			expect(await oidsGitResolves(writePack(objects))).toEqual(expected.sort())
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 
 	it("round-trips arbitrary blob sets through real git (generative)", async () => {

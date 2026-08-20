@@ -2,10 +2,8 @@
  * PG NAMESPACE PROBE — two isolated schemas share ONE database. Does anything leak?
  *
  * `createIsolatedSchema` carves a schema per test/composition out of ONE postgres
- * database, and `repos.id` is a per-schema identity sequence, so the SAME surrogate
- * id (1, 2, 3…) exists in every schema simultaneously. Several things in this
- * codebase are named by that id, or by a bare relation name, and are resolved
- * through `search_path` rather than being schema-qualified in the SQL:
+ * database. Several operations use bare relation names resolved through
+ * `search_path` rather than schema-qualified SQL:
  *
  *   gc.ts        `create temp table gc_live`             (TEMP since D12; resolves
  *                via pg_temp ahead of the schema — session-private BY DESIGN, so
@@ -17,7 +15,7 @@
  *   copy-insert  `create temp table copy_stg_${target}`  (target-named)
  *
  * If any of those resolved database-globally instead of per-schema, two schemas
- * running the same repo NAME (hence the same repo id) would collide: B's `truncate`
+ * running the same repo name would collide: B's `truncate`
  * or `drop` could wipe A's live set mid-sweep and A's anti-join would then match —
  * and delete — its entire reachable set. That is the shape the GC docstring itself
  * warns about for two PROCESSES; this test asks the same question for two SCHEMAS.
@@ -38,7 +36,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	gitReachableOids,
+	listDifferences,
+	objectBytesDigest,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -47,7 +49,7 @@ import {
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-/** IDENTICAL on both sides — so both schemas mint the same `repos.id`. */
+/** Identical on both sides so only schema isolation distinguishes the stores. */
 const REPO = "workspace/probe/collide"
 const STEPS = 45
 const ROUNDS = [1, 2]
@@ -108,8 +110,7 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 
 	/** Every reachable object oid in a real repo working copy. */
 	async function repoOids(dir: string): Promise<Set<string>> {
-		const out = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-		return new Set(parseRevListObjectOids(out.stdout))
+		return new Set(await gitReachableOids(dir))
 	}
 
 	beforeAll(async () => {
@@ -118,7 +119,7 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 		sides = [alpha, beta]
 		console.log(`schemas: ${alpha.db.schema} / ${beta.db.schema} (same database)`)
 
-		// CONCURRENT push — both schemas mint repo id 1 at the same moment.
+		// CONCURRENT push of the same repo name through both schemas.
 		await Promise.all(
 			sides.map((s) =>
 				spawnGit(["push", "-q", s.url, "refs/heads/main:refs/heads/main"], {
@@ -126,26 +127,6 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 				}),
 			),
 		)
-		const ids = await Promise.all(
-			sides.map(
-				async (s) =>
-					(await s.db.sql<{ id: string }[]>`select id from repos where name = ${REPO}`)[0]
-						?.id,
-			),
-		)
-		console.log(
-			`repos.id per schema: ${ids.join(" / ")} (identical ⇒ gc_live_N collides by name)`,
-		)
-		// The premise, not an observation: `repos.id` is a per-schema identity
-		// sequence and each schema is freshly migrated, so both sides must mint the
-		// SAME id for the same repo name. If they ever diverge, every id-named
-		// object below (`gc_live_<id>`, `copy_stg_<target>`) lands in a distinct
-		// name per schema and the collision surface this file exists to probe is
-		// not exercised at all — while both rounds still pass.
-		expect(
-			ids[0],
-			"the id-collision surface requires both schemas to mint the same repos.id",
-		).toBe(ids[1])
 	}, 900_000)
 
 	afterAll(async () => {
@@ -157,8 +138,8 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 
 	for (const round of ROUNDS) {
 		it(`round ${round}: concurrent repack + gc + clone leaves each schema's history intact`, async () => {
-			// Interleaved as hard as possible: gc_live_<id> is created, truncated,
-			// loaded, swept and dropped by both sides at once, while both serve a
+			// Interleaved as hard as possible: `gc_live` is created, truncated, loaded,
+			// swept and dropped by both sides at once, while both serve a
 			// mirror clone.
 			const targets = sides.map((s) => ({
 				dest: join(mk(`clone-${s.tag}-${round}`), "c"),
@@ -196,12 +177,19 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 				if (tip !== side.tip) {
 					problems.push(`${side.tag}: clone tip ${tip} != source tip ${side.tip}`)
 				}
-				// Byte-compare EVERY object against the source.
-				for (const oid of await repoOids(dest)) {
-					const got = (await spawnGit(["cat-file", "-p", oid], { cwd: dest })).stdoutBytes
-					const want = (await spawnGit(["cat-file", "-p", oid], { cwd: side.src }))
-						.stdoutBytes
-					if (!got.equals(want)) problems.push(`${side.tag}: object ${oid} BYTES DIFFER`)
+				const cloneOids = [...(await repoOids(dest))].sort()
+				const sourceOids = [...(await repoOids(side.src))].sort()
+				const objectDiff = listDifferences(cloneOids, sourceOids)
+				if (objectDiff.onlyLeft.length > 0 || objectDiff.onlyRight.length > 0) {
+					problems.push(
+						`${side.tag}: clone object set differs from source ` +
+							`(clone-only ${objectDiff.onlyLeft.length}, source-only ${objectDiff.onlyRight.length})`,
+					)
+				} else if (
+					(await objectBytesDigest(dest, cloneOids)) !==
+					(await objectBytesDigest(side.src, sourceOids))
+				) {
+					problems.push(`${side.tag}: clone object bytes differ from source`)
 				}
 			}
 

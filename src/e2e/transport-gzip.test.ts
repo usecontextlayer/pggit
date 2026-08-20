@@ -29,6 +29,7 @@ import { createRefStore } from "@/store/refs-store"
 import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 // A minimal, valid v2 `ls-refs` request (command + delim + flush, no args → list
 // every ref). Built from our own pkt-line encoders so the gzip cases test the
@@ -100,8 +101,7 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 	// request. The original bug (server fed the gzip body to the pkt-line parser)
 	// surfaced here as HTTP 500 "expected 'packfile'".
 	it("real git clones a many-ref repo (gzipped fetch request) cleanly", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-gzip-dest-"))
-		try {
+		await withTempDir("pggit-gzip-dest-", async (dest) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -112,9 +112,7 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 			])
 			await spawnGit(["fsck", "--full"], { cwd: dest })
 			expect(await allObjectOids(dest)).toEqual(await allObjectOids(src))
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 
 	// Deterministic: a manually gzip-compressed request body must be decoded and

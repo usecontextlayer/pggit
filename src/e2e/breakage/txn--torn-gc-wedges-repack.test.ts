@@ -151,7 +151,7 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 		const keptAnchor = keptRow.base
 		if (keptAnchor === null) throw new Error("fixture wrong: kept tree is not a delta")
 
-		// ── The force push: main rewinds far below the anchor, `keep` survives.
+		// ── The store rewind: main moves far below the anchor, `keep` survives.
 		await refs.setRef(REPO, "refs/heads/main", rewindTo)
 
 		// ── The crash: real GC, killed the instant it reaches post-sweep cleanup.

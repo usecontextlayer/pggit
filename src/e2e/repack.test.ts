@@ -17,9 +17,10 @@ import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
-import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
+import { allObjectOids, PACK_DIR, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("M3 — at-rest repack invariant", () => {
 	let db: IsolatedDb
@@ -56,8 +57,7 @@ describe("M3 — at-rest repack invariant", () => {
 
 	/** Clone the server fresh and return its sorted object set, fsck-verified. */
 	async function cloneBackObjects(): Promise<string[]> {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-repack-back-"))
-		try {
+		return withTempDir("pggit-repack-back-", async (dest) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -68,9 +68,7 @@ describe("M3 — at-rest repack invariant", () => {
 			])
 			await spawnGit(["fsck", "--full"], { cwd: dest })
 			return await allObjectOids(dest)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	}
 
 	// A regression FLOOR for the at-rest contract: consolidating a repo's history
@@ -84,7 +82,7 @@ describe("M3 — at-rest repack invariant", () => {
 		// Consolidate the source into a single pack (what a repack worker would ship)
 		// and re-ingest it. The served set + refs must not move.
 		await spawnGit(["repack", "-adq"], { cwd: src })
-		const packDir = join(src, ".git/objects/pack")
+		const packDir = join(src, PACK_DIR)
 		const packName = readdirSync(packDir).find((f) => f.endsWith(".pack"))
 		if (!packName) throw new Error("no pack produced by repack")
 		await objects.ingestPack("repo", readFileSync(join(packDir, packName)))

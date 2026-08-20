@@ -28,6 +28,7 @@ import type { ObjectStore } from "@/store/object-store"
 import { allObjectOids, loadAllObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 const REPO = "oracle"
 
@@ -175,8 +176,7 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 		want: string,
 		have: string | null,
 	): Promise<Set<string>> {
-		const client = mkdtempSync(join(tmpdir(), "pggit-oracle-client-"))
-		try {
+		return withTempDir("pggit-oracle-client-", async (client) => {
 			await spawnGit(["init", "-q", client])
 			if (have !== null) {
 				await spawnGit(
@@ -190,9 +190,7 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 			})
 			const after = await allObjectOids(client)
 			return new Set(after.filter((o) => !before.has(o)))
-		} finally {
-			rmSync(client, { force: true, recursive: true })
-		}
+		})
 	}
 
 	/** Assert pggit's fetch transfers exactly the set canonical git's does. */

@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
@@ -11,11 +10,12 @@ import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { loadAllObjects, parseLsTree } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /**
- * Spine S3's differential gate: over ANY sequence of pushes, the diff-driven
- * projection is row-for-row identical to a from-scratch rebuild of the same tip
- * — `repo_file` under `applyRefAdvance` ≡ `buildFileList(tip)` — and
+ * The repo-file projection's differential gate: over ANY sequence of pushes, the
+ * diff-driven projection is row-for-row identical to a from-scratch rebuild of
+ * the same tip — `repo_file` under `applyRefAdvance` ≡ `buildFileList(tip)` — and
  * `repo_file_head` always names the tip it reflects. The mutation pool
  * deliberately covers the diff's edge classes: nested adds/removes, content
  * changes, mode flips, and file↔directory swaps at one path.
@@ -49,7 +49,7 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
 	fc.constant({ kind: "swap" as const, path: "swapper" }),
 )
 
-describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () => {
+describe("repo_file incremental ≡ full rebuild", () => {
 	let db: IsolatedDb
 	let objects: ObjectStore
 
@@ -170,8 +170,7 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 				}),
 				async (pushes) => {
 					const repo = `diff/${run++}`
-					const dir = mkdtempSync(join(tmpdir(), "pggit-projdiff-"))
-					try {
+					await withTempDir("pggit-projdiff-", async (dir) => {
 						await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 						writeFileSync(join(dir, "seed.txt"), "seed\n")
 						await spawnGit(["add", "-A"], { cwd: dir })
@@ -210,9 +209,7 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 							expect(rows).toEqual(full)
 							expect(await projectedHead(repo)).toBe(tip)
 						}
-					} finally {
-						rmSync(dir, { force: true, recursive: true })
-					}
+					})
 				},
 			),
 			// Pinned seed (424_242) for a deterministic gate, matching the sibling
@@ -224,8 +221,7 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 
 	it("an older oid arriving late is SKIPPED — the projection never moves backwards", async () => {
 		const repo = "diff/monotonic"
-		const dir = mkdtempSync(join(tmpdir(), "pggit-projmono-"))
-		try {
+		await withTempDir("pggit-projmono-", async (dir) => {
 			await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 			writeFileSync(join(dir, "f.txt"), "one\n")
 			await spawnGit(["add", "-A"], { cwd: dir })
@@ -255,8 +251,6 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 			expect(outcome).toBe("skipped")
 			expect(await projectedRows(repo)).toEqual(rowsAtNewer)
 			expect(await projectedHead(repo)).toBe(newer)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
+		})
 	})
 })

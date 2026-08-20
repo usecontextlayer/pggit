@@ -29,6 +29,7 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("HEAD symref on first push to an auto-created repo", () => {
 	let isolated: IsolatedDb
@@ -71,8 +72,7 @@ describe("HEAD symref on first push to an auto-created repo", () => {
 
 	it("a clone checks the branch out and resolves HEAD to the pushed tip", async () => {
 		// A normal clone, WITH checkout — exactly what a user runs.
-		const dest = mkdtempSync(join(tmpdir(), "head-symref-dest-"))
-		try {
+		await withTempDir("head-symref-dest-", async (dest) => {
 			await spawnGit(["clone", "-c", "protocol.version=2", "--quiet", url, dest])
 
 			// The working tree is populated with the pushed content.
@@ -88,8 +88,6 @@ describe("HEAD symref on first push to an auto-created repo", () => {
 				await spawnGit(["rev-parse", "HEAD"], { cwd: dest })
 			).stdout.trim()
 			expect(destHead).toBe(srcHead)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

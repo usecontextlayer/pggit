@@ -2,9 +2,9 @@
  * The in-band refusal path has a hard size ceiling, and the GC-vs-serve race is
  * what walks into it.
  *
- * When `buildPack`'s want-closure comes back with missing objects it raises
- * `WantNotFoundError([...want.missing])` — EVERY missing oid, not just the
- * wants. `handleFetch` turns that into `encodeErr(err.message)` =
+ * When `routeServeSet` reports missing objects, `buildPack` raises
+ * `WantNotFoundError([...missingWants, ...rest])` — EVERY missing oid, not just
+ * the wants. `handleFetch` turns that into `encodeErr(err.message)` =
  * `encodePktLine("ERR upload-pack: not our ref <oid> <oid> ...")`, and
  * `encodePktLine` THROWS above WRITER_MAX_PAYLOAD (65515 bytes). The throw
  * happens inside handleFetch's own catch block, so it escapes to the app's
@@ -32,6 +32,7 @@ import { randomBytes } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -39,7 +40,7 @@ import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
-import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { loadReachableObjects } from "@/testing/git-fixtures"
 import {
 	repoUrl,
@@ -55,7 +56,6 @@ const REWIND = 1100
 /** N missing objects per part-1 probe, swept across the ~1,597-oid ceiling. */
 const MISSING_SWEEP = [10, 500, 1500, 1590, 1600, 1700, 4000]
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 function classify(err: unknown): "PROTO" | "HTTP500" | "OTHER" | "OK" {
@@ -95,11 +95,7 @@ describe("race — the in-band refusal path's pkt-line size ceiling", () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		scratch.push(src)
 		objects = await loadReachableObjects(src, ["--all"])
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		const commits = await commitsOldestFirst(src, "HEAD")
 		tip = commits[commits.length - 1] as string
 		rewindTo = commits[commits.length - 1 - REWIND] as string
 

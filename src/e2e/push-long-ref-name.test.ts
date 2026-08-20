@@ -22,7 +22,6 @@
  * status. Fixed by the boundary cap, which is why the over-long fixtures here stay
  * incompressible: that is the shape that used to reach the btree.
  */
-import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -32,11 +31,11 @@ import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { deterministicFiller } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { ZERO_OID } from "@/testing/pkt-oracle"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
-
-const ZERO = "0".repeat(40)
 
 /**
  * nam01 — the ref-name cap in both directions, and the state a rejection leaves.
@@ -48,23 +47,6 @@ const ZERO = "0".repeat(40)
  * rejected push leaves ZERO objects, because the boundary check runs before ingest.
  */
 describe("nam01 — the storable ref-name cap, pinned in both directions", () => {
-	/**
-	 * Deterministic incompressible hex string of exactly `len` chars: a SHA-256 chain
-	 * seeded by a fixed string, hex-concatenated and truncated. High-entropy hex does
-	 * not compress under pglz, so a name built from it is genuinely unstorable in the
-	 * btree PK past ~2704 bytes — the storage pressure the boundary cap keeps off the
-	 * store, and the reason a compressible name of the same length proves nothing.
-	 */
-	function incompressibleName(len: number): string {
-		let seed = Buffer.from("pggit-nam01")
-		let out = ""
-		while (out.length < len) {
-			seed = createHash("sha256").update(seed).digest()
-			out += seed.toString("hex")
-		}
-		return out.slice(0, len)
-	}
-
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let src: string
@@ -73,11 +55,11 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 	// receive-pack's own MAX_REF_NAME_BYTES: the boundary rejects anything longer,
 	// in-band, rather than letting the btree PK raise an opaque storage error.
 	const MAX_REF_NAME_BYTES = 2000
-	const refAtCap = `refs/heads/${incompressibleName(MAX_REF_NAME_BYTES - "refs/heads/".length)}`
-	const refOverCap = `refs/heads/${incompressibleName(MAX_REF_NAME_BYTES + 1 - "refs/heads/".length)}`
+	const refAtCap = `refs/heads/${deterministicFiller("long-ref", MAX_REF_NAME_BYTES - "refs/heads/".length)}`
+	const refOverCap = `refs/heads/${deterministicFiller("long-ref", MAX_REF_NAME_BYTES + 1 - "refs/heads/".length)}`
 	// 2832 chars also overflows the btree's 2704-byte index-entry cap (the observed
 	// `index row size 2832 exceeds ... 2704`) — the original reproduction.
-	const longRef = `refs/heads/${incompressibleName(2832 - "refs/heads/".length)}`
+	const longRef = `refs/heads/${deterministicFiller("long-ref", 2832 - "refs/heads/".length)}`
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
@@ -120,7 +102,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 			app,
 			repo,
 			receivePackRequest(
-				[`${ZERO} ${commitOid} ${refAtCap}\0report-status object-format=sha1\n`],
+				[`${ZERO_OID} ${commitOid} ${refAtCap}\0report-status object-format=sha1\n`],
 				pack,
 			),
 		)
@@ -135,7 +117,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 			app,
 			repo,
 			receivePackRequest(
-				[`${ZERO} ${commitOid} ${refOverCap}\0report-status object-format=sha1\n`],
+				[`${ZERO_OID} ${commitOid} ${refOverCap}\0report-status object-format=sha1\n`],
 				pack,
 			),
 		)
@@ -153,7 +135,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 			app,
 			repo,
 			receivePackRequest(
-				[`${ZERO} ${commitOid} ${longRef}\0report-status object-format=sha1\n`],
+				[`${ZERO_OID} ${commitOid} ${longRef}\0report-status object-format=sha1\n`],
 				pack,
 			),
 		)
@@ -210,30 +192,12 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
  * per-ref `ng`.
  */
 describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diverge", () => {
-	/**
-	 * A deterministic, INCOMPRESSIBLE ref-name tail of `len` lowercase-hex chars.
-	 * Chained SHA-256 hex is high-entropy, so Postgres' btree TOAST compression
-	 * cannot shrink it below the 2704-byte index-entry ceiling — the pressure that
-	 * used to reach the storage layer, and the reason a repeated/compressible name of
-	 * the same length is not the same fixture. No Math.random / Date.now: the bytes
-	 * are a pure function of the fixed seed.
-	 */
-	function incompressibleHex(len: number): string {
-		let out = ""
-		let seed = "pggit-nam02-seed"
-		while (out.length < len) {
-			seed = createHash("sha256").update(seed).digest("hex")
-			out += seed
-		}
-		return out.slice(0, len)
-	}
-
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
 	let url: string
 	// 2800 incompressible chars > the ~2704-byte btree index-entry ceiling.
-	const longRef = `refs/heads/${incompressibleHex(2800)}`
+	const longRef = `refs/heads/${deterministicFiller("long-ref", 2800)}`
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))

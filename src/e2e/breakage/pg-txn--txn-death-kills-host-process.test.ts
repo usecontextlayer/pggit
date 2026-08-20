@@ -19,7 +19,7 @@
  * handler, which pggit does not install.
  *
  * THIS IS EVERY WRITE PATH IN pggit. `pg.begin` is how `object-store.insertObjects`
- * (the object⟺edges invariant), `gc.loadLive`, `repack.flush`, and
+ * (the object⟺derived-rows invariant), `gc.loadLive`, `repack.flush`, and
  * `repo-file-projection.applyRefAdvance` all commit. The controls below show
  * the scope precisely:
  *
@@ -51,9 +51,9 @@
  * `perf/breakage/` (outside `tsconfig.json`'s `include`, so a stray copy can never
  * break `tsc`) and removed in `afterAll`.
  *
- * The source script exits non-zero when a child dies; the assertions below encode
- * the CORRECT contract (a killed backend is a failed request, never a dead host),
- * so the two `pg.begin` modes are red today and the two controls are green.
+ * The source script exited non-zero when a child died. The patched driver's live
+ * contract is that a killed backend fails the request, never the host, so all four
+ * modes below must remain green.
  */
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
@@ -85,6 +85,7 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".."
  */
 const CHILD_SOURCE = `/** Emitted at runtime by src/e2e/breakage/pg-txn--txn-death-kills-host-process.test.ts. */
 import { readFileSync } from "node:fs"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres from "postgres"
 import { z } from "zod"
 import { createObjectStore } from "@/store/object-store"
@@ -109,7 +110,6 @@ const mode = env.BK_MODE
 const packPath = env.BK_PACK
 const repo = env.BK_REPO
 const needle = FAULT_POINTS[mode]
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const sql = postgres(PG, { connection: { search_path: schema }, max: 1, onnotice: () => {} })
 const [p] = await sql\`select pg_backend_pid() as pid\`

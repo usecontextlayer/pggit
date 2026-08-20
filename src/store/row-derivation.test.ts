@@ -8,7 +8,7 @@ import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-// Spine chunk 1 at the store seam: seeding a REAL git repo yields exactly one
+// At the store seam, seeding a REAL git repo yields exactly one
 // `git_commit`/`git_tag` row per commit/tag object — values cross-checked against
 // real git's own readings of the same repo — and NOTHING else gets a row (trees
 // and blobs are content, not graph rows). The e2e derivation suite

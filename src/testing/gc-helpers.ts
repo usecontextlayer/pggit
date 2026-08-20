@@ -1,15 +1,11 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { ZERO_OID } from "@/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
-import {
-	allObjectOids,
-	parseRevListObjectOids,
-	requireGitOid,
-} from "@/testing/git-fixtures"
+import { allObjectOids, gitReachableOids } from "@/testing/git-fixtures"
 import {
 	repoUrl as gitServerRepoUrl,
 	setupGitServerFixture,
@@ -17,6 +13,7 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /**
  * Shared scaffolding for the GC behavioural suite
@@ -71,20 +68,6 @@ export async function teardownGcFixture(fx: GcFixture): Promise<void> {
  * first push). */
 export function repoUrl(fx: Pick<GcFixture, "server">, repo: string): string {
 	return gitServerRepoUrl(fx.server, repo)
-}
-
-/** Run `fn` inside a fresh `mkdtemp` dir, always removing it afterwards. The
- * canonical "temp git workdir" wrapper so callers never leak dirs on a throw. */
-export async function withTempDir<T>(
-	prefix: string,
-	fn: (dir: string) => Promise<T>,
-): Promise<T> {
-	const dir = mkdtempSync(join(tmpdir(), prefix))
-	try {
-		return await fn(dir)
-	} finally {
-		rmSync(dir, { force: true, recursive: true })
-	}
 }
 
 /** The file one push writes — the options `pushFile` and `pushDenied` share. */
@@ -156,7 +139,7 @@ export async function pushFile(
 						oldOid: current.oid,
 						ref: "refs/heads/main",
 					},
-					{ newOid: ZERO_OID_HEX, oldOid: head, ref: tmpRef },
+					{ newOid: ZERO_OID, oldOid: head, ref: tmpRef },
 				],
 				false,
 			)
@@ -170,9 +153,6 @@ export async function pushFile(
 		return { head, reachable }
 	})
 }
-
-/** The all-zeros sha1 oid: `create` as an old value, `delete` as a new value. */
-const ZERO_OID_HEX = "0".repeat(40)
 
 /**
  * The deny-non-FF-era orphan generator (replaces the retired force-commit
@@ -241,44 +221,20 @@ export async function cloneAndFsck(
 	})
 }
 
-/**
- * The real-git reachable object closure of an on-disk repo — every commit, tree,
- * blob, AND annotated-tag object reachable from any ref. `rev-list --objects
- * --all` yields commits/trees/blobs reachable from refs; `--all` includes tag
- * refs but lists their PEELED target, so the annotated-tag objects themselves are
- * added separately via `--all --objects` over `for-each-ref`'s tag oids. This is
- * the independent expected-survivors oracle for GC-7/PBT-1 (compare to the
- * surviving `git_object` rows under `graceSeconds: 0`).
- */
-export async function gitReachableOids(dir: string): Promise<string[]> {
-	const revList = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = new Set(parseRevListObjectOids(revList.stdout))
-	// Annotated-tag OBJECTS: `rev-list --objects --all` lists a tag ref's peeled
-	// target, not the tag object, so add every ref oid that is itself a tag object.
-	const refLines = await spawnGit(
-		["for-each-ref", "--format=%(objecttype) %(objectname)"],
-		{ cwd: dir },
-	)
-	for (const line of refLines.stdout.trim().split("\n").filter(Boolean)) {
-		const fields = line.split(" ")
-		if (fields.length !== 2) {
-			throw new Error(`unexpected for-each-ref line: ${line}`)
-		}
-		const [type, oid] = fields as [string, string]
-		const parsedOid = requireGitOid(oid, `for-each-ref line ${JSON.stringify(line)}`)
-		switch (type) {
-			case "tag":
-				oids.add(parsedOid)
-				break
-			case "blob":
-			case "commit":
-			case "tree":
-				break
-			default:
-				throw new Error(`unexpected for-each-ref object type: ${line}`)
-		}
-	}
-	return [...oids].sort()
+/** Canonical git's reachable OIDs after fetching the served `main` ref. */
+export async function servedMainReachableOids(
+	fx: Pick<GcFixture, "server">,
+	repo: string,
+): Promise<string[]> {
+	return withTempDir("pggit-reachable-main-", async (dir) => {
+		await spawnGit(["init", "-q"], { cwd: dir })
+		await spawnGit(
+			["-c", "protocol.version=2", "fetch", repoUrl(fx, repo), "refs/heads/main"],
+			{ cwd: dir },
+		)
+		await spawnGit(["update-ref", "refs/heads/main", "FETCH_HEAD"], { cwd: dir })
+		return gitReachableOids(dir)
+	})
 }
 
 /** Every `git_object` OID (hex) stored for `repo`, sorted — the Postgres survivor
@@ -364,8 +320,8 @@ export async function countDerivedRows(
 
 /** Commit/tag OBJECTS with no derived row, plus derived rows whose object is
  * gone — both directions of the object⟺derived-rows invariant in one probe.
- * MUST come back empty after any pass: the first direction is chunk 1's "every
- * stored commit has its row", the second is the 0009 FK cascade doing GC's
+ * MUST come back empty after any pass: the first direction is "every stored
+ * commit has its derived row", the second is the 0009 FK cascade doing GC's
  * bookkeeping. (The stray direction is DDL-guaranteed; asserting it pins the
  * cascade wiring against a future migration regression.) */
 export async function derivedRowViolations(

@@ -15,8 +15,8 @@ describe("object store", () => {
 			const objects: PackInputObject[] = [
 				{ content: Buffer.from("hello\n"), type: "blob" },
 				{ content: Buffer.from([0, 1, 2, 255, 254]), type: "blob" },
-				// A well-formed commit: putPack now derives + validates edges, so a
-				// non-blob's content must parse (not be opaque bytes).
+				// A well-formed commit: putPack derives commit metadata and validates
+				// object structure, so a non-blob's content must parse (not be opaque bytes).
 				{
 					content: Buffer.from(
 						`tree ${"0".repeat(40)}\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\nbody\n`,

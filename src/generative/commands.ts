@@ -33,6 +33,7 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import fc from "fast-check"
 import { assertNever } from "@/assert-never"
+import { cyclicAt } from "@/testing/git-fixtures"
 import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 // Bounded pools: reuse drives edits/overwrites + nested trees, and keeps the
@@ -174,13 +175,6 @@ function writeContent(dir: string, path: string, content: ContentSpec): void {
 	writeFileSync(full, data)
 }
 
-/** Wraparound index into a non-empty array (narrows the `noUncheckedIndexedAccess` undefined). */
-function pick<T>(arr: readonly T[], idx: number): T {
-	const value = arr[idx % arr.length]
-	if (value === undefined) throw new Error("pick: empty array")
-	return value
-}
-
 /** The offset into NAMES of the first name at-or-after `from` that is not yet a
  * branch — the sibling `divergeAndMerge` can create at the current tip, so the
  * merge base is that tip. */
@@ -188,7 +182,7 @@ type FreeName = { kind: "available"; index: number } | { kind: "exhausted" }
 
 function freeName(model: RepoModel, from: number): FreeName {
 	for (let i = 0; i < NAMES.length; i++) {
-		if (!model.existingBranches.has(pick(NAMES, from + i))) {
+		if (!model.existingBranches.has(cyclicAt(NAMES, from + i))) {
 			return { index: from + i, kind: "available" }
 		}
 	}
@@ -204,7 +198,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			return
 		}
 		case "deleteFile": {
-			const full = join(model.dir, pick(PATHS, cmd.idx))
+			const full = join(model.dir, cyclicAt(PATHS, cmd.idx))
 			if (existsSync(full)) {
 				rmSync(full)
 				model.dirty = true
@@ -236,7 +230,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			return
 		}
 		case "branch": {
-			const name = pick(NAMES, cmd.idx)
+			const name = cyclicAt(NAMES, cmd.idx)
 			if (model.commitCount === 0 || model.existingBranches.has(name)) return
 			// `HEAD` is an EXPLICIT start-point, not a redundant default. Branches and
 			// tags draw from the same NAMES pool, so `x` can be both — and a bare
@@ -254,7 +248,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 		case "checkout": {
 			if (model.dirty || model.existingBranches.size === 0) return
 			const branches = [...model.existingBranches]
-			const target = pick(branches, cmd.idx)
+			const target = cyclicAt(branches, cmd.idx)
 			await spawnGit(["checkout", "-q", target], { cwd: model.dir })
 			model.currentBranch = target
 			return
@@ -263,7 +257,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			if (model.dirty || model.commitCount === 0) return
 			const others = [...model.existingBranches].filter((b) => b !== model.currentBranch)
 			if (others.length === 0) return
-			const target = pick(others, cmd.idx)
+			const target = cyclicAt(others, cmd.idx)
 			const before = (
 				await spawnGit(["rev-parse", "HEAD"], { cwd: model.dir })
 			).stdout.trim()
@@ -295,7 +289,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			return
 		}
 		case "tag": {
-			const name = pick(NAMES, cmd.idx)
+			const name = cyclicAt(NAMES, cmd.idx)
 			if (model.commitCount === 0 || model.tags.has(name)) return
 			const args = cmd.annotated
 				? ["tag", "-a", "-m", `tag ${name}`, name]
@@ -317,8 +311,8 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 		// diverge and can never conflict — the merge is a real multi-parent commit,
 		// not a fast-forward and not an abort.
 		case "divergeAndMerge": {
-			const sidePath = pick(PATHS, cmd.pathIdx)
-			const ourPath = pick(PATHS, cmd.pathIdx + 1)
+			const sidePath = cyclicAt(PATHS, cmd.pathIdx)
+			const ourPath = cyclicAt(PATHS, cmd.pathIdx + 1)
 			// Something to branch FROM. `commit` is a no-op on a clean tree, so this
 			// only lands one when the macro starts on an empty or dirty repo.
 			if (model.commitCount === 0) {
@@ -339,7 +333,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 				if (taken === undefined) throw new Error("divergeAndMerge: no sibling exists")
 				sibling = taken
 			} else {
-				sibling = pick(NAMES, free.index)
+				sibling = cyclicAt(NAMES, free.index)
 				await step(model, { idx: free.index, kind: "branch" })
 			}
 			const branchIdx = (name: string) => [...model.existingBranches].indexOf(name)

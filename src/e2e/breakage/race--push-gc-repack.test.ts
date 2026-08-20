@@ -37,6 +37,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -44,7 +45,7 @@ import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
-import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { loadReachableObjects } from "@/testing/git-fixtures"
 import {
 	repoUrl,
@@ -58,7 +59,6 @@ const ITERS = 40
 const RUNS = 120
 const REWIND = 40
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const msg = (e: unknown) =>
 	(e instanceof Error ? e.message : String(e)).split("\n")[0] ?? ""
 
@@ -80,11 +80,7 @@ describe("race — a wire push, a gc(), a repack() and a clone all in flight", (
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		scratch.push(src)
 		objects = await loadReachableObjects(src, ["--all"])
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		const commits = await commitsOldestFirst(src, "HEAD")
 		tip = commits[commits.length - 1] as string
 		rewindTo = commits[commits.length - 1 - REWIND] as string
 

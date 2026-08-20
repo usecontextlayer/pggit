@@ -25,6 +25,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps, type GitDeps } from "@/index"
 import type { PackInputObject } from "@/pack/write-pack"
@@ -39,7 +40,6 @@ const ITERS = 20
 const RUNS = 120
 const MODES = ["clone", "repack", "push"] as const
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const msg = (e: unknown) =>
 	(e instanceof Error ? e.message : String(e)).split("\n")[0] ?? ""
 

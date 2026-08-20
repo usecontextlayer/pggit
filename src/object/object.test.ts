@@ -1,11 +1,11 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { commitTreeOid, computeOid, treeEntries } from "@/object/object"
 import { expectGitFormatError } from "@/testing/format-error"
-import { requireGitObjectType } from "@/testing/git-fixtures"
+import { objectsByType } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /** A well-formed tree entry: `<mode> <name>\0<20-byte oid>`. */
 function treeEntry(mode: string, name: string, oidByte: number): Buffer {
@@ -16,8 +16,7 @@ describe("computeOid", () => {
 	// The single-blob case is subsumed by this all-types differential (it runs the
 	// same git-oracle comparison over blob+tree+commit+tag in a real repo).
 	it("matches git for every object type in a real repo (blob, tree, commit, tag)", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-oid-all-"))
-		try {
+		await withTempDir("pggit-oid-all-", async (dir) => {
 			await spawnGit(["init", "-q"], { cwd: dir })
 			writeFileSync(join(dir, "a.txt"), "hello\n")
 			writeFileSync(join(dir, "b.txt"), "world\n")
@@ -25,27 +24,14 @@ describe("computeOid", () => {
 			await spawnGit(["commit", "-q", "-m", "seed"], { cwd: dir })
 			await spawnGit(["tag", "-a", "v1", "-m", "release"], { cwd: dir })
 
-			const list = await spawnGit(
-				["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-				{ cwd: dir },
-			)
 			const typesSeen = new Set<string>()
-			for (const line of list.stdout.trim().split("\n")) {
-				const [oid, type] = line.split(" ")
-				if (!oid || !type) throw new Error(`unexpected batch-check line: ${line}`)
+			for (const { oid, type } of await objectsByType(dir)) {
 				const raw = await spawnGit(["cat-file", type, oid], { cwd: dir })
-				expect(
-					computeOid(
-						requireGitObjectType(type, `batch-check line ${JSON.stringify(line)}`),
-						raw.stdoutBytes,
-					),
-				).toBe(oid)
+				expect(computeOid(type, raw.stdoutBytes)).toBe(oid)
 				typesSeen.add(type)
 			}
 			expect(typesSeen).toEqual(new Set(["blob", "tree", "commit", "tag"]))
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
+		})
 	})
 })
 

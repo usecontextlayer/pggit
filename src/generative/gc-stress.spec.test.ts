@@ -15,8 +15,8 @@
  *          with a commit and a file of its OWN, so the reachable closure genuinely
  *          spans many tips and the live-set materialization is wide.
  *   ORPHANS — many INDEPENDENT deep/wide histories are seeded into Postgres WITHOUT
- *          a ref (and, for the force-commit half, prior force-committed snapshots),
- *          so GC has a large genuinely-unreachable set to reclaim in MANY batches.
+ *          a ref, so GC has a large genuinely-unreachable set to reclaim in MANY
+ *          batches.
  *
  * The §4 contract asserted here (observable-only, `graceSeconds: 0`):
  *
@@ -44,12 +44,10 @@
  * PERFORMANCE: each candidate is a full PG round-trip seeding tens of thousands of
  * rows, so the run counts are deliberately TINY (`NUM_RUNS`) and the seed is pinned
  * (424_242) for determinism, matching the sibling specs. The deep/wide builder uses
- * `git fast-import` (one process per history) + a bespoke `cat-file --batch` loader
- * (one process for ALL object contents) — empirically ~0.5s to build+load a
- * 90-commit/120-file history vs ~128s for `loadAllObjects`' per-object `cat-file`
- * spawn loop, which is why the bespoke loader exists. Both run through `spawnGit`,
- * so they inherit the pinned identity/clock and the GIT_* env scrub like every other
- * oracle call — the batching is the only difference. Each property logs the REALIZED
+ * `git fast-import` (one process per history) + the shared `loadAllObjects` batch
+ * loader (one process for ALL object contents) — empirically ~0.5s to build+load a
+ * 90-commit/120-file history. Both run through `spawnGit`, so they inherit the pinned
+ * identity/clock and the GIT_* env scrub like every other oracle call. Each property logs the REALIZED
  * scale (chain depth, files, nesting, refs, orphan-set size) after `fc.assert` so the
  * deep/wide reach is VISIBLE.
  *
@@ -63,26 +61,20 @@ import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import {
 	ageObjects,
 	countDerivedRows,
 	countObjects,
 	type GcFixture,
-	gitReachableOids,
 	objectOids,
 	repoUrl,
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
-import { loadAllObjects } from "@/testing/git-fixtures"
-import { PINNED_DATE, PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
-
-// fast-import's committer line wants `<unix-seconds> <tz>`, NOT git's `@<seconds>`
-// env form, but the OID-pinning identity must be byte-identical to PINNED_DATE so a
-// rebuilt repo (STRESS-3) yields the same OIDs. PINNED_DATE is `@1700000000 +0000`;
-// strip the leading `@` for the fast-import `committer` line.
-const FI_WHEN = PINNED_DATE.replace(/^@/, "")
-const FI_COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${FI_WHEN}`
+import { gitReachableOids, loadAllObjects } from "@/testing/git-fixtures"
+import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /**
  * The shape of ONE deep/wide history. `chainDepth` commits, each snapshot holding
@@ -124,7 +116,11 @@ function nestedPath(fileIdx: number, nesting: number, salt: number): string {
 function fastImportStream(spec: HistorySpec): string {
 	const out: string[] = ["reset refs/heads/main"]
 	for (let c = 0; c < spec.chainDepth; c++) {
-		out.push(`commit refs/heads/main`, `mark :${c + 1}`, `committer ${FI_COMMITTER}`)
+		out.push(
+			`commit refs/heads/main`,
+			`mark :${c + 1}`,
+			`committer ${FAST_IMPORT_COMMITTER}`,
+		)
 		const msg = `commit ${c} salt ${spec.salt}`
 		out.push(`data ${Buffer.byteLength(msg)}`, msg)
 		if (c > 0) out.push(`from :${c}`)
@@ -147,7 +143,7 @@ function fastImportStream(spec: HistorySpec): string {
 	// live-set materialization would go unexercised while the header advertised it.
 	const branches = spec.branches ?? []
 	for (const [i, branch] of branches.entries()) {
-		out.push(`commit refs/heads/${branch}`, `committer ${FI_COMMITTER}`)
+		out.push(`commit refs/heads/${branch}`, `committer ${FAST_IMPORT_COMMITTER}`)
 		const msg = `branch ${branch} salt ${spec.salt}`
 		out.push(`data ${Buffer.byteLength(msg)}`, msg)
 		// Fork point: mark `chainDepth - (i+1)` is commit index `chainDepth-i-2`, so
@@ -171,15 +167,12 @@ async function fastImport(dir: string, stream: string): Promise<void> {
 async function buildHistory(
 	spec: HistorySpec,
 ): Promise<{ objects: PackInputObject[]; tip: string }> {
-	const dir = mkdtempSync(join(tmpdir(), "pggit-stress-"))
-	try {
+	return withTempDir("pggit-stress-", async (dir) => {
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 		await fastImport(dir, fastImportStream(spec))
 		const tip = (await spawnGit(["rev-parse", "main"], { cwd: dir })).stdout.trim()
 		return { objects: await loadAllObjects(dir), tip }
-	} finally {
-		rmSync(dir, { force: true, recursive: true })
-	}
+	})
 }
 
 /** The deep/wide branch names — the WIDE-ref axis. `main` is the chain tip; every
@@ -287,16 +280,13 @@ async function seedDeepWideRepo(
  * whose file set varies, so it reads no specific file. */
 async function fetchAndFsck(fx: Pick<GcFixture, "server">, repo: string): Promise<void> {
 	const url = repoUrl(fx, repo)
-	const dir = mkdtempSync(join(tmpdir(), "pggit-stress-back-"))
-	try {
+	await withTempDir("pggit-stress-back-", async (dir) => {
 		await spawnGit(["init", "-q"], { cwd: dir })
 		await spawnGit(["-c", "protocol.version=2", "fetch", url, "refs/heads/main"], {
 			cwd: dir,
 		})
 		await spawnGit(["fsck", "--full"], { cwd: dir })
-	} finally {
-		rmSync(dir, { force: true, recursive: true })
-	}
+	})
 }
 
 /**

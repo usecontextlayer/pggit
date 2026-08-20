@@ -1,5 +1,5 @@
 /**
- * Spine chunk 1 (S1 gates): every stored commit/tag object gets its
+ * Commit/tag row derivation: every stored commit/tag object gets its
  * `git_commit`/`git_tag` row, derived transactionally at ingest — and
  * `generation` behaves EXACTLY as designed in both directions:
  *
@@ -34,6 +34,7 @@ import {
 } from "@/testing/git-server-fixture"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 const EPOCH = 1_700_000_000
 
@@ -115,7 +116,7 @@ function requireMapEntry<K, V>(map: Map<K, V>, key: K, context: string): V {
 	return value
 }
 
-describe("spine S1 — git_commit/git_tag derivation", () => {
+describe("git_commit/git_tag derivation", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let store: ObjectStore
@@ -267,8 +268,7 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 	})
 
 	it("a real `git push` over the wire derives rows for every commit and tag", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-s1-wire-"))
-		try {
+		await withTempDir("pggit-s1-wire-", async (dir) => {
 			await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 			writeFileSync(join(dir, "f.txt"), "one\n")
 			await spawnGit(["add", "."], { cwd: dir })
@@ -291,13 +291,11 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 			const [tagCount] = tags
 			if (tagCount === undefined) throw new Error("tag-count aggregate returned no row")
 			expect(Number(tagCount.n)).toBe(1)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
+		})
 	})
 })
 
-describe("spine S1 — 0009 backfill derives rows for pre-0009 data", () => {
+describe("0009 backfill derives rows for pre-0009 data", () => {
 	let db: IsolatedDb
 
 	beforeAll(async () => {

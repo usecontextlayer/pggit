@@ -16,11 +16,9 @@ import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { pktLineUnpack } from "@/testing/pkt-oracle"
+import { pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
-
-const ZERO = "0".repeat(40)
 
 /** Clone the served repo and add one commit on main; return the new tip. */
 async function divergedClone(
@@ -102,7 +100,7 @@ describe("M2 — concurrent push race + malformed-pack rejection", () => {
 	it("reports a malformed pack as `ng ... unpacker error` and leaves the ref unset", async () => {
 		const newOid = "a".repeat(40)
 		const body = receivePackRequest(
-			[`${ZERO} ${newOid} refs/heads/bad\0report-status`],
+			[`${ZERO_OID} ${newOid} refs/heads/bad\0report-status`],
 			Buffer.from("this is not a valid packfile"), // garbage → readPack throws
 		)
 		const res = await postReceivePack(app, "badrepo", body)

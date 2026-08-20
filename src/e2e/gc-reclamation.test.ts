@@ -4,15 +4,12 @@ import {
 	cloneAndFsck,
 	derivedRows,
 	type GcFixture,
-	gitReachableOids,
 	objectOids,
 	pushFile,
-	repoUrl,
+	servedMainReachableOids,
 	setupGcFixture,
 	teardownGcFixture,
-	withTempDir,
 } from "@/testing/gc-helpers"
-import { spawnGit } from "@/testing/spawn-git"
 
 /**
  * GC reclamation & grace — `docs/2026-06-24-force-commit-gc-design.md` §4,
@@ -41,25 +38,6 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 		await teardownGcFixture(fx)
 	})
 
-	/**
-	 * The reachable closure (sorted hex OIDs) of `repo`'s current `refs/heads/main`
-	 * tip, computed by the real-git oracle from a throwaway fetch of that ref —
-	 * independent of any `pushFile` return value. The expected-survivors oracle for
-	 * GC-1 (it includes peeled tag targets via `gitReachableOids`).
-	 */
-	async function reachableOfTip(repo: string): Promise<string[]> {
-		return withTempDir("pggit-gc-tip-", async (dir) => {
-			await spawnGit(["init", "-q"], { cwd: dir })
-			await spawnGit(
-				["-c", "protocol.version=2", "fetch", repoUrl(fx, repo), "refs/heads/main"],
-				{ cwd: dir },
-			)
-			// Point a local ref at the fetched tip so `rev-list --all` walks it.
-			await spawnGit(["update-ref", "refs/heads/main", "FETCH_HEAD"], { cwd: dir })
-			return gitReachableOids(dir)
-		})
-	}
-
 	// GC-1 — Liveness preserved. After a rewind orphans the old tip, GC with
 	// grace=0 still keeps every object reachable from the CURRENT ref tip (incl.
 	// peeled targets); a full clone after GC is byte-identical reachable content
@@ -72,7 +50,7 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 		await pushFile(fx, repo, { content: "second revision\n", rewind: true })
 
 		// Live survivor oracle: real-git reachable closure of the current tip.
-		const liveOids = await reachableOfTip(repo)
+		const liveOids = await servedMainReachableOids(fx, repo)
 		const cloneBefore = await cloneAndFsck(fx, repo)
 
 		// Age everything so grace=0 is free to reclaim the orphans (not the live set).

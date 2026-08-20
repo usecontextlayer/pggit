@@ -6,17 +6,16 @@ import {
 	derivedRows,
 	derivedRowViolations,
 	type GcFixture,
-	gitReachableOids,
 	objectOids,
 	pushDenied,
 	pushFile,
 	repoUrl,
 	setupGcFixture,
 	teardownGcFixture,
-	withTempDir,
 } from "@/testing/gc-helpers"
-import { objectsByType, requireGitOid } from "@/testing/git-fixtures"
+import { gitReachableOids, objectsByType, requireGitOid } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /**
  * GC integrity contract — `docs/2026-06-24-force-commit-gc-design.md` §4,
@@ -202,13 +201,13 @@ describe("GC integrity — derived rows, idempotence, exact reachable set (§4 G
 	})
 
 	it("GC-5: every surviving commit/tag keeps its exact derived row (matches git's own readings)", async () => {
-		const repo = "gc5-complete-edges"
+		const repo = "gc5-exact-derived-rows"
 		const final = await pushFile(fx, repo, { content: "v1\n" })
 		await pushDenied(fx, repo, { content: "v2\n" })
 		await pushDenied(fx, repo, { content: "v3\n" })
 
-		// Reconstruct the surviving tip on disk to derive its real-git edge topology —
-		// the independent oracle for "complete edge set, nothing wrongly deleted".
+		// Reconstruct the surviving tip on disk to derive its real-git relationships —
+		// the independent oracle for "exact derived rows, nothing wrongly deleted".
 		const expectedRows = await withTempDir("pggit-gc5-oracle-", async (dir) => {
 			await spawnGit(["init", "-q"], { cwd: dir })
 			// Fetch into a real local ref, not just FETCH_HEAD: the row/closure oracle

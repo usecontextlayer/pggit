@@ -20,8 +20,7 @@
  *   delta target kept) → clone (tier at its most damaged) → repack repair →
  *   clone → gc → clone
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
@@ -34,6 +33,7 @@ import {
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -58,12 +58,7 @@ type CloneCheck = {
 describe("wire — denied push, GC, repack: the tier stays servable", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk } = createScratchArena()
 
 	let deniedPush = ""
 	/** `lateTree`'s delta base after the first repack — null means it is not a delta. */
@@ -227,7 +222,7 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("has the fixture it needs: the divergent push is DENIED, not accepted", () => {

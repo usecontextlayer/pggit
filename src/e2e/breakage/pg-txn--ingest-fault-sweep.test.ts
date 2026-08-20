@@ -9,7 +9,7 @@
  * `insertObjects` is one `pg.begin` containing the `copyInsert` of the object
  * rows (a `create temp table … on commit drop`, a streaming `COPY … from
  * stdin`, and an `insert … select … on conflict do nothing`) plus the derived
- * `git_commit`/`git_tag` value-list INSERTs (spine chunk 1), followed AFTER the
+ * `git_commit`/`git_tag` value-list INSERTs, followed AFTER the
  * commit by `update repos set last_pushed_at = clock_timestamp()`. Each of
  * those is a distinct crash point with a distinct consequence.
  *
@@ -45,6 +45,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { OBJECT_TYPE_CODE } from "@/database/object-type-codes"
@@ -59,8 +60,6 @@ import { spawnGit, spawnGitBounded } from "@/testing/spawn-git"
 
 const RUNS = 700
 const BOUND_MS = 45_000
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /** git with a hard wall-clock bound, so a hang is observed rather than waited on. */
 const gitBounded = (args: string[], cwd: string) => spawnGitBounded(args, cwd, BOUND_MS)

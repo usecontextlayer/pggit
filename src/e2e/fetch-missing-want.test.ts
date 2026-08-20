@@ -30,6 +30,7 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 import { fetchRequest } from "@/testing/wire-fetch"
 
 // A well-formed 40-hex OID a seeded repo does not (and cannot) contain.
@@ -113,8 +114,7 @@ describe("mal01 — fetch of a want absent from a non-empty repo errors cleanly 
 
 	it("fetching a want the repo does not have fails CLEANLY — no HTTP 5xx, no 'expected packfile'", async () => {
 		// Fetch a specific, absent OID into a fresh client repo over protocol v2.
-		const dest = mkdtempSync(join(tmpdir(), "pggit-mal01-dest-"))
-		try {
+		await withTempDir("pggit-mal01-dest-", async (dest) => {
 			await spawnGit(["init", "-q"], { cwd: dest })
 			const outcome = await attemptGit(
 				["-c", "protocol.version=2", "fetch", url, ABSENT_OID],
@@ -131,8 +131,6 @@ describe("mal01 — fetch of a want absent from a non-empty repo errors cleanly 
 			expect(outcome.stderr).not.toMatch(/expected 'packfile'/)
 			// And the message names the absent ref, the way real git does.
 			expect(outcome.stderr).toMatch(/not our ref/)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

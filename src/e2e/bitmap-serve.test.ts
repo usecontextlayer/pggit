@@ -1,10 +1,10 @@
 /**
- * The bitmap serve fast path (spine chunk 5b, S6): after a drain, a no-have
+ * The bitmap serve fast path: after a drain, a no-have
  * unfiltered fetch is answered from the epoch's bitmaps instead of the tree
  * walk — and the answer must be EXACTLY what the walk would have served. The
- * arbiter is the S6 gate: the same real-git fetch against the same repo, run
- * before and after the drain, must transfer the identical object set (and
- * fsck), across every shape the router can take:
+ * arbiter is the drain-invariance gate: the same real-git fetch against the same
+ * repo, run before and after the drain, must transfer the identical object set
+ * (and fsck), across every shape the router can take:
  *
  *   - a full clone whose wants are all epoch tips (the pure-OR path, no walk)
  *   - a single-branch fetch (a want SUBSET of the tips)
@@ -33,10 +33,11 @@ import {
 } from "@/testing/gc-helpers"
 import { allObjectOids, parseRevListObjectOids } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 const REPO = "epoch/serve"
 
-describe("bitmap-served fetches (chunk 5b)", () => {
+describe("bitmap-served fetches", () => {
 	let fx: GcFixture
 	let src = ""
 	let url = ""
@@ -87,8 +88,7 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 
 	/** Clone (optionally filtered/single-branch), fsck, return the odb oids. */
 	async function cloneOids(extra: string[] = []): Promise<string[]> {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-bmserve-dest-"))
-		try {
+		return withTempDir("pggit-bmserve-dest-", async (dest) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -100,15 +100,12 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 			])
 			await spawnGit(["fsck", "--full", "--no-dangling"], { cwd: dest })
 			return await allObjectOids(dest)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	}
 
 	/** Fetch exactly one ref into a fresh empty repo; fsck; return the oids. */
 	async function fetchOneOids(refspec: string): Promise<string[]> {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-bmserve-one-"))
-		try {
+		return withTempDir("pggit-bmserve-one-", async (dest) => {
 			await spawnGit(["init", "-q", dest])
 			// --no-tags: fetch would otherwise auto-follow the annotated tag into
 			// the transfer (include-tag), and the rev-list expectations below are
@@ -121,9 +118,7 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 			)
 			await spawnGit(["fsck", "--full", "--no-dangling"], { cwd: dest })
 			return await allObjectOids(dest)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	}
 
 	it("a full clone after the drain transfers the identical set (pure bitmap OR)", async () => {
@@ -242,8 +237,7 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 
 		// The positive twin: tag auto-follow ships both chain tags, since they
 		// point (transitively) into the transferred history.
-		const dest = mkdtempSync(join(tmpdir(), "pggit-bmserve-tags-"))
-		try {
+		await withTempDir("pggit-bmserve-tags-", async (dest) => {
 			await spawnGit(["init", "-q", dest])
 			await spawnGit(
 				[
@@ -260,8 +254,6 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 			const followed = await allObjectOids(dest)
 			expect(followed).toContain(v1Oid)
 			expect(followed).toContain(vmetaOid)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

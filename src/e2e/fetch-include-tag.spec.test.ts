@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import { bindRepoBackend } from "@/protocol/repo-backend"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -18,6 +19,7 @@ import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 import { spawnUploadPack } from "@/testing/upload-pack-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
 
@@ -50,13 +52,7 @@ describe("include-tag augmentation", () => {
 		av2 = (await spawnGit(["rev-parse", "refs/tags/av2"], { cwd: dir })).stdout.trim()
 
 		await seedRepoIntoStore("repo", dir, { objects, refs })
-		backend = {
-			buildPack: (w, h, o, t) => objects.buildPack("repo", w, h, o, t),
-			getSymref: (n) => refs.getSymref("repo", n),
-			listRefs: () => refs.listRefs("repo"),
-			processHaves: (h) => objects.processHaves("repo", h),
-			readyToGiveUp: (w, c) => objects.readyToGiveUp("repo", w, c),
-		}
+		backend = bindRepoBackend({ objects, refs }, "repo")
 	}, 180_000)
 
 	afterAll(async () => {
@@ -65,17 +61,14 @@ describe("include-tag augmentation", () => {
 	})
 
 	async function servedOids(out: Buffer): Promise<Set<string>> {
-		const scratch = mkdtempSync(join(tmpdir(), "pggit-inctag-pack-"))
-		try {
+		return withTempDir("pggit-inctag-pack-", async (scratch) => {
 			await spawnGit(["init", "-q"], { cwd: scratch })
 			await spawnGit(["index-pack", "--stdin"], {
 				cwd: scratch,
 				input: sidebandDemux(out).band1,
 			})
 			return new Set(await allObjectOids(scratch))
-		} finally {
-			rmSync(scratch, { force: true, recursive: true })
-		}
+		})
 	}
 
 	it("includes an annotated tag whose peeled target is served, but not one pointing outside it", async () => {

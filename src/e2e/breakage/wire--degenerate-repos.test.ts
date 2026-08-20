@@ -15,8 +15,7 @@
  *
  * Every assertion encodes the CORRECT outcome, so a red test IS the bug.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
@@ -26,6 +25,7 @@ import {
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -41,12 +41,7 @@ type Counts = { wholes: number; deltas: number }
 describe("wire — degenerate repository states under the encoding tier", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk } = createScratchArena()
 
 	let unknownRepack: Counts
 	let unknownCloneRefs = ""
@@ -173,7 +168,7 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("repack of a repo name never written writes nothing", () => {

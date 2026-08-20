@@ -10,6 +10,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"
+import { bindRepoBackend } from "@/protocol/repo-backend"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore, type RefRow } from "@/store/refs-store"
@@ -60,13 +61,7 @@ describe("peeled_oid at ref-write", () => {
 		}
 
 		await seedRepoIntoStore("repo", dir, { objects, refs })
-		backend = {
-			buildPack: (w, h, o) => objects.buildPack("repo", w, h, o),
-			getSymref: (n) => refs.getSymref("repo", n),
-			listRefs: () => refs.listRefs("repo"),
-			processHaves: (h) => objects.processHaves("repo", h),
-			readyToGiveUp: (w, c) => objects.readyToGiveUp("repo", w, c),
-		}
+		backend = bindRepoBackend({ objects, refs }, "repo")
 	}, 180_000)
 
 	afterAll(async () => {

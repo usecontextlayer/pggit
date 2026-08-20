@@ -15,21 +15,19 @@
  *
  * Differentially checked against a plain bare git remote wherever the shape allows.
  */
-import { createHash } from "node:crypto"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
-import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { objectsByType } from "@/testing/git-fixtures"
+import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { allObjectOids, objectBytesDigest } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -44,12 +42,7 @@ const BRANCHES = 400
 
 /** sha256 over every local object's raw bytes, in oid order — the byte-level oracle. */
 async function bytesDigest(dir: string): Promise<string> {
-	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	return createHash("sha256").update(res.stdoutBytes).digest("hex")
+	return objectBytesDigest(dir, await allObjectOids(dir))
 }
 
 type ManyRefResult = TestResult<{ refetch: TestResult<string> }>
@@ -57,12 +50,7 @@ type ManyRefResult = TestResult<{ refetch: TestResult<string> }>
 describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk, own: ownScratch } = createScratchArena()
 
 	const exactOid = new Map<string, TestResult<boolean>>()
 	const haves = new Map<string, TestResult<string>>()
@@ -71,12 +59,8 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS })
-		scratch.push(src)
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		ownScratch(src)
+		const commits = await commitsOldestFirst(src, "HEAD")
 		// Many refs: one branch every few commits.
 		for (let i = 0; i < BRANCHES; i++) {
 			const c = commits[(i * 7 + 3) % commits.length] as string
@@ -230,7 +214,7 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("serves a want for an exact non-tip OID, byte-identical to the source", () => {

@@ -59,6 +59,7 @@
  * reproduction is a red test.
  */
 import { rmSync } from "node:fs"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
@@ -84,8 +85,6 @@ const REPO = "txn/copy-hang"
  * itself stays active for a few hundred ms.
  */
 const COPY_NEEDLE = 'copy "copy_stg_git_object"'
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /** Poll `pid` until it is executing the ingest COPY, then cancel THAT statement;
  * report whether it ever fired. Bounded by `WAIT_S` so a push that never reaches
@@ -178,10 +177,7 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 		probe = await spawnGitBounded(["ls-remote", url], src, 10_000)
 
 		// And a graceful shutdown cannot complete either.
-		closed = await Promise.race([
-			server.close().then(() => true),
-			new Promise<boolean>((r) => setTimeout(() => r(false), 5000)),
-		])
+		closed = await Promise.race([server.close().then(() => true), sleep(5000, false)])
 	}, 600_000)
 
 	afterAll(async () => {
@@ -191,10 +187,7 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 		if (pid > 0) {
 			await admin`select pg_terminate_backend(${pid})`.catch(() => {})
 		}
-		await Promise.race([
-			appSql?.end({ timeout: 3 }).catch(() => {}),
-			new Promise((r) => setTimeout(r, 4000)),
-		])
+		await Promise.race([appSql?.end({ timeout: 3 }).catch(() => {}), sleep(4000)])
 		await admin?.end().catch(() => {})
 		await db?.drop().catch(() => {})
 		if (src) rmSync(src, { force: true, recursive: true })

@@ -22,7 +22,7 @@
  * Converted from `breakage/race--repo-recreate-stale-resolver.ts` (`--runs=400`).
  * Deterministic — no loop to preserve.
  */
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
@@ -31,20 +31,11 @@ import type { PackInputObject } from "@/pack/write-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import { loadReachableObjects, packFileBytes } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const RUNS = 400
-
-/** Bytes of the pack files the CLIENT actually received. */
-function clonePackBytes(dir: string): number {
-	const packDir = join(dir, ".git/objects/pack")
-	return readdirSync(packDir)
-		.filter((f) => f.endsWith(".pack"))
-		.map((f) => statSync(join(packDir, f)).size)
-		.reduce((a, b) => a + b, 0)
-}
 
 describe("race — a long-lived Repack against a deleted-and-recreated repo name", () => {
 	let db: IsolatedDb
@@ -95,7 +86,7 @@ describe("race — a long-lived Repack against a deleted-and-recreated repo name
 				dest,
 			])
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			const n = clonePackBytes(dest)
+			const n = await packFileBytes(dest)
 			rmSync(dest, { force: true, recursive: true })
 			return n
 		}

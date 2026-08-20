@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
@@ -7,6 +7,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 // Whole-repo deletion over the real wire: push with canonical git, delete through
 // the admin surface, and verify the three observable consequences — every row
@@ -39,17 +40,14 @@ describe("e2e — repo deletion (real git)", () => {
 
 	/** Init a throwaway repo with one commit and push it to `name`. */
 	async function pushFixture(name: string, marker: string): Promise<string> {
-		const src = mkdtempSync(join(tmpdir(), "pggit-del-src-"))
-		try {
+		return withTempDir("pggit-del-src-", async (src) => {
 			await spawnGit(["init", "-q"], { cwd: src })
 			writeFileSync(join(src, "file.txt"), `${marker}\n`)
 			await spawnGit(["add", "."], { cwd: src })
 			await spawnGit(["commit", "-q", "-m", marker], { cwd: src })
 			await spawnGit(["push", url(name), "HEAD:refs/heads/main"], { cwd: src })
 			return (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	}
 
 	/** Rows remaining per child table for a repo surrogate id. */
@@ -102,8 +100,7 @@ describe("e2e — repo deletion (real git)", () => {
 		// shared resolver forgot the dead id — with a stale cache this push would
 		// FK-fail writing objects).
 		const newHead = await pushFixture(CONTENT, "content-v2")
-		const back = mkdtempSync(join(tmpdir(), "pggit-del-back-"))
-		try {
+		await withTempDir("pggit-del-back-", async (back) => {
 			await spawnGit(["init", "-q"], { cwd: back })
 			await spawnGit(
 				["-c", "protocol.version=2", "fetch", url(CONTENT), "refs/heads/main"],
@@ -112,9 +109,7 @@ describe("e2e — repo deletion (real git)", () => {
 			expect(
 				(await spawnGit(["rev-parse", "FETCH_HEAD"], { cwd: back })).stdout.trim(),
 			).toBe(newHead)
-		} finally {
-			rmSync(back, { force: true, recursive: true })
-		}
+		})
 		const [reborn] = await db.sql.unsafe<{ id: string }[]>(
 			"select id from repos where name = $1",
 			[CONTENT],
@@ -123,17 +118,14 @@ describe("e2e — repo deletion (real git)", () => {
 		expect(reborn.id).not.toBe(contentId)
 
 		// The sibling repo was never touched: still cloneable with its content.
-		const sibling = mkdtempSync(join(tmpdir(), "pggit-del-sib-"))
-		try {
+		await withTempDir("pggit-del-sib-", async (sibling) => {
 			await spawnGit(["init", "-q"], { cwd: sibling })
 			await spawnGit(
 				["-c", "protocol.version=2", "fetch", url(CHAT_HOME), "refs/heads/main"],
 				{ cwd: sibling },
 			)
 			await spawnGit(["fsck", "--full"], { cwd: sibling })
-		} finally {
-			rmSync(sibling, { force: true, recursive: true })
-		}
+		})
 	}, 120_000)
 
 	it("enumerates by prefix for the caller-owned grammar", async () => {

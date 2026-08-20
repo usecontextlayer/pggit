@@ -7,18 +7,15 @@
  * present — independent of how the store batches the write (no assertion on chunk
  * size, only on the end state).
  */
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { allObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 async function gitBlobOids(contents: readonly Buffer[]): Promise<string[]> {
-	const dir = mkdtempSync(join(tmpdir(), "pggit-large-push-oracle-"))
-	try {
+	return withTempDir("pggit-large-push-oracle-", async (dir) => {
 		await spawnGit(["init", "-q"], { cwd: dir })
 		const stream: Buffer[] = []
 		for (const [i, content] of contents.entries()) {
@@ -27,9 +24,7 @@ async function gitBlobOids(contents: readonly Buffer[]): Promise<string[]> {
 		}
 		await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: Buffer.concat(stream) })
 		return await allObjectOids(dir)
-	} finally {
-		rmSync(dir, { force: true, recursive: true })
-	}
+	})
 }
 
 describe("M2 — large push exceeding the bind-parameter ceiling", () => {

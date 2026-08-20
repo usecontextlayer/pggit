@@ -26,6 +26,7 @@ import { createRefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
 	let db: IsolatedDb
@@ -62,8 +63,7 @@ describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
 	})
 
 	it("rejects a protocol.version=0 clone loudly (not a silent empty repo)", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-a12-v0-dest-"))
-		try {
+		await withTempDir("pggit-a12-v0-dest-", async (dest) => {
 			const outcome = await attemptGit([
 				"-c",
 				"protocol.version=0",
@@ -74,8 +74,6 @@ describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
 			])
 			expect(outcome.ok).toBe(false)
 			expect(outcome.stderr).toMatch(/40[03]/)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

@@ -17,6 +17,7 @@ import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("M0 — full clone over smart-HTTP v2 (real git)", () => {
 	let db: IsolatedDb
@@ -52,8 +53,7 @@ describe("M0 — full clone over smart-HTTP v2 (real git)", () => {
 	})
 
 	it("clones, passes fsck --full, and recovers the exact object set", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-m0-dest-"))
-		try {
+		await withTempDir("pggit-m0-dest-", async (dest) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -75,8 +75,6 @@ describe("M0 — full clone over smart-HTTP v2 (real git)", () => {
 			expect(existsSync(join(dest, "a.txt"))).toBe(true)
 			expect(readFileSync(join(dest, "a.txt"), "utf8")).toBe("alpha2\n")
 			expect((await spawnGit(["tag", "--list"], { cwd: dest })).stdout.trim()).toBe("v1")
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

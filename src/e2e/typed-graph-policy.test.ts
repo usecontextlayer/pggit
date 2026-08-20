@@ -95,7 +95,7 @@ describe("typed-graph policy", () => {
 
 	it("a parent whose derived row is MISSING crashes loud — corruption, never a sweepable miss", async () => {
 		// The adversarial review's critical: judged as a typed-edge "missing", a
-		// reachable parent with a broken chunk-1 invariant would be EXCLUDED from
+		// reachable parent with a missing derived row would be EXCLUDED from
 		// GC's live set and swept — corruption converted into data loss. It must
 		// crash the walk instead, in connectivity AND in the GC pass.
 		const repo = "policy/corrupt"

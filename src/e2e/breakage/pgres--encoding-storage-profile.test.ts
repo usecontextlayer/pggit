@@ -1,11 +1,9 @@
 /**
  * pgres — DOES THE ENCODING TIER'S DECLARED STORAGE PROFILE ACTUALLY EXIST?
  *
- * Settles design Concern C4 ("inline `STORAGE EXTERNAL` on the partitioned parent
- * propagates to leaf partitions — UNVERIFIED EXPECTATION; check before release")
- * and audits the leaf reloptions against the profile migration 0008's own comment
- * claims it copies ("the delete-aware profile the GC sweep already gave
- * git_object/git_edge (0005)").
+ * Turns design Concern C4's original unverified `STORAGE EXTERNAL` propagation
+ * expectation into a live contract and audits the leaf reloptions against the
+ * delete-aware profile migration 0008 copies from `git_object` (0005).
  *
  * Two independent judges:
  *  (a) CATALOG — `pg_attribute.attstorage` / `attcompression` on the `data` column
@@ -38,124 +36,26 @@
  * git_object and 0008 originally did not give the encoding leaves; 0008 carries
  * it now, and this pins it.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import type { PackInputObject } from "@/pack/write-pack"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import {
+	appendLifecycleLineage,
+	createAppendOnlyRepo,
+	FAST_IMPORT_COMMITTER,
+	RUNS_DIR,
+	runDirName,
+} from "@/testing/append-only-repo"
+import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "storage-profile"
-/** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const RUNS_DIR = ".engine/runs/planner-updates"
-
-// ── fixture plumbing (inlined from the probe; e2e tests carry their own helpers) ──
-
-function hash32(s: string): string {
-	// tiny deterministic hex generator (no crypto import churn in hot loops)
-	let h1 = 0x811c9dc5
-	let h2 = 0x01000193
-	for (let i = 0; i < s.length; i++) {
-		h1 = Math.imul(h1 ^ s.charCodeAt(i), 16777619) >>> 0
-		h2 = Math.imul(h2 + s.charCodeAt(i), 2654435761) >>> 0
-	}
-	return (
-		(h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0")
-	)
-}
-
-/** Deterministic, poorly-compressible hex filler. */
-function filler(salt: string, len: number): string {
-	let out = ""
-	let i = 0
-	while (out.length < len) out += hash32(`${salt}-${i++}`)
-	return out.slice(0, len)
-}
-
-function runDirName(salt: string, i: number): string {
-	const h = `${hash32(`${salt}-run-${i}`)}${hash32(`${salt}-run2-${i}`)}${hash32(`${salt}-run3-${i}`)}${hash32(`${salt}-run4-${i}`)}`
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-}
-
-/** A fast-import stream fragment: `count` append-only run commits onto `from`. */
-function runCommits(opts: {
-	salt: string
-	count: number
-	from?: string
-	blobChars: number
-	markStart: number
-}): string {
-	const out: string[] = []
-	let mark = opts.markStart
-	const next = () => ++mark
-	const blob = (content: string): number => {
-		const m = next()
-		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
-		return m
-	}
-	let from = opts.from
-	for (let i = 0; i < opts.count; i++) {
-		const dir = runDirName(opts.salt, i)
-		const record = blob(
-			`{"run":"${dir}","payload":"${filler(`${opts.salt}-rec-${i}`, opts.blobChars)}"}\n`,
-		)
-		const stderr = blob(`${filler(`${opts.salt}-err-${i}`, 120)}\n`)
-		const cm = next()
-		const msg = `${opts.salt} run ${i}`
-		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n` +
-				(from ? `from ${from}\n` : "") +
-				`M 100644 :${record} ${RUNS_DIR}/${dir}/record.json\n` +
-				`M 100644 :${stderr} ${RUNS_DIR}/${dir}/stderr\n`,
-		)
-		from = `:${cm}`
-	}
-	return out.join("")
-}
-
-/** A fast-import stream whose runs directory is WIDE — `width` entries seeded up
- * front, then `commits` appends — so the runs tree object is 100 KB+ and its whole
- * ("anchor") encoding is far past any TOAST threshold. */
-function wideStream(width: number, commits: number, blobChars: number): string {
-	const out: string[] = []
-	let mark = 0
-	const next = () => ++mark
-	const blob = (c: string): number => {
-		const m = next()
-		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(c)}\n${c}\n`)
-		return m
-	}
-	const seeded: string[] = []
-	for (let i = 0; i < width; i++) {
-		const m = blob(`${filler(`wide-${i}`, blobChars)}\n`)
-		const h = filler(`name-${i}`, 32)
-		seeded.push(
-			`M 100644 :${m} ${RUNS_DIR}/${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}/record.json`,
-		)
-	}
-	const seed = next()
-	out.push(
-		`commit refs/heads/main\nmark :${seed}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
-	)
-	out.push(
-		runCommits({
-			blobChars,
-			count: commits,
-			from: `:${seed}`,
-			markStart: mark,
-			salt: "wide",
-		}),
-	)
-	return out.join("")
-}
 
 type Measured = { heap: number; toast: number; idx: number; data: number; rows: number }
 
@@ -164,6 +64,36 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 	const scratch: string[] = []
 	let narrow: Measured
 	let wide: Measured
+
+	function scratchDir(tag: string): string {
+		const dir = mkdtempSync(join(tmpdir(), `pggit-${tag}-`))
+		scratch.push(dir)
+		return dir
+	}
+
+	/** Seed one wide tree, then use the canonical lifecycle appender for its lineage. */
+	async function createWideRepo(width: number, commits: number): Promise<string> {
+		const dir = scratchDir("storage-profile-wide")
+		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
+		const blobs: string[] = []
+		const entries: string[] = []
+		for (let i = 0; i < width; i++) {
+			const content = `${i}\n`
+			const mark = i + 1
+			blobs.push(`blob\nmark :${mark}\ndata ${Buffer.byteLength(content)}\n${content}`)
+			entries.push(`M 100644 :${mark} ${RUNS_DIR}/${runDirName(i)}/record.json`)
+		}
+		const commitMark = width + 1
+		await spawnGit(["fast-import", "--quiet"], {
+			cwd: dir,
+			input:
+				`${blobs.join("")}commit refs/heads/main\nmark :${commitMark}\n` +
+				`committer ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${entries.join("\n")}\n`,
+		})
+		const seed = (await spawnGit(["rev-parse", "main"], { cwd: dir })).stdout.trim()
+		await appendLifecycleLineage(dir, "main", seed, "wide", commits)
+		return dir
+	}
 
 	/** `git_pack_encoding`'s exact on-disk split, summed across its 16 hash leaves. */
 	async function encodingStorage(): Promise<{
@@ -215,35 +145,12 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			order by c.relkind desc, c.relname`
 	}
 
-	/** Seed one repo through the public store, repack it, and measure the tier. */
-	async function build(repo: string, stream: string): Promise<Measured> {
-		const root = mkdtempSync(join(tmpdir(), `pggit-${repo}-`))
-		scratch.push(root)
-		const dir = join(root, "repo")
-		mkdirSync(dir, { recursive: true })
-		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
-		await spawnGit(["fast-import", "--quiet", "--force"], { cwd: dir, input: stream })
-		const tip = (
-			await spawnGit(["rev-parse", "refs/heads/main"], { cwd: dir })
-		).stdout.trim()
-
-		const store = createObjectStore(db.sql)
-		const objectsToSeed = await loadReachableObjects(dir, [tip])
-		let batch: PackInputObject[] = []
-		let bytes = 0
-		const flush = async (): Promise<void> => {
-			if (batch.length === 0) return
-			await store.putPack(repo, batch)
-			batch = []
-			bytes = 0
-		}
-		for (const object of objectsToSeed) {
-			batch.push(object)
-			bytes += object.content.length
-			if (bytes >= 12_000_000 || batch.length >= 5000) await flush()
-		}
-		await flush()
-		await createRefStore(db.sql).setRef(repo, "refs/heads/main", tip)
+	/** Seed one repo through the canonical store fixture, repack it, and measure. */
+	async function build(repo: string, dir: string): Promise<Measured> {
+		await seedRepoIntoStore(repo, dir, {
+			objects: createObjectStore(db.sql),
+			refs: createRefStore(db.sql),
+		})
 		await createRepack(db.sql).repack(repo)
 
 		const storage = await encodingStorage()
@@ -261,14 +168,13 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		// Both ends of the size distribution, in ONE schema: the wide repo's own
 		// contribution to the cumulative byte counters is read by difference.
-		narrow = await build(
-			`${REPO}-narrow`,
-			runCommits({ blobChars: 120, count: 120, markStart: 0, salt: "narrow" }),
-		)
+		const narrowDir = await createAppendOnlyRepo({ runs: 120 })
+		scratch.push(narrowDir)
+		narrow = await build(`${REPO}-narrow`, narrowDir)
 		// 300 commits ⇒ ~9 anchors at ANCHOR_EVERY=32, each a ~100KB+ whole of the
 		// 3000-entry tree — comfortably past the 1MB oversize gate below (80 commits
 		// landed ~2 anchors ≈ 560KB, under its own precondition).
-		wide = await build(`${REPO}-wide`, wideStream(3000, 300, 400))
+		wide = await build(`${REPO}-wide`, await createWideRepo(3000, 300))
 	}, 300_000)
 
 	afterAll(async () => {

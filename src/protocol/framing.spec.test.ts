@@ -8,8 +8,7 @@
  * caps, the `0000`/`0001`/`0002` specials); the round-trip cross-checks our
  * framing against bytes captured from real git.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import {
@@ -19,6 +18,7 @@ import {
 	WRITER_MAX_PAYLOAD,
 } from "@/protocol/pkt-line"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /** Raw latin1 bytes (binary-safe) for asserting against literal hex frames. */
 const bytes = (s: string) => Buffer.from(s, "latin1")
@@ -61,8 +61,7 @@ describe("§8.3 pkt-line framing — literal byte corpus", () => {
 
 describe("§8.3 pkt-line framing — round-trips real git's advertisement byte-for-byte", () => {
 	it("re-frames `git upload-pack --advertise-refs` output identically", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pggit-framing-"))
-		try {
+		await withTempDir("pggit-framing-", async (dir) => {
 			await spawnGit(["init", "-q"], { cwd: dir })
 			writeFileSync(join(dir, "a.txt"), "hi\n")
 			await spawnGit(["add", "."], { cwd: dir })
@@ -78,8 +77,6 @@ describe("§8.3 pkt-line framing — round-trips real git's advertisement byte-f
 			const { packets, rest } = decodePktStream(advert)
 			expect(rest.length).toBe(0)
 			expect(Buffer.concat(packets.map(encodePkt))).toEqual(advert)
-		} finally {
-			rmSync(dir, { force: true, recursive: true })
-		}
+		})
 	})
 })

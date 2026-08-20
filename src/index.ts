@@ -11,7 +11,8 @@ import {
 	handleReceivePack,
 	type ReceiveBackend,
 } from "@/protocol/receive-pack"
-import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
+import { bindRepoBackend } from "@/protocol/repo-backend"
+import { handleUploadPack } from "@/protocol/upload-pack"
 import { encodeAdvertisement } from "@/protocol/v2"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import {
@@ -120,17 +121,6 @@ function parseGitPath(path: string): { repoId: string; service: GitService } | n
 	return null
 }
 
-function backendFor(deps: GitAppDeps, repoId: string): RepoBackend {
-	return {
-		buildPack: (wants, haves, omitBlobs, includeTag, thinPack) =>
-			deps.objects.buildPack(repoId, wants, haves, omitBlobs, includeTag, thinPack),
-		getSymref: (name) => deps.refs.getSymref(repoId, name),
-		listRefs: () => deps.refs.listRefs(repoId),
-		processHaves: (haves) => deps.objects.processHaves(repoId, haves),
-		readyToGiveUp: (wants, common) => deps.objects.readyToGiveUp(repoId, wants, common),
-	}
-}
-
 function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 	const backend: ReceiveBackend = {
 		applyRefUpdates: (commands, atomic) =>
@@ -229,7 +219,7 @@ export function createGitApp(
 		if (!parsed) return c.notFound()
 		if (parsed.service === "git-upload-pack") {
 			const body = await readRequestBody(c)
-			const out = await handleUploadPack(body, backendFor(deps, parsed.repoId))
+			const out = await handleUploadPack(body, bindRepoBackend(deps, parsed.repoId))
 			// Layer-1 wire size, measured at the boundary where bytes actually leave —
 			// a no-op unless the perf harness activated a collector, so production pays
 			// nothing and the metric survives any restructure of the core.

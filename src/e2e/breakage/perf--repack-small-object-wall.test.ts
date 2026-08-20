@@ -38,13 +38,10 @@ import type { PackInputObject } from "@/pack/write-pack"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import { loadReachableObjects, refsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
-
-/** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
+import { spawnGit } from "@/testing/spawn-git"
 
 /** Two sizes under porsager's 65,534-parameter ceiling, two over it. */
 const SIZES = [10_000, 60_000, 70_000, 100_000]
@@ -61,7 +58,7 @@ function stream(w: number): string {
 		changes.push(`M 100644 :${i + 1} d${i % 100}/f${i}.txt`)
 	}
 	out.push(
-		`commit refs/heads/main\nmark :${w + 1}\ncommitter ${COMMITTER}\ndata 4\nseed\n${changes.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${w + 1}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${changes.join("\n")}\n`,
 	)
 	return out.join("")
 }

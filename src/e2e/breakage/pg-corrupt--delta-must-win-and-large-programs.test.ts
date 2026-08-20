@@ -36,6 +36,7 @@ import { deflateSync, inflateSync } from "node:zlib"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -105,7 +106,6 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 	 */
 	async function buildSource(dir: string): Promise<void> {
 		await spawnGit(["init", "-q", "-b", "main", dir])
-		const who = "pggit oracle <oracle@pggit.test> 1700000000 +0000"
 		const out: string[] = []
 		out.push("blob\nmark :1\ndata 3\nxy\n")
 		let prev = 0
@@ -116,7 +116,7 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 			const ops = ["D path"]
 			for (let e = 0; e < 24; e++) ops.push(`M 100644 :1 path/${nameFor(`p${v}`, e)}`)
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${who}\ndata ${msg.length}\n${msg}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\n` +
 					(prev === 0 ? "" : `from :${prev}\n`) +
 					`${ops.join("\n")}\n`,
 			)
@@ -133,7 +133,7 @@ describe("pg-corrupt — the delta-must-win guard and large delta programs", () 
 				ops.push(`M 100644 :1 wide/${nameFor(e % 2 === 0 ? "stable" : `w${v}`, e)}`)
 			}
 			out.push(
-				`commit refs/heads/main\nmark :${cm}\ncommitter ${who}\ndata ${msg.length}\n${msg}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\n` +
 					`from :${prev}\n${ops.join("\n")}\n`,
 			)
 			prev = cm

@@ -24,10 +24,9 @@ import { createGitApp } from "@/index"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { ZERO_OID } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
-
-const ZERO = "0".repeat(40)
 
 /** Atomic receive-pack body: update r1 and r2 (caps incl. `atomic` on line 1). */
 function atomicBody(
@@ -106,7 +105,7 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 				app,
 				repo,
 				receivePackRequest(
-					[`${ZERO} ${base} refs/heads/r1\0report-status\n`],
+					[`${ZERO_OID} ${base} refs/heads/r1\0report-status\n`],
 					(
 						await spawnGit(["pack-objects", "--stdout", "--revs"], {
 							cwd: src,
@@ -119,7 +118,7 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 				app,
 				repo,
 				receivePackRequest(
-					[`${ZERO} ${base} refs/heads/r2\0report-status\n`],
+					[`${ZERO_OID} ${base} refs/heads/r2\0report-status\n`],
 					(
 						await spawnGit(["pack-objects", "--stdout", "--revs"], {
 							cwd: src,

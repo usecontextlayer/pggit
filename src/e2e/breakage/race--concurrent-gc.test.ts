@@ -23,6 +23,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -48,7 +49,6 @@ const PASSES = 2
  * observed hang sat at zero CPU with zero in-flight queries for 25 minutes. */
 const HANG_MS = 60_000
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const msg = (e: unknown) =>
 	(e instanceof Error ? e.message : String(e)).split("\n")[0] ?? ""
 

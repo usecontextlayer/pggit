@@ -36,7 +36,6 @@
  * reproduced); fixed by resolving the repo name fresh per pass through the
  * unmemoized `lookupRepoId` primitive.
  */
-import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -46,71 +45,20 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
-import { requiredAt } from "@/testing/git-fixtures"
+import { buildLifecycleSource, commitsOldestFirst } from "@/testing/append-only-repo"
+import { packFileBytes, requiredAt } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/slate/recreated"
-/** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-
-function filler(salt: string, len: number): string {
-	let out = ""
-	while (out.length < len) {
-		out += createHash("sha1").update(`${salt}-${out.length}`).digest("hex")
-	}
-	return out.slice(0, len)
-}
-
-/** The append-only shape the delta tier exists for: one run dir per commit. */
-function stream(runs: number): string {
-	const out: string[] = []
-	let mark = 0
-	const next = () => ++mark
-	const blob = (c: string): number => {
-		const m = next()
-		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(c)}\n${c}\n`)
-		return m
-	}
-	const seeded: string[] = []
-	for (let i = 0; i < 6; i++) {
-		seeded.push(
-			`M 100644 :${blob(`# doc ${i}\n${filler(`doc-${i}`, 600)}\n`)} docs/doc-${i}.md`,
-		)
-	}
-	let prev = next()
-	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
-	)
-	for (let i = 0; i < runs; i++) {
-		const h = createHash("sha1").update(`run-${i}`).digest("hex")
-		const d = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-		const rec = blob(`{"run":"${d}","payload":"${filler(`rec-${i}`, 400)}"}\n`)
-		const err = blob(`${filler(`err-${i}`, 120)}\n`)
-		const cm = next()
-		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata 3\nrun\nfrom :${prev}\n` +
-				`M 100644 :${rec} .engine/runs/planner-updates/${d}/record.json\n` +
-				`M 100644 :${err} .engine/runs/planner-updates/${d}/stderr\n`,
-		)
-		prev = cm
-	}
-	return out.join("")
-}
 
 /** Bytes of the pack a mirror clone received (client-side, no server counters). */
 async function clonedPackBytes(url: string, dest: string): Promise<number> {
 	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-	const countObjects = await spawnGit(["count-objects", "-v"], { cwd: dest })
-	const sizePack = countObjects.stdout.match(/^size-pack: (\d+)$/m)?.[1]
-	if (sizePack === undefined) {
-		throw new Error(`git count-objects omitted size-pack: ${countObjects.stdout}`)
-	}
-	const kb = Number(sizePack)
+	const bytes = await packFileBytes(dest)
 	rmSync(dest, { force: true, recursive: true })
-	return kb * 1024
+	return bytes
 }
 
 describe("lifecycle breakage — silent no-op repack after repo recreate", () => {
@@ -129,13 +77,8 @@ describe("lifecycle breakage — silent no-op repack after repo recreate", () =>
 		root = mkdtempSync(join(tmpdir(), "pggit-breakage-recreate-"))
 
 		const src = join(root, "src")
-		await spawnGit(["init", "-q", "-b", "main", src])
-		await spawnGit(["fast-import", "--quiet"], { cwd: src, input: stream(200) })
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "main"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		await buildLifecycleSource(src, 200)
+		const commits = await commitsOldestFirst(src, "main")
 		const tip = requiredAt(commits, commits.length - 1, "main commit history")
 		const mid = requiredAt(commits, 80, "main commit history")
 

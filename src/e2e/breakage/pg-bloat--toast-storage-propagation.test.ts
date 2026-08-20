@@ -4,8 +4,8 @@
  * `0008_pack_encoding.ts` declares `data bytea storage external` INLINE on the
  * HASH-partitioned PARENT `git_pack_encoding`, asserting (from the 0001 precedent
  * that inline COMPRESSION propagates) that the attribute reaches all 16 leaf
- * partitions. The design doc records this as an UNVERIFIED EXPECTATION and asks
- * for the one-line catalog check before release. This file is that check, plus
+ * partitions. The design originally recorded that as an unverified expectation;
+ * this file turns it into a live catalog and behavioral contract, plus
  * a behavioural proof that does not trust the catalog alone, plus the cost
  * accounting for whichever way it lands.
  *

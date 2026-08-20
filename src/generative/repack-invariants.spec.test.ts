@@ -1,50 +1,3 @@
-/**
- * §8.4 generative kernel differential — REPACK's structural invariants over
- * GENERATED edit sequences (finding [2.16]).
- *
- * The derived pack-encoding tier (`git_pack_encoding`, design D1/D2/D4/D9) owes
- * four things after a pass, and until now each was pinned by its own hand-picked
- * fixture on its own single shape: depth ≤ 1 on two scenarios
- * (`wire--incremental-repack-passes`), coverage at four object counts
- * (`perf--repack-small-object-wall`), coverage + topology at three crash points
- * (`txn--interrupted-repack`), the second-pass no-op on one widening linear
- * history (`lifecycle--incremental-repack-idempotence`). This asserts ALL FOUR on
- * every shape a generator reaches, and shrinks a violation to the minimal edit
- * sequence that produces it — the diagnosis the fixtures cannot give.
- *
- * One candidate = one random edit sequence (append / rewrite / delete an entry,
- * mode swap, blob→dir swap, widen a directory, deep path, orphan root, force the
- * branch back k commits), replayed into a real repo through ONE `fast-import`
- * stream, pushed over the wire, then `repack()`ed. Per candidate:
- *
- *   1. COVERAGE     every `git_object` row ends the pass with exactly one
- *                   encoding row (`count(git_pack_encoding) == count(git_object)`).
- *   2. STAR TOPOLOGY no delta's base is itself a delta, no delta's base is
- *                    missing, no self-delta (D2/D9 — depth ≤ 1, unconditionally).
- *   3. IDEMPOTENCE  a second `repack()` returns `{wholes: 0, deltas: 0}` (D4 —
- *                   rows are never rewritten, so a pass over covered input is a
- *                   read and nothing else).
- *   4. INVISIBILITY a mirror clone is fsck-clean and byte-identical (object set,
- *                   ref set, and a `cat-file --batch` digest of every object) to a
- *                   mirror clone of a `file://` remote holding the same history —
- *                   the tier is DERIVED, so no client may ever observe it.
- *
- * (1)–(3) are pure DB reads; (4) is two clones. Self-delta additionally cannot
- * survive the `git_pack_encoding_base_not_self` CHECK (0008) — asserted anyway, so
- * dropping the constraint cannot silently remove the guarantee.
- *
- * NON-VACUITY: a corpus in which repack never emitted a DELTA satisfies (2)
- * trivially, so the tallied delta count and the realized shape mix are FLOORED
- * after `fc.assert` — the same discipline as `gc.spec`'s SHAPE_FLOORS. That is why
- * the seed commit lays down a WIDE directory: successive versions of a wide tree
- * are where the delta beats the whole form, which is the shape the tier exists for.
- *
- * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned
- * seed). A failure is a real repack bug, not a test to weaken.
- */
-import { createHash } from "node:crypto"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
@@ -52,15 +5,18 @@ import { assertNever } from "@/assert-never"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
-import { mirrorClone } from "@/testing/git-fixtures"
+import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	uuidFromSeed,
+} from "@/testing/append-only-repo"
+import { cyclicAt, mirrorClone } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 const REPO = "workspace/probe/repack-invariants"
 const REFSPEC = "refs/heads/*:refs/heads/*"
-/** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 
 /** The directories the edit commands target. `runs/` is the WIDE one (the seed
  * commit fills it), so its successive tree versions are what the delta tier
@@ -72,7 +28,7 @@ const SEED_WIDTH = 30
 
 // ── the generated edit language ─────────────────────────────────────────────
 // Every command carries its own parameters; indices wrap into the model's live
-// path list, so a shrunk sequence stays replayable (the `pick` discipline from
+// path list, so a shrunk sequence stays replayable (the `cyclicAt` discipline from
 // generative/commands.ts).
 
 type Edit =
@@ -153,28 +109,6 @@ type Entry = { mode: string; content: string }
 /** One committed state of `refs/heads/main`: its fast-import mark and its tree. */
 type Snapshot = { mark: number; files: Map<string, Entry> }
 
-/** Deterministic filler (hex, poorly compressible) — the append-only fixture's. */
-function filler(salt: string, len: number): string {
-	let out = ""
-	while (out.length < len) {
-		out += createHash("sha1").update(`${salt}-${out.length}`).digest("hex")
-	}
-	return out.slice(0, len)
-}
-
-/** A uuid-shaped entry name — 36 chars, so one wide-tree entry costs ~63 bytes. */
-function uuidName(seed: string): string {
-	const h = createHash("sha1").update(seed).digest("hex")
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-}
-
-/** Wraparound index into a non-empty list (`noUncheckedIndexedAccess`-safe). */
-function pick<T>(xs: readonly T[], idx: number): T {
-	const v = xs[idx % xs.length]
-	if (v === undefined) throw new Error("pick: empty list")
-	return v
-}
-
 /**
  * Replay an edit sequence into a real repo through ONE `fast-import` stream, and
  * report which shapes it realized. The model tracks the tree of `refs/heads/main`
@@ -207,7 +141,7 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 		const m = ++mark
 		const msg = `c${seq++}` // unique per commit: the clock is pinned, the message is not
 		stream.push(
-			`commit refs/heads/${branch}\nmark :${m}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n` +
+			`commit refs/heads/${branch}\nmark :${m}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\n` +
 				(from === null ? "" : `from :${from}\n`) +
 				`${ops.join("\n")}\n`,
 		)
@@ -231,10 +165,14 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 	// The seed commit: a WIDE directory (where deltas win) plus a few docs.
 	const seedOps = [
 		...Array.from({ length: SEED_WIDTH }, (_, i) =>
-			write(`runs/${uuidName(`seed-${i}`)}.json`, "100644", `{"run":${i}}\n`),
+			write(`runs/${uuidFromSeed(`seed-${i}`)}.json`, "100644", `{"run":${i}}\n`),
 		),
 		...Array.from({ length: 4 }, (_, i) =>
-			write(`docs/doc-${i}.md`, "100644", `# doc ${i}\n\n${filler(`doc-${i}`, 400)}\n`),
+			write(
+				`docs/doc-${i}.md`,
+				"100644",
+				`# doc ${i}\n\n${deterministicFiller(`doc-${i}`, 400)}\n`,
+			),
 		),
 	]
 	commitMain(seedOps)
@@ -243,36 +181,46 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 		const live = paths()
 		switch (edit.kind) {
 			case "append": {
-				const path = `${pick(DIRS, edit.dir)}/${uuidName(`a-${seq}-${mark}`)}.json`
+				const path = `${cyclicAt(DIRS, edit.dir)}/${uuidFromSeed(`a-${seq}-${mark}`)}.json`
 				if (files.has(path)) break
-				commitMain([write(path, "100644", `{"payload":"${filler(`a-${seq}`, 200)}"}\n`)])
+				commitMain([
+					write(
+						path,
+						"100644",
+						`{"payload":"${deterministicFiller(`a-${seq}`, 200)}"}\n`,
+					),
+				])
 				break
 			}
 			case "rewrite": {
 				if (live.length === 0) break
-				const path = pick(live, edit.idx)
+				const path = cyclicAt(live, edit.idx)
 				const entry = files.get(path)
 				if (entry === undefined)
 					throw new Error(`rewrite: live path missing from model: ${path}`)
 				commitMain([
-					write(path, entry.mode, `${entry.content}${filler(`r-${seq}`, 64)}\n`),
+					write(
+						path,
+						entry.mode,
+						`${entry.content}${deterministicFiller(`r-${seq}`, 64)}\n`,
+					),
 				])
 				break
 			}
 			case "delete": {
 				if (live.length === 0) break
-				const path = pick(live, edit.idx)
+				const path = cyclicAt(live, edit.idx)
 				files.delete(path)
 				commitMain([`D ${path}`])
 				break
 			}
 			case "modeSwap": {
 				if (live.length === 0) break
-				const path = pick(live, edit.idx)
+				const path = cyclicAt(live, edit.idx)
 				const entry = files.get(path)
 				if (entry === undefined)
 					throw new Error(`modeSwap: live path missing from model: ${path}`)
-				const mode = pick(["100644", "100755", "120000"], edit.mode)
+				const mode = cyclicAt(["100644", "100755", "120000"], edit.mode)
 				if (mode === entry.mode) break
 				// A symlink blob IS its target path; swapping back leaves that text as
 				// ordinary file content, which is exactly what git does.
@@ -284,7 +232,7 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 			}
 			case "fileToDir": {
 				if (live.length === 0) break
-				const path = pick(live, edit.idx)
+				const path = cyclicAt(live, edit.idx)
 				if (!files.has(path))
 					throw new Error(`fileToDir: live path missing from model: ${path}`)
 				// blob → tree at the SAME name: the tree-diff pairing that repack must
@@ -298,10 +246,10 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 				break
 			}
 			case "widenDir": {
-				const dir = pick(DIRS, edit.dir)
+				const dir = cyclicAt(DIRS, edit.dir)
 				const ops = Array.from({ length: edit.count }, (_, i) =>
 					write(
-						`${dir}/${uuidName(`w-${seq}-${mark}-${i}`)}.json`,
+						`${dir}/${uuidFromSeed(`w-${seq}-${mark}-${i}`)}.json`,
 						"100644",
 						`{"w":${i}}\n`,
 					),
@@ -311,7 +259,7 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 			}
 			case "deepPath": {
 				const segments = Array.from({ length: edit.depth }, (_, i) => `n${i}`).join("/")
-				const path = `deep/${segments}/${uuidName(`d-${seq}-${mark}`)}.json`
+				const path = `deep/${segments}/${uuidFromSeed(`d-${seq}-${mark}`)}.json`
 				if (files.has(path)) break
 				commitMain([write(path, "100644", `{"deep":${edit.depth}}\n`)])
 				break
@@ -332,7 +280,7 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 				// unreachable and are never pushed, and the next commit re-diverges from
 				// the older tree — a force-push history, without a non-FF wire push.
 				if (history.length < 2) break
-				const target = pick(history.slice(0, -1), edit.steps)
+				const target = cyclicAt(history.slice(0, -1), edit.steps)
 				const idx = history.indexOf(target)
 				history.length = idx + 1
 				files.clear()
@@ -429,67 +377,70 @@ describe("§8.4 generative — repack invariants over random edit sequences", ()
 			fc.asyncProperty(
 				fc.array(editArb, { maxLength: 60, minLength: 20 }),
 				async (edits) => {
-					const root = mkdtempSync(join(tmpdir(), "pggit-repack-inv-"))
-					const src = join(root, "src")
-					const control = join(root, "control.git")
-					const isolated = await createIsolatedSchema(baseUrl)
-					let server: GitServer | undefined
-					try {
-						const shape = await buildRepo(src, edits)
-						if (shape.fileToDir) realized.fileToDir++
-						if (shape.modeSwap) realized.modeSwap++
-						if (shape.moveBack) realized.moveBack++
-						if (shape.orphanRoot) realized.orphanRoot++
-						if (shape.symlink) realized.symlink++
+					await withTempDir("pggit-repack-inv-", async (root) => {
+						const src = join(root, "src")
+						const control = join(root, "control.git")
+						const isolated = await createIsolatedSchema(baseUrl)
+						let server: GitServer | undefined
+						try {
+							const shape = await buildRepo(src, edits)
+							if (shape.fileToDir) realized.fileToDir++
+							if (shape.modeSwap) realized.modeSwap++
+							if (shape.moveBack) realized.moveBack++
+							if (shape.orphanRoot) realized.orphanRoot++
+							if (shape.symlink) realized.symlink++
 
-						// The control: a plain bare remote holding the SAME history, which is
-						// what "invisible" is measured against.
-						await spawnGit(["init", "-q", "--bare", "-b", "main", control])
-						await spawnGit(["push", "-q", control, REFSPEC], { cwd: src })
+							// The control: a plain bare remote holding the SAME history, which is
+							// what "invisible" is measured against.
+							await spawnGit(["init", "-q", "--bare", "-b", "main", control])
+							await spawnGit(["push", "-q", control, REFSPEC], { cwd: src })
 
-						server = await serveOnPort(createGitApp(createGitDeps(isolated.sql)), 0)
-						const url = `http://127.0.0.1:${server.port}/${REPO}`
-						await spawnGit(["push", "-q", url, REFSPEC], { cwd: src })
+							server = await serveOnPort(createGitApp(createGitDeps(isolated.sql)), 0)
+							const url = `http://127.0.0.1:${server.port}/${REPO}`
+							await spawnGit(["push", "-q", url, REFSPEC], { cwd: src })
 
-						const repack = createRepack(isolated.sql)
-						const first = await repack.repack(REPO)
-						expect(
-							first.wholes + first.deltas,
-							"the pass encoded NOTHING — every later claim is vacuous",
-						).toBeGreaterThan(0)
-						realized.deltaRows += first.deltas
+							const repack = createRepack(isolated.sql)
+							const first = await repack.repack(REPO)
+							expect(
+								first.wholes + first.deltas,
+								"the pass encoded NOTHING — every later claim is vacuous",
+							).toBeGreaterThan(0)
+							realized.deltaRows += first.deltas
 
-						// 1. Coverage: every object row carries exactly one encoding row.
-						const cov = await coverage(isolated)
-						expect({ encodings: cov.encodings, uncovered: cov.uncovered }).toEqual({
-							encodings: cov.objects,
-							uncovered: 0,
-						})
+							// 1. Coverage: every object row carries exactly one encoding row.
+							const cov = await coverage(isolated)
+							expect({ encodings: cov.encodings, uncovered: cov.uncovered }).toEqual({
+								encodings: cov.objects,
+								uncovered: 0,
+							})
 
-						// 2. Star topology (D2/D9): every delta's base is a WHOLE encoding.
-						expect(topologyViolations(await encodingRows(isolated))).toEqual([])
+							// 2. Star topology (D2/D9): every delta's base is a WHOLE encoding.
+							expect(topologyViolations(await encodingRows(isolated))).toEqual([])
 
-						// 3. Idempotence (D4): the second pass finds nothing pending.
-						expect(await repack.repack(REPO)).toEqual({ deltas: 0, wholes: 0 })
+							// 3. Idempotence (D4): the second pass finds nothing pending.
+							expect(await repack.repack(REPO)).toEqual({ deltas: 0, wholes: 0 })
 
-						// 4. Invisibility: the client sees the file:// control, byte for byte.
-						const served = await mirrorClone(url, join(root, "from-pggit"))
-						const oracle = await mirrorClone(`file://${control}`, join(root, "from-file"))
-						expect(served.fsck).toBe("")
-						expect({
-							digest: served.digest,
-							objects: served.objects,
-							refs: served.refs,
-						}).toEqual({
-							digest: oracle.digest,
-							objects: oracle.objects,
-							refs: oracle.refs,
-						})
-					} finally {
-						await server?.close()
-						await isolated.drop()
-						rmSync(root, { force: true, recursive: true })
-					}
+							// 4. Invisibility: the client sees the file:// control, byte for byte.
+							const served = await mirrorClone(url, join(root, "from-pggit"))
+							const oracle = await mirrorClone(
+								`file://${control}`,
+								join(root, "from-file"),
+							)
+							expect(served.fsck).toBe("")
+							expect({
+								digest: served.digest,
+								objects: served.objects,
+								refs: served.refs,
+							}).toEqual({
+								digest: oracle.digest,
+								objects: oracle.objects,
+								refs: oracle.refs,
+							})
+						} finally {
+							await server?.close()
+							await isolated.drop()
+						}
+					})
 				},
 			),
 			{ numRuns: NUM_RUNS, seed: 424_242 },

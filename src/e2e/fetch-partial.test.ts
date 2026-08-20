@@ -17,6 +17,7 @@ import {
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("M1 — blobless partial clone (real git)", () => {
 	let db: IsolatedDb
@@ -51,8 +52,7 @@ describe("M1 — blobless partial clone (real git)", () => {
 	})
 
 	it("clones with --filter=blob:none, transferring every object except blobs", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-m1-dest-"))
-		try {
+		await withTempDir("pggit-m1-dest-", async (dest) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -77,14 +77,11 @@ describe("M1 — blobless partial clone (real git)", () => {
 			expect(blobOids.length).toBeGreaterThan(0)
 			// The blobless pack carried exactly the commits + trees + tag.
 			expect(await allObjectOids(dest)).toEqual(expectedNonBlob)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 
 	it("lazily fetches blobs from the promisor remote on checkout", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-m1-lazy-"))
-		try {
+		await withTempDir("pggit-m1-lazy-", async (dest) => {
 			// Checkout is ON: the initial fetch is blobless (our filter), then the
 			// checkout must lazily fault HEAD's blobs back via bare `want <oid>`
 			// (allowAnySHA1InWant). Correct file contents prove the blobs really
@@ -134,8 +131,6 @@ describe("M1 — blobless partial clone (real git)", () => {
 				headBlobs.filter((oid) => !have.has(oid)),
 				"the checkout never faulted HEAD's blobs back from the promisor remote",
 			).toEqual([])
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	})
 })

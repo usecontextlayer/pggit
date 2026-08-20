@@ -37,6 +37,7 @@ import { createRefStore, type RefStore } from "@/store/refs-store"
 import { allObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 const TAG = "huge"
 /** 270_000_000 bytes > 0x1fffffe8 / 2 ≈ 268_435_443, so this value's hex text form
@@ -87,8 +88,7 @@ describe("large blob past the V8 string cap — pushed, then fetched back", () =
 	})
 
 	it("serves the exact blob to a fresh canonical-git repository", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "pggit-large-blob-dest-"))
-		try {
+		await withTempDir("pggit-large-blob-dest-", async (dest) => {
 			await spawnGit(["init", "-q"], { cwd: dest })
 			await spawnGit(
 				[
@@ -111,8 +111,6 @@ describe("large blob past the V8 string cap — pushed, then fetched back", () =
 					(await spawnGit(["cat-file", "-s", blobOid], { cwd: dest })).stdout.trim(),
 				),
 			).toBe(SIZE)
-		} finally {
-			rmSync(dest, { force: true, recursive: true })
-		}
+		})
 	}, 300_000)
 })

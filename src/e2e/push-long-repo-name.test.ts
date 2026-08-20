@@ -31,7 +31,6 @@
  * message at the right layer is the recommended follow-up.
  */
 
-import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -41,30 +40,23 @@ import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { deterministicFiller } from "@/testing/append-only-repo"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 /**
- * Deterministic, INCOMPRESSIBLE repo name. Concatenating sha256 hex of distinct
- * counters yields a string with no repeated block, so the btree index tuple cannot
+ * Deterministic, INCOMPRESSIBLE repo name. The shared fixture's salted hash chain
+ * yields a string with no repeated block, so the btree index tuple cannot
  * be compressed under the 2704-byte ceiling — this is what trips `repos_name_key`.
  * (A repeated-block name of the same length would compress and insert fine, which
  * is exactly why the ceiling is content-dependent.) ~2800 hex chars + "nam-".
  */
-function incompressibleName(): string {
-	let hex = ""
-	for (let i = 0; hex.length < 2800; i++) {
-		hex += createHash("sha256").update(`nam03-incompressible|${i}`).digest("hex")
-	}
-	return `nam-${hex.slice(0, 2800)}`
-}
-
 describe("nam03 — over-long incompressible repo name fails clean (in-band, atomic, server-healthy)", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
-	const longName = incompressibleName()
+	const longName = `nam-${deterministicFiller("nam03-incompressible", 2800)}`
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))

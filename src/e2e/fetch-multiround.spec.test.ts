@@ -17,6 +17,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { decodePktStream } from "@/protocol/pkt-line"
+import { bindRepoBackend } from "@/protocol/repo-backend"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -69,14 +70,7 @@ describe("M1 multi-round negotiation", () => {
 		u1 = (await spawnGit(["rev-parse", "unrelated"], { cwd: dir })).stdout.trim()
 
 		await seedRepoIntoStore("repo", dir, { objects, refs })
-		backend = {
-			buildPack: (wants, haves, omitBlobs) =>
-				objects.buildPack("repo", wants, haves, omitBlobs),
-			getSymref: (name) => refs.getSymref("repo", name),
-			listRefs: () => refs.listRefs("repo"),
-			processHaves: (haves) => objects.processHaves("repo", haves),
-			readyToGiveUp: (wants, common) => objects.readyToGiveUp("repo", wants, common),
-		}
+		backend = bindRepoBackend({ objects, refs }, "repo")
 	}, 180_000)
 
 	afterAll(async () => {

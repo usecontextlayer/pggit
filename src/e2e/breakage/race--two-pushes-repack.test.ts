@@ -25,6 +25,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
@@ -45,7 +46,6 @@ const ITERS = 25
 const RUNS = 400
 const MODES = ["same-path", "two-push"] as const
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 const msg = (e: unknown) =>
 	(e instanceof Error ? e.message : String(e)).split("\n")[0] ?? ""
 

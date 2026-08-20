@@ -27,10 +27,8 @@ import { writePack } from "@/pack/write-pack"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { pktLineUnpack } from "@/testing/pkt-oracle"
+import { pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
-
-const ZERO = "0".repeat(40)
 
 describe("delete of a nonexistent ref is reported per-ref, not a 500", () => {
 	let db: IsolatedDb
@@ -53,7 +51,7 @@ describe("delete of a nonexistent ref is reported per-ref, not a 500", () => {
 		withEmptyPack: boolean,
 	): Promise<{ report: string; status: number }> {
 		const body = receivePackRequest(
-			[`${ZERO} ${ZERO} ${ref}\0report-status`],
+			[`${ZERO_OID} ${ZERO_OID} ${ref}\0report-status`],
 			withEmptyPack ? writePack([]) : undefined,
 		)
 		const res = await postReceivePack(app, "repo", body)

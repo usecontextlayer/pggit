@@ -6,16 +6,16 @@
  * Git trees are content-addressed, so one tree oid can sit in unrelated histories.
  * Repack fixes that tree's delta base once, from whichever lineage the topo walk
  * reaches first. A client that clones ONLY the other branch gets a served set that
- * does not contain the anchor — design D8's `base in served set` test is the sole
- * thing standing between that and an unresolvable REF_DELTA.
+ * does not contain the anchor. Under design D8', that no-have request must fall
+ * back to the whole form; a thin request may use the anchor only when `clientHas`
+ * proves it.
  *
  * Shapes covered:
  *   1. `--single-branch` clone of the branch whose closure excludes the anchor.
  *   2. Fetch of one branch by exact ref after the other was repacked.
  *   3. Full clone (both branches) as the control.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
@@ -26,6 +26,7 @@ import {
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -45,12 +46,7 @@ type CloneCase = {
 describe("wire — a cross-lineage shared tree served in every closure", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk } = createScratchArena()
 
 	let sharedTree = ""
 	const cases: CloneCase[] = []
@@ -137,8 +133,9 @@ describe("wire — a cross-lineage shared tree served in every closure", () => {
 			})
 		}
 
-		// Fetch just the orphan ref into a clone that already has ALL of main — the
-		// anchor is then a `have`, so the delta must ship whole.
+		// Fetch just the orphan ref into a clone that already has ALL of main. The
+		// anchor is then a `have`, so D8' may use it as an external base for a thin
+		// pack; otherwise the object ships whole.
 		const withMain = join(mk("wm"), "c")
 		orphanOntoMain = await captureTestResult(async () => {
 			await spawnGit([
@@ -171,7 +168,7 @@ describe("wire — a cross-lineage shared tree served in every closure", () => {
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("clones fsck-clean in every closure, anchor present or not", () => {

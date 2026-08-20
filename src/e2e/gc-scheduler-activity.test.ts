@@ -1,7 +1,7 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { ZERO_OID } from "@/oid"
 import {
 	type GcFixture,
 	pushFile,
@@ -11,6 +11,7 @@ import {
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /**
  * GC scheduler — activity signal (`docs/2026-06-24-gc-scheduler-design.md` §6,
@@ -70,8 +71,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		// it back, committing on top, and pushing the (fast-forward) child. A ff push
 		// ingests a new commit/tree/blob, so it must advance the stamp too — this is
 		// the mutation a "rewind-only" stamp would miss.
-		const ffDir = mkdtempSync(join(tmpdir(), "pggit-sch1-ff-"))
-		try {
+		await withTempDir("pggit-sch1-ff-", async (ffDir) => {
 			const url = repoUrl(fx, repo)
 			await spawnGit(["init", "-q", "-b", "main"], { cwd: ffDir })
 			await spawnGit(["fetch", url, "refs/heads/main"], { cwd: ffDir })
@@ -81,9 +81,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 			await spawnGit(["commit", "-q", "-m", "ff"], { cwd: ffDir })
 			// No `--force`: this is a genuine fast-forward (the child is a descendant).
 			await spawnGit(["push", url, "HEAD:refs/heads/main"], { cwd: ffDir })
-		} finally {
-			rmSync(ffDir, { force: true, recursive: true })
-		}
+		})
 		const afterFf = await pushedAt(repo)
 		expect(afterFf.getTime()).toBeGreaterThan(afterCreate.getTime())
 
@@ -109,29 +107,23 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		// Seed main so the repo exists, then push a second branch `topic` whose tip is
 		// an independent commit (a real storage mutation that creates the ref).
 		await pushFile(fx, repo, { content: "main\n" })
-		const topicDir = mkdtempSync(join(tmpdir(), "pggit-sch2-topic-"))
-		try {
+		await withTempDir("pggit-sch2-topic-", async (topicDir) => {
 			await spawnGit(["init", "-q", "-b", "topic"], { cwd: topicDir })
 			writeFileSync(join(topicDir, "file.txt"), "topic branch\n")
 			await spawnGit(["add", "."], { cwd: topicDir })
 			await spawnGit(["commit", "-q", "-m", "topic"], { cwd: topicDir })
 			await spawnGit(["push", url, "HEAD:refs/heads/topic"], { cwd: topicDir })
-		} finally {
-			rmSync(topicDir, { force: true, recursive: true })
-		}
+		})
 		const afterCreateTopic = await pushedAt(repo)
 
 		// A WIRE delete is denied outright now (deny-non-FF policy) and, being a
 		// pure refusal, must NOT advance the stamp.
-		const delDir = mkdtempSync(join(tmpdir(), "pggit-sch2-del-"))
-		try {
+		await withTempDir("pggit-sch2-del-", async (delDir) => {
 			await spawnGit(["init", "-q"], { cwd: delDir })
 			await expect(
 				spawnGit(["push", url, ":refs/heads/topic"], { cwd: delDir }),
 			).rejects.toThrow(/deletion denied/i)
-		} finally {
-			rmSync(delDir, { force: true, recursive: true })
-		}
+		})
 		expect(await pushedAt(repo)).toEqual(afterCreateTopic)
 
 		// The STORE-level delete (the internal path a retired ref takes) is a ref
@@ -142,7 +134,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		expect(await names()).toContain("refs/heads/topic")
 		const deleted = await fx.refs.applyRefUpdates(
 			repo,
-			[{ newOid: "0".repeat(40), oldOid: "0".repeat(40), ref: "refs/heads/topic" }],
+			[{ newOid: ZERO_OID, oldOid: ZERO_OID, ref: "refs/heads/topic" }],
 			false,
 		)
 		expect(deleted).toEqual([true])
@@ -165,7 +157,6 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 	// before == after.
 	it("SCH-1: a ref op that changes nothing leaves last_pushed_at unchanged", async () => {
 		const repo = "sch1-noop"
-		const zero = "0".repeat(40)
 
 		await pushFile(fx, repo, { content: "seed\n" })
 		const before = await pushedAt(repo)
@@ -174,7 +165,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		// no-op success that mutates no storage.
 		const results = await fx.refs.applyRefUpdates(
 			repo,
-			[{ newOid: zero, oldOid: zero, ref: "refs/heads/never-existed" }],
+			[{ newOid: ZERO_OID, oldOid: ZERO_OID, ref: "refs/heads/never-existed" }],
 			false,
 		)
 		expect(results).toEqual([true])

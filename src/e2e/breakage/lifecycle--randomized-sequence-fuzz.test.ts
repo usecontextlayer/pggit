@@ -34,8 +34,7 @@
  * Originated as exploration-7 probe `lifecycle--randomized-sequence-fuzz.ts`
  * (exit 1 on any mismatch against the file:// oracle); fixed, then converted.
  */
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { rmSync } from "node:fs"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
@@ -49,13 +48,14 @@ import {
 	commitsOldestFirst,
 } from "@/testing/append-only-repo"
 import { ageObjects } from "@/testing/gc-helpers"
-import { mirrorClone, requiredAt } from "@/testing/git-fixtures"
+import { cyclicAt, mirrorClone, requiredAt } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 const REPO = "workspace/slate/fuzz"
 
@@ -65,14 +65,6 @@ const SOURCE_COMMITS = 24
 const NUM_RUNS = 4
 const MIN_COMMANDS = 10
 const MAX_COMMANDS = 16
-
-/** Wraparound index into a non-empty list — how every generated index lands on a
- * live ref/commit, so a shrunk sequence stays replayable. */
-function pick<T>(xs: readonly T[], idx: number): T {
-	const v = xs[idx % xs.length]
-	if (v === undefined) throw new Error("pick: empty list")
-	return v
-}
 
 // ── the generated lifecycle language ────────────────────────────────────────
 // One command per lifecycle operation the original op list drew, each carrying its
@@ -190,210 +182,212 @@ async function runSequence(
 	commands: Command[],
 	tally: Tally,
 ): Promise<void> {
-	const root = mkdtempSync(join(tmpdir(), "pggit-breakage-fuzz-"))
-	const dir = (name: string): string => join(root, name)
-	const fixture = await setupGitServerFixture(baseUrl)
-	const { db, server } = fixture
-	try {
-		const src = dir("src")
-		await buildLifecycleSource(src, SOURCE_COMMITS)
-		const commits = await commitsOldestFirst(src, "main")
+	return withTempDir("pggit-breakage-fuzz-", async (root) => {
+		const dir = (name: string): string => join(root, name)
+		const fixture = await setupGitServerFixture(baseUrl)
+		const { db, server } = fixture
+		try {
+			const src = dir("src")
+			await buildLifecycleSource(src, SOURCE_COMMITS)
+			const commits = await commitsOldestFirst(src, "main")
 
-		const ref = dir("ref.git")
-		await spawnGit(["init", "-q", "--bare", "-b", "main", ref])
-		const url = repoUrl(server, REPO)
-		const repack = createRepack(db.sql)
-		const gc = createGc(db.sql)
-		const refs = fixture.deps.refs
+			const ref = dir("ref.git")
+			await spawnGit(["init", "-q", "--bare", "-b", "main", ref])
+			const url = repoUrl(server, REPO)
+			const repack = createRepack(db.sql)
+			const gc = createGc(db.sql)
+			const refs = fixture.deps.refs
 
-		/** pggit's ref state, mirrored to ref.git on every mutation. */
-		const state = new Map<string, string>()
-		const setBoth = async (name: string, oid: string): Promise<void> => {
-			await refs.setRef(REPO, name, oid)
-			await spawnGit(["update-ref", name, oid], { cwd: ref })
-			state.set(name, oid)
-		}
-		const delBoth = async (name: string): Promise<void> => {
-			const old = state.get(name)
-			if (!old) return
-			await refs.applyRefUpdates(
-				REPO,
-				[{ newOid: ZERO_OID, oldOid: old, ref: name }],
-				false,
-			)
-			await spawnGit(["update-ref", "-d", name, old], { cwd: ref })
-			state.delete(name)
-		}
-		const pushBoth = async (sha: string, name: string): Promise<void> => {
-			await spawnGit(["push", "-q", url, `${sha}:${name}`], { cwd: src })
-			await spawnGit(["push", "-q", ref, `${sha}:${name}`], { cwd: src })
-			state.set(name, sha)
-		}
-		/** Commits currently reachable in the reference — safe force-move targets. */
-		const reachableCommits = async (): Promise<string[]> => {
-			const out = await spawnGit(["rev-list", "--all", "--max-count=400"], { cwd: ref })
-			return out.stdout.trim().split("\n").filter(Boolean)
-		}
-		const heads = (): string[] =>
-			[...state.keys()].filter((k) => k.startsWith("refs/heads/")).sort()
-
-		await pushBoth(
-			requiredAt(commits, commits.length - 1, "main commit history"),
-			"refs/heads/main",
-		)
-		await repack.repack(REPO)
-
-		let seq = 0
-		for (const [round, command] of commands.entries()) {
-			// A command whose precondition does not hold is a silent no-op (the
-			// "sensible but randomized" discipline); `note` stays null and the round
-			// costs no clone, because the state it would compare is the previous one.
-			let note: string | null = null
-			switch (command.kind) {
-				case "advance": {
-					// Bases come from BRANCH tips only: a tag ref names a tag object, and
-					// fast-import's `from` demands a commit.
-					const base = state.get(pick(heads(), command.branch))
-					if (base === undefined) break
-					const branch = `l${seq++}`
-					const tip = await appendLifecycleBranch(
-						src,
-						branch,
-						base,
-						branch,
-						command.commits,
-					)
-					const target = pick(heads(), command.target)
-					// FF only when it really is one; otherwise a force-move.
-					if (state.get(target) === base) await pushBoth(tip, target)
-					else {
-						const staging = `refs/heads/stg${seq++}`
-						await spawnGit(["push", "-q", url, `${tip}:${staging}`], { cwd: src })
-						await spawnGit(["push", "-q", ref, `${tip}:${staging}`], { cwd: src })
-						state.set(staging, tip)
-						await setBoth(target, tip)
-						await delBoth(staging)
-					}
-					tally.advance++
-					note = `advance ${target} (+${branch}, ${command.commits})`
-					break
-				}
-				case "forceMove": {
-					const cands = await reachableCommits()
-					if (cands.length === 0) break
-					const target = pick(heads(), command.target)
-					const to = pick(cands, command.to)
-					await setBoth(target, to)
-					tally.forceMove++
-					note = `force-move ${target} -> ${to.slice(0, 8)}`
-					break
-				}
-				case "deleteRef": {
-					// Tag refs are deletable unconditionally; a head only while another
-					// head survives it, so the repo never runs out of branches to move.
-					const live = [...state.keys()]
-						.filter((name) => !name.startsWith("refs/heads/") || heads().length > 1)
-						.sort()
-					if (live.length === 0) break
-					const target = pick(live, command.target)
-					await delBoth(target)
-					tally.deleteRef++
-					note = `delete ${target}`
-					break
-				}
-				case "orphan": {
-					const cands = await reachableCommits()
-					if (cands.length === 0) break
-					const from = pick(cands, command.from)
-					const tree = (
-						await spawnGit(["rev-parse", `${from}^{tree}`], { cwd: src })
-					).stdout.trim()
-					const orphan = (
-						await spawnGit(["commit-tree", tree, "-m", `orphan-${seq++}`], { cwd: src })
-					).stdout.trim()
-					await pushBoth(orphan, `refs/heads/orphan${round}`)
-					tally.orphan++
-					note = `orphan from ${from.slice(0, 8)}`
-					break
-				}
-				case "tag": {
-					const cands = await reachableCommits()
-					if (cands.length === 0) break
-					const from = pick(cands, command.from)
-					const name = `t${seq++}`
-					await spawnGit(["tag", "-a", name, "-m", `tag ${name}`, from], { cwd: src })
-					const tagOid = (await spawnGit(["rev-parse", name], { cwd: src })).stdout.trim()
-					await pushBoth(tagOid, `refs/tags/${name}`)
-					tally.tag++
-					note = `tag ${name}`
-					break
-				}
-				case "branch": {
-					const cands = await reachableCommits()
-					if (cands.length === 0) break
-					await pushBoth(pick(cands, command.from), `refs/heads/b${round}`)
-					tally.branch++
-					note = `branch b${round}`
-					break
-				}
-				case "gc": {
-					const result = await gc.gc(REPO, { graceSeconds: command.grace })
-					// The oracle keeps its own garbage only when pggit was told to keep
-					// its own; unreachable objects are invisible to a mirror clone either
-					// way, so this only keeps the two repos operationally alike.
-					if (command.grace === 0)
-						await spawnGit(["gc", "-q", "--prune=now"], { cwd: ref })
-					tally.gc++
-					tally.gcDeleted += result.deletedObjects
-					note = `gc grace=${command.grace} obj=${result.deletedObjects}`
-					break
-				}
-				case "age": {
-					// Every row the store holds becomes an hour old, so the NEXT gc with a
-					// middling grace splits the garbage by cohort — deterministically, where
-					// the original file slept 1.6 s and hoped.
-					await ageObjects(db, REPO, "1 hour")
-					tally.age++
-					note = "age 1h"
-					break
-				}
-				case "repack": {
-					const first = await repack.repack(REPO)
-					const second = await repack.repack(REPO)
-					expect(
-						second,
-						`round ${round}: the second repack pass was not a no-op`,
-					).toEqual({ deltas: 0, wholes: 0 })
-					tally.repack++
-					tally.repackRows += first.wholes + first.deltas
-					note = `repack ${first.wholes}w/${first.deltas}d`
-					break
-				}
-				default:
-					assertNever(command)
+			/** pggit's ref state, mirrored to ref.git on every mutation. */
+			const state = new Map<string, string>()
+			const setBoth = async (name: string, oid: string): Promise<void> => {
+				await refs.setRef(REPO, name, oid)
+				await spawnGit(["update-ref", name, oid], { cwd: ref })
+				state.set(name, oid)
 			}
-			if (note === null) continue
+			const delBoth = async (name: string): Promise<void> => {
+				const old = state.get(name)
+				if (!old) return
+				await refs.applyRefUpdates(
+					REPO,
+					[{ newOid: ZERO_OID, oldOid: old, ref: name }],
+					false,
+				)
+				await spawnGit(["update-ref", "-d", name, old], { cwd: ref })
+				state.delete(name)
+			}
+			const pushBoth = async (sha: string, name: string): Promise<void> => {
+				await spawnGit(["push", "-q", url, `${sha}:${name}`], { cwd: src })
+				await spawnGit(["push", "-q", ref, `${sha}:${name}`], { cwd: src })
+				state.set(name, sha)
+			}
+			/** Commits currently reachable in the reference — safe force-move targets. */
+			const reachableCommits = async (): Promise<string[]> => {
+				const out = await spawnGit(["rev-list", "--all", "--max-count=400"], { cwd: ref })
+				return out.stdout.trim().split("\n").filter(Boolean)
+			}
+			const heads = (): string[] =>
+				[...state.keys()].filter((k) => k.startsWith("refs/heads/")).sort()
 
-			const served = await mirrorClone(url, dir(`pg-${round}`))
-			const oracle = await mirrorClone(`file://${ref}`, dir(`rf-${round}`))
-			const label = `round ${round} [${note}]`
-			tally.comparisons++
-			expect(served.fsck, `${label}: the clone is not fsck --strict clean`).toBe("")
-			expect(
-				{ digest: served.digest, objects: served.objects, refs: served.refs },
-				`${label}: pggit and the file:// oracle diverged`,
-			).toEqual({
-				digest: oracle.digest,
-				objects: oracle.objects,
-				refs: oracle.refs,
-			})
-			rmSync(dir(`pg-${round}`), { force: true, recursive: true })
-			rmSync(dir(`rf-${round}`), { force: true, recursive: true })
+			await pushBoth(
+				requiredAt(commits, commits.length - 1, "main commit history"),
+				"refs/heads/main",
+			)
+			await repack.repack(REPO)
+
+			let seq = 0
+			for (const [round, command] of commands.entries()) {
+				// A command whose precondition does not hold is a silent no-op (the
+				// "sensible but randomized" discipline); `note` stays null and the round
+				// costs no clone, because the state it would compare is the previous one.
+				let note: string | null = null
+				switch (command.kind) {
+					case "advance": {
+						// Bases come from BRANCH tips only: a tag ref names a tag object, and
+						// fast-import's `from` demands a commit.
+						const base = state.get(cyclicAt(heads(), command.branch))
+						if (base === undefined) break
+						const branch = `l${seq++}`
+						const tip = await appendLifecycleBranch(
+							src,
+							branch,
+							base,
+							branch,
+							command.commits,
+						)
+						const target = cyclicAt(heads(), command.target)
+						// FF only when it really is one; otherwise a force-move.
+						if (state.get(target) === base) await pushBoth(tip, target)
+						else {
+							const staging = `refs/heads/stg${seq++}`
+							await spawnGit(["push", "-q", url, `${tip}:${staging}`], { cwd: src })
+							await spawnGit(["push", "-q", ref, `${tip}:${staging}`], { cwd: src })
+							state.set(staging, tip)
+							await setBoth(target, tip)
+							await delBoth(staging)
+						}
+						tally.advance++
+						note = `advance ${target} (+${branch}, ${command.commits})`
+						break
+					}
+					case "forceMove": {
+						const cands = await reachableCommits()
+						if (cands.length === 0) break
+						const target = cyclicAt(heads(), command.target)
+						const to = cyclicAt(cands, command.to)
+						await setBoth(target, to)
+						tally.forceMove++
+						note = `force-move ${target} -> ${to.slice(0, 8)}`
+						break
+					}
+					case "deleteRef": {
+						// Tag refs are deletable unconditionally; a head only while another
+						// head survives it, so the repo never runs out of branches to move.
+						const live = [...state.keys()]
+							.filter((name) => !name.startsWith("refs/heads/") || heads().length > 1)
+							.sort()
+						if (live.length === 0) break
+						const target = cyclicAt(live, command.target)
+						await delBoth(target)
+						tally.deleteRef++
+						note = `delete ${target}`
+						break
+					}
+					case "orphan": {
+						const cands = await reachableCommits()
+						if (cands.length === 0) break
+						const from = cyclicAt(cands, command.from)
+						const tree = (
+							await spawnGit(["rev-parse", `${from}^{tree}`], { cwd: src })
+						).stdout.trim()
+						const orphan = (
+							await spawnGit(["commit-tree", tree, "-m", `orphan-${seq++}`], { cwd: src })
+						).stdout.trim()
+						await pushBoth(orphan, `refs/heads/orphan${round}`)
+						tally.orphan++
+						note = `orphan from ${from.slice(0, 8)}`
+						break
+					}
+					case "tag": {
+						const cands = await reachableCommits()
+						if (cands.length === 0) break
+						const from = cyclicAt(cands, command.from)
+						const name = `t${seq++}`
+						await spawnGit(["tag", "-a", name, "-m", `tag ${name}`, from], { cwd: src })
+						const tagOid = (
+							await spawnGit(["rev-parse", name], { cwd: src })
+						).stdout.trim()
+						await pushBoth(tagOid, `refs/tags/${name}`)
+						tally.tag++
+						note = `tag ${name}`
+						break
+					}
+					case "branch": {
+						const cands = await reachableCommits()
+						if (cands.length === 0) break
+						await pushBoth(cyclicAt(cands, command.from), `refs/heads/b${round}`)
+						tally.branch++
+						note = `branch b${round}`
+						break
+					}
+					case "gc": {
+						const result = await gc.gc(REPO, { graceSeconds: command.grace })
+						// The oracle keeps its own garbage only when pggit was told to keep
+						// its own; unreachable objects are invisible to a mirror clone either
+						// way, so this only keeps the two repos operationally alike.
+						if (command.grace === 0)
+							await spawnGit(["gc", "-q", "--prune=now"], { cwd: ref })
+						tally.gc++
+						tally.gcDeleted += result.deletedObjects
+						note = `gc grace=${command.grace} obj=${result.deletedObjects}`
+						break
+					}
+					case "age": {
+						// Every row the store holds becomes an hour old, so the NEXT gc with a
+						// middling grace splits the garbage by cohort — deterministically, where
+						// the original file slept 1.6 s and hoped.
+						await ageObjects(db, REPO, "1 hour")
+						tally.age++
+						note = "age 1h"
+						break
+					}
+					case "repack": {
+						const first = await repack.repack(REPO)
+						const second = await repack.repack(REPO)
+						expect(
+							second,
+							`round ${round}: the second repack pass was not a no-op`,
+						).toEqual({ deltas: 0, wholes: 0 })
+						tally.repack++
+						tally.repackRows += first.wholes + first.deltas
+						note = `repack ${first.wholes}w/${first.deltas}d`
+						break
+					}
+					default:
+						assertNever(command)
+				}
+				if (note === null) continue
+
+				const served = await mirrorClone(url, dir(`pg-${round}`))
+				const oracle = await mirrorClone(`file://${ref}`, dir(`rf-${round}`))
+				const label = `round ${round} [${note}]`
+				tally.comparisons++
+				expect(served.fsck, `${label}: the clone is not fsck --strict clean`).toBe("")
+				expect(
+					{ digest: served.digest, objects: served.objects, refs: served.refs },
+					`${label}: pggit and the file:// oracle diverged`,
+				).toEqual({
+					digest: oracle.digest,
+					objects: oracle.objects,
+					refs: oracle.refs,
+				})
+				rmSync(dir(`pg-${round}`), { force: true, recursive: true })
+				rmSync(dir(`rf-${round}`), { force: true, recursive: true })
+			}
+		} finally {
+			await teardownGitServerFixture(fixture)
 		}
-	} finally {
-		await teardownGitServerFixture(fixture)
-		rmSync(root, { force: true, recursive: true })
-	}
+	})
 }
 
 /**

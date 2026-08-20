@@ -48,36 +48,28 @@
  * non-atomic multi-ref push MAY partially apply (canonical git: per-ref ok/ng,
  * exit 1 when any ref fails), so the binding rule is that the per-ref REPORT is
  * truthful, the projection matches the served tip, the watermark tracks the
- * orphan, and a retry+gc+repack+clone converges. The fixes: a post-CAS stamp
- * failure and a per-ref CAS failure are absorbed into ng/log lines instead of
- * escaping as an HTTP 500 after refs already moved.
+ * orphan, and a retry+gc+repack+clone converges. The fixes preserve the committed
+ * ref's successful report while logging a post-CAS stamp failure, and turn a
+ * per-ref CAS failure into that ref's `ng` instead of an HTTP 500 after earlier
+ * refs already moved.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { parseLsTree } from "@/testing/git-fixtures"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
+import { lsTreeSnapshot } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `pggit oracle <oracle@pggit.test> ${WHEN}`
 const FAULT_POINTS = ["A-post-commit-stamp", "B-second-ref-in-batch"] as const
 type FaultPoint = (typeof FAULT_POINTS)[number]
-
-/** A revision's worktree as sorted `path\0mode\0oid` — the same shape `repo_file`
- * stores, so the projection and a real clone are directly comparable. */
-async function lsTree(dir: string, rev: string): Promise<string[]> {
-	const out = await spawnGit(["ls-tree", "-r", rev], { cwd: dir })
-	return parseLsTree(out.stdout)
-		.map((e) => `${e.path}\0${e.mode}\0${e.oid}`)
-		.sort()
-}
 
 function refMapOf(stdout: string): Map<string, string> {
 	return new Map(
@@ -132,15 +124,15 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 			input: [
 				"blob\nmark :1\ndata 6\nalpha\n\n",
 				"blob\nmark :2\ndata 5\nbeta\n\n",
-				`commit refs/heads/main\nmark :3\ncommitter ${COMMITTER}\ndata 2\nc1\nM 100644 :1 a.txt\nM 100644 :2 b.txt\n`,
+				`commit refs/heads/main\nmark :3\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc1\nM 100644 :1 a.txt\nM 100644 :2 b.txt\n`,
 				"blob\nmark :4\ndata 8\ngamma-2\n\n",
 				"blob\nmark :5\ndata 8\ndelta-2\n\n",
-				`commit refs/heads/main\nmark :6\ncommitter ${COMMITTER}\ndata 2\nc2\nfrom :3\nM 100644 :4 a.txt\nM 100644 :5 c.txt\nD b.txt\n`,
+				`commit refs/heads/main\nmark :6\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nc2\nfrom :3\nM 100644 :4 a.txt\nM 100644 :5 c.txt\nD b.txt\n`,
 			].join(""),
 		})
 		const c2 = (await spawnGit(["rev-parse", "main"], { cwd: src })).stdout.trim()
 		const c1 = (await spawnGit(["rev-parse", "main~1"], { cwd: src })).stdout.trim()
-		const treeC2 = await lsTree(src, c2)
+		const treeC2 = await lsTreeSnapshot(src, c2)
 
 		for (const point of FAULT_POINTS) {
 			const repo = `txn/postcas-${point}`
@@ -191,7 +183,7 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 					}
 					await held
 				})
-				await new Promise((r) => setTimeout(r, 150))
+				await sleep(150)
 
 				const targeted =
 					point === "A-post-commit-stamp"
@@ -263,7 +255,7 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 					cloneError = `clone failed after convergence attempt: ${cl.stderr.trim().slice(0, 200)}`
 				} else {
 					await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-					const cloneTree = await lsTree(dest, "HEAD")
+					const cloneTree = await lsTreeSnapshot(dest, "HEAD")
 					const finalProj = await projection("refs/heads/main")
 					if (JSON.stringify(cloneTree) !== JSON.stringify(finalProj)) {
 						convergenceGap = { clone: cloneTree, projection: finalProj }

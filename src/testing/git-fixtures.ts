@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { readdirSync } from "node:fs"
+import { readdirSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { z } from "zod"
 import type { GitObjectType } from "@/object/object"
@@ -47,6 +47,12 @@ export function requiredAt<T>(values: readonly T[], index: number, context: stri
 	return value
 }
 
+/** Wrap an arbitrary index into a non-empty fixture list. */
+export function cyclicAt<T>(values: readonly T[], index: number): T {
+	if (values.length === 0) throw new Error("cyclicAt: empty list")
+	return requiredAt(values, index % values.length, "cyclicAt")
+}
+
 /** Parse every `<oid>[ <path>]` row emitted by `git rev-list --objects`. */
 export function parseRevListObjectOids(stdout: string): string[] {
 	return stdout
@@ -58,6 +64,38 @@ export function parseRevListObjectOids(stdout: string): string[] {
 			const oid = space < 0 ? line : line.slice(0, space)
 			return requireGitOid(oid, `rev-list line ${JSON.stringify(line)}`)
 		})
+}
+
+/** Canonical git's reachable object closure, including annotated-tag objects that `rev-list --objects --all` reports only through their peeled targets. */
+export async function gitReachableOids(dir: string): Promise<string[]> {
+	const revList = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
+	const oids = new Set(parseRevListObjectOids(revList.stdout))
+	// Annotated-tag OBJECTS: `rev-list --objects --all` lists a tag ref's peeled
+	// target, not the tag object, so add every ref oid that is itself a tag object.
+	const refLines = await spawnGit(
+		["for-each-ref", "--format=%(objecttype) %(objectname)"],
+		{ cwd: dir },
+	)
+	for (const line of refLines.stdout.trim().split("\n").filter(Boolean)) {
+		const fields = line.split(" ")
+		if (fields.length !== 2) {
+			throw new Error(`unexpected for-each-ref line: ${line}`)
+		}
+		const [type, oid] = fields as [string, string]
+		const parsedOid = requireGitOid(oid, `for-each-ref line ${JSON.stringify(line)}`)
+		switch (type) {
+			case "tag":
+				oids.add(parsedOid)
+				break
+			case "blob":
+			case "commit":
+			case "tree":
+				break
+			default:
+				throw new Error(`unexpected for-each-ref object type: ${line}`)
+		}
+	}
+	return [...oids].sort()
 }
 
 /** Read the requested objects through one binary-safe `cat-file --batch` process. */
@@ -117,16 +155,7 @@ async function loadObjects(
 
 /** Every object in a real repo, as pack inputs (content read binary-safe). */
 export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-		{ cwd: dir },
-	)
-	const oids = list.stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => requireGitOid(line, `object-list line ${JSON.stringify(line)}`))
-	return loadObjects(dir, oids)
+	return loadObjects(dir, await allObjectOids(dir))
 }
 
 /** Every object reachable from the supplied revisions, as pack inputs. */
@@ -165,6 +194,14 @@ export function parseLsTree(
 				path,
 			}
 		})
+}
+
+/** A revision's recursive tree as sorted `path\0mode\0oid` rows. */
+export async function lsTreeSnapshot(dir: string, revision: string): Promise<string[]> {
+	const out = await spawnGit(["ls-tree", "-r", revision], { cwd: dir })
+	return parseLsTree(out.stdout)
+		.map((entry) => `${entry.path}\0${entry.mode}\0${entry.oid}`)
+		.sort()
 }
 
 /** Sorted list of every object OID in a real repo. */
@@ -211,6 +248,39 @@ export type MirrorState = {
 	fsck: string
 }
 
+/** Served and canonical mirror observations, plus their directional object-set difference. */
+export type MirrorComparison = {
+	served: MirrorState
+	oracle: MirrorState
+	objects: {
+		onlyServed: string[]
+		onlyOracle: string[]
+	}
+}
+
+function parseRefRows(
+	stdout: string,
+	command: "for-each-ref" | "show-ref",
+): { name: string; oid: Oid }[] {
+	return stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			const split = line.indexOf(" ")
+			if (split < 0 || split === line.length - 1) {
+				throw new Error(`unexpected ${command} line: ${line}`)
+			}
+			return {
+				name: line.slice(split + 1),
+				oid: requireGitOid(
+					line.slice(0, split),
+					`${command} line ${JSON.stringify(line)}`,
+				),
+			}
+		})
+}
+
 /** Mirror-clone a remote and return its validated refs, objects, bytes, and fsck. */
 export async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
 	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
@@ -219,21 +289,8 @@ export async function mirrorClone(url: string, dest: string): Promise<MirrorStat
 		["for-each-ref", "--format=%(objectname) %(refname)"],
 		{ cwd: dest },
 	)
-	const refs = refsOutput.stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => {
-			const split = line.indexOf(" ")
-			if (split < 0 || split === line.length - 1) {
-				throw new Error(`unexpected for-each-ref line: ${line}`)
-			}
-			const oid = requireGitOid(
-				line.slice(0, split),
-				`for-each-ref line ${JSON.stringify(line)}`,
-			)
-			return `${oid} ${line.slice(split + 1)}`
-		})
+	const refs = parseRefRows(refsOutput.stdout, "for-each-ref")
+		.map(({ name, oid }) => `${oid} ${name}`)
 		.sort()
 	const complaints = `${fsck.stdout}${fsck.stderr}`
 		.split("\n")
@@ -248,6 +305,24 @@ export async function mirrorClone(url: string, dest: string): Promise<MirrorStat
 	}
 }
 
+/** Clone both remotes and return comparison data without asserting on it. */
+export async function compareMirrorClones(
+	served: { url: string; dest: string },
+	oracle: { url: string; dest: string },
+): Promise<MirrorComparison> {
+	const servedState = await mirrorClone(served.url, served.dest)
+	const oracleState = await mirrorClone(oracle.url, oracle.dest)
+	const difference = listDifferences(servedState.objects, oracleState.objects)
+	return {
+		objects: {
+			onlyOracle: difference.onlyRight,
+			onlyServed: difference.onlyLeft,
+		},
+		oracle: oracleState,
+		served: servedState,
+	}
+}
+
 /**
  * A repo's local branches + tags as sorted {name, oid} pairs — matching what the
  * RefStore stores (an annotated tag's ref points at the tag object). For asserting
@@ -258,24 +333,9 @@ export async function refsOf(dir: string): Promise<{ name: string; oid: string }
 		["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/"],
 		{ cwd: dir },
 	)
-	return out.stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => {
-			const split = line.indexOf(" ")
-			if (split < 0 || split === line.length - 1) {
-				throw new Error(`unexpected for-each-ref line: ${line}`)
-			}
-			return {
-				name: line.slice(split + 1),
-				oid: requireGitOid(
-					line.slice(0, split),
-					`for-each-ref line ${JSON.stringify(line)}`,
-				),
-			}
-		})
-		.sort((a, b) => a.name.localeCompare(b.name))
+	return parseRefRows(out.stdout, "for-each-ref").sort((a, b) =>
+		a.name.localeCompare(b.name),
+	)
 }
 
 /**
@@ -290,16 +350,8 @@ export async function seedRepoIntoStore(
 ): Promise<void> {
 	await stores.objects.putPack(repoId, await loadAllObjects(srcDir))
 	const showRef = await spawnGit(["show-ref"], { cwd: srcDir })
-	for (const line of showRef.stdout.trim().split("\n").filter(Boolean)) {
-		const split = line.indexOf(" ")
-		if (split < 0 || split === line.length - 1) {
-			throw new Error(`unexpected show-ref line: ${line}`)
-		}
-		await stores.refs.setRef(
-			repoId,
-			line.slice(split + 1),
-			requireGitOid(line.slice(0, split), `show-ref line ${JSON.stringify(line)}`),
-		)
+	for (const { name, oid } of parseRefRows(showRef.stdout, "show-ref")) {
+		await stores.refs.setRef(repoId, name, oid)
 	}
 	const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: srcDir })).stdout.trim()
 	await stores.refs.setSymref(repoId, "HEAD", head)
@@ -310,6 +362,20 @@ export const PACK_DIR = ".git/objects/pack"
 /** The `.pack` filenames in a real repo's pack dir. */
 export function packFiles(dir: string): string[] {
 	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
+}
+
+/** Total bytes occupied by a real repo's pack files, bare or non-bare. */
+export async function packFileBytes(dir: string): Promise<number> {
+	const packDir = (
+		await spawnGit(
+			["rev-parse", "--path-format=absolute", "--git-path", "objects/pack"],
+			{ cwd: dir },
+		)
+	).stdout.trim()
+	return readdirSync(packDir)
+		.filter((file) => file.endsWith(".pack"))
+		.map((file) => statSync(join(packDir, file)).size)
+		.reduce((total, size) => total + size, 0)
 }
 
 type VerifyPackObject =

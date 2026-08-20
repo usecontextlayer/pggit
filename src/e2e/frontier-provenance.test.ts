@@ -1,5 +1,5 @@
 /**
- * The frontier's boundary provenance (spine S6): `boundaryHits` = the haves the
+ * The frontier's boundary provenance: `boundaryHits` = the haves the
  * want-side walk actually REACHED (each provably inside the wants' closure, so
  * its closure may be OR'd into a bitmap serve without over-serving), and
  * `boundaryExact` = every exclusion the walk made is justified by a hit have.
@@ -24,7 +24,7 @@ import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "frontier/provenance"
 
-describe("frontier boundary provenance (chunk 5b)", () => {
+describe("frontier boundary provenance", () => {
 	let fx: GcFixture
 	let db: ReturnType<typeof initKysely<Database>>
 	let id: ReposId

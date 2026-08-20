@@ -7,7 +7,7 @@
  * scheduler, outcome-asserted not concurrency-asserted).
  *
  * OBSERVABLE-ONLY: every assertion is on the real-`git` oracle
- * (`cloneAndFsck` / `gitReachableOids` via the throwaway-fetch `reachableOfTip`),
+ * (`cloneAndFsck` / `servedMainReachableOids`),
  * Postgres rows (`objectOids` over `git_object`), or the `drainOnce()`
  * `DrainSummary` return value. Nothing here probes scheduler internals (timer
  * mechanics, concurrency choreography, advisory locks, the candidate SQL,
@@ -25,15 +25,12 @@ import {
 	ageObjects,
 	cloneAndFsck,
 	type GcFixture,
-	gitReachableOids,
 	objectOids,
 	pushFile,
-	repoUrl,
+	servedMainReachableOids,
 	setupGcFixture,
 	teardownGcFixture,
-	withTempDir,
 } from "@/testing/gc-helpers"
-import { spawnGit } from "@/testing/spawn-git"
 
 describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 	let fx: GcFixture
@@ -45,26 +42,6 @@ describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 	afterAll(async () => {
 		await teardownGcFixture(fx)
 	})
-
-	/**
-	 * The real-git reachable closure (sorted hex OIDs) of `repo`'s current
-	 * `refs/heads/main` tip, computed by the oracle from a throwaway fetch of that
-	 * ref — independent of any `pushFile` return value. The per-repo
-	 * expected-survivors oracle: with `graceSeconds: 0` on aged rows, a correct
-	 * drain leaves `git_object` reduced to EXACTLY this set (live kept, orphans
-	 * gone).
-	 */
-	async function reachableOfTip(repo: string): Promise<string[]> {
-		return withTempDir("pggit-sch8-tip-", async (dir) => {
-			await spawnGit(["init", "-q"], { cwd: dir })
-			await spawnGit(
-				["-c", "protocol.version=2", "fetch", repoUrl(fx, repo), "refs/heads/main"],
-				{ cwd: dir },
-			)
-			await spawnGit(["update-ref", "refs/heads/main", "FETCH_HEAD"], { cwd: dir })
-			return gitReachableOids(dir)
-		})
-	}
 
 	// SCH-8 — Tenant isolation through the loop. ONE fixture, several repos all made
 	// eligible (each pushed → `last_pushed_at` set, none yet GC'd), then a SINGLE
@@ -137,7 +114,7 @@ describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 		// + fsck-clean. We collect each repo's survivor set to also prove disjointness.
 		const survivorsByRepo = new Map<string, string[]>()
 		for (const repo of allRepos) {
-			const expected = await reachableOfTip(repo)
+			const expected = await servedMainReachableOids(fx, repo)
 			const survivors = await objectOids(fx.db, repo)
 			survivorsByRepo.set(repo, survivors)
 			// Exact equality: orphans gone (rewind repos) AND nothing live lost.

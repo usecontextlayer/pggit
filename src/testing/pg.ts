@@ -59,3 +59,16 @@ export async function createIsolatedSchema(baseUrl: string): Promise<IsolatedDb>
 		sql,
 	}
 }
+
+/** Run against a fresh migrated schema and always drop it afterwards. */
+export async function withIsolatedSchema<T>(
+	baseUrl: string,
+	fn: (db: IsolatedDb) => Promise<T>,
+): Promise<T> {
+	const db = await createIsolatedSchema(baseUrl)
+	try {
+		return await fn(db)
+	} finally {
+		await db.drop()
+	}
+}

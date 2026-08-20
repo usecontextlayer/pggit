@@ -20,16 +20,12 @@
  * covered nowhere else: that `encodeDelta`'s bytes are a format canonical git
  * accepts, isolated from the tier that decides which deltas to emit.
  */
-import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { deflateSync } from "node:zlib"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { assertNever } from "@/assert-never"
-import { computeOid, type GitObjectType } from "@/object/object"
+import { computeOid } from "@/object/object"
 import { encodeDelta } from "@/pack/delta"
-import { encodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 import { writePack } from "@/pack/write-pack"
 import {
 	commitsOldestFirst,
@@ -37,41 +33,8 @@ import {
 	readObject,
 	runsTreeAt,
 } from "@/testing/append-only-repo"
+import { buildRefDeltaPack, type RefDeltaPackEntry } from "@/testing/ref-delta-pack"
 import { spawnGit } from "@/testing/spawn-git"
-
-const PACK_TYPE_CODE: Record<GitObjectType, number> = {
-	blob: PACK_OBJ_TYPE.BLOB,
-	commit: PACK_OBJ_TYPE.COMMIT,
-	tag: PACK_OBJ_TYPE.TAG,
-	tree: PACK_OBJ_TYPE.TREE,
-}
-
-type PackEntry =
-	| { content: Buffer; kind: "base"; type: GitObjectType }
-	| { baseOid: string; delta: Buffer; kind: "ref" }
-
-/** A v2 packfile carrying whole objects and REF_DELTA entries (test-only; see header). */
-function buildPack(entries: PackEntry[]): Buffer {
-	const header = Buffer.alloc(12)
-	header.write("PACK", 0, "latin1")
-	header.writeUInt32BE(2, 4)
-	header.writeUInt32BE(entries.length, 8)
-	const parts: Buffer[] = [header]
-	for (const e of entries) {
-		if (e.kind === "base") {
-			parts.push(encodeObjectHeader(PACK_TYPE_CODE[e.type], e.content.length))
-			parts.push(deflateSync(e.content))
-		} else if (e.kind === "ref") {
-			parts.push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, e.delta.length))
-			parts.push(Buffer.from(e.baseOid, "hex"))
-			parts.push(deflateSync(e.delta))
-		} else {
-			assertNever(e)
-		}
-	}
-	const body = Buffer.concat(parts)
-	return Buffer.concat([body, createHash("sha1").update(body).digest()])
-}
 
 /** An empty scratch repository for git to ingest packs into. */
 async function scratchRepo(tag: string): Promise<string> {
@@ -140,7 +103,7 @@ describe("encodeDelta — canonical git reads what we write", () => {
 
 		await gitIngestPack(
 			repo,
-			buildPack([
+			buildRefDeltaPack([
 				{ content: base, kind: "base", type: "blob" },
 				{ baseOid, delta: encodeDelta(base, target), kind: "ref" },
 			]),
@@ -169,7 +132,7 @@ describe("encodeDelta — canonical git reads what we write", () => {
 
 		await gitIngestPack(
 			repo,
-			buildPack([{ baseOid, delta: encodeDelta(base, target), kind: "ref" }]),
+			buildRefDeltaPack([{ baseOid, delta: encodeDelta(base, target), kind: "ref" }]),
 			true,
 		)
 
@@ -181,8 +144,8 @@ describe("encodeDelta — canonical git reads what we write", () => {
 
 	it("accepts a delta CHAIN — a delta whose base is itself a delta", async () => {
 		// Chains are not exotic: a repack that deltas each version against the previous
-		// one produces them by construction, and their depth is the thing chunk 2 must
-		// bound. git must resolve ours the same way it resolves its own.
+		// one produces them by construction, and repack must bound their depth. git
+		// must resolve ours the same way it resolves its own.
 		const repo = await scratchRepo("chain")
 		scratch.push(repo)
 
@@ -193,7 +156,7 @@ describe("encodeDelta — canonical git reads what we write", () => {
 
 		await gitIngestPack(
 			repo,
-			buildPack([
+			buildRefDeltaPack([
 				{ content: a, kind: "base", type: "blob" },
 				{ baseOid: aOid, delta: encodeDelta(a, b), kind: "ref" },
 				{ baseOid: bOid, delta: encodeDelta(b, c), kind: "ref" },
@@ -227,7 +190,7 @@ describe("encodeDelta — canonical git reads what we write", () => {
 		expect(trees.length).toBeGreaterThan(50)
 
 		const first = trees[0] as Buffer
-		const entries: PackEntry[] = [{ content: first, kind: "base", type: "tree" }]
+		const entries: RefDeltaPackEntry[] = [{ content: first, kind: "base", type: "tree" }]
 		for (let i = 1; i < trees.length; i++) {
 			const base = trees[i - 1] as Buffer
 			const target = trees[i] as Buffer
@@ -237,7 +200,7 @@ describe("encodeDelta — canonical git reads what we write", () => {
 				kind: "ref",
 			})
 		}
-		const deltified = buildPack(entries)
+		const deltified = buildRefDeltaPack(entries)
 		await gitIngestPack(repo, deltified)
 
 		// Every tree recovered exactly, by git.

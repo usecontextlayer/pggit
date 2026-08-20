@@ -12,8 +12,7 @@
  *   - merges (root tree pairs with FIRST parent only), octopus merges
  *   - orphan roots, empty commits (tree reused verbatim), reverts (old tree reused)
  *   - a path that flips between blob / subtree / symlink / gitlink across commits
- *   - non-UTF8 and case-colliding directory names (the pairing map is keyed by a
- *     utf8-decoded name)
+ *   - valid UTF-8 normalization look-alikes and case-colliding directory names
  *   - deep nesting and wide flat directories in the same tree
  *   - annotated tags and tag-of-tag chains over the above
  *
@@ -22,20 +21,18 @@
  * byte-for-byte, and pggit's clone must be `fsck --strict` clean. The seeds are
  * pinned, so a failing shape is reproducible.
  */
-import { createHash } from "node:crypto"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
-import { objectsByType } from "@/testing/git-fixtures"
+import { allObjectOids, objectBytesDigest } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -168,7 +165,7 @@ async function generate(dir: string, seed: number): Promise<void> {
 			])
 			nested.set("flip", { mode: "40000", name: flipName, oid: sub, type: "tree" })
 		}
-		// Deep nesting under a randomly picked (sometimes invalid-utf8) name.
+		// Deep nesting under a randomly picked normalization/case look-alike name.
 		let deep = await mktree(dir, [
 			{ mode: "100644", name: Buffer.from("leaf"), oid: pick(blobs), type: "blob" },
 		])
@@ -199,11 +196,11 @@ async function generate(dir: string, seed: number): Promise<void> {
 			oid: nestedTree,
 			type: "tree",
 		})
-		// Two sibling directories whose names are DIFFERENT invalid-utf8 bytes: the
-		// repack pairing map decodes names as utf8, which collapses both to U+FFFD.
+		// Two sibling directories use distinct valid UTF-8 normalization forms. Their
+		// decoded names render alike but must remain distinct.
 		for (const [key, nameBytes] of [
-			["bad1", NAME_BYTES[3] as Buffer],
-			["bad2", NAME_BYTES[4] as Buffer],
+			["nfc", NAME_BYTES[3] as Buffer],
+			["nfd", NAME_BYTES[4] as Buffer],
 		] as const) {
 			const t = await mktree(dir, [
 				{
@@ -300,23 +297,13 @@ async function inventory(dir: string): Promise<string> {
 
 /** sha256 over every object's raw bytes, in oid order — the byte-level oracle. */
 async function bytesDigest(dir: string): Promise<string> {
-	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	return createHash("sha256").update(res.stdoutBytes).digest("hex")
+	return objectBytesDigest(dir, await allObjectOids(dir))
 }
 
 describe("wire — generated repository shapes match a plain git remote exactly", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk } = createScratchArena()
 
 	const shapes: ShapeResult[] = []
 
@@ -447,7 +434,7 @@ describe("wire — generated repository shapes match a plain git remote exactly"
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("clones every generated shape from pggit, fsck-clean", () => {

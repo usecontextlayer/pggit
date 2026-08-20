@@ -49,13 +49,6 @@ const SIZES_MB = [64, 190]
 const mb = (n: number): string => `${(n / 1_000_000).toFixed(1)} MB`
 const rss = (): string => `rss=${mb(process.memoryUsage().rss)}`
 
-/** Offset of the first differing byte, or -1 when the buffers are identical. */
-function firstDiff(a: Buffer, b: Buffer): number {
-	const n = Math.min(a.length, b.length)
-	for (let i = 0; i < n; i++) if (a[i] !== b[i]) return i
-	return a.length === b.length ? -1 : n
-}
-
 for (const sizeMb of SIZES_MB) {
 	describe(`pg-corrupt — a ${sizeMb} MB incompressible blob through the encoding tier`, () => {
 		type EncodingState =
@@ -182,7 +175,7 @@ for (const sizeMb of SIZES_MB) {
 
 			const got = readFileSync(join(dest, "big.bin"))
 			expect(got.length).toBe(payload.length)
-			expect(firstDiff(got, payload)).toBe(-1)
+			expect(got.equals(payload)).toBe(true)
 			console.log(`byte-compare: identical (${mb(got.length)})`)
 		}, 900_000)
 
@@ -193,7 +186,7 @@ for (const sizeMb of SIZES_MB) {
 			const t = Date.now()
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest2])
 			console.log(`clone #2 (encoding present): ok in ${Date.now() - t}ms (${rss()})`)
-			expect(firstDiff(readFileSync(join(dest2, "big.bin")), payload)).toBe(-1)
+			expect(readFileSync(join(dest2, "big.bin")).equals(payload)).toBe(true)
 		}, 900_000)
 	})
 }

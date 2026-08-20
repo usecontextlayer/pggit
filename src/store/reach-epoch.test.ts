@@ -1,5 +1,5 @@
 /**
- * The epoch's pure position/serialization math (spine chunk 5b). The trap this
+ * The reachability epoch's pure position/serialization math. The trap this
  * pins by name: bit positions are POSITIONAL against the SORTED oid array —
  * walk-order arrays produce plausible-looking bitmaps that serve the wrong
  * objects. The property here is the load-bearing one: hex-string sort order

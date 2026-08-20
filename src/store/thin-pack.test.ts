@@ -1,5 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
@@ -7,6 +6,7 @@ import { allObjectOids, bigFile, loadAllObjects } from "@/testing/git-fixtures"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () => {
 	let db: IsolatedDb
@@ -22,8 +22,7 @@ describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () =
 	})
 
 	it("resolves a thin pack against stored bases — and fails without them", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-thin-src-"))
-		try {
+		await withTempDir("pggit-thin-src-", async (src) => {
 			await spawnGit(["init", "-q"], { cwd: src })
 			writeFileSync(join(src, "big.txt"), bigFile("original"))
 			await spawnGit(["add", "."], { cwd: src })
@@ -71,8 +70,6 @@ describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () =
 			const stored = await objects.getObject("repo-base", blobOid)
 			if (stored === null) throw new Error(`reconstructed blob ${blobOid} is missing`)
 			expect(stored.content.toString("utf8")).toBe(bigFile("EDITED"))
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 })

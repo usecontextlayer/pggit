@@ -6,14 +6,14 @@
  * A blobless clone's served set is commits+trees only, so tree deltas ship as
  * REF_DELTA with tree bases — the deltified path at its most exposed. Then git
  * lazily fetches individual blobs by exact OID (`want <blob>` + `filter blob:none`),
- * which drives buildPack's promisor re-add branch against the encoding tier.
+ * which drives `routeServeSet`'s exact-blob promisor rule against the encoding
+ * tier.
  *
  * Oracle: the same sequence against a plain bare git remote over file://, plus
  * fsck and byte-level object comparison.
  */
 import { createHash } from "node:crypto"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
@@ -26,6 +26,7 @@ import {
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -59,12 +60,7 @@ type BloblessArm =
 describe("wire — blobless clone + promisor fetch against the deltified path", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk, own: ownScratch } = createScratchArena()
 
 	const arms: BloblessArm[] = []
 	const requireArms = (): [BloblessArm, BloblessArm] => {
@@ -98,7 +94,7 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS })
-		scratch.push(src)
+		ownScratch(src)
 		const bare = join(mk("bare"), "oracle.git")
 		await spawnGit(["clone", "--bare", "-q", src, bare])
 		// A plain bare repo can only serve a filtered fetch if it allows filters.
@@ -203,7 +199,7 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("takes a blobless clone that is fsck-clean on both remotes", () => {

@@ -61,7 +61,7 @@ import { spawnGit } from "@/testing/spawn-git"
  * subset of the repo's refs) — the PBT-1/PBT-3 expected-survivors oracle. `git
  * rev-list --objects <tip…>` yields the commit/tree/blob closure of those tips,
  * and passing an annotated-tag object's oid peels it AND lists the tag object
- * itself, so this needs no extra tag incantation (cf. `gc-helpers`' all-refs
+ * itself, so this needs no extra tag incantation (cf. `git-fixtures`' all-refs
  * `gitReachableOids`, which must add tag objects because `--all` lists peeled
  * targets). Returns sorted hex, matching `objectOids` for a direct `toEqual`.
  */

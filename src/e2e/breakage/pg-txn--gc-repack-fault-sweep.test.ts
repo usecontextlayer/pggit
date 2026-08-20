@@ -63,14 +63,16 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
+import { ZERO_OID } from "@/oid"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
-import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
@@ -98,9 +100,6 @@ const SWEEP_BATCH_LIMIT = 500
 /** `pg_stat_activity.query` fragments, lowercased and whitespace-collapsed. */
 const SWEEP = "delete from git_object"
 const ANALYZE = "analyze git_object"
-const ZERO_OID = "0".repeat(40)
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const short = (e: unknown) =>
 	`${(e as { code?: string }).code ?? ""} ${(e as Error).message}`.trim().slice(0, 90)
 
@@ -301,11 +300,7 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 		})
 		server = await serveOnPort(createGitApp(createGitDeps(appSql)), 0)
 
-		const commits = (
-			await spawnGit(["rev-list", "--reverse", "main"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
+		const commits = await commitsOldestFirst(src, "main")
 		const tip = commits[commits.length - 1]
 		const mid = commits[Math.floor(commits.length / 2)]
 		if (!tip || !mid) throw new Error("fixture too short to orphan")
@@ -330,10 +325,10 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 			await createRepack(admin).repack(repo) // an encoding tier to damage
 
 			// ── the fault ────────────────────────────────────────────────────
-			// gc and repack each get a FRESH client: an aborted pass strands its
-			// connection in an open aborted transaction (a separate finding —
-			// pg-txn--gc-poisons-pooled-connection.test.ts), which would otherwise mask
-			// the row-level convergence question this sweep is asking.
+			// gc and repack each get a FRESH client so one case's injected timeout or
+			// connection termination cannot contaminate the next case. Connection cleanup
+			// itself is pinned by pg-txn--gc-poisons-pooled-connection.test.ts; this sweep
+			// isolates the row-level convergence question.
 			const mkFaulty = () =>
 				postgres(baseUrl, {
 					connection:

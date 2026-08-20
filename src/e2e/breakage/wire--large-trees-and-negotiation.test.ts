@@ -17,21 +17,24 @@
  *     delta-eligibility rule bites hardest. Run under all three negotiation
  *     algorithms, differentially against a plain bare git remote.
  */
-import { createHash } from "node:crypto"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo, RUNS_DIR } from "@/testing/append-only-repo"
-import { objectsByType, parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	objectBytesDigest,
+	parseRevListObjectOids,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
 	teardownGitServerFixture,
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -53,12 +56,8 @@ type NegotiationRound = {
 
 /** `<object count>:<sha256 over every local object's raw bytes, in oid order>`. */
 async function digest(dir: string): Promise<string> {
-	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	return `${oids.length}:${createHash("sha256").update(res.stdoutBytes).digest("hex")}`
+	const oids = await allObjectOids(dir)
+	return `${oids.length}:${await objectBytesDigest(dir, oids)}`
 }
 
 /** The fetched branch's closure only — what actually came from the remote. */
@@ -70,22 +69,13 @@ async function closureDigest(dir: string, rev: string): Promise<string> {
 			),
 		),
 	].sort()
-	const bytes = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${objects.join("\n")}\n`,
-	})
-	return `${objects.length}:${createHash("sha256").update(bytes.stdoutBytes).digest("hex")}`
+	return `${objects.length}:${await objectBytesDigest(dir, objects)}`
 }
 
 describe("wire — >64 KiB trees and multi-round negotiation", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	const scratch: string[] = []
-	const mk = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const { cleanup: cleanupScratch, make: mk, own: ownScratch } = createScratchArena()
 
 	let tipRunsTreeBytes = 0
 	let largeClone: TestResult<string>
@@ -95,7 +85,7 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS })
-		scratch.push(src)
+		ownScratch(src)
 		tipRunsTreeBytes = Number(
 			(
 				await spawnGit(["cat-file", "-s", `HEAD:${RUNS_DIR}`], { cwd: src })
@@ -160,7 +150,7 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 		// leaves nothing to negotiate against; its own assertion reports that break.
 		if (largeClone.kind === "failed") return
 		const grown = await createAppendOnlyRepo({ docs: 6, runs: RUNS + 40 })
-		scratch.push(grown)
+		ownScratch(grown)
 		await spawnGit(["push", "-q", url, "refs/heads/*:refs/heads/*"], { cwd: grown })
 		await spawnGit(["push", "-q", bareUrl, "refs/heads/*:refs/heads/*"], { cwd: grown })
 		await spawnGit(["repack", "-a", "-d", "-q"], { cwd: bare })
@@ -212,7 +202,7 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 
 	afterAll(async () => {
 		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		cleanupScratch()
 	})
 
 	it("has the fixture it needs: the tip runs-tree is past the 0xFFFF COPY split", () => {

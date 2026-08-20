@@ -23,9 +23,8 @@ import { createGc } from "@/store/gc"
 import { createRepack, type RepackResult } from "@/store/repack"
 import { buildLifecycleSource, commitsOldestFirst } from "@/testing/append-only-repo"
 import {
-	listDifferences,
-	type MirrorState,
-	mirrorClone,
+	compareMirrorClones,
+	type MirrorComparison,
 	requiredAt,
 } from "@/testing/git-fixtures"
 import {
@@ -35,21 +34,11 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { captureTestResult, type TestResult } from "@/testing/test-result"
 
 const REPO = "workspace/slate/degenerate"
 
-type CloneCheck =
-	| { kind: "failed"; tag: string; error: unknown }
-	| {
-			kind: "succeeded"
-			tag: string
-			objectsOnlyPg: number
-			objectsOnlyRef: number
-			refsPg: string[]
-			refsRef: string[]
-			fsck: string
-			bytesMatch: boolean
-	  }
+type CloneCheck = TestResult<MirrorComparison> & { tag: string }
 
 describe("lifecycle breakage — drain to empty and refill", () => {
 	let db: IsolatedDb
@@ -80,27 +69,14 @@ describe("lifecycle breakage — drain to empty and refill", () => {
 		const check = async (tag: string): Promise<void> => {
 			const a = dir(`pg-${tag}`)
 			const b = dir(`rf-${tag}`)
-			let pgc: MirrorState
-			try {
-				pgc = await mirrorClone(url, a)
-			} catch (error) {
-				checks.push({ error, kind: "failed", tag })
-				return
+			const result = await captureTestResult(() =>
+				compareMirrorClones({ dest: a, url }, { dest: b, url: `file://${ref}` }),
+			)
+			checks.push({ ...result, tag })
+			if (result.kind === "succeeded") {
+				rmSync(a, { force: true, recursive: true })
+				rmSync(b, { force: true, recursive: true })
 			}
-			const rfc = await mirrorClone(`file://${ref}`, b)
-			const od = listDifferences(pgc.objects, rfc.objects)
-			checks.push({
-				bytesMatch: pgc.digest === rfc.digest,
-				fsck: pgc.fsck,
-				kind: "succeeded",
-				objectsOnlyPg: od.onlyLeft.length,
-				objectsOnlyRef: od.onlyRight.length,
-				refsPg: pgc.refs,
-				refsRef: rfc.refs,
-				tag,
-			})
-			rmSync(a, { force: true, recursive: true })
-			rmSync(b, { force: true, recursive: true })
 		}
 		const pushBoth = async (sha: string, name: string): Promise<void> => {
 			await spawnGit(["push", "-q", url, `${sha}:${name}`], { cwd: src })
@@ -202,8 +178,11 @@ describe("lifecycle breakage — drain to empty and refill", () => {
 	it("hands the client exactly the oracle's object set", () => {
 		expect(
 			checks.flatMap((c) =>
-				c.kind === "succeeded" && (c.objectsOnlyPg > 0 || c.objectsOnlyRef > 0)
-					? [`${c.tag}: onlyPG=${c.objectsOnlyPg} onlyREF=${c.objectsOnlyRef}`]
+				c.kind === "succeeded" &&
+				(c.value.objects.onlyServed.length > 0 || c.value.objects.onlyOracle.length > 0)
+					? [
+							`${c.tag}: onlyServed=${c.value.objects.onlyServed.length} onlyOracle=${c.value.objects.onlyOracle.length}`,
+						]
 					: [],
 			),
 		).toEqual([])
@@ -212,25 +191,31 @@ describe("lifecycle breakage — drain to empty and refill", () => {
 	it("hands the client exactly the oracle's refs", () => {
 		expect(
 			checks.flatMap((c) =>
-				c.kind === "succeeded" ? [{ refs: c.refsPg, tag: c.tag }] : [],
+				c.kind === "succeeded" ? [{ refs: c.value.served.refs, tag: c.tag }] : [],
 			),
 		).toEqual(
 			checks.flatMap((c) =>
-				c.kind === "succeeded" ? [{ refs: c.refsRef, tag: c.tag }] : [],
+				c.kind === "succeeded" ? [{ refs: c.value.oracle.refs, tag: c.tag }] : [],
 			),
 		)
 	})
 
 	it("serves byte-identical objects to the oracle", () => {
 		expect(
-			checks.flatMap((c) => (c.kind === "succeeded" && !c.bytesMatch ? [c.tag] : [])),
+			checks.flatMap((c) =>
+				c.kind === "succeeded" && c.value.served.digest !== c.value.oracle.digest
+					? [c.tag]
+					: [],
+			),
 		).toEqual([])
 	})
 
 	it("every clone passes git fsck --strict", () => {
 		expect(
 			checks.flatMap((c) =>
-				c.kind === "succeeded" && c.fsck.length > 0 ? [`${c.tag}: ${c.fsck}`] : [],
+				c.kind === "succeeded" && c.value.served.fsck.length > 0
+					? [`${c.tag}: ${c.value.served.fsck}`]
+					: [],
 			),
 		).toEqual([])
 	})

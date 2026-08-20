@@ -3,10 +3,10 @@
  *
  * `createRepack.repack()` accumulates encoding rows and flushes every WRITE_BATCH
  * (1000) rows in its OWN `pg.begin`. A pass over a real repo is therefore many
- * independent commits with no pass-level watermark and no resume record. The
- * design's D4 ("frozen, deterministic policy") claims a pass can be interrupted
- * and resumed safely because rows are never rewritten and bases finalize before
- * dependents.
+ * independent commits. It has a success watermark but no in-progress/resume
+ * record, so a crash never stamps the pass and a retry resumes from committed
+ * rows. The design's D4 ("frozen, deterministic policy") claims this is safe
+ * because rows are never rewritten and bases finalize before dependents.
  *
  * This kills the pass at every flush boundary in turn, resumes with a fresh
  * Repack, and then checks — through the tier's own invariants AND through canonical
@@ -38,7 +38,7 @@ import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { type IsolatedDb, withIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -143,17 +143,6 @@ describe("repack × crash — an interrupted pass and what it leaves behind", ()
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		const srcOids = await allObjectOids(src)
 
-		/** Run `fn` against a fresh isolated schema, dropping it afterwards. Each kill
-		 * point needs its own schema: they start from the same pristine seed. */
-		async function withSchema<T>(fn: (db: IsolatedDb) => Promise<T>): Promise<T> {
-			const db = await createIsolatedSchema(pgBaseUrl)
-			try {
-				return await fn(db)
-			} finally {
-				await db.drop()
-			}
-		}
-
 		async function cloneVerdict(url: string, dest: string): Promise<CloneVerdict> {
 			return captureTestResult(async () => {
 				await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
@@ -166,7 +155,7 @@ describe("repack × crash — an interrupted pass and what it leaves behind", ()
 		}
 
 		// Reference: one uninterrupted pass, for the convergence check (I6).
-		const reference = await withSchema(async (db) => {
+		const reference = await withIsolatedSchema(pgBaseUrl, async (db) => {
 			await seedRepoIntoStore("ref", src, {
 				objects: createObjectStore(db.sql),
 				refs: createRefStore(db.sql),
@@ -176,7 +165,7 @@ describe("repack × crash — an interrupted pass and what it leaves behind", ()
 		})
 
 		for (const killAt of KILL_AT) {
-			const outcome = await withSchema(async (db) => {
+			const outcome = await withIsolatedSchema(pgBaseUrl, async (db) => {
 				const objects = createObjectStore(db.sql)
 				const refs = createRefStore(db.sql)
 				await seedRepoIntoStore("r", src, { objects, refs })

@@ -50,15 +50,15 @@ import { IS_CI } from "@/testing/ci"
 import {
 	ageObjects,
 	type GcFixture,
-	gitReachableOids,
 	objectOids,
 	pushFile,
 	repoUrl,
 	setupGcFixture,
 	teardownGcFixture,
-	withTempDir,
 } from "@/testing/gc-helpers"
+import { gitReachableOids } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 /** One operation against a single repo within a run. The generator emits a stream
  * of these; the test interprets them through a tiny per-repo model (below) so every

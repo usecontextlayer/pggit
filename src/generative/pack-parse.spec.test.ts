@@ -58,6 +58,7 @@ import {
 	loadAllObjects,
 	parseVerifyPackObjects,
 	requiredAt,
+	requireGitOid,
 } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -245,10 +246,7 @@ async function packRepo(
 		],
 		{ cwd: dir },
 	)
-	const hash = out.stdout.trim()
-	if (!/^[0-9a-f]{40}$/.test(hash)) {
-		throw new Error(`git pack-objects named no pack: ${JSON.stringify(out.stdout)}`)
-	}
+	const hash = requireGitOid(out.stdout.trim(), "git pack-objects output")
 	return {
 		bytes: readFileSync(`${prefix}-${hash}.pack`),
 		idxPath: `${prefix}-${hash}.idx`,

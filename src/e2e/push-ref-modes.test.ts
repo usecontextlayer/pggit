@@ -9,6 +9,7 @@ import { createRefStore, type RefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 
 describe("M2 — ref command modes: deny-non-FF policy (real git)", () => {
 	let db: IsolatedDb
@@ -31,8 +32,7 @@ describe("M2 — ref command modes: deny-non-FF policy (real git)", () => {
 	})
 
 	it("DENIES a delete-only push (refs only advance; was: accepted pre-2026-07-05)", async () => {
-		const src = mkdtempSync(join(tmpdir(), "pggit-del-"))
-		try {
+		await withTempDir("pggit-del-", async (src) => {
 			await spawnGit(["init", "-q"], { cwd: src })
 			writeFileSync(join(src, "a.txt"), "alpha\n")
 			await spawnGit(["add", "."], { cwd: src })
@@ -50,9 +50,7 @@ describe("M2 — ref command modes: deny-non-FF policy (real git)", () => {
 			).rejects.toThrow(/deletion denied/i)
 			// The ref survives untouched.
 			expect(await refs.listRefs("repo-del")).toEqual(before)
-		} finally {
-			rmSync(src, { force: true, recursive: true })
-		}
+		})
 	})
 
 	it("DENIES a non-fast-forward force push; a genuine FF still lands (was: accepted pre-2026-07-05)", async () => {
