@@ -15,48 +15,46 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { objectsByType } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "workspace/probe/blobless"
 const RUNS = 120
 
-type BloblessArm = {
+type ClonedArm = {
 	label: string
-	cloneError: string | null
-	fsckAfterCloneError: string | null
+	fsckAfterClone: TestResult<void>
 	/** What the filtered clone actually landed locally — the probe printed these to
 	 * show the clone really is blob-light, so the promisor path is not vacuous. */
 	localObjects: number
 	localBlobs: number
-	checkoutError: string | null
-	fsckAfterCheckoutError: string | null
-	lazyBlobError: string | null
-	lazyBlobMatches: boolean
-	worktreeDigest: string
-	worktreeStatus: string
 }
 
-async function allLocalObjects(dir: string): Promise<string[]> {
-	const res = await spawnGit(["cat-file", "--batch-check", "--batch-all-objects"], {
-		cwd: dir,
-	})
-	return res.stdout.split("\n").filter(Boolean).sort()
-}
-
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
-}
+type BloblessArm =
+	| { kind: "clone-failed"; label: string; error: unknown }
+	| (ClonedArm & { kind: "checkout-failed"; error: unknown })
+	| (ClonedArm & {
+			kind: "checked-out"
+			fsckAfterCheckout: TestResult<void>
+			lazyBlob: TestResult<boolean>
+			worktreeDigest: string
+			worktreeStatus: string
+	  })
 
 describe("wire — blobless clone + promisor fetch against the deltified path", () => {
 	let db: IsolatedDb
@@ -69,6 +67,34 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 	}
 
 	const arms: BloblessArm[] = []
+	const requireArms = (): [BloblessArm, BloblessArm] => {
+		const [pggit, git] = arms
+		if (pggit === undefined || git === undefined || arms.length !== 2) {
+			throw new Error(`expected pggit and git arms, got ${arms.length}`)
+		}
+		return [pggit, git]
+	}
+	const requireClonedArms = (): [ClonedArm, ClonedArm] => {
+		const [pggit, git] = requireArms()
+		if (pggit.kind === "clone-failed")
+			throw new Error(`pggit blobless clone failed: ${String(pggit.error)}`)
+		if (git.kind === "clone-failed")
+			throw new Error(`git blobless clone failed: ${String(git.error)}`)
+		return [pggit, git]
+	}
+	const requireCheckedOutArms = (): [
+		Extract<BloblessArm, { kind: "checked-out" }>,
+		Extract<BloblessArm, { kind: "checked-out" }>,
+	] => {
+		const [pggit, git] = requireArms()
+		if (pggit.kind !== "checked-out" || git.kind !== "checked-out") {
+			const failed = pggit.kind !== "checked-out" ? pggit : git
+			throw new Error(
+				`blobless checkout did not complete: ${failed.kind === "clone-failed" || failed.kind === "checkout-failed" ? String(failed.error) : failed.kind}`,
+			)
+		}
+		return [pggit, git]
+	}
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS })
@@ -79,9 +105,10 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 		await spawnGit(["config", "uploadpack.allowFilter", "true"], { cwd: bare })
 		await spawnGit(["config", "uploadpack.allowAnySHA1InWant", "true"], { cwd: bare })
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const pggitUrl = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		const pggitUrl = repoUrl(server, REPO)
 		const bareUrl = `file://${bare}`
 
 		await spawnGit(["push", "-q", pggitUrl, "--all"], { cwd: src })
@@ -97,7 +124,7 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 			["git", bareUrl],
 		] as const) {
 			const dest = join(mk(`bl-${label}`), "c")
-			const cloneError = await errorOf(() =>
+			const clone = await captureTestResult(() =>
 				spawnGit([
 					"-c",
 					"protocol.version=2",
@@ -113,60 +140,42 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 					dest,
 				]),
 			)
-			if (cloneError !== null) {
-				arms.push({
-					checkoutError: null,
-					cloneError,
-					fsckAfterCheckoutError: null,
-					fsckAfterCloneError: null,
-					label,
-					lazyBlobError: null,
-					lazyBlobMatches: false,
-					localBlobs: 0,
-					localObjects: 0,
-					worktreeDigest: "",
-					worktreeStatus: "",
-				})
+			if (clone.kind === "failed") {
+				arms.push({ error: clone.error, kind: "clone-failed", label })
 				continue
 			}
-			const objs = await allLocalObjects(dest)
-			const localBlobs = objs.filter((l) => l.includes(" blob ")).length
+			const objs = await objectsByType(dest)
+			const localBlobs = objs.filter((object) => object.type === "blob").length
 			// A blobless clone must still be a valid promisor repo.
-			const fsckAfterCloneError = await errorOf(() =>
-				spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest }),
-			)
+			const fsckAfterClone = await captureTestResult(async () => {
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+			})
 
 			// Now force the promisor path: check out the tree, which lazily fetches every
 			// blob it needs by exact OID.
-			const checkoutError = await errorOf(() =>
+			const checkout = await captureTestResult(() =>
 				spawnGit(["checkout", "-q", "main"], { cwd: dest }),
 			)
-			if (checkoutError !== null) {
+			if (checkout.kind === "failed") {
 				arms.push({
-					checkoutError,
-					cloneError,
-					fsckAfterCheckoutError: null,
-					fsckAfterCloneError,
+					error: checkout.error,
+					fsckAfterClone,
+					kind: "checkout-failed",
 					label,
-					lazyBlobError: null,
-					lazyBlobMatches: false,
 					localBlobs,
 					localObjects: objs.length,
-					worktreeDigest: "",
-					worktreeStatus: "",
 				})
 				continue
 			}
-			const fsckAfterCheckoutError = await errorOf(() =>
-				spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest }),
-			)
+			const fsckAfterCheckout = await captureTestResult(async () => {
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+			})
 
 			// And a single explicit lazy fetch of one deep blob.
-			let lazyBlobMatches = false
-			const lazyBlobError = await errorOf(async () => {
+			const lazyBlob = await captureTestResult(async () => {
 				const got = await spawnGit(["cat-file", "blob", oneBlob], { cwd: dest })
 				const want = await spawnGit(["cat-file", "blob", oneBlob], { cwd: src })
-				lazyBlobMatches = got.stdoutBytes.equals(want.stdoutBytes)
+				return got.stdoutBytes.equals(want.stdoutBytes)
 			})
 
 			// The checked-out worktree, hashed — compared between the two remotes below.
@@ -176,13 +185,11 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 			const h = createHash("sha256")
 			for (const f of files.sort()) h.update(f).update(readFileSync(join(dest, f)))
 			arms.push({
-				checkoutError,
-				cloneError,
-				fsckAfterCheckoutError,
-				fsckAfterCloneError,
+				fsckAfterCheckout,
+				fsckAfterClone,
+				kind: "checked-out",
 				label,
-				lazyBlobError,
-				lazyBlobMatches,
+				lazyBlob,
 				localBlobs,
 				localObjects: objs.length,
 				worktreeDigest: `${files.length}:${h.digest("hex")}`,
@@ -195,48 +202,67 @@ describe("wire — blobless clone + promisor fetch against the deltified path", 
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
 	it("takes a blobless clone that is fsck-clean on both remotes", () => {
 		expect(arms.length).toBe(2)
 		for (const a of arms) {
-			const at = `${a.label} — ${a.localObjects} local objects, ${a.localBlobs} blobs`
-			expect(a.cloneError, at).toBeNull()
-			expect(a.fsckAfterCloneError, at).toBeNull()
+			const at =
+				a.kind === "clone-failed"
+					? `${a.label}: ${String(a.error)}`
+					: `${a.label} — ${a.localObjects} local objects, ${a.localBlobs} blobs`
+			expect(a.kind, at).not.toBe("clone-failed")
+			if (a.kind !== "clone-failed") {
+				expect(
+					a.fsckAfterClone.kind,
+					testResultContext(a.fsckAfterClone, `${at} fsck`),
+				).toBe("succeeded")
+			}
 		}
 		// The omission proof. Every other assertion in this file is satisfied by a
 		// full unfiltered clone — a checkout of a repo that already holds every blob
 		// is clean and identical — so `blob:none` is only honored if pggit lands the
 		// same number of blobs the git control does, and the control lands none.
+		const [pggit, git] = requireClonedArms()
 		expect(
-			arms[1]?.localBlobs,
+			git.localBlobs,
 			"the git control is not blob-light — the fixture proves nothing",
 		).toBe(0)
 		expect(
-			arms[0]?.localBlobs,
+			pggit.localBlobs,
 			"pggit's blobless clone landed blobs the git control did not",
-		).toBe(arms[1]?.localBlobs)
+		).toBe(git.localBlobs)
 	})
 
 	it("checks out through the promisor blob path, still fsck-clean", () => {
 		for (const a of arms) {
-			expect(a.checkoutError, a.label).toBeNull()
-			expect(a.fsckAfterCheckoutError, a.label).toBeNull()
+			const at =
+				a.kind === "clone-failed" || a.kind === "checkout-failed"
+					? `${a.label}: ${String(a.error)}`
+					: a.label
+			expect(a.kind, at).toBe("checked-out")
+			if (a.kind === "checked-out") {
+				expect(
+					a.fsckAfterCheckout.kind,
+					testResultContext(a.fsckAfterCheckout, `${a.label} fsck after checkout`),
+				).toBe("succeeded")
+			}
 		}
 	})
 
 	it("serves an explicitly lazy-fetched deep blob byte-identically", () => {
 		for (const a of arms) {
-			expect(a.lazyBlobError, a.label).toBeNull()
-			expect(a.lazyBlobMatches, a.label).toBe(true)
+			if (a.kind !== "checked-out") continue
+			expect(a.lazyBlob.kind, testResultContext(a.lazyBlob, a.label)).toBe("succeeded")
+			if (a.lazyBlob.kind === "succeeded") expect(a.lazyBlob.value, a.label).toBe(true)
 		}
 	})
 
 	it("leaves a clean worktree identical to the one a plain git remote produces", () => {
-		for (const a of arms) expect(a.worktreeStatus, a.label).toBe("")
-		expect(arms[0]?.worktreeDigest).toBe(arms[1]?.worktreeDigest)
+		const [pggit, git] = requireCheckedOutArms()
+		for (const a of [pggit, git]) expect(a.worktreeStatus, a.label).toBe("")
+		expect(pggit.worktreeDigest).toBe(git.worktreeDigest)
 	})
 })

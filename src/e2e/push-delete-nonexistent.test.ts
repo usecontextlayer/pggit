@@ -24,11 +24,11 @@
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { writePack } from "@/pack/write-pack"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
 
@@ -52,17 +52,13 @@ describe("delete of a nonexistent ref is reported per-ref, not a 500", () => {
 		ref: string,
 		withEmptyPack: boolean,
 	): Promise<{ report: string; status: number }> {
-		const body = Buffer.concat([
-			encodePktLine(Buffer.from(`${ZERO} ${ZERO} ${ref}\0report-status`)),
-			encodePkt({ type: "flush" }),
-			...(withEmptyPack ? [writePack([])] : []),
-		])
-		const res = await app.request("/repo/git-receive-pack", {
-			body: new Uint8Array(body),
-			method: "POST",
-		})
+		const body = receivePackRequest(
+			[`${ZERO} ${ZERO} ${ref}\0report-status`],
+			withEmptyPack ? writePack([]) : undefined,
+		)
+		const res = await postReceivePack(app, "repo", body)
 		return {
-			report: pktLineUnpack(Buffer.from(await res.arrayBuffer())),
+			report: pktLineUnpack(res.body),
 			status: res.status,
 		}
 	}

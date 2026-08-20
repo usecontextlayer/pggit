@@ -28,16 +28,20 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
-import { type GitServer, serveOnPort } from "@/server"
-import { createObjectStore, type ObjectStore } from "@/store/object-store"
-import { createRefStore, type RefStore } from "@/store/refs-store"
+import type { GitServer } from "@/server"
+import type { ObjectStore } from "@/store/object-store"
+import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { allObjectOids, loadReachableObjects, refsOf } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const ITERS = 40
@@ -69,16 +73,16 @@ describe("race — concurrent repack passes on one repo", () => {
 		sourceRefs = await refsOf(src)
 		head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		store = createObjectStore(db.sql)
-		refs = createRefStore(db.sql)
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		store = fixture.deps.objects
+		refs = fixture.deps.refs
 		repack = createRepack(db.sql)
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -143,7 +147,7 @@ describe("race — concurrent repack passes on one repo", () => {
 					"protocol.version=2",
 					"clone",
 					"-q",
-					`http://127.0.0.1:${server.port}/${repo}`,
+					repoUrl(server, repo),
 					dest,
 				])
 				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })

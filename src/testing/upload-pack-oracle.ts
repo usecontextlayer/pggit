@@ -14,9 +14,13 @@
 import { spawn } from "node:child_process"
 import { assertNever } from "@/assert-never"
 import { decodePktStream } from "@/protocol/pkt-line"
-import { buildGitEnv } from "@/testing/spawn-git"
+import {
+	buildGitEnv,
+	type NonZeroExitCode,
+	parseNonZeroExitCode,
+} from "@/testing/spawn-git"
 
-type ExpectedUploadPackError = { code: number; out: Buffer }
+type ExpectedUploadPackError = { code: NonZeroExitCode; out: Buffer }
 
 type SpawnUploadPackOptions = { expectInBandError: true }
 
@@ -92,7 +96,7 @@ export async function spawnUploadPack(
 					)
 					return
 				}
-				resolve({ code, out })
+				resolve({ code: parseNonZeroExitCode(code), out })
 				return
 			}
 			// By default, a signal death or non-zero exit means the oracle never

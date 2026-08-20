@@ -123,7 +123,8 @@ describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 		// No derived row survives for an orphaned commit/tag (the 0009 cascades).
 		const orphanSet = new Set(orphaned)
 		for (const row of await derivedRows(fx.db, repo)) {
-			const oid = row.split(" ")[1] as string
+			const oid = row.split(" ")[1]
+			if (oid === undefined) throw new Error(`malformed derived-row key: ${row}`)
 			expect(orphanSet.has(oid)).toBe(false)
 		}
 

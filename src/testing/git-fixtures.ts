@@ -1,25 +1,49 @@
+import { createHash } from "node:crypto"
 import { readdirSync } from "node:fs"
 import { join } from "node:path"
+import { z } from "zod"
 import type { GitObjectType } from "@/object/object"
+import { isOid, type Oid } from "@/oid"
 import type { PackInputObject } from "@/pack/write-pack"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { spawnGit } from "@/testing/spawn-git"
 
-const OBJECT_TYPES = new Set<GitObjectType>(["blob", "commit", "tag", "tree"])
+const gitObjectTypeSchema = z.enum(["blob", "commit", "tag", "tree"])
 
-function objectType(value: string, line: string): GitObjectType {
-	if (!OBJECT_TYPES.has(value as GitObjectType)) {
-		throw new Error(`unexpected git object-list line: ${line}`)
+export function requireGitObjectType(value: string, context: string): GitObjectType {
+	const parsed = gitObjectTypeSchema.safeParse(value)
+	if (!parsed.success) {
+		throw new Error(`unexpected git object type ${JSON.stringify(value)} in ${context}`)
 	}
-	return value as GitObjectType
+	return parsed.data
 }
 
 /** Validate one SHA-1 oid emitted by canonical git before it enters an oracle set. */
-export function requireGitOid(value: string, context: string): string {
-	if (!/^[0-9a-f]{40}$/.test(value)) {
+export function requireGitOid(value: string, context: string): Oid {
+	if (!isOid(value)) {
 		throw new Error(`unexpected git oid ${JSON.stringify(value)} in ${context}`)
 	}
+	return value
+}
+
+/** Directional list difference, preserving each input's order and duplicates. */
+export function listDifferences<T>(
+	left: readonly T[],
+	right: readonly T[],
+): { onlyLeft: T[]; onlyRight: T[] } {
+	const leftValues = new Set(left)
+	const rightValues = new Set(right)
+	return {
+		onlyLeft: left.filter((value) => !rightValues.has(value)),
+		onlyRight: right.filter((value) => !leftValues.has(value)),
+	}
+}
+
+/** Index a fixture list, failing with the caller's semantic context. */
+export function requiredAt<T>(values: readonly T[], index: number, context: string): T {
+	const value = values[index]
+	if (value === undefined) throw new Error(`${context}: missing index ${index}`)
 	return value
 }
 
@@ -79,7 +103,7 @@ async function loadObjects(
 		}
 		objects.push({
 			content: batch.stdoutBytes.subarray(contentStart, contentEnd),
-			type: objectType(rawType, header),
+			type: requireGitObjectType(rawType, `cat-file header ${JSON.stringify(header)}`),
 		})
 		pos = contentEnd + 1
 	}
@@ -134,7 +158,7 @@ export function parseLsTree(
 			if (!/^[0-7]{6}$/.test(mode)) {
 				throw new Error(`unexpected ls-tree mode: ${line}`)
 			}
-			objectType(type, line)
+			requireGitObjectType(type, `ls-tree line ${JSON.stringify(line)}`)
 			return {
 				mode,
 				oid: requireGitOid(oid, `ls-tree line ${JSON.stringify(line)}`),
@@ -155,6 +179,73 @@ export async function allObjectOids(dir: string): Promise<string[]> {
 		.filter(Boolean)
 		.map((line) => requireGitOid(line, `object-list line ${JSON.stringify(line)}`))
 		.sort()
+}
+
+/** A byte-exact digest of the requested objects, read in stable oid order. */
+export async function objectBytesDigest(
+	dir: string,
+	oids: readonly string[],
+): Promise<string> {
+	const unique = [
+		...new Set(oids.map((oid) => requireGitOid(oid, "object digest request"))),
+	].sort()
+	const objects = await loadObjects(dir, unique)
+	const digest = createHash("sha256")
+	for (const [index, oid] of unique.entries()) {
+		const object = objects[index]
+		if (object === undefined) {
+			throw new Error(`cat-file --batch omitted digest object ${oid}`)
+		}
+		digest.update(`${oid} ${object.type} ${object.content.length}\n`)
+		digest.update(object.content)
+		digest.update("\n")
+	}
+	return digest.digest("hex")
+}
+
+/** Everything a client can observe through a canonical mirror clone. */
+export type MirrorState = {
+	refs: string[]
+	objects: string[]
+	digest: string
+	fsck: string
+}
+
+/** Mirror-clone a remote and return its validated refs, objects, bytes, and fsck. */
+export async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
+	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
+	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+	const refsOutput = await spawnGit(
+		["for-each-ref", "--format=%(objectname) %(refname)"],
+		{ cwd: dest },
+	)
+	const refs = refsOutput.stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			const split = line.indexOf(" ")
+			if (split < 0 || split === line.length - 1) {
+				throw new Error(`unexpected for-each-ref line: ${line}`)
+			}
+			const oid = requireGitOid(
+				line.slice(0, split),
+				`for-each-ref line ${JSON.stringify(line)}`,
+			)
+			return `${oid} ${line.slice(split + 1)}`
+		})
+		.sort()
+	const complaints = `${fsck.stdout}${fsck.stderr}`
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && !line.startsWith("notice:"))
+	const objects = await allObjectOids(dest)
+	return {
+		digest: await objectBytesDigest(dest, objects),
+		fsck: complaints.join("\n"),
+		objects,
+		refs,
+	}
 }
 
 /**
@@ -221,13 +312,9 @@ export function packFiles(dir: string): string[] {
 	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
 }
 
-type VerifyPackObject = {
-	baseOid?: string
-	delta: boolean
-	depth?: number
-	oid: string
-	offset: number
-}
+type VerifyPackObject =
+	| { kind: "whole"; oid: string; offset: number }
+	| { kind: "delta"; baseOid: string; depth: number; oid: string; offset: number }
 
 function verifyPackInteger(value: string, field: string, line: string): number {
 	const parsed = Number(value)
@@ -253,7 +340,7 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 			verifyPackInteger(rawPackedSize, "packed size", line)
 			const offset = verifyPackInteger(rawOffset, "offset", line)
 			if (rawDepth === undefined || rawBaseOid === undefined) {
-				objects.push({ delta: false, offset, oid })
+				objects.push({ kind: "whole", offset, oid })
 				continue
 			}
 			const depth = verifyPackInteger(rawDepth, "delta depth", line)
@@ -265,8 +352,8 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 					rawBaseOid,
 					`verify-pack base in line ${JSON.stringify(line)}`,
 				),
-				delta: true,
 				depth,
+				kind: "delta",
 				offset,
 				oid,
 			})
@@ -320,7 +407,7 @@ export async function objectsByType(
 		}
 		out.push({
 			oid: requireGitOid(oid, `object-list line ${JSON.stringify(line)}`),
-			type: objectType(type, line),
+			type: requireGitObjectType(type, `object-list line ${JSON.stringify(line)}`),
 		})
 	}
 	return out

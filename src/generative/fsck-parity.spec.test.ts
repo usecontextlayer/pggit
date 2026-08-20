@@ -51,11 +51,12 @@ import { attemptGit, spawnGit } from "@/testing/spawn-git"
 const NUL = Buffer.from([0])
 const PINNED = { numRuns: 80, seed: 424_242 } as const
 
-/** git's verdict on ONE object: did it ERROR, and which message classes did it
- * report? `classes` are git's own fsck message ids where it emits one (`hasDot`,
- * `treeNotSorted`, …) and the normalized message text where it does not (the
- * parser-level `object could not be parsed` family). */
-type GitVerdict = { classes: string[]; errored: boolean; out: string }
+/** git's verdict on ONE object. A rejection carries the non-empty set of message
+ * classes: git's own fsck ids where it emits one (`hasDot`, `treeNotSorted`, …),
+ * or normalized message text for the parser-level families. */
+type GitVerdict =
+	| { kind: "accepted"; out: string }
+	| { kind: "rejected"; classes: [string, ...string[]]; out: string }
 
 /** Normalize the free-form half of an fsck line so a class is stable across runs:
  * object ids and the scratch repo's object paths are the only varying parts. */
@@ -71,7 +72,6 @@ function normalizeMessage(text: string): string {
  */
 function parseFsck(out: string): GitVerdict {
 	const classes = new Set<string>()
-	let errored = false
 	for (const line of out.split("\n").filter((l) => l.length > 0)) {
 		// Informational: unreachable objects (everything here is unreachable — the
 		// scratch repo has no refs) and the matching "no refs" notice.
@@ -90,21 +90,24 @@ function parseFsck(out: string): GitVerdict {
 		// '.'`); a few (`broken links`) carry only prose.
 		const msgId = attributed ? /^([a-zA-Z]+): /.exec(rest)?.[1] : undefined
 		classes.add(msgId ?? normalizeMessage(rest))
-		errored = true
 	}
-	return { classes: [...classes].sort(), errored, out }
+	const [first, ...rest] = [...classes].sort()
+	return first === undefined
+		? { kind: "accepted", out }
+		: { classes: [first, ...rest], kind: "rejected", out }
 }
 
-/** pggit's verdict on the same bytes: the `GitFormatError` code it rejects with,
- * or `null` when the object passes the whole ingest-boundary check. */
-function pggitVerdict(type: GitObjectType, content: Buffer): string | null {
+/** pggit's verdict on the same bytes, with the `GitFormatError` code on rejection. */
+type PggitVerdict = { kind: "accepted" } | { kind: "rejected"; code: string }
+
+function pggitVerdict(type: GitObjectType, content: Buffer): PggitVerdict {
 	try {
 		validateObject(type, content)
 		if (type === "commit") deriveCommitRow(content)
 		if (type === "tag") deriveTagRow(content)
-		return null
+		return { kind: "accepted" }
 	} catch (e) {
-		if (e instanceof GitFormatError) return e.code
+		if (e instanceof GitFormatError) return { code: e.code, kind: "rejected" }
 		throw e
 	}
 }
@@ -192,20 +195,16 @@ function tally(counts: Map<string, number>, key: string): void {
 /** The whole contract, applied to one candidate. */
 function judge(
 	git: GitVerdict,
-	pggit: string | null,
+	pggit: PggitVerdict,
 	recorded: Recorded,
 	stats: Stats,
 	shown: string,
 ): void {
-	if (git.errored && pggit !== null) {
-		stats.agreeReject++
-		return
-	}
-	if (!git.errored && pggit === null) {
-		stats.agreeAccept++
-		return
-	}
-	if (git.errored) {
+	if (git.kind === "rejected") {
+		if (pggit.kind === "rejected") {
+			stats.agreeReject++
+			return
+		}
 		for (const c of git.classes) {
 			tally(stats.underClasses, c)
 			expect(
@@ -215,10 +214,14 @@ function judge(
 		}
 		return
 	}
-	tally(stats.overCodes, pggit as string)
+	if (pggit.kind === "accepted") {
+		stats.agreeAccept++
+		return
+	}
+	tally(stats.overCodes, pggit.code)
 	expect(
-		recorded.overRejected.has(pggit as string),
-		`pggit rejected with "${pggit}" but git fsck --strict reported no error on these bytes — an unrecorded divergence.\n${git.out}\nobject: ${shown}`,
+		recorded.overRejected.has(pggit.code),
+		`pggit rejected with "${pggit.code}" but git fsck --strict reported no error on these bytes — an unrecorded divergence.\n${git.out}\nobject: ${shown}`,
 	).toBe(true)
 }
 
@@ -534,7 +537,7 @@ describe("§8.4 generative — ingest validation vs `git fsck --strict`", () => 
 					const content = tagBytes(spec, blobOid)
 					const git = await gitVerdict(fixture, "tag", content)
 					const pggit = pggitVerdict("tag", content)
-					if (git.errored && pggit === null) {
+					if (git.kind === "rejected" && pggit.kind === "accepted") {
 						const shape = `objects=${spec.objects} types=${spec.types}`
 						expect(spec.objects, `pggit accepted a tag git refused, ${shape}`).toBe(1)
 						expect(

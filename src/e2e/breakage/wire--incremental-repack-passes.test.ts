@@ -20,21 +20,32 @@ import { createHash } from "node:crypto"
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { parseVerifyPackObjects } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const COMMITS = 90
 const CHECKPOINTS = new Set([1, 31, 32, 33, 63, 64, 65, COMMITS])
 
 type Checkpoint = {
 	commits: number
-	cloneError: string | null
-	shape: { maxDepth: number; deltas: number; inventoryMatchesSource: boolean } | null
+	result: TestResult<{
+		maxDepth: number
+		deltas: number
+		inventoryMatchesSource: boolean
+	}>
 }
 
 /** Max delta chain depth over every pack in a clone, plus the delta count. */
@@ -45,7 +56,7 @@ async function depthOf(dir: string): Promise<{ maxDepth: number; deltas: number 
 	for (const f of readdirSync(p).filter((x) => x.endsWith(".idx"))) {
 		const out = await spawnGit(["verify-pack", "-v", join(p, f)], { cwd: dir })
 		for (const object of parseVerifyPackObjects(out.stdout)) {
-			if (object.depth === undefined) continue
+			if (object.kind === "whole") continue
 			deltas++
 			maxDepth = Math.max(maxDepth, object.depth)
 		}
@@ -63,15 +74,6 @@ async function inventory(dir: string): Promise<string> {
 		.join("\n")
 }
 
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
-}
-
 describe("wire — depth ≤ 1 and exact object sets across every incremental pass", () => {
 	let db: IsolatedDb
 	let server: GitServer
@@ -86,8 +88,9 @@ describe("wire — depth ≤ 1 and exact object sets across every incremental pa
 	const churn: Checkpoint[] = []
 
 	beforeAll(async () => {
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
 		const repack = createRepack(db.sql)
 		const base = `http://127.0.0.1:${server.port}`
 
@@ -115,7 +118,7 @@ describe("wire — depth ≤ 1 and exact object sets across every incremental pa
 
 				if (!CHECKPOINTS.has(i + 1)) continue
 				const dest = join(mk(`c-${name}-${i + 1}`), "c")
-				const cloneError = await errorOf(async () => {
+				const clone = await captureTestResult(async () => {
 					await spawnGit([
 						"-c",
 						"protocol.version=2",
@@ -130,18 +133,20 @@ describe("wire — depth ≤ 1 and exact object sets across every incremental pa
 					])
 					await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 				})
-				if (cloneError !== null) {
-					out.push({ cloneError, commits: i + 1, shape: null })
+				if (clone.kind === "failed") {
+					out.push({ commits: i + 1, result: clone })
 					continue
 				}
 				const d = await depthOf(dest)
 				out.push({
-					cloneError,
 					commits: i + 1,
-					shape: {
-						deltas: d.deltas,
-						inventoryMatchesSource: (await inventory(dest)) === (await inventory(src)),
-						maxDepth: d.maxDepth,
+					result: {
+						kind: "succeeded",
+						value: {
+							deltas: d.deltas,
+							inventoryMatchesSource: (await inventory(dest)) === (await inventory(src)),
+							maxDepth: d.maxDepth,
+						},
 					},
 				})
 			}
@@ -169,8 +174,7 @@ describe("wire — depth ≤ 1 and exact object sets across every incremental pa
 	}, 900_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -179,11 +183,14 @@ describe("wire — depth ≤ 1 and exact object sets across every incremental pa
 		expect(checkpoints.length).toBe(CHECKPOINTS.size)
 		for (const c of checkpoints) {
 			const at = `[${name}] at ${c.commits} commits`
-			expect(c.cloneError, at).toBeNull()
-			if (!c.shape) throw new Error(`${at}: clone succeeded but no shape was recorded`)
+			expect(c.result.kind, testResultContext(c.result, at)).toBe("succeeded")
+			if (c.result.kind === "failed") continue
 			// The star topology claims depth ≤ 1 (design D2/D9).
-			expect(c.shape.maxDepth, `${at} (${c.shape.deltas} deltas)`).toBeLessThanOrEqual(1)
-			expect(c.shape.inventoryMatchesSource, at).toBe(true)
+			expect(
+				c.result.value.maxDepth,
+				`${at} (${c.result.value.deltas} deltas)`,
+			).toBeLessThanOrEqual(1)
+			expect(c.result.value.inventoryMatchesSource, at).toBe(true)
 		}
 	}
 

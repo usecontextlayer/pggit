@@ -50,12 +50,14 @@ import { join } from "node:path"
 import { inflateSync } from "node:zlib"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
+import { z } from "zod"
 import { decodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 import { readPack } from "@/pack/read-pack"
 import {
 	allObjectOids,
 	loadAllObjects,
 	parseVerifyPackObjects,
+	requiredAt,
 } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -145,8 +147,15 @@ function summarizeDelta(program: Buffer): Omit<ScannedEntry, "form"> {
  * the next pack entry. `@types/node` carries no overload for that shape. */
 type InflateInfo = { buffer: Buffer; engine: { bytesWritten: number } }
 
+const inflateInfoSchema = z
+	.object({
+		buffer: z.instanceof(Buffer),
+		engine: z.object({ bytesWritten: z.number() }).passthrough(),
+	})
+	.passthrough()
+
 function inflateEntry(pack: Buffer, offset: number): InflateInfo {
-	return inflateSync(pack.subarray(offset), { info: true }) as unknown as InflateInfo
+	return inflateInfoSchema.parse(inflateSync(pack.subarray(offset), { info: true }))
 }
 
 /** The OFS_DELTA back-offset varint's LENGTH (its value is `readPack`'s business;
@@ -271,7 +280,7 @@ async function expectPackMatchesGit(
 		.sort(byBytes)
 	expect(recovered.length).toBe(canonical.length)
 	for (const [i, got] of recovered.entries()) {
-		const want = canonical[i] as { content: Buffer; type: string }
+		const want = requiredAt(canonical, i, "canonical object list")
 		expect(got.type).toBe(want.type)
 		expect(
 			Buffer.compare(got.content, want.content),
@@ -283,18 +292,19 @@ async function expectPackMatchesGit(
 	expect(entries.length).toBe(parsed.length)
 	for (const [i, entry] of entries.entries()) {
 		if (entry.form === "base") continue
+		const object = requiredAt(parsed, i, "parsed pack")
 		expect(
 			entry.produced,
-			`delta program ${i} produces ${entry.produced} bytes, the object is ${(parsed[i] as { content: Buffer }).content.length}`,
-		).toBe((parsed[i] as { content: Buffer }).content.length)
+			`delta program ${i} produces ${entry.produced} bytes, the object is ${object.content.length}`,
+		).toBe(object.content.length)
 	}
 	const verify = await spawnGit(["verify-pack", "-v", pack.idxPath], { cwd: dir })
 	const gitDeltaOids = parseVerifyPackObjects(verify.stdout)
-		.filter((o) => o.delta)
+		.filter((o) => o.kind === "delta")
 		.map((o) => o.oid)
 		.sort()
 	const scannedDeltaOids = parsed
-		.filter((_, i) => (entries[i] as ScannedEntry).form !== "base")
+		.filter((_, i) => requiredAt(entries, i, "scanned pack").form !== "base")
 		.map((p) => p.oid)
 		.sort()
 	expect(scannedDeltaOids).toEqual(gitDeltaOids)
@@ -363,8 +373,10 @@ const shapeArb = fc.array(
 async function buildRepo(dir: string, shape: FileSpec[]): Promise<void> {
 	await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 	const contents = shape.map((f) => baseLines(f.lineCount))
-	const flush = (i: number): void =>
-		writeFileSync(join(dir, `f${i}.txt`), `${(contents[i] as string[]).join("\n")}\n`)
+	const flush = (i: number): void => {
+		const content = requiredAt(contents, i, "generated file contents")
+		writeFileSync(join(dir, `f${i}.txt`), `${content.join("\n")}\n`)
+	}
 	const commit = async (message: string): Promise<void> => {
 		await spawnGit(["add", "."], { cwd: dir })
 		await spawnGit(["commit", "-q", "-m", message], { cwd: dir })
@@ -377,8 +389,9 @@ async function buildRepo(dir: string, shape: FileSpec[]): Promise<void> {
 		for (const [i, file] of shape.entries()) {
 			const edit = file.edits[round]
 			if (!edit) continue
+			const content = requiredAt(contents, i, "generated file contents")
 			for (const line of edit) {
-				;(contents[i] as string[])[line % file.lineCount] = `mutated ${round} ${line}`
+				content[line % file.lineCount] = `mutated ${round} ${line}`
 			}
 			flush(i)
 		}
@@ -386,15 +399,15 @@ async function buildRepo(dir: string, shape: FileSpec[]): Promise<void> {
 	}
 }
 
-async function withTempDirs<T>(
-	count: number,
-	fn: (dirs: string[]) => Promise<T>,
+async function withTempDirPair<T>(
+	fn: (dir: string, outDir: string) => Promise<T>,
 ): Promise<T> {
-	const dirs = Array.from({ length: count }, () =>
+	const dirs = [
 		mkdtempSync(join(tmpdir(), "pggit-pack-parse-")),
-	)
+		mkdtempSync(join(tmpdir(), "pggit-pack-parse-")),
+	] as const
 	try {
-		return await fn(dirs)
+		return await fn(dirs[0], dirs[1])
 	} finally {
 		for (const dir of dirs) rmSync(dir, { force: true, recursive: true })
 	}
@@ -405,10 +418,10 @@ describe("§8.4 generative — readPack vs git's encoder parameter space", () =>
 		const coverage = newCoverage()
 		await fc.assert(
 			fc.asyncProperty(shapeArb, encoderArb, async (shape, options) => {
-				await withTempDirs(2, async ([dir, outDir]) => {
-					await buildRepo(dir as string, shape)
-					const pack = await packRepo(dir as string, outDir as string, options)
-					tallyCoverage(coverage, await expectPackMatchesGit(dir as string, pack))
+				await withTempDirPair(async (dir, outDir) => {
+					await buildRepo(dir, shape)
+					const pack = await packRepo(dir, outDir, options)
+					tallyCoverage(coverage, await expectPackMatchesGit(dir, pack))
 				})
 			}),
 			{ numRuns: 25, seed: 424_242 },
@@ -428,25 +441,25 @@ describe("§8.4 generative — readPack vs git's encoder parameter space", () =>
 		// One fixture pair covers it; the wire form is looped rather than generated
 		// because OFS vs REF is a property of the ENTRY header, not of the program.
 		const coverage = newCoverage()
-		await withTempDirs(2, async ([dir, outDir]) => {
-			await spawnGit(["init", "-q", "-b", "main"], { cwd: dir as string })
+		await withTempDirPair(async (dir, outDir) => {
+			await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 			const lines = baseLines(520_000)
-			writeFileSync(join(dir as string, "big.txt"), `${lines.join("\n")}\n`)
+			writeFileSync(join(dir, "big.txt"), `${lines.join("\n")}\n`)
 			lines[Math.floor(lines.length * 0.9)] = "mutated late in a very large file"
-			writeFileSync(join(dir as string, "big2.txt"), `${lines.join("\n")}\n`)
-			await spawnGit(["add", "."], { cwd: dir as string })
+			writeFileSync(join(dir, "big2.txt"), `${lines.join("\n")}\n`)
+			await spawnGit(["add", "."], { cwd: dir })
 			await spawnGit(["commit", "-q", "-m", "large near-identical pair"], {
-				cwd: dir as string,
+				cwd: dir,
 			})
 
 			for (const deltaBaseOffset of [true, false]) {
-				const pack = await packRepo(dir as string, outDir as string, {
+				const pack = await packRepo(dir, outDir, {
 					deltaBaseOffset,
 					depth: 50,
 					noReuseDelta: true,
 					window: 10,
 				})
-				tallyCoverage(coverage, await expectPackMatchesGit(dir as string, pack))
+				tallyCoverage(coverage, await expectPackMatchesGit(dir, pack))
 			}
 		})
 		console.log(reportCoverage("pack-parse wide", coverage))

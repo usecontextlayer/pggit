@@ -17,7 +17,6 @@ import { describe, expect, inject, it } from "vitest"
 import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
 import { createGitApp } from "@/index"
 import { writePack } from "@/pack/write-pack"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { handleReceivePack, type ReceiveBackend } from "@/protocol/receive-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
@@ -26,17 +25,9 @@ import { allObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { EMPTY_TREE, pktLineUnpack } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
-
-/** A receive-pack body: command lines, a flush, then the raw pack. */
-function receiveBody(commandLine: string, pack: Buffer): Buffer {
-	return Buffer.concat([
-		encodePktLine(Buffer.from(commandLine)),
-		encodePkt({ type: "flush" }),
-		pack,
-	])
-}
 
 describe("§8.4 generative — connectivity rejection over random graphs", () => {
 	it("rejects a pack missing the tip's reachable objects, leaving the ref unset", async () => {
@@ -67,8 +58,8 @@ describe("§8.4 generative — connectivity rejection over random graphs", () =>
 							objectType: (oid) => objects.objectType("r", oid),
 						}
 						const pack = writePack([{ content: commit, type: "commit" }])
-						const body = receiveBody(
-							`${ZERO} ${tip} refs/heads/probe\0report-status`,
+						const body = receivePackRequest(
+							[`${ZERO} ${tip} refs/heads/probe\0report-status`],
 							pack,
 						)
 						const report = pktLineUnpack(await handleReceivePack(body, backend))

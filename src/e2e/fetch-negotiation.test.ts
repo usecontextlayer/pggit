@@ -80,8 +80,11 @@ describe("M1 — incremental fetch negotiation (real git)", () => {
 			)
 
 			const newPacks = packFiles(dest).filter((p) => !packsAfterClone.has(p))
-			expect(newPacks.length).toBe(1)
-			const transferred = await packObjectOids(dest, newPacks[0] as string)
+			const [newPack] = newPacks
+			if (newPack === undefined || newPacks.length !== 1) {
+				throw new Error(`expected one new pack, got ${newPacks.length}`)
+			}
+			const transferred = await packObjectOids(dest, newPack)
 
 			// The delta = everything reachable from c3 that the clone did not have.
 			const delta = (await allObjectOids(src)).filter((o) => !haveAfterClone.includes(o))

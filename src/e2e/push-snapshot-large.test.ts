@@ -87,11 +87,13 @@ describe("a06 — repo_file snapshot insert stays under the bind-parameter ceili
 			select count(*)::int as n
 			from repo_file f join repos r on r.id = f.repo_id
 			where r.name = 'repo'`
-		expect(files?.n).toBe(N)
+		if (files === undefined) throw new Error("snapshot count query returned no row")
+		expect(files.n).toBe(N)
 		const [head] = await isolated.sql<{ commit_oid: Buffer; ref_name: string }[]>`
 			select h.ref_name, h.commit_oid
 			from repo_file_head h join repos r on r.id = h.repo_id
 			where r.name = 'repo'`
-		expect(head?.commit_oid.toString("hex")).toBe(tip)
+		if (head === undefined) throw new Error("snapshot head row missing")
+		expect(head.commit_oid.toString("hex")).toBe(tip)
 	}, 120_000)
 })

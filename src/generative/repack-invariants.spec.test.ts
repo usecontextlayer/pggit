@@ -52,7 +52,7 @@ import { assertNever } from "@/assert-never"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { mirrorClone } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -349,47 +349,6 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 	await spawnGit(["init", "-q", "-b", "main", dir])
 	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: stream.join("") })
 	return shape
-}
-
-// ── the observables ─────────────────────────────────────────────────────────
-
-/** A byte-exact digest of a repo's whole object set: one `cat-file --batch` pass
- * hashing every `<oid> <type> <size>\n<raw bytes>` in oid order. Two repos agree
- * here iff every object is byte-identical. */
-async function objectBytesDigest(dir: string, oids: string[]): Promise<string> {
-	if (oids.length === 0) return "empty"
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	return createHash("sha256").update(res.stdoutBytes).digest("hex")
-}
-
-type MirrorState = { refs: string[]; objects: string[]; digest: string; fsck: string }
-
-/** Mirror-clone `url`, `fsck --strict` it, and return everything a client can see. */
-async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
-	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
-	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-	// `git fsck` exits 0 and prints `notice:` lines for non-problems — not defects.
-	const complaints = `${fsck.stdout}${fsck.stderr}`
-		.split("\n")
-		.map((l) => l.trim())
-		.filter((l) => l.length > 0 && !l.startsWith("notice:"))
-	const refs = (
-		await spawnGit(["for-each-ref", "--format=%(objectname) %(refname)"], { cwd: dest })
-	).stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.sort()
-	const objects = await allObjectOids(dest)
-	return {
-		digest: await objectBytesDigest(dest, objects),
-		fsck: complaints.join("\n"),
-		objects,
-		refs,
-	}
 }
 
 /** The tier's whole shape: one row per encoded object, with its base (null = whole). */

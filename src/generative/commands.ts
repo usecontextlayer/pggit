@@ -183,12 +183,16 @@ function pick<T>(arr: readonly T[], idx: number): T {
 
 /** The offset into NAMES of the first name at-or-after `from` that is not yet a
  * branch — the sibling `divergeAndMerge` can create at the current tip, so the
- * merge base is that tip. `null` when all five names are already branches. */
-function freeNameIdx(model: RepoModel, from: number): number | null {
+ * merge base is that tip. */
+type FreeName = { kind: "available"; index: number } | { kind: "exhausted" }
+
+function freeName(model: RepoModel, from: number): FreeName {
 	for (let i = 0; i < NAMES.length; i++) {
-		if (!model.existingBranches.has(pick(NAMES, from + i))) return from + i
+		if (!model.existingBranches.has(pick(NAMES, from + i))) {
+			return { index: from + i, kind: "available" }
+		}
 	}
-	return null
+	return { kind: "exhausted" }
 }
 
 /** Apply one command, but only run `git` when the operation is currently valid. */
@@ -326,17 +330,17 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			}
 			await step(model, { kind: "commit" })
 			const origin = model.currentBranch
-			const freeIdx = freeNameIdx(model, cmd.nameIdx)
+			const free = freeName(model, cmd.nameIdx)
 			let sibling: string
-			if (freeIdx === null) {
+			if (free.kind === "exhausted") {
 				// All five names are branches, so one of them is not `origin`. Merging an
 				// EXISTING branch can hit a real content conflict, which `merge` aborts.
 				const taken = [...model.existingBranches].find((b) => b !== origin)
 				if (taken === undefined) throw new Error("divergeAndMerge: no sibling exists")
 				sibling = taken
 			} else {
-				sibling = pick(NAMES, freeIdx)
-				await step(model, { idx: freeIdx, kind: "branch" })
+				sibling = pick(NAMES, free.index)
+				await step(model, { idx: free.index, kind: "branch" })
 			}
 			const branchIdx = (name: string) => [...model.existingBranches].indexOf(name)
 			await step(model, { idx: branchIdx(sibling), kind: "checkout" })

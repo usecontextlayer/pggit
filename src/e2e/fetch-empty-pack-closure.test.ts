@@ -95,7 +95,7 @@ describe("neg02 — buildPack must not re-add a want already in the have-closure
 		// first keeps the differential honest — a helper that silently found no PACK
 		// would otherwise let `null === null` pass for agreement.
 		const oracle = await spawnUploadPack(src, request)
-		expect(packObjectCount(oracle)).toBe(0)
-		expect(packObjectCount(ours)).toBe(packObjectCount(oracle))
+		expect(packObjectCount(oracle)).toEqual({ kind: "pack", objectCount: 0 })
+		expect(packObjectCount(ours)).toEqual(packObjectCount(oracle))
 	}, 60_000)
 })

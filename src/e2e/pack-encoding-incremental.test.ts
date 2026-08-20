@@ -96,9 +96,10 @@ describe("repack — incremental passes", () => {
 			select
 				(select count(*) from git_object where repo_id = ${id}::bigint)::text as objects,
 				(select count(*) from git_pack_encoding where repo_id = ${id}::bigint)::text as encodings`
-		expect(counts?.encodings).toBe(counts?.objects)
+		if (counts === undefined) throw new Error("inventory count query returned no row")
+		expect(counts.encodings).toBe(counts.objects)
 		// And the growth was real: pass 2 had genuinely new objects to cover.
-		expect(Number(counts?.objects)).toBeGreaterThan(firstPassRows.size)
+		expect(Number(counts.objects)).toBeGreaterThan(firstPassRows.size)
 	})
 
 	it("deltifies in the incremental pass — the star invariant has rows to judge", () => {
@@ -116,7 +117,8 @@ describe("repack — incremental passes", () => {
 			where d.repo_id = ${id}::bigint
 				and d.base_oid is not null
 				and b.base_oid is not null`
-		expect(violations?.chained).toBe("0")
+		if (violations === undefined) throw new Error("star-invariant query returned no row")
+		expect(violations.chained).toBe("0")
 	})
 
 	it("never rewrites a finalized encoding (the frozen policy)", async () => {

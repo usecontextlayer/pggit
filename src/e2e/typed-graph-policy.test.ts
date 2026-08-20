@@ -22,7 +22,7 @@ import { WantNotFoundError } from "@/protocol/errors"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const REPO = "policy/typed"
 
@@ -58,11 +58,9 @@ describe("typed-graph policy", () => {
 
 	it("rejects a blob or tree pushed to refs/heads/* — and accepts them under refs/tags/*", async () => {
 		for (const bad of [blobOid, treeOid]) {
-			const denied = await spawnGit(["push", url, `${bad}:refs/heads/nontip`], {
-				cwd: src,
-			}).catch((e) => e as Error)
-			expect(denied).toBeInstanceOf(Error)
-			expect(String(denied)).toContain("invalid new value provided")
+			const denied = await attemptGit(["push", url, `${bad}:refs/heads/nontip`], src)
+			expect(denied.ok).toBe(false)
+			expect(denied.stderr).toContain("invalid new value provided")
 		}
 		// The same objects are legal tag targets (git's rule, matched exactly).
 		await spawnGit(["push", "-q", url, `${blobOid}:refs/tags/blobtag`], { cwd: src })
@@ -138,7 +136,8 @@ describe("typed-graph policy", () => {
 		const [row] = await db.sql<{ n: string }[]>`
 			select count(*)::text as n from git_object
 			where oid = ${Buffer.from(parentOid, "hex")}`
-		expect(row?.n).toBe("1")
+		if (row === undefined) throw new Error("object count query returned no row")
+		expect(row.n).toBe("1")
 	})
 
 	it("a tag whose derived row is missing crashes peeling and include-tag augmentation", async () => {

@@ -11,7 +11,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
@@ -19,6 +18,7 @@ import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
 
@@ -88,10 +88,11 @@ describe("M2 — concurrent push race + malformed-pack rejection", () => {
 			const stored = (await refs.listRefs("race")).find(
 				(r) => r.name === "refs/heads/main",
 			)
+			if (stored === undefined) throw new Error("winning push left main unset")
 			const winnerTip = results[0].status === "fulfilled" ? a.tip : b.tip
-			expect(stored?.oid).toBe(winnerTip)
+			expect(stored.oid).toBe(winnerTip)
 			// The loser's distinct commit never became the ref tip.
-			expect(stored?.oid).not.toBe(results[0].status === "fulfilled" ? b.tip : a.tip)
+			expect(stored.oid).not.toBe(results[0].status === "fulfilled" ? b.tip : a.tip)
 		} finally {
 			rmSync(a.dir, { force: true, recursive: true })
 			rmSync(b.dir, { force: true, recursive: true })
@@ -100,17 +101,13 @@ describe("M2 — concurrent push race + malformed-pack rejection", () => {
 
 	it("reports a malformed pack as `ng ... unpacker error` and leaves the ref unset", async () => {
 		const newOid = "a".repeat(40)
-		const body = Buffer.concat([
-			encodePktLine(Buffer.from(`${ZERO} ${newOid} refs/heads/bad\0report-status`)),
-			encodePkt({ type: "flush" }),
+		const body = receivePackRequest(
+			[`${ZERO} ${newOid} refs/heads/bad\0report-status`],
 			Buffer.from("this is not a valid packfile"), // garbage → readPack throws
-		])
-		const res = await app.request("/badrepo/git-receive-pack", {
-			body: new Uint8Array(body),
-			method: "POST",
-		})
+		)
+		const res = await postReceivePack(app, "badrepo", body)
 		expect(res.status).toBe(200) // the failure is reported in-band, not as HTTP error
-		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
+		const report = pktLineUnpack(res.body)
 		// `unpack <error>` — and specifically NOT `unpack ok`, which the previous
 		// wildcard matched and which is the one outcome this case must never see.
 		expect(report).toMatch(/^unpack (?!ok\n)[^\n]+\n/)

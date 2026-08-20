@@ -41,6 +41,11 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 	let root = ""
 	let pggitUrl = ""
 	const rev = new Map<string, Rev>()
+	const revOid = (name: string): Rev => {
+		const oid = rev.get(name)
+		if (oid === undefined) throw new Error(`fixture revision ${name} is missing`)
+		return oid
+	}
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
@@ -77,7 +82,7 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 		await commit("linear2", "linear2")
 
 		// merge: a side branch off base merged into main
-		await git("checkout", "-q", "-b", "side", rev.get("linear1") as string)
+		await git("checkout", "-q", "-b", "side", revOid("linear1"))
 		write("side.txt", "side\n")
 		await commit("side1", "side1")
 		await git("checkout", "-q", "main")
@@ -86,7 +91,7 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 
 		// octopus: three tiny branches merged at once
 		for (const n of ["o1", "o2", "o3"]) {
-			await git("checkout", "-q", "-b", n, rev.get("merge") as string)
+			await git("checkout", "-q", "-b", n, revOid("merge"))
 			write(`${n}.txt`, `${n}\n`)
 			await commit(n, n)
 			await git("checkout", "-q", "main")
@@ -98,20 +103,20 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 		)
 
 		// criss-cross: A and B each merge the other, then main merges A
-		await git("checkout", "-q", "-b", "ccA", rev.get("octopus") as string)
+		await git("checkout", "-q", "-b", "ccA", revOid("octopus"))
 		write("cc-a.txt", "a\n")
 		await commit("ccA1", "ccA1")
-		await git("checkout", "-q", "-b", "ccB", rev.get("octopus") as string)
+		await git("checkout", "-q", "-b", "ccB", revOid("octopus"))
 		write("cc-b.txt", "b\n")
 		await commit("ccB1", "ccB1")
 		await git("checkout", "-q", "ccA")
 		await git("merge", "-q", "-m", "a-takes-b", "ccB")
 		rev.set("ccA2", (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim())
 		await git("checkout", "-q", "ccB")
-		await git("merge", "-q", "-m", "b-takes-a", rev.get("ccA1") as string)
+		await git("merge", "-q", "-m", "b-takes-a", revOid("ccA1"))
 		rev.set("ccB2", (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim())
 		await git("checkout", "-q", "main")
-		await git("merge", "-q", "-m", "take-cc", rev.get("ccA2") as string)
+		await git("merge", "-q", "-m", "take-cc", revOid("ccA2"))
 		rev.set("cc", (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim())
 
 		// rename: move a whole directory
@@ -119,7 +124,7 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 		await commit("rename", "rename dir → moved")
 
 		// revert: the tree returns to an ancestor's exact tree
-		await git("revert", "--no-edit", rev.get("rename") as string)
+		await git("revert", "--no-edit", revOid("rename"))
 		rev.set("revert", (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim())
 
 		// tag on the tip
@@ -130,7 +135,7 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 		)
 
 		// an abandoned branch for the rewound-have case (not an ancestor of main)
-		await git("checkout", "-q", "-b", "abandoned", rev.get("linear2") as string)
+		await git("checkout", "-q", "-b", "abandoned", revOid("linear2"))
 		write("abandoned.txt", "gone\n")
 		await commit("abandoned", "abandoned")
 		await git("checkout", "-q", "main")
@@ -256,9 +261,9 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 
 	it("an exact blob want is served alone (the promisor rule)", async () => {
 		const blobOid = (
-			await spawnGit(["rev-parse", `${rev.get("revert")}:a.txt`], { cwd: src })
+			await spawnGit(["rev-parse", `${revOid("revert")}:a.txt`], { cwd: src })
 		).stdout.trim()
-		const pack = await objects.buildPack(REPO, [blobOid], [rev.get("cc") as string], true)
+		const pack = await objects.buildPack(REPO, [blobOid], [revOid("cc")], true)
 		const parsed = await readPack(pack, async () => null)
 		expect(parsed.map((o) => computeOid(o.type, o.content))).toEqual([blobOid])
 	})
@@ -305,9 +310,9 @@ describe("served set ≡ canonical git, for every (want, have) pair", () => {
 			from git_commit c
 			join repos r on r.id = c.repo_id
 			where r.name = ${orphanRepo} and c.oid = ${Buffer.from(tip, "hex")}`
-		expect(gen, "the tip commit row is missing entirely").toBeDefined()
+		if (gen === undefined) throw new Error("the tip commit row is missing entirely")
 		expect(
-			gen?.generation,
+			gen.generation,
 			"the tip's generation was backfilled — NULL is absorbing",
 		).toBeNull()
 

@@ -31,11 +31,15 @@ import { randomBytes } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/bigbytea"
@@ -54,19 +58,17 @@ function firstDiff(a: Buffer, b: Buffer): number {
 
 for (const sizeMb of SIZES_MB) {
 	describe(`pg-corrupt — a ${sizeMb} MB incompressible blob through the encoding tier`, () => {
+		type EncodingState =
+			| { kind: "missing" }
+			| { kind: "present"; dataSize: number; dataLength: number; stored: number }
 		const size = Math.round(sizeMb * 1_000_000)
 		let db: IsolatedDb
 		let server: GitServer
 		let url = ""
 		let src = ""
 		let payload = Buffer.alloc(0)
-		/** The big blob's `git_pack_encoding` row, or null when repack wrote none. */
-		let encodingRow: {
-			n: number
-			data_size: number
-			data_len: number
-			stored: number
-		} | null = null
+		/** Whether repack wrote the big blob's `git_pack_encoding` row. */
+		let encoding: EncodingState = { kind: "missing" }
 		const dirs: string[] = []
 		const mk = (tag: string): string => {
 			const d = mkdtempSync(join(tmpdir(), `pggit-bigb-${tag}-`))
@@ -90,9 +92,10 @@ for (const sizeMb of SIZES_MB) {
 			).stdout.trim()
 			console.log(`blob oid ${bigOid} (${rss()})`)
 
-			db = await createIsolatedSchema(inject("pgBaseUrl"))
-			server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-			url = `http://127.0.0.1:${server.port}/${REPO}`
+			const fixture = await setupGitServerFixture()
+			db = fixture.db
+			server = fixture.server
+			url = repoUrl(server, REPO)
 
 			let t = Date.now()
 			await spawnGit(["push", "-q", url, "refs/heads/main:refs/heads/main"], { cwd: src })
@@ -107,7 +110,12 @@ for (const sizeMb of SIZES_MB) {
 			// The exact size of the unguarded read the serve path is about to make.
 			// `data` comes back as `\x`+hex, so the JS string is TWICE `data_len`.
 			const [row] = await db.sql<
-				{ n: number; data_size: number; data_len: number; stored: number }[]
+				{
+					n: number
+					data_size: number | null
+					data_len: number | null
+					stored: number | null
+				}[]
 			>`
 				select count(*)::int as n,
 				       max(e.data_size)::int as data_size,
@@ -116,18 +124,34 @@ for (const sizeMb of SIZES_MB) {
 				from git_pack_encoding e
 					join repos rr on rr.id = e.repo_id
 				where rr.name = ${REPO} and e.oid = ${Buffer.from(bigOid, "hex")}`
-			encodingRow = row ?? null
-			if (row && row.n > 0) {
+			if (row === undefined) throw new Error("encoding aggregate returned no row")
+			if (row.n === 0) {
+				encoding = { kind: "missing" }
+			} else if (
+				row.n === 1 &&
+				row.data_size !== null &&
+				row.data_len !== null &&
+				row.stored !== null
+			) {
+				encoding = {
+					dataLength: row.data_len,
+					dataSize: row.data_size,
+					kind: "present",
+					stored: row.stored,
+				}
 				console.log(
 					`encoding row: data_size=${mb(row.data_size)} data=${mb(row.data_len)} ` +
 						`stored=${mb(row.stored)} → serve reads a ${mb(row.data_len * 2)} hex string`,
+				)
+			} else {
+				throw new Error(
+					`invalid encoding aggregate for ${bigOid}: ${JSON.stringify(row)}`,
 				)
 			}
 		}, 900_000)
 
 		afterAll(async () => {
-			await server?.close()
-			await db?.drop()
+			await teardownGitServerFixture({ db, server })
 			payload = Buffer.alloc(0)
 			for (const d of dirs) rmSync(d, { force: true, recursive: true })
 			console.log(`peak ${rss()}`)
@@ -138,12 +162,11 @@ for (const sizeMb of SIZES_MB) {
 			// here sit below it. Without the row, the second test drives the raw
 			// chunked path — not the unguarded `e.data` read this file exists to probe
 			// — and passes identically.
+			if (encoding.kind !== "present") {
+				throw new Error("no encoding row — the unguarded e.data read is never exercised")
+			}
 			expect(
-				encodingRow?.n,
-				"no encoding row — the unguarded e.data read is never exercised",
-			).toBe(1)
-			expect(
-				encodingRow?.data_len ?? 0,
+				encoding.dataLength,
 				"the encoding row carries no bytes, so the doubled-hex read is not on the serve path",
 			).toBeGreaterThan(0)
 		})

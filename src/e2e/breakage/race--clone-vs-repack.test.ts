@@ -27,16 +27,20 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
-import { type GitServer, serveOnPort } from "@/server"
-import { createObjectStore, type ObjectStore } from "@/store/object-store"
-import { createRefStore, type RefStore } from "@/store/refs-store"
+import type { GitServer } from "@/server"
+import type { ObjectStore } from "@/store/object-store"
+import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids, loadReachableObjects } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { allObjectOids, loadReachableObjects, refsOf } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const ITERS = 30
@@ -55,8 +59,8 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 	let src = ""
 	let baseObjects: PackInputObject[] = []
 	let fullObjects: PackInputObject[] = []
-	let baseRefs: string[] = []
-	let fullRefs: string[] = []
+	let baseRefs: { name: string; oid: string }[] = []
+	let fullRefs: { name: string; oid: string }[] = []
 	let srcOidsFull: string[] = []
 	let head = ""
 	const scratch: string[] = []
@@ -70,10 +74,10 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS + 40 })
 		scratch.push(srcBase, src)
 		baseObjects = await loadReachableObjects(srcBase, ["--all"])
-		baseRefs = (await spawnGit(["show-ref"], { cwd: srcBase })).stdout.trim().split("\n")
+		baseRefs = await refsOf(srcBase)
 		head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
 		fullObjects = await loadReachableObjects(src, ["--all"])
-		fullRefs = (await spawnGit(["show-ref"], { cwd: src })).stdout.trim().split("\n")
+		fullRefs = await refsOf(src)
 		srcOidsFull = await allObjectOids(src)
 		const baseTip = (
 			await spawnGit(["rev-parse", "HEAD"], { cwd: srcBase })
@@ -87,25 +91,27 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 		if (!ancestor)
 			throw new Error("fixture: base history is not a prefix of full history")
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		store = createObjectStore(db.sql)
-		refs = createRefStore(db.sql)
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		store = fixture.deps.objects
+		refs = fixture.deps.refs
 		repack = createRepack(db.sql)
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 	}, 900_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
 	it("a clone/fetch raced by a repack lands complete and fsck-clean", async () => {
 		const breaks: string[] = []
-		const setRefs = async (repo: string, lines: string[]): Promise<void> => {
-			for (const line of lines) {
-				const [oid, name] = line.split(" ")
-				if (oid && name) await refs.setRef(repo, name, oid)
+		const setRefs = async (
+			repo: string,
+			entries: { name: string; oid: string }[],
+		): Promise<void> => {
+			for (const entry of entries) {
+				await refs.setRef(repo, entry.name, entry.oid)
 			}
 			await refs.setSymref(repo, "HEAD", head)
 		}
@@ -121,7 +127,7 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 				const repo = `race/clone-repack/${mode}/${i}`
 				const dest = join(mkdtempSync(join(tmpdir(), `race-cr-${mode}-`)), "c")
 				scratch.push(dest)
-				const url = `http://127.0.0.1:${server.port}/${repo}`
+				const url = repoUrl(server, repo)
 				const problems: string[] = []
 
 				try {

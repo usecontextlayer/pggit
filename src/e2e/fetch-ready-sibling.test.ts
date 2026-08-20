@@ -100,7 +100,7 @@ describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (g
 		const oracle = await spawnUploadPack(src, body)
 		expect(ackSection(oracle)).toContain("ready\n")
 		expect(ackSection(out)).toBe(ackSection(oracle))
-		expect(packObjectCount(out)).toBe(packObjectCount(oracle))
+		expect(packObjectCount(out)).toEqual(packObjectCount(oracle))
 		const { packets } = decodePktStream(out)
 		expect(packets.some((p) => p.type === "delim")).toBe(true)
 		expect(sidebandDemux(out).band1.subarray(0, 4).toString("latin1")).toBe("PACK")

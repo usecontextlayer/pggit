@@ -46,6 +46,7 @@ import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { assertNever } from "@/assert-never"
 import { createGcScheduler } from "@/gc-scheduler"
+import { IS_CI } from "@/testing/ci"
 import {
 	ageObjects,
 	type GcFixture,
@@ -233,7 +234,6 @@ async function applyStep(
  * modest locally and broaden under CI. Seed pinned (424_242) so every run — and
  * every shrink re-run — is reproducible.
  */
-const IS_CI = process.env.CI !== undefined && process.env.CI !== ""
 const NUM_RUNS = IS_CI ? 30 : 12
 
 describe("§6 PBT-S1 — property-based scheduler differential", () => {

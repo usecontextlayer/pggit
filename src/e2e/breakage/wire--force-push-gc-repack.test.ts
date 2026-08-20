@@ -23,14 +23,23 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRepack } from "@/store/repack"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { objectsByType, parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "workspace/probe/forcepush"
 /** Long enough that the `dir/` lineage spans several ANCHOR_EVERY=32 segments. */
@@ -39,20 +48,11 @@ const SIDE_STEPS = 90
 
 type CloneCheck = {
 	label: string
-	error: string | null
-	/** ref name → [observed in the clone, expected from the source]. */
-	refs: Map<string, [string, string]>
-	keptTreeMatches: boolean
-	keptTreeError: string | null
-}
-
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
+	result: TestResult<{
+		/** ref name → the observed and expected tips, if observation succeeded. */
+		refs: Map<string, TestResult<[string, string]>>
+		keptTree: TestResult<boolean>
+	}>
 }
 
 describe("wire — denied push, GC, repack: the tier stays servable", () => {
@@ -74,7 +74,7 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 	let gcSecond: GcResult
 	let repackRepair = { deltas: 0, wholes: 0 }
 	const clones: CloneCheck[] = []
-	let afterSecondGcError: string | null = null
+	let afterSecondGc: CloneCheck
 
 	beforeAll(async () => {
 		const src = mk("src")
@@ -105,31 +105,26 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 				})
 			).stdout,
 		)
-		const types = (
-			await spawnGit(["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
-				cwd: src,
-				input: `${sideOnly.join("\n")}\n`,
-			})
-		).stdout
+		const sideOnlySet = new Set(sideOnly)
 		const sideTrees = new Set(
-			types
-				.split("\n")
-				.filter((l) => l.endsWith(" tree"))
-				.map((l) => l.split(" ")[0] ?? ""),
+			(await objectsByType(src))
+				.filter((object) => object.type === "tree" && sideOnlySet.has(object.oid))
+				.map((object) => object.oid),
 		)
 		const sideTreesNewestFirst = sideOnly.filter((o) => sideTrees.has(o))
 		/** The object that must outlive its anchor; chosen after the repack below. */
 		let lateTree = ""
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const url = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		const url = repoUrl(server, REPO)
 		const repack = createRepack(db.sql)
 		const gc = createGc(db.sql)
 
 		const cloneAndCheck = async (label: string, tag: string): Promise<CloneCheck> => {
 			const dest = join(mk(tag), "c")
-			const error = await errorOf(async () => {
+			const clone = await captureTestResult(async () => {
 				await spawnGit([
 					"-c",
 					"protocol.version=2",
@@ -144,28 +139,28 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 				])
 				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 			})
-			const refs = new Map<string, [string, string]>()
-			let keptTreeMatches = false
-			let keptTreeError: string | null = null
-			if (error === null) {
-				for (const ref of ["main", "keeper"]) {
-					const got = await spawnGit(["rev-parse", `refs/remotes/origin/${ref}`], {
-						cwd: dest,
-					})
-						.then((x) => x.stdout.trim())
-						.catch(() => "<missing>")
-					const want = (
-						await spawnGit(["rev-parse", `refs/heads/${ref}`], { cwd: src })
-					).stdout.trim()
-					refs.set(ref, [got, want])
-				}
-				keptTreeError = await errorOf(async () => {
-					const got = await spawnGit(["cat-file", "tree", lateTree], { cwd: dest })
-					const want = await spawnGit(["cat-file", "tree", lateTree], { cwd: src })
-					keptTreeMatches = got.stdoutBytes.equals(want.stdoutBytes)
-				})
+			if (clone.kind === "failed") return { label, result: clone }
+			const refs = new Map<string, TestResult<[string, string]>>()
+			for (const ref of ["main", "keeper"]) {
+				const want = (
+					await spawnGit(["rev-parse", `refs/heads/${ref}`], { cwd: src })
+				).stdout.trim()
+				refs.set(
+					ref,
+					await captureTestResult<[string, string]>(async () => {
+						const got = await spawnGit(["rev-parse", `refs/remotes/origin/${ref}`], {
+							cwd: dest,
+						})
+						return [got.stdout.trim(), want]
+					}),
+				)
 			}
-			return { error, keptTreeError, keptTreeMatches, label, refs }
+			const keptTree = await captureTestResult(async () => {
+				const got = await spawnGit(["cat-file", "tree", lateTree], { cwd: dest })
+				const want = await spawnGit(["cat-file", "tree", lateTree], { cwd: src })
+				return got.stdoutBytes.equals(want.stdoutBytes)
+			})
+			return { label, result: { kind: "succeeded", value: { keptTree, refs } } }
 		}
 
 		await spawnGit(["push", "-q", url, "refs/heads/main:refs/heads/main"], { cwd: src })
@@ -219,19 +214,19 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 			const [anchorRow] = await db.sql<{ n: number }[]>`
 				select count(*)::int as n from git_object
 				where oid = ${Buffer.from(keptAnchor, "hex")}`
-			anchorGone = anchorRow?.n === 0
+			if (anchorRow === undefined) throw new Error("anchor count query returned no row")
+			anchorGone = anchorRow.n === 0
 		}
 		clones.push(await cloneAndCheck("clone after gc (before repair repack)", "pre"))
 		repackRepair = await repack.repack(REPO)
 		clones.push(await cloneAndCheck("clone after repair repack", "post"))
 
 		gcSecond = await gc.gc(REPO, { graceSeconds: 0 })
-		afterSecondGcError = (await cloneAndCheck("clone after second gc", "after")).error
+		afterSecondGc = await cloneAndCheck("clone after second gc", "after")
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -251,33 +246,44 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 
 	it("clones fsck-clean both immediately after gc and after the repair repack", () => {
 		for (const c of clones) {
-			expect(
-				c.error,
+			const at =
 				`${c.label} — gc reclaimed ${gcFirst.deletedObjects} objects; ` +
-					`repair repack wrote ${repackRepair.wholes} wholes + ${repackRepair.deltas} deltas`,
-			).toBeNull()
+				`repair repack wrote ${repackRepair.wholes} wholes + ${repackRepair.deltas} deltas`
+			expect(c.result.kind, testResultContext(c.result, at)).toBe("succeeded")
 		}
 	})
 
 	it("serves both refs at the source's tips in every one of those clones", () => {
 		for (const c of clones) {
-			for (const [ref, [got, want]] of c.refs) {
-				expect(got, `${c.label} — ref ${ref}`).toBe(want)
+			if (c.result.kind === "failed") continue
+			expect(c.result.value.refs.size, c.label).toBe(2)
+			for (const [ref, result] of c.result.value.refs) {
+				const at = `${c.label} — ref ${ref}`
+				expect(result.kind, testResultContext(result, at)).toBe("succeeded")
+				if (result.kind === "succeeded") {
+					const [got, want] = result.value
+					expect(got, at).toBe(want)
+				}
 			}
 		}
 	})
 
 	it("still serves the kept tree whose delta anchor GC reclaimed, byte-identical", () => {
 		for (const c of clones) {
-			expect(c.keptTreeError, c.label).toBeNull()
-			expect(c.keptTreeMatches, c.label).toBe(true)
+			if (c.result.kind === "failed") continue
+			const result = c.result.value.keptTree
+			expect(result.kind, testResultContext(result, c.label)).toBe("succeeded")
+			if (result.kind === "succeeded") expect(result.value, c.label).toBe(true)
 		}
 	})
 
 	it("clones fsck-clean after a SECOND gc pass over the repaired tier", () => {
 		expect(
-			afterSecondGcError,
-			`second gc reclaimed ${gcSecond.deletedObjects} objects`,
-		).toBeNull()
+			afterSecondGc.result.kind,
+			testResultContext(
+				afterSecondGc.result,
+				`second gc reclaimed ${gcSecond.deletedObjects} objects`,
+			),
+		).toBe("succeeded")
 	})
 })

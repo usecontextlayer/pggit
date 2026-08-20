@@ -4,12 +4,12 @@ import { join } from "node:path"
 import type { Hono } from "hono"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
 
@@ -52,18 +52,12 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 
 			// Hand-build a (non-sideband) receive-pack request: one create command,
 			// flush, then the incomplete pack.
-			const body = Buffer.concat([
-				encodePktLine(
-					Buffer.from(`${ZERO} ${commit} refs/heads/broken\0report-status\n`),
-				),
-				encodePkt({ type: "flush" }),
+			const body = receivePackRequest(
+				[`${ZERO} ${commit} refs/heads/broken\0report-status\n`],
 				incompletePack,
-			])
-			const res = await app.request("/repo-broken/git-receive-pack", {
-				body,
-				method: "POST",
-			})
-			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+			)
+			const res = await postReceivePack(app, "repo-broken", body)
+			const report = res.body.toString("utf8")
 
 			// The pack unpacked, but connectivity fails → the ref is rejected, unset.
 			expect(report).toContain("unpack ok")
@@ -92,16 +86,12 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 					input: `${commit}\n`,
 				})
 			).stdoutBytes
-			const body = Buffer.concat([
-				encodePktLine(Buffer.from(`${ZERO} ${commit} refs/heads/main\0report-status\n`)),
-				encodePkt({ type: "flush" }),
+			const body = receivePackRequest(
+				[`${ZERO} ${commit} refs/heads/main\0report-status\n`],
 				fullPack,
-			])
-			const res = await app.request("/repo-ok/git-receive-pack", {
-				body,
-				method: "POST",
-			})
-			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+			)
+			const res = await postReceivePack(app, "repo-ok", body)
+			const report = res.body.toString("utf8")
 
 			expect(report).toContain("unpack ok")
 			expect(report).toContain("ok refs/heads/main")
@@ -136,18 +126,12 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 					input: `${commit}\n`,
 				})
 			).stdoutBytes
-			const body = Buffer.concat([
-				encodePktLine(
-					Buffer.from(`${ZERO} ${commit} refs/heads/withsub\0report-status\n`),
-				),
-				encodePkt({ type: "flush" }),
+			const body = receivePackRequest(
+				[`${ZERO} ${commit} refs/heads/withsub\0report-status\n`],
 				pack,
-			])
-			const res = await app.request("/repo-gitlink/git-receive-pack", {
-				body,
-				method: "POST",
-			})
-			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+			)
+			const res = await postReceivePack(app, "repo-gitlink", body)
+			const report = res.body.toString("utf8")
 
 			// A gitlink is not a connectivity requirement (it lives in another repo), so
 			// the push lands despite the submodule commit being absent.
@@ -181,16 +165,12 @@ describe("M2 — connectivity check rejects an incomplete push (spec §10)", () 
 					input: `${tagObj}\n`,
 				})
 			).stdoutBytes
-			const body = Buffer.concat([
-				encodePktLine(Buffer.from(`${ZERO} ${tagObj} refs/tags/v1\0report-status\n`)),
-				encodePkt({ type: "flush" }),
+			const body = receivePackRequest(
+				[`${ZERO} ${tagObj} refs/tags/v1\0report-status\n`],
 				pack,
-			])
-			const res = await app.request("/repo-tag-missing/git-receive-pack", {
-				body,
-				method: "POST",
-			})
-			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+			)
+			const res = await postReceivePack(app, "repo-tag-missing", body)
+			const report = res.body.toString("utf8")
 
 			// Connectivity descends the tag→target edge and finds the target absent.
 			expect(report).toContain("unpack ok")

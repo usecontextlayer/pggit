@@ -222,7 +222,9 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 
 			// Disabling stops the loop, NOT the stamp: the push still recorded activity.
 			const state = await repoGcState(sqlDb(), repo)
-			expect(state.lastPushedAt).not.toBeNull()
+			if (state.kind !== "pushed-never-drained") {
+				throw new Error(`expected pushed, undrained repo ${repo}; got ${state.kind}`)
+			}
 
 			// The server still serves a complete, fsck-clean clone at the latest tip.
 			const clone = await cloneAndFsck(at(disabled), repo)

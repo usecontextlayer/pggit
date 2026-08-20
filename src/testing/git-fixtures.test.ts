@@ -33,8 +33,8 @@ describe("git fixture output parsers", () => {
 				`${b} blob   7 16 12\n${a} tree   29 40 28 1 ${b}\nnon delta: 1 object\nchain length = 1: 1 object\n/tmp/x.pack: ok\n`,
 			),
 		).toEqual([
-			{ delta: false, offset: 12, oid: b },
-			{ baseOid: b, delta: true, depth: 1, offset: 28, oid: a },
+			{ kind: "whole", offset: 12, oid: b },
+			{ baseOid: b, depth: 1, kind: "delta", offset: 28, oid: a },
 		])
 	})
 

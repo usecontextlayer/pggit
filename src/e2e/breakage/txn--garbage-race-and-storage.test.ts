@@ -22,6 +22,11 @@ import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "r"
 const RUNS = 150
@@ -33,12 +38,17 @@ const TRIALS = [1, 2, 3, 4, 5]
 /** Leftovers a repack/GC interleaving must never produce. */
 type Leftovers = { ghost: number; orphan: number; depth2: number }
 
-type Trial = { trial: number; notes: string[]; leftovers: Leftovers; clone: string }
+type Trial = {
+	trial: number
+	notes: string[]
+	leftovers: Leftovers
+	clone: TestResult<string>
+}
 
 const settled = (r: PromiseSettledResult<unknown>): string =>
 	r.status === "fulfilled"
 		? JSON.stringify(r.value)
-		: `THREW ${(r.reason as Error).message.slice(0, 90)}`
+		: `THREW ${String(r.reason).slice(0, 90)}`
 
 describe("repack × GC over garbage — the race", () => {
 	let root = ""
@@ -88,26 +98,24 @@ describe("repack × GC over garbage — the race", () => {
 								where d.base_oid is not null and b.base_oid is not null)::int as depth2`
 					if (!leftovers) throw new Error("leftover query returned no row")
 
-					server = await serveOnPort(createGitApp({ objects, refs }), 0)
+					const liveServer = await serveOnPort(createGitApp({ objects, refs }), 0)
+					server = liveServer
 					const dest = join(root, `c${trial}`)
-					let clone: string
-					try {
+					const clone = await captureTestResult(async () => {
 						await spawnGit([
 							"-c",
 							"protocol.version=2",
 							"clone",
 							"-q",
 							"--mirror",
-							`http://127.0.0.1:${server.port}/${REPO}`,
+							`http://127.0.0.1:${liveServer.port}/${REPO}`,
 							dest,
 						])
 						const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], {
 							cwd: dest,
 						})
-						clone = `${fsck.stdout}${fsck.stderr}`.trim() || "clean"
-					} catch (err) {
-						clone = `*** CLONE FAILED: ${(err as Error).message.slice(0, 120)}`
-					}
+						return `${fsck.stdout}${fsck.stderr}`.trim()
+					})
 
 					return {
 						clone,
@@ -145,7 +153,9 @@ describe("repack × GC over garbage — the race", () => {
 
 	it("S4: the raced repo still clones fsck-clean, every trial", () => {
 		for (const t of trials) {
-			expect(t.clone, `trial ${t.trial}: ${t.notes.join(" | ")}`).toBe("clean")
+			const context = `trial ${t.trial}: ${t.notes.join(" | ")}`
+			expect(t.clone.kind, testResultContext(t.clone, context)).toBe("succeeded")
+			if (t.clone.kind === "succeeded") expect(t.clone.value, context).toBe("")
 		}
 	}, 300_000)
 })

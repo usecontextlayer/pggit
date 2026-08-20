@@ -153,7 +153,8 @@ describe("breakage/pg-txn — repo_file must never describe a superseded tip", (
 				select encode(oid, 'hex') as oid from git_ref
 				where name = 'refs/heads/main'
 					and repo_id = (select id from repos where name = ${repo})`
-			return row?.oid ?? ""
+			if (row?.oid == null) throw new Error(`main ref is missing for ${repo}`)
+			return row.oid
 		}
 		const projectionOf = async (repo: string) => {
 			const rows = await admin<{ path: string; mode: string; oid: string }[]>`

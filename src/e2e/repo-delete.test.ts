@@ -56,11 +56,12 @@ describe("e2e — repo deletion (real git)", () => {
 	async function childRowCounts(repoId: string): Promise<Record<string, number>> {
 		const counts: Record<string, number> = {}
 		for (const table of ["git_object", "git_commit", "git_ref", "repo_file"]) {
-			const [row] = await db.sql.unsafe(
+			const [row] = await db.sql.unsafe<{ n: number }[]>(
 				`select count(*)::int as n from ${table} where repo_id = $1`,
 				[repoId],
 			)
-			counts[table] = row?.n ?? -1
+			if (row === undefined) throw new Error(`count query returned no row for ${table}`)
+			counts[table] = row.n
 		}
 		return counts
 	}
@@ -69,11 +70,12 @@ describe("e2e — repo deletion (real git)", () => {
 		await pushFixture(CONTENT, "content-v1")
 		await pushFixture(CHAT_HOME, "chat-v1")
 
-		const [contentRow] = await db.sql.unsafe("select id from repos where name = $1", [
-			CONTENT,
-		])
-		const contentId = contentRow?.id as string
-		expect(contentId).toBeDefined()
+		const [contentRow] = await db.sql.unsafe<{ id: string }[]>(
+			"select id from repos where name = $1",
+			[CONTENT],
+		)
+		if (contentRow === undefined) throw new Error(`repo row missing for ${CONTENT}`)
+		const contentId = contentRow.id
 		// The push populated all four row classes (snapshots included via createGitDeps).
 		const before = await childRowCounts(contentId)
 		for (const table of Object.keys(before)) {
@@ -113,10 +115,12 @@ describe("e2e — repo deletion (real git)", () => {
 		} finally {
 			rmSync(back, { force: true, recursive: true })
 		}
-		const [reborn] = await db.sql.unsafe("select id from repos where name = $1", [
-			CONTENT,
-		])
-		expect(reborn?.id).not.toBe(contentId)
+		const [reborn] = await db.sql.unsafe<{ id: string }[]>(
+			"select id from repos where name = $1",
+			[CONTENT],
+		)
+		if (reborn === undefined) throw new Error(`reborn repo row missing for ${CONTENT}`)
+		expect(reborn.id).not.toBe(contentId)
 
 		// The sibling repo was never touched: still cloneable with its content.
 		const sibling = mkdtempSync(join(tmpdir(), "pggit-del-sib-"))

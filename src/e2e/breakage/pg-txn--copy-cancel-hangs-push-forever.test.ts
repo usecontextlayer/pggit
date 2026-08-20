@@ -106,24 +106,26 @@ async function cancelIngestCopy(admin: Sql, pid: number): Promise<boolean> {
 }
 
 describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", () => {
+	type BackendObservation =
+		| { kind: "gone" }
+		| { kind: "present"; state: string; query: string }
 	let db: IsolatedDb
 	let admin: Sql
 	let appSql: Sql
 	let server: GitServer
 	let src = ""
-	let pid = 0
+	let pid: number
 
 	let push: SpawnGitBoundedResult
 	let copyCancelled = false
-	let backendState = ""
-	let backendQuery = ""
+	let backend: BackendObservation
 	let probe: SpawnGitBoundedResult
 	let closed = false
 	/** Diagnostic the source printed: nothing lands, so this is availability, not
 	 * corruption. Kept as evidence, not as a verdict — the ingest runs in ONE
 	 * transaction, so "the cancelled push stored nothing" restates the rollback
 	 * rather than testing the settle behaviour this suite exists for. */
-	let storedObjects = 0
+	let storedObjects: number
 	let storedRefs = 0
 
 	beforeAll(async () => {
@@ -143,7 +145,8 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 			onnotice: () => {},
 		})
 		const [p] = await appSql<{ pid: number }[]>`select pg_backend_pid() as pid`
-		pid = p?.pid ?? 0
+		if (p === undefined) throw new Error("pg_backend_pid returned no row")
+		pid = p.pid
 		server = await serveOnPort(createGitApp(createGitDeps(appSql)), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 
@@ -160,12 +163,15 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 		const [act] = await admin<{ state: string; q: string }[]>`
 			select state, left(query, 55) as q
 			from pg_stat_activity where pid = ${pid}`
-		backendState = act?.state ?? ""
-		backendQuery = act?.q ?? ""
+		backend =
+			act === undefined
+				? { kind: "gone" }
+				: { kind: "present", query: act.q, state: act.state }
 
 		const [rows] = await admin<{ n: number }[]>`
 			select count(*)::int as n from git_object`
-		storedObjects = rows?.n ?? 0
+		if (rows === undefined) throw new Error("git_object count returned no row")
+		storedObjects = rows.n
 		storedRefs = (await admin<{ name: string }[]>`select name from git_ref`).length
 
 		// The capacity consequence: the pool is gone, so every later request queues.
@@ -217,6 +223,9 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 		// into its `unpack <status>` line), never as a success that silently stored
 		// nothing. 57014 is worded "canceling statement due to …" whether the abort
 		// came from a statement_timeout or a cancel request.
+		if (!push.settled) {
+			throw new Error(`git push did not settle: ${push.out.trim().slice(-300)}`)
+		}
 		expect(
 			push.code,
 			`git push exited 0 with the ingest COPY cancelled: ${push.out.trim().slice(-300)}`,
@@ -225,9 +234,14 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 	})
 
 	it("the pooled connection is not stranded in an aborted transaction", () => {
+		const stranded = backend.kind === "present" && backend.state.includes("aborted")
+		const observed =
+			backend.kind === "gone"
+				? "the original backend exited"
+				: `backend is "${backend.state}" on "${backend.query}…"`
 		expect(
-			backendState.includes("aborted"),
-			`the server's only pooled connection is stranded in "${backendState}" on "${backendQuery}…" — never rolled back, never returned to the pool (store held ${storedObjects} git_object rows / ${storedRefs} refs at the time)`,
+			stranded,
+			`the server's only pooled connection is stranded: ${observed} — never rolled back, never returned to the pool (store held ${storedObjects} git_object rows / ${storedRefs} refs at the time)`,
 		).toBe(false)
 	})
 

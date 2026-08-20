@@ -96,7 +96,8 @@ describe("TOAST storage propagation on the partitioned encoding tier (C4)", () =
 		)
 		const parent = rows.find((r) => r.relname === "git_pack_encoding")
 		const leaves = rows.filter((r) => r.relname !== "git_pack_encoding")
-		expect(parent?.attstorage).toBe("e")
+		if (parent === undefined) throw new Error("catalog omitted git_pack_encoding parent")
+		expect(parent.attstorage).toBe("e")
 		// Without this the `filter` below would pass vacuously on an empty match.
 		expect(leaves.length).toBeGreaterThan(0)
 		expect(leaves.filter((l) => l.attstorage !== "e").map((l) => l.relname)).toEqual([])
@@ -111,13 +112,13 @@ describe("TOAST storage propagation on the partitioned encoding tier (C4)", () =
 		)
 		const parent = rows.find((r) => r.relname === "git_object")
 		const leaves = rows.filter((r) => r.relname !== "git_object")
-		expect(parent).toBeDefined()
+		if (parent === undefined) throw new Error("catalog omitted git_object parent")
 		expect(leaves.length).toBeGreaterThan(0)
 		expect(
 			leaves.filter(
 				(l) =>
-					l.attstorage !== parent?.attstorage ||
-					l.attcompression !== parent?.attcompression,
+					l.attstorage !== parent.attstorage ||
+					l.attcompression !== parent.attcompression,
 			),
 		).toEqual([])
 	})

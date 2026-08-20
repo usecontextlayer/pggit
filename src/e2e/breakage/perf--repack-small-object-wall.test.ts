@@ -34,10 +34,11 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import type { GitObjectType } from "@/object/object"
+import type { PackInputObject } from "@/pack/write-pack"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
+import { loadReachableObjects, refsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -50,8 +51,6 @@ const SIZES = [10_000, 60_000, 70_000, 100_000]
 
 /** Objects per `putPack` round-trip when seeding (bytes are negligible here). */
 const SEED_BATCH = 20_000
-
-type RawObject = { oid: string; type: GitObjectType; content: Buffer }
 
 /** One commit, W tiny unique files spread over 100 directories. */
 function stream(w: number): string {
@@ -105,60 +104,28 @@ describe("repack — the small-object bind-parameter wall", () => {
 		await spawnGit(["repack", "-adf", "-q"], { cwd: dir })
 		const ms = Date.now() - t0
 		const out = await spawnGit(["count-objects", "-v"], { cwd: dir })
-		const kb = Number(out.stdout.match(/size-pack: (\d+)/)?.[1] ?? 0)
+		const sizePack = out.stdout.match(/^size-pack: (\d+)$/m)?.[1]
+		if (sizePack === undefined) {
+			throw new Error(`git count-objects omitted size-pack: ${out.stdout}`)
+		}
+		const kb = Number(sizePack)
 		return { ms, packBytes: kb * 1024 }
 	}
 
-	/** Every reachable object of a repo, via ONE `git cat-file --batch`. */
-	async function reachableObjects(dir: string): Promise<RawObject[]> {
-		const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-		const oids = [
-			...new Set(
-				list.stdout
-					.split("\n")
-					.map((l) => l.slice(0, 40))
-					.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-			),
-		]
-		const res = await spawnGit(["cat-file", "--batch"], {
-			cwd: dir,
-			input: `${oids.join("\n")}\n`,
-		})
-		const buf = res.stdoutBytes
-		const objs: RawObject[] = []
-		let pos = 0
-		while (pos < buf.length) {
-			const nl = buf.indexOf(0x0a, pos)
-			if (nl < 0) break
-			const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-			if (!oid || !type || !sizeStr) break
-			const size = Number(sizeStr)
-			const start = nl + 1
-			objs.push({
-				content: buf.subarray(start, start + size),
-				oid,
-				type: type as GitObjectType,
-			})
-			pos = start + size + 1
-		}
-		return objs
-	}
-
 	/** Seed a real repo's objects + refs through the public store. */
-	async function seedRepo(repoId: string, dir: string, objs: RawObject[]): Promise<void> {
+	async function seedRepo(
+		repoId: string,
+		dir: string,
+		objs: PackInputObject[],
+	): Promise<void> {
 		for (let i = 0; i < objs.length; i += SEED_BATCH) {
-			await objects.putPack(
-				repoId,
-				objs.slice(i, i + SEED_BATCH).map((o) => ({ content: o.content, type: o.type })),
-			)
+			await objects.putPack(repoId, objs.slice(i, i + SEED_BATCH))
 		}
-		const showRef = await spawnGit(["show-ref", "--heads"], { cwd: dir })
-		for (const line of showRef.stdout.trim().split("\n")) {
-			const [oid, name] = line.split(" ")
-			if (oid && name) await refs.setRef(repoId, name, oid)
+		for (const ref of await refsOf(dir)) {
+			await refs.setRef(repoId, ref.name, ref.oid)
 		}
 		const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: dir })).stdout.trim()
-		if (head) await refs.setSymref(repoId, "HEAD", head)
+		await refs.setSymref(repoId, "HEAD", head)
 	}
 
 	beforeAll(async () => {
@@ -178,7 +145,7 @@ describe("repack — the small-object bind-parameter wall", () => {
 			const repoId = `small-${w}`
 			const dir = await importRepo(`w${w}`, stream(w))
 			const git = await gitRepack(dir, `w${w}-git`)
-			const objs = await reachableObjects(dir)
+			const objs = await loadReachableObjects(dir, ["--all"])
 			await seedRepo(repoId, dir, objs)
 
 			const t0 = Date.now()

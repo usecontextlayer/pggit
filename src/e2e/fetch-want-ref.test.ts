@@ -85,13 +85,14 @@ describe("mal04 — ref-in-want (want-ref, unadvertised) must fail loudly, not c
 		const body = Buffer.from(await res.arrayBuffer())
 		// A non-200 is the loud refusal this test demands; its body is a plain-text
 		// error, not pkt-framed, so the strict pack parser only runs on a 200.
-		const objCount = res.status === 200 ? packObjectCount(body) : null
+		const result =
+			res.status === 200 ? packObjectCount(body) : { kind: "http-error" as const }
 
 		// ORACLE: an unadvertised ref-in-want request must NOT succeed as a clone with
 		// an empty pack. Either it fails loudly (status >= 400, no pack) OR — if some
 		// day implemented — it serves the requested ref's closure (objCount > 0). The
 		// silent-empty divergence is exactly status 200 + a zero-object pack.
-		const silentEmptyClone = res.status === 200 && objCount === 0
+		const silentEmptyClone = result.kind === "pack" && result.objectCount === 0
 		expect(
 			silentEmptyClone,
 			"want-ref must not be silently dropped to an empty pack",

@@ -103,9 +103,9 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 
 		const first = await scheduler.drainOnce()
 		const mine = first.find((e) => e.repo === repo)
-		expect(mine).toBeDefined()
-		expect(mine?.deletedObjects).toBe(0) // everything is younger than grace
-		expect(mine?.settled).toBe(false)
+		if (mine === undefined) throw new Error(`drain summary omitted ${repo}`)
+		expect(mine.deletedObjects).toBe(0) // everything is younger than grace
+		expect(mine.settled).toBe(false)
 
 		// Still eligible: the young garbage exists and MUST get a post-grace pass.
 		const eligible = await fx.db.sql<{ name: string }[]>`
@@ -122,8 +122,9 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 
 		const second = await scheduler.drainOnce()
 		const settled = second.find((e) => e.repo === repo)
-		expect(settled?.deletedObjects).toBeGreaterThan(0) // v1's orphans reclaimed
-		expect(settled?.settled).toBe(true)
+		if (settled === undefined) throw new Error(`second drain summary omitted ${repo}`)
+		expect(settled.deletedObjects).toBeGreaterThan(0) // v1's orphans reclaimed
+		expect(settled.settled).toBe(true)
 		const after = await fx.db.sql<{ name: string }[]>`
 			select name from repos
 			where last_pushed_at is not null
@@ -167,7 +168,8 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		// caught here (the rest of the suite only ever reads entry.repo, so this is
 		// the sole guard on the count surface).
 		const entry = summary.find((e) => e.repo === repo)
-		expect(entry?.deletedObjects).toBe(orphaned.length)
+		if (entry === undefined) throw new Error(`drain summary omitted ${repo}`)
+		expect(entry.deletedObjects).toBe(orphaned.length)
 
 		// Survivors == the current tip's reachable closure: nothing live lost AND no
 		// orphan survives. Equality fixes both directions at once.
@@ -179,7 +181,8 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		// surviving git_commit/git_tag row belongs to an orphaned object.
 		const orphanSet = new Set(orphaned)
 		for (const row of await derivedRows(fx.db, repo)) {
-			const oid = row.split(" ")[1] as string
+			const oid = row.split(" ")[1]
+			if (oid === undefined) throw new Error(`malformed derived-row key: ${row}`)
 			expect(orphanSet.has(oid)).toBe(false)
 		}
 
@@ -246,8 +249,9 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		// would NOT re-include it. This is the precondition for the re-trigger to be
 		// meaningful (otherwise the repo would always be eligible).
 		const settled = await repoGcState(fx.db, repo)
-		expect(settled.lastGcAt).not.toBeNull()
-		expect(settled.lastPushedAt).not.toBeNull()
+		if (settled.kind !== "pushed-and-drained") {
+			throw new Error(`expected drained repo ${repo}; got ${settled.kind}`)
+		}
 
 		// A NEW rewind AFTER that stamp orphans round-1's tip and re-stamps
 		// `last_pushed_at`. The durable signal must now strictly exceed the prior GC
@@ -255,9 +259,10 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		const r2Tip = await pushFile(fx, repo, { content: "round2\n", rewind: true })
 		expect(r2Tip.head).not.toBe(r1Tip.head)
 		const reStamped = await repoGcState(fx.db, repo)
-		const gcAt = settled.lastGcAt as Date
-		const pushedAt = reStamped.lastPushedAt as Date
-		expect(pushedAt.getTime()).toBeGreaterThan(gcAt.getTime())
+		if (reStamped.kind !== "pushed-and-drained") {
+			throw new Error(`expected re-pushed repo ${repo}; got ${reStamped.kind}`)
+		}
+		expect(reStamped.pushedAt.getTime()).toBeGreaterThan(settled.gcAt.getTime())
 
 		// The NEW orphans (round-1's tip closure, now unreachable from round-2's tip)
 		// are still in Postgres before the second drain — the drain must remove them.
@@ -306,11 +311,16 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		const { oids } = await fx.objects.putPack(repo, [
 			{ content: Buffer.from("orphan ingest\n"), type: "blob" },
 		])
-		expect(oids).toHaveLength(1)
-		const orphan = oids[0] as string
+		const [orphan] = oids
+		if (orphan === undefined || oids.length !== 1) {
+			throw new Error(`expected one ingested object, got ${oids.length}`)
+		}
 
 		// The ingest stamped activity, so the repo is GC-eligible despite having no ref.
-		expect((await repoGcState(fx.db, repo)).lastPushedAt).not.toBeNull()
+		const state = await repoGcState(fx.db, repo)
+		if (state.kind !== "pushed-never-drained") {
+			throw new Error(`expected pushed, undrained repo ${repo}; got ${state.kind}`)
+		}
 		expect(await objectOids(fx.db, repo)).toContain(orphan)
 
 		// Aged + drained: the unreferenced object is reclaimed (unreachable from every

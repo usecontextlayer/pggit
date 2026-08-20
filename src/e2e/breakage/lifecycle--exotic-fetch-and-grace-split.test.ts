@@ -18,101 +18,27 @@
  * Each (probe, tier-state) run gets its own isolated schema, exactly as the
  * source did: the no-tier run must never see a repack the tier run performed.
  */
-import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
-import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { buildLifecycleSource, commitsOldestFirst } from "@/testing/append-only-repo"
+import {
+	listDifferences,
+	mirrorClone,
+	parseRevListObjectOids,
+	requiredAt,
+} from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/slate/exotic"
-/** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const RUNS_DIR = ".engine/runs/planner-updates"
-
-/** Deterministic filler of a given length (hex, so it is poorly compressible). */
-function filler(salt: string, len: number): string {
-	let out = ""
-	while (out.length < len) {
-		out += createHash("sha1").update(`${salt}-${out.length}`).digest("hex")
-	}
-	return out.slice(0, len)
-}
-
-/** A uuid-shaped run directory name — 36 chars, so a tree entry costs ~63 bytes. */
-function uuidName(seed: string): string {
-	const h = createHash("sha1").update(seed).digest("hex")
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-}
-
-/**
- * Build a real git repo whose shape makes the delta tier bite: a flat,
- * append-only `.engine/runs/planner-updates` directory gaining one subdir per
- * commit (so the same tree path has `main+1` successive versions — many segments
- * at ANCHOR_EVERY=32).
- */
-async function buildSource(dir: string, mainCommits: number): Promise<void> {
-	const out: string[] = []
-	let mark = 0
-	const next = () => ++mark
-	const blob = (content: string): number => {
-		const m = next()
-		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
-		return m
-	}
-
-	const seeded: string[] = []
-	for (let i = 0; i < 6; i++) {
-		const m = blob(`# doc ${i}\n\n${filler(`doc-${i}-v0`, 600)}\n`)
-		seeded.push(`M 100644 :${m} docs/doc-${i}.md`)
-	}
-	let prev = next()
-	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
-	)
-	for (let i = 0; i < mainCommits; i++) {
-		const d = uuidName(`m-run-${i}`)
-		const record = blob(`{"run":"${d}","payload":"${filler(`m-rec-${i}`, 400)}"}\n`)
-		const stderr = blob(`${filler(`m-err-${i}`, 120)}\n`)
-		const cm = next()
-		const msg = `main run ${i}`
-		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
-				`M 100644 :${record} ${RUNS_DIR}/${d}/record.json\n` +
-				`M 100644 :${stderr} ${RUNS_DIR}/${d}/stderr\n`,
-		)
-		prev = cm
-	}
-
-	await spawnGit(["init", "-q", "-b", "main", dir])
-	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: out.join("") })
-}
-
-async function revList(dir: string, rev: string): Promise<string[]> {
-	const out = await spawnGit(["rev-list", "--reverse", rev], { cwd: dir })
-	return out.stdout.trim().split("\n").filter(Boolean)
-}
-
-function diffLists(a: string[], b: string[]): { onlyA: string[]; onlyB: string[] } {
-	const sa = new Set(a)
-	const sb = new Set(b)
-	return { onlyA: a.filter((x) => !sb.has(x)), onlyB: b.filter((x) => !sa.has(x)) }
-}
-
-/** Index into a fixture list, loudly (`noUncheckedIndexedAccess`). */
-function at<T>(xs: T[], i: number): T {
-	const v = xs[i]
-	if (v === undefined) throw new Error(`fixture too short: index ${i} of ${xs.length}`)
-	return v
-}
 
 /**
  * `contract` says what the probe is held to against a `file://` bare remote of the
@@ -134,13 +60,8 @@ const PROBES: Probe[] = [
 		contract: "oracle",
 		name: "mirror clone",
 		run: async (url, dest) => {
-			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			return `${
-				parseRevListObjectOids(
-					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
-				).sort().length
-			} objects`
+			const mirror = await mirrorClone(url, dest)
+			return `${mirror.objects.length} objects`
 		},
 	},
 	{
@@ -232,15 +153,20 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 			index: number,
 			withTier: boolean,
 		): Promise<string> => {
-			const db = await createIsolatedSchema(baseUrl)
+			const fixture = await setupGitServerFixture(baseUrl)
+			const { db, server } = fixture
 			try {
 				const src = dir(`src-${index}-${withTier}`)
-				await buildSource(src, 120)
-				const commits = await revList(src, "main")
-				const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-				const url = `http://127.0.0.1:${server.port}/${REPO}`
+				await buildLifecycleSource(src, 120)
+				const commits = await commitsOldestFirst(src, "main")
+				const url = repoUrl(server, REPO)
 				await spawnGit(
-					["push", "-q", url, `${at(commits, commits.length - 1)}:refs/heads/main`],
+					[
+						"push",
+						"-q",
+						url,
+						`${requiredAt(commits, commits.length - 1, "main commit history")}:refs/heads/main`,
+					],
 					{ cwd: src },
 				)
 				if (withTier) await createRepack(db.sql).repack(REPO)
@@ -253,10 +179,9 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 				}
 				rmSync(dest, { force: true, recursive: true })
 				rmSync(src, { force: true, recursive: true })
-				await server.close()
 				return result
 			} finally {
-				await db.drop()
+				await teardownGitServerFixture(fixture)
 			}
 		}
 
@@ -265,15 +190,20 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 		// in both arms compares equal — so every probe is also run against canonical
 		// git, which decides what the right answer was.
 		const ctlSrc = dir("ctl-src")
-		await buildSource(ctlSrc, 120)
-		const ctlCommits = await revList(ctlSrc, "main")
+		await buildLifecycleSource(ctlSrc, 120)
+		const ctlCommits = await commitsOldestFirst(ctlSrc, "main")
 		const ctl = dir("ctl.git")
 		await spawnGit(["init", "-q", "--bare", "-b", "main", ctl])
 		// Without this the control silently ignores `--filter` and full-clones, which
 		// would make the blobless probe a comparison against a non-filtering server.
 		await spawnGit(["config", "uploadpack.allowFilter", "true"], { cwd: ctl })
 		await spawnGit(
-			["push", "-q", ctl, `${at(ctlCommits, ctlCommits.length - 1)}:refs/heads/main`],
+			[
+				"push",
+				"-q",
+				ctl,
+				`${requiredAt(ctlCommits, ctlCommits.length - 1, "control commit history")}:refs/heads/main`,
+			],
 			{ cwd: ctlSrc },
 		)
 
@@ -296,38 +226,77 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 		}
 
 		// --- grace split: some garbage reclaimed, some retained, repack in between ---
-		const db = await createIsolatedSchema(baseUrl)
+		const fixture = await setupGitServerFixture(baseUrl)
+		const { db, server } = fixture
 		try {
 			const src = dir("gsrc")
-			await buildSource(src, 140)
-			const commits = await revList(src, "main")
+			await buildLifecycleSource(src, 140)
+			const commits = await commitsOldestFirst(src, "main")
 			const ref = dir("gref.git")
 			await spawnGit(["init", "-q", "--bare", "-b", "main", ref])
-			const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-			const url = `http://127.0.0.1:${server.port}/${REPO}`
+			const url = repoUrl(server, REPO)
 			const repack = createRepack(db.sql)
 			const gc = createGc(db.sql)
-			const refs = createRefStore(db.sql)
+			const refs = fixture.deps.refs
 
-			await spawnGit(["push", "-q", url, `${at(commits, 99)}:refs/heads/main`], {
-				cwd: src,
-			})
-			await spawnGit(["push", "-q", ref, `${at(commits, 99)}:refs/heads/main`], {
-				cwd: src,
-			})
+			await spawnGit(
+				[
+					"push",
+					"-q",
+					url,
+					`${requiredAt(commits, 99, "main commit history")}:refs/heads/main`,
+				],
+				{
+					cwd: src,
+				},
+			)
+			await spawnGit(
+				[
+					"push",
+					"-q",
+					ref,
+					`${requiredAt(commits, 99, "main commit history")}:refs/heads/main`,
+				],
+				{
+					cwd: src,
+				},
+			)
 			await repack.repack(REPO)
 			await new Promise((r) => setTimeout(r, 2500))
-			await spawnGit(["push", "-q", url, `${at(commits, 139)}:refs/heads/main`], {
-				cwd: src,
-			})
-			await spawnGit(["push", "-q", ref, `${at(commits, 139)}:refs/heads/main`], {
-				cwd: src,
-			})
+			await spawnGit(
+				[
+					"push",
+					"-q",
+					url,
+					`${requiredAt(commits, 139, "main commit history")}:refs/heads/main`,
+				],
+				{
+					cwd: src,
+				},
+			)
+			await spawnGit(
+				[
+					"push",
+					"-q",
+					ref,
+					`${requiredAt(commits, 139, "main commit history")}:refs/heads/main`,
+				],
+				{
+					cwd: src,
+				},
+			)
 			await repack.repack(REPO)
 			// rewind far back: everything after commit 50 is now garbage, but only the
 			// FIRST push's objects are older than the 2s grace.
-			await refs.setRef(REPO, "refs/heads/main", at(commits, 50))
-			await spawnGit(["update-ref", "refs/heads/main", at(commits, 50)], { cwd: ref })
+			await refs.setRef(
+				REPO,
+				"refs/heads/main",
+				requiredAt(commits, 50, "main commit history"),
+			)
+			await spawnGit(
+				["update-ref", "refs/heads/main", requiredAt(commits, 50, "main commit history")],
+				{ cwd: ref },
+			)
 			await gc.gc(REPO, { graceSeconds: 2 })
 			await repack.repack(REPO)
 			await gc.gc(REPO, { graceSeconds: 0 })
@@ -337,22 +306,14 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 
 			const a = dir("gpg")
 			const b = dir("gref")
-			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, a])
-			await spawnGit(["clone", "-q", "--mirror", `file://${ref}`, b])
-			const f = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: a })
-			const aObjects = parseRevListObjectOids(
-				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: a })).stdout,
-			).sort()
-			const bObjects = parseRevListObjectOids(
-				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: b })).stdout,
-			).sort()
-			const d = diffLists(aObjects, bObjects)
-			graceOnlyPg = d.onlyA.length
-			graceOnlyRef = d.onlyB.length
-			graceFsck = `${f.stdout}${f.stderr}`.trim()
-			await server.close()
+			const served = await mirrorClone(url, a)
+			const oracle = await mirrorClone(`file://${ref}`, b)
+			const d = listDifferences(served.objects, oracle.objects)
+			graceOnlyPg = d.onlyLeft.length
+			graceOnlyRef = d.onlyRight.length
+			graceFsck = served.fsck
 		} finally {
-			await db.drop()
+			await teardownGitServerFixture(fixture)
 		}
 	}, 900_000)
 

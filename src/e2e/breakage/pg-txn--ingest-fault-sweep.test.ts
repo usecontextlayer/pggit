@@ -183,7 +183,8 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 				onnotice: () => {},
 			})
 			const [p] = await faultSql<{ pid: number }[]>`select pg_backend_pid() as pid`
-			const pid = p?.pid ?? 0
+			if (p === undefined) throw new Error("pg_backend_pid returned no row")
+			const pid = p.pid
 			const faulty = await serveOnPort(createGitApp(createGitDeps(faultSql)), 0)
 			const faultUrl = `http://127.0.0.1:${faulty.port}/${repo}`
 			const cleanUrl = `http://127.0.0.1:${clean.port}/${repo}`
@@ -239,7 +240,7 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 					cloneTail = cl.out.trim().split("\n").filter(Boolean).slice(-1)[0] ?? ""
 					if (cloneOk) {
 						const fsck = await gitBounded(["fsck", "--strict", "--no-dangling"], dest)
-						fsckClean = fsck.code === 0
+						fsckClean = fsck.settled && fsck.code === 0
 						fsckTail = fsck.out.trim().slice(0, 200)
 						const got = new Set(
 							parseRevListObjectOids(

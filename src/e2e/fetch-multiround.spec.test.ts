@@ -97,7 +97,7 @@ describe("M1 multi-round negotiation", () => {
 		const oracle = await spawnUploadPack(dir, request)
 		expect(ackSection(oracle)).not.toContain("ready")
 		expect(ackSection(out)).toBe(ackSection(oracle))
-		expect(packObjectCount(oracle)).toBeNull()
+		expect(packObjectCount(oracle)).toEqual({ kind: "no-pack" })
 		expect(out.toString("utf8")).not.toContain("packfile")
 		expect(sidebandDemux(out).band1.length).toBe(0)
 	})

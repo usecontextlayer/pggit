@@ -106,7 +106,8 @@ describe("repack × GC — the derived tier follows the inventory", () => {
 				and not exists (
 					select 1 from git_object o
 					where o.repo_id = e.repo_id and o.oid = e.oid)`
-		expect(orphans?.n).toBe("0")
+		if (orphans === undefined) throw new Error("orphan count query returned no row")
+		expect(orphans.n).toBe("0")
 	})
 
 	it("GC left no delta encoding referencing a removed base", async () => {
@@ -119,7 +120,8 @@ describe("repack × GC — the derived tier follows the inventory", () => {
 				and not exists (
 					select 1 from git_object o
 					where o.repo_id = e.repo_id and o.oid = e.base_oid)`
-		expect(dangling?.n).toBe("0")
+		if (dangling === undefined) throw new Error("dangling-base query returned no row")
+		expect(dangling.n).toBe("0")
 	})
 
 	it("the next repack pass restores full coverage and reports its repairs", async () => {
@@ -129,7 +131,8 @@ describe("repack × GC — the derived tier follows the inventory", () => {
 			select
 				(select count(*) from git_object where repo_id = ${id}::bigint)::text as objects,
 				(select count(*) from git_pack_encoding where repo_id = ${id}::bigint)::text as encodings`
-		expect(counts?.encodings).toBe(counts?.objects)
+		if (counts === undefined) throw new Error("inventory count query returned no row")
+		expect(counts.encodings).toBe(counts.objects)
 		// GC swept the dangling deltas, so this pass had genuine holes to re-encode —
 		// and a SECOND pass over the repaired tier is back to a no-op.
 		expect(result.wholes + result.deltas).toBeGreaterThan(0)

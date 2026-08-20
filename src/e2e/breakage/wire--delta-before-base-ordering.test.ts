@@ -29,14 +29,23 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { parseVerifyPackObjects } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { objectsByType, parseVerifyPackObjects } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "workspace/probe/ordering"
 const RUNS = 300
@@ -57,7 +66,7 @@ async function ordering(dir: string): Promise<Ordering> {
 		const objects = parseVerifyPackObjects(out.stdout)
 		const offsetOf = new Map(objects.map((object) => [object.oid, object.offset]))
 		for (const object of objects) {
-			if (object.baseOid === undefined) continue
+			if (object.kind === "whole") continue
 			deltas++
 			const baseOffset = offsetOf.get(object.baseOid)
 			if (baseOffset === undefined) {
@@ -73,28 +82,12 @@ async function ordering(dir: string): Promise<Ordering> {
 
 /** `<object count>:<sha256 over every local object's raw bytes, in oid order>`. */
 async function digest(dir: string): Promise<string> {
-	const list = await spawnGit(["cat-file", "--batch-check", "--batch-all-objects"], {
-		cwd: dir,
-	})
-	const oids = list.stdout
-		.split("\n")
-		.filter(Boolean)
-		.map((l) => l.split(" ")[0] as string)
-		.sort()
+	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
 	const res = await spawnGit(["cat-file", "--batch"], {
 		cwd: dir,
 		input: `${oids.join("\n")}\n`,
 	})
 	return `${oids.length}:${createHash("sha256").update(res.stdoutBytes).digest("hex")}`
-}
-
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
 }
 
 describe("wire — delta emission order and the client resolvers it stresses", () => {
@@ -109,12 +102,9 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 
 	let pggitOrder: Ordering
 	let gitOrder: Ordering
-	let unpackCloneError: string | null = null
+	let unpackClone: TestResult<string>
 	let indexPackDigest = ""
-	let unpackDigest = ""
-	const fetchErrors = new Map<string, string | null>()
-	let finalIndexPackDigest = ""
-	let finalUnpackDigest = ""
+	const fetches = new Map<string, TestResult<string>>()
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS })
@@ -123,9 +113,10 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 		await spawnGit(["clone", "--bare", "-q", src, bare])
 		await spawnGit(["repack", "-a", "-d", "-q"], { cwd: bare })
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const url = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		const url = repoUrl(server, REPO)
 
 		await spawnGit(["push", "-q", url, "refs/heads/*:refs/heads/*"], { cwd: src })
 		await createRepack(db.sql).repack(REPO)
@@ -142,7 +133,7 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 		// `fetch.unpackLimit` above the object count forces unpack-objects instead of
 		// index-pack; it resolves out-of-order REF_DELTAs from a deferred list.
 		const dU = join(mk("cU"), "c")
-		unpackCloneError = await errorOf(async () => {
+		unpackClone = await captureTestResult(async () => {
 			await spawnGit([
 				"-c",
 				"protocol.version=2",
@@ -161,9 +152,9 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 				dU,
 			])
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dU })
+			return digest(dU)
 		})
 		indexPackDigest = await digest(dP)
-		unpackDigest = unpackCloneError === null ? await digest(dU) : ""
 
 		// A SMALL incremental fetch — the shape a per-navigation pull actually is, and
 		// the one that goes through unpack-objects by DEFAULT (under 100 objects).
@@ -182,14 +173,14 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 		] as const) {
 			// A clone that never landed has nothing to fetch onto; its own assertion
 			// above already reports the break.
-			if (dest === dU && unpackCloneError !== null) continue
+			if (dest === dU && unpackClone.kind === "failed") continue
 			const cfg =
 				label === "forced unpack-objects"
 					? ["-c", "fetch.unpackLimit=1000000", "-c", "transfer.unpackLimit=1000000"]
 					: []
-			fetchErrors.set(
+			fetches.set(
 				label,
-				await errorOf(async () => {
+				await captureTestResult(async () => {
 					await spawnGit(
 						[
 							"-c",
@@ -204,16 +195,14 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 						{ cwd: dest },
 					)
 					await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+					return digest(dest)
 				}),
 			)
 		}
-		finalIndexPackDigest = await digest(dP)
-		finalUnpackDigest = unpackCloneError === null ? await digest(dU) : ""
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -231,16 +220,26 @@ describe("wire — delta emission order and the client resolvers it stresses", (
 	})
 
 	it("clones through git unpack-objects, fsck-clean and identical to index-pack", () => {
-		expect(unpackCloneError).toBeNull()
-		expect(unpackDigest).toBe(indexPackDigest)
+		expect(unpackClone.kind, testResultContext(unpackClone, "unpack-objects clone")).toBe(
+			"succeeded",
+		)
+		if (unpackClone.kind === "succeeded") expect(unpackClone.value).toBe(indexPackDigest)
 	})
 
 	it("takes a small incremental fetch through BOTH client resolvers", () => {
-		for (const [label, err] of fetchErrors) expect(err, label).toBeNull()
-		expect(fetchErrors.size).toBe(2)
+		for (const [label, result] of fetches) {
+			expect(result.kind, testResultContext(result, label)).toBe("succeeded")
+		}
+		expect(fetches.size).toBe(2)
 	})
 
 	it("leaves both resolvers with the same object store after the fetch", () => {
-		expect(finalUnpackDigest).toBe(finalIndexPackDigest)
+		const indexed = fetches.get("default resolver")
+		const unpacked = fetches.get("forced unpack-objects")
+		expect(indexed?.kind).toBe("succeeded")
+		expect(unpacked?.kind).toBe("succeeded")
+		if (indexed?.kind === "succeeded" && unpacked?.kind === "succeeded") {
+			expect(unpacked.value).toBe(indexed.value)
+		}
 	})
 })

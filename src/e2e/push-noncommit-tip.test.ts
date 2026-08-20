@@ -22,41 +22,14 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { encodePktLine } from "@/protocol/pkt-line"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
-
-function receiveBody(commands: string[], pack: Buffer): Buffer {
-	const lines = commands.map((c, i) =>
-		encodePktLine(
-			Buffer.from(
-				i === 0 ? `${c}\0report-status object-format=sha1\n` : `${c}\n`,
-				"utf8",
-			),
-		),
-	)
-	return Buffer.concat([...lines, Buffer.from("0000"), pack])
-}
-
-async function postReceivePack(
-	app: ReturnType<typeof createGitApp>,
-	repo: string,
-	body: Buffer,
-): Promise<{ status: number; text: string }> {
-	const res = await app.request(`/${repo}/git-receive-pack`, {
-		body: new Uint8Array(body),
-		method: "POST",
-	})
-	return {
-		status: res.status,
-		text: Buffer.from(await res.arrayBuffer()).toString("utf8"),
-	}
-}
 
 describe("a13 — branch tip that is not a commit must not 500", () => {
 	let db: IsolatedDb
@@ -117,27 +90,33 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 			await postReceivePack(
 				app,
 				repo,
-				receiveBody([`${ZERO} ${commitOid} refs/heads/main`], fullPack),
+				receivePackRequest(
+					[`${ZERO} ${commitOid} refs/heads/main\0report-status object-format=sha1\n`],
+					fullPack,
+				),
 			)
 			// Now point a BRANCH at a non-commit object (objects already in store).
 			const res = await postReceivePack(
 				app,
 				repo,
-				receiveBody([`${ZERO} ${tip()} refs/heads/bad-${name}`], Buffer.alloc(0)),
+				receivePackRequest([
+					`${ZERO} ${tip()} refs/heads/bad-${name}\0report-status object-format=sha1\n`,
+				]),
 			)
+			const report = res.body.toString("utf8")
 
 			expect(
 				res.status,
-				`branch->${name}: expected HTTP 200 report-status, got ${res.status} body=${res.text.slice(0, 80)}`,
+				`branch->${name}: expected HTTP 200 report-status, got ${res.status} body=${report.slice(0, 80)}`,
 			).toBe(200)
 			expect(
-				res.text,
+				report,
 				`branch->${name}: must not leak internal server error`,
 			).not.toContain("internal server error")
 
 			// Canonical git's outcome, per type: an in-band `ng` naming the ref, and no
 			// ref in the store. (git's own wording is `invalid new value provided`.)
-			expect(res.text, `branch->${name}: must be rejected in-band like git`).toContain(
+			expect(report, `branch->${name}: must be rejected in-band like git`).toContain(
 				`ng refs/heads/bad-${name}`,
 			)
 			const stored = Object.fromEntries(

@@ -21,14 +21,23 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo, RUNS_DIR } from "@/testing/append-only-repo"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { objectsByType, parseRevListObjectOids } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "workspace/probe/bigtrees"
 /** ~1200 uuid-named subdirs ⇒ the runs tree passes 100 KiB, so COPY runs split. */
@@ -38,22 +47,13 @@ const ALGORITHMS = ["default", "skipping", "noop"] as const
 
 type NegotiationRound = {
 	algo: string
-	pggitError: string | null
-	gitError: string | null
-	pggitClosure: string
-	gitClosure: string
+	pggit: TestResult<string>
+	git: TestResult<string>
 }
 
 /** `<object count>:<sha256 over every local object's raw bytes, in oid order>`. */
 async function digest(dir: string): Promise<string> {
-	const list = await spawnGit(["cat-file", "--batch-check", "--batch-all-objects"], {
-		cwd: dir,
-	})
-	const oids = list.stdout
-		.split("\n")
-		.filter(Boolean)
-		.map((l) => l.split(" ")[0] as string)
-		.sort()
+	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
 	const res = await spawnGit(["cat-file", "--batch"], {
 		cwd: dir,
 		input: `${oids.join("\n")}\n`,
@@ -77,15 +77,6 @@ async function closureDigest(dir: string, rev: string): Promise<string> {
 	return `${objects.length}:${createHash("sha256").update(bytes.stdoutBytes).digest("hex")}`
 }
 
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
-}
-
 describe("wire — >64 KiB trees and multi-round negotiation", () => {
 	let db: IsolatedDb
 	let server: GitServer
@@ -97,10 +88,9 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 	}
 
 	let tipRunsTreeBytes = 0
-	let largeCloneError: string | null = null
+	let largeClone: TestResult<string>
 	let srcDigest = ""
-	let cloneDigest = ""
-	const spotTrees: { rev: string; oid: string; matches: boolean }[] = []
+	const spotTrees: { rev: string; oid: string; result: TestResult<boolean> }[] = []
 	const rounds: NegotiationRound[] = []
 
 	beforeAll(async () => {
@@ -116,9 +106,10 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 		await spawnGit(["clone", "--bare", "-q", src, bare])
 		await spawnGit(["repack", "-a", "-d", "-q"], { cwd: bare })
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const url = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		const url = repoUrl(server, REPO)
 		const bareUrl = `file://${bare}`
 
 		await spawnGit(["push", "-q", url, "refs/heads/*:refs/heads/*"], { cwd: src })
@@ -126,7 +117,7 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 
 		// ---- A. large-tree clone, byte-compared to the source --------------------
 		const cP = join(mk("cP"), "c")
-		largeCloneError = await errorOf(async () => {
+		largeClone = await captureTestResult(async () => {
 			await spawnGit([
 				"-c",
 				"protocol.version=2",
@@ -142,9 +133,9 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 				cP,
 			])
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: cP })
+			return digest(cP)
 		})
 		srcDigest = await digest(src)
-		cloneDigest = largeCloneError === null ? await digest(cP) : ""
 
 		// Spot-check the biggest tree objects explicitly.
 		for (const rev of [
@@ -157,16 +148,17 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 				await spawnGit(["rev-parse", `${rev}:${RUNS_DIR}`], { cwd: src })
 			).stdout.trim()
 			const a = (await spawnGit(["cat-file", "tree", oid], { cwd: src })).stdoutBytes
-			const b = await spawnGit(["cat-file", "tree", oid], { cwd: cP })
-				.then((x) => x.stdoutBytes)
-				.catch(() => Buffer.alloc(0))
-			spotTrees.push({ matches: a.equals(b), oid, rev })
+			const result = await captureTestResult(async () => {
+				const b = await spawnGit(["cat-file", "tree", oid], { cwd: cP })
+				return a.equals(b.stdoutBytes)
+			})
+			spotTrees.push({ oid, result, rev })
 		}
 
 		// ---- B. multi-round negotiation from a divergent client ------------------
 		// Every divergent client is cloned FROM `cP`, so a broken large-tree clone
 		// leaves nothing to negotiate against; its own assertion reports that break.
-		if (largeCloneError !== null) return
+		if (largeClone.kind === "failed") return
 		const grown = await createAppendOnlyRepo({ docs: 6, runs: RUNS + 40 })
 		scratch.push(grown)
 		await spawnGit(["push", "-q", url, "refs/heads/*:refs/heads/*"], { cwd: grown })
@@ -175,8 +167,7 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 		await createRepack(db.sql).repack(REPO)
 
 		for (const algo of ALGORITHMS) {
-			const errors = new Map<string, string | null>()
-			const closures = new Map<string, string>()
+			const outcomes = new Map<string, TestResult<string>>()
 			for (const [label, remote] of [
 				["pggit", url],
 				["git", bareUrl],
@@ -196,29 +187,31 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 					algo === "default"
 						? ["-c", "protocol.version=2"]
 						: ["-c", "protocol.version=2", "-c", `fetch.negotiationAlgorithm=${algo}`]
-				const err = await errorOf(async () => {
+				const fetched = await captureTestResult(async () => {
 					await spawnGit(
 						[...cfg, "-c", "transfer.fsckobjects=true", "fetch", "-q", "origin"],
 						{ cwd: dest },
 					)
 					await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 				})
-				errors.set(label, err)
-				if (err === null) closures.set(label, await closureDigest(dest, "origin/main"))
+				outcomes.set(
+					label,
+					fetched.kind === "failed"
+						? fetched
+						: { kind: "succeeded", value: await closureDigest(dest, "origin/main") },
+				)
 			}
-			rounds.push({
-				algo,
-				gitClosure: closures.get("git") ?? "",
-				gitError: errors.get("git") ?? null,
-				pggitClosure: closures.get("pggit") ?? "",
-				pggitError: errors.get("pggit") ?? null,
-			})
+			const git = outcomes.get("git")
+			const pggit = outcomes.get("pggit")
+			if (git === undefined || pggit === undefined) {
+				throw new Error(`negotiation ${algo} omitted a remote outcome`)
+			}
+			rounds.push({ algo, git, pggit })
 		}
 	}, 1_200_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -227,22 +220,30 @@ describe("wire — >64 KiB trees and multi-round negotiation", () => {
 	})
 
 	it("clones the >64 KiB-tree repo fsck-clean and byte-identical to the source", () => {
-		expect(largeCloneError).toBeNull()
-		expect(cloneDigest).toBe(srcDigest)
+		expect(largeClone.kind, testResultContext(largeClone, "large-tree clone")).toBe(
+			"succeeded",
+		)
+		if (largeClone.kind === "succeeded") expect(largeClone.value).toBe(srcDigest)
 	})
 
 	it("serves every spot-checked large runs-tree byte-for-byte", () => {
 		for (const t of spotTrees) {
-			expect(t.matches, `runs tree at ${t.rev} (${t.oid})`).toBe(true)
+			const at = `runs tree at ${t.rev} (${t.oid})`
+			expect(t.result.kind, testResultContext(t.result, at)).toBe("succeeded")
+			if (t.result.kind === "succeeded") expect(t.result.value, at).toBe(true)
 		}
 	})
 
 	it("survives a multi-round negotiation under every algorithm, matching git", () => {
 		expect(rounds.length).toBe(ALGORITHMS.length)
 		for (const r of rounds) {
-			expect(r.pggitError, `${r.algo}/pggit`).toBeNull()
-			expect(r.gitError, `${r.algo}/git`).toBeNull()
-			expect(r.pggitClosure, r.algo).toBe(r.gitClosure)
+			expect(r.pggit.kind, testResultContext(r.pggit, `${r.algo}/pggit`)).toBe(
+				"succeeded",
+			)
+			expect(r.git.kind, testResultContext(r.git, `${r.algo}/git`)).toBe("succeeded")
+			if (r.pggit.kind === "succeeded" && r.git.kind === "succeeded") {
+				expect(r.pggit.value, r.algo).toBe(r.git.value)
+			}
 		}
 	})
 })

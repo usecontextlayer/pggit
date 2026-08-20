@@ -201,14 +201,16 @@ export function renderRefAdvertV0(buf: Buffer): RefAdvertV0 {
 }
 
 /**
- * Object count from a complete v2 smart-HTTP fetch response (the PACK header is
- * `PACK` + a 4-byte version + a 4-byte big-endian object count), or null if its
- * band-1 stream carries no pack. Searching the raw response is not sufficient:
+ * Pack state from a complete v2 smart-HTTP fetch response. A present pack carries
+ * its header's 4-byte big-endian object count; an absent pack is named explicitly.
+ * Searching the raw response is not sufficient:
  * ordinary protocol text, progress, and errors may all contain the bytes `PACK`.
  */
-export function packObjectCount(body: Buffer): number | null {
+export type PackObjectCount = { kind: "no-pack" } | { kind: "pack"; objectCount: number }
+
+export function packObjectCount(body: Buffer): PackObjectCount {
 	const pack = sidebandDemux(body).band1
-	if (pack.length === 0) return null
+	if (pack.length === 0) return { kind: "no-pack" }
 	if (pack.length < 12) {
 		throw new Error(`packObjectCount: truncated ${pack.length}-byte band-1 stream`)
 	}
@@ -216,5 +218,5 @@ export function packObjectCount(body: Buffer): number | null {
 	if (magic !== "PACK") {
 		throw new Error(`packObjectCount: unexpected band-1 magic ${JSON.stringify(magic)}`)
 	}
-	return pack.readUInt32BE(8)
+	return { kind: "pack", objectCount: pack.readUInt32BE(8) }
 }

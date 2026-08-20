@@ -50,21 +50,23 @@ describe("reach-epoch producer (chunk 5b)", () => {
 		mainTips.push(await commit("a.txt", "one\n"))
 		mainTips.push(await commit("b.txt", "two\n"))
 		// A feature branch off main~1 and an annotated tag on main~1.
-		await spawnGit(["checkout", "-q", "-b", "feature", mainTips[0] as string], {
-			cwd: src,
-		})
+		const firstMainTip = mainTips[0]
+		if (firstMainTip === undefined) throw new Error("first main tip was not created")
+		await spawnGit(["checkout", "-q", "-b", "feature", firstMainTip], { cwd: src })
 		await commit("f.txt", "feat\n")
-		await spawnGit(["tag", "-a", "-m", "v1", "v1", mainTips[0] as string], { cwd: src })
+		await spawnGit(["tag", "-a", "-m", "v1", "v1", firstMainTip], { cwd: src })
 		tagOid = (await spawnGit(["rev-parse", "refs/tags/v1"], { cwd: src })).stdout.trim()
 		await spawnGit(["checkout", "-q", "main"], { cwd: src })
 		mainTips.push(await commit("c.txt", "three\n"))
 
 		const url = repoUrl(fx, REPO)
 		await spawnGit(["push", "-q", url, "main", "feature", "refs/tags/v1"], { cwd: src })
-		const [row] = await fx.db.sql<{ id: string }[]>`
-			select id::text as id from repos where name = ${REPO}`
-		if (row === undefined) throw new Error(`repo row missing for ${REPO}`)
-		id = row.id as unknown as ReposId
+		const row = await db
+			.selectFrom("repos")
+			.select("id")
+			.where("name", "=", REPO)
+			.executeTakeFirstOrThrow()
+		id = row.id
 	}, 120_000)
 
 	afterAll(async () => {
@@ -95,8 +97,7 @@ describe("reach-epoch producer (chunk 5b)", () => {
 		const all = new Set<string>()
 		for (const tip of tips) {
 			const bits = epoch.bitmaps.get(tip)
-			expect(bits, `bitmap for tip ${tip}`).toBeDefined()
-			if (bits === undefined) continue
+			if (bits === undefined) throw new Error(`bitmap missing for tip ${tip}`)
 			const named = oidsOfUnion([bits], epoch.oids)
 			const { present, missing } = await fullClosure(db, id, [tip], false)
 			expect(missing.size).toBe(0)
@@ -154,7 +155,9 @@ describe("reach-epoch producer (chunk 5b)", () => {
 		// The rewind signature the planner short-circuits on: the new tip is
 		// INSIDE the old epoch array but not among its tips — a delta walk from
 		// it would re-walk old history for nothing.
-		await fx.refs.setRef(REPO, "refs/heads/main", mainTips[1] as string)
+		const ancestorTip = mainTips[1]
+		if (ancestorTip === undefined) throw new Error("second main tip was not created")
+		await fx.refs.setRef(REPO, "refs/heads/main", ancestorTip)
 		const result = await fx.gc.gc(REPO, { graceSeconds: 0 })
 		expect(result.epoch).toBe("rebuilt")
 		expect(result.deletedObjects).toBeGreaterThan(0) // mainTips[2..] reclaimed

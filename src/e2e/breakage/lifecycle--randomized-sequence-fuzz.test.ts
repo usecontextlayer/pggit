@@ -34,29 +34,30 @@
  * Originated as exploration-7 probe `lifecycle--randomized-sequence-fuzz.ts`
  * (exit 1 on any mismatch against the file:// oracle); fixed, then converted.
  */
-import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
 import { assertNever } from "@/assert-never"
-import { createGitApp, createGitDeps } from "@/index"
 import { ZERO_OID } from "@/oid"
-import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
-import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import {
+	appendLifecycleBranch,
+	buildLifecycleSource,
+	commitsOldestFirst,
+} from "@/testing/append-only-repo"
 import { ageObjects } from "@/testing/gc-helpers"
-import { parseRevListObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { mirrorClone, requiredAt } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/slate/fuzz"
-/** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
-const RUNS_DIR = ".engine/runs/planner-updates"
 
 /** The seed history every candidate starts from. Small enough that a per-command
  * mirror-clone comparison is cheap, wide enough that the delta tier engages. */
@@ -64,157 +65,6 @@ const SOURCE_COMMITS = 24
 const NUM_RUNS = 4
 const MIN_COMMANDS = 10
 const MAX_COMMANDS = 16
-
-/** Deterministic filler of a given length (hex, so it is poorly compressible). */
-function filler(salt: string, len: number): string {
-	let out = ""
-	while (out.length < len) {
-		out += createHash("sha1").update(`${salt}-${out.length}`).digest("hex")
-	}
-	return out.slice(0, len)
-}
-
-/** A uuid-shaped run directory name — 36 chars, so a tree entry costs ~63 bytes. */
-function uuidName(seed: string): string {
-	const h = createHash("sha1").update(seed).digest("hex")
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-}
-
-/**
- * Build a real git repo whose shape makes the delta tier bite: a flat,
- * append-only `.engine/runs/planner-updates` directory gaining one subdir per
- * commit (so the same tree path has `main+1` successive versions — many segments
- * at ANCHOR_EVERY=32).
- */
-async function buildSource(dir: string, mainCommits: number): Promise<void> {
-	const out: string[] = []
-	let mark = 0
-	const next = () => ++mark
-	const blob = (content: string): number => {
-		const m = next()
-		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
-		return m
-	}
-
-	const seeded: string[] = []
-	for (let i = 0; i < 6; i++) {
-		const m = blob(`# doc ${i}\n\n${filler(`doc-${i}-v0`, 600)}\n`)
-		seeded.push(`M 100644 :${m} docs/doc-${i}.md`)
-	}
-	let prev = next()
-	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
-	)
-	for (let i = 0; i < mainCommits; i++) {
-		const d = uuidName(`m-run-${i}`)
-		const record = blob(`{"run":"${d}","payload":"${filler(`m-rec-${i}`, 400)}"}\n`)
-		const stderr = blob(`${filler(`m-err-${i}`, 120)}\n`)
-		const cm = next()
-		const msg = `main run ${i}`
-		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
-				`M 100644 :${record} ${RUNS_DIR}/${d}/record.json\n` +
-				`M 100644 :${stderr} ${RUNS_DIR}/${d}/stderr\n`,
-		)
-		prev = cm
-	}
-
-	await spawnGit(["init", "-q", "-b", "main", dir])
-	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: out.join("") })
-}
-
-/** Append `count` single-file commits onto `fromSha` on `branch`; returns the tip. */
-async function lineage(
-	dir: string,
-	branch: string,
-	fromSha: string,
-	salt: string,
-	count: number,
-): Promise<string> {
-	const out: string[] = []
-	let mark = 0
-	const next = () => ++mark
-	const blob = (content: string): number => {
-		const m = next()
-		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
-		return m
-	}
-	let prev: string | number = fromSha
-	for (let i = 0; i < count; i++) {
-		const d = uuidName(`${salt}-${i}`)
-		const record = blob(`{"run":"${d}","payload":"${filler(`${salt}-r-${i}`, 300)}"}\n`)
-		const cm = next()
-		const msg = `${salt} ${i}`
-		out.push(
-			`commit refs/heads/${branch}\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n` +
-				`from ${typeof prev === "string" ? prev : `:${prev}`}\n` +
-				`M 100644 :${record} ${RUNS_DIR}/${d}/record.json\n`,
-		)
-		prev = cm
-	}
-	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: out.join("") })
-	return (await spawnGit(["rev-parse", branch], { cwd: dir })).stdout.trim()
-}
-
-async function revList(dir: string, rev: string): Promise<string[]> {
-	const out = await spawnGit(["rev-list", "--reverse", rev], { cwd: dir })
-	return out.stdout.trim().split("\n").filter(Boolean)
-}
-
-/**
- * A byte-exact digest of a repo's whole reachable object set: one `cat-file
- * --batch` pass, hashing every object's `<oid> <type> <size>\n<raw bytes>` in
- * oid order. Two repos agree here iff every reachable object is byte-identical.
- */
-async function objectBytesDigest(dir: string, objects: string[]): Promise<string> {
-	const unique = [...new Set(objects)]
-	if (unique.length === 0) return "empty"
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${unique.join("\n")}\n`,
-	})
-	return createHash("sha256").update(res.stdoutBytes).digest("hex")
-}
-
-/** Everything a client can observe about one remote, through a real mirror clone. */
-type MirrorState = { refs: string[]; objects: string[]; digest: string; fsck: string }
-
-/** Mirror-clone `url` into `dest`, fsck --strict, and return the observable state. */
-async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
-	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
-	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-	// `for-each-ref`, not `show-ref`: show-ref exits 1 on a repo with no refs,
-	// which spawnGit turns into a rejection and a false "clone failed".
-	const refs = (
-		await spawnGit(["for-each-ref", "--format=%(objectname) %(refname)"], { cwd: dest })
-	).stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.sort()
-	// `git fsck` exits 0 and prints `notice: ...` lines for non-problems (e.g.
-	// "No default references" on a ref-less repo) — those are not defects.
-	const fsckLines = `${fsck.stdout}${fsck.stderr}`
-		.split("\n")
-		.map((l) => l.trim())
-		.filter((l) => l.length > 0 && !l.startsWith("notice:"))
-	const objects = parseRevListObjectOids(
-		(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
-	).sort()
-	return {
-		digest: await objectBytesDigest(dest, objects),
-		fsck: fsckLines.join("\n"),
-		objects,
-		refs,
-	}
-}
-
-/** Index into a fixture list, loudly (`noUncheckedIndexedAccess`). */
-function at<T>(xs: T[], i: number): T {
-	const v = xs[i]
-	if (v === undefined) throw new Error(`fixture too short: index ${i} of ${xs.length}`)
-	return v
-}
 
 /** Wraparound index into a non-empty list — how every generated index lands on a
  * live ref/commit, so a shrunk sequence stays replayable. */
@@ -342,20 +192,19 @@ async function runSequence(
 ): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "pggit-breakage-fuzz-"))
 	const dir = (name: string): string => join(root, name)
-	const db = await createIsolatedSchema(baseUrl)
-	let server: GitServer | undefined
+	const fixture = await setupGitServerFixture(baseUrl)
+	const { db, server } = fixture
 	try {
 		const src = dir("src")
-		await buildSource(src, SOURCE_COMMITS)
-		const commits = await revList(src, "main")
+		await buildLifecycleSource(src, SOURCE_COMMITS)
+		const commits = await commitsOldestFirst(src, "main")
 
 		const ref = dir("ref.git")
 		await spawnGit(["init", "-q", "--bare", "-b", "main", ref])
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const url = `http://127.0.0.1:${server.port}/${REPO}`
+		const url = repoUrl(server, REPO)
 		const repack = createRepack(db.sql)
 		const gc = createGc(db.sql)
-		const refs = createRefStore(db.sql)
+		const refs = fixture.deps.refs
 
 		/** pggit's ref state, mirrored to ref.git on every mutation. */
 		const state = new Map<string, string>()
@@ -388,7 +237,10 @@ async function runSequence(
 		const heads = (): string[] =>
 			[...state.keys()].filter((k) => k.startsWith("refs/heads/")).sort()
 
-		await pushBoth(at(commits, commits.length - 1), "refs/heads/main")
+		await pushBoth(
+			requiredAt(commits, commits.length - 1, "main commit history"),
+			"refs/heads/main",
+		)
 		await repack.repack(REPO)
 
 		let seq = 0
@@ -404,7 +256,13 @@ async function runSequence(
 					const base = state.get(pick(heads(), command.branch))
 					if (base === undefined) break
 					const branch = `l${seq++}`
-					const tip = await lineage(src, branch, base, branch, command.commits)
+					const tip = await appendLifecycleBranch(
+						src,
+						branch,
+						base,
+						branch,
+						command.commits,
+					)
 					const target = pick(heads(), command.target)
 					// FF only when it really is one; otherwise a force-move.
 					if (state.get(target) === base) await pushBoth(tip, target)
@@ -533,8 +391,7 @@ async function runSequence(
 			rmSync(dir(`rf-${round}`), { force: true, recursive: true })
 		}
 	} finally {
-		await server?.close()
-		await db.drop()
+		await teardownGitServerFixture(fixture)
 		rmSync(root, { force: true, recursive: true })
 	}
 }

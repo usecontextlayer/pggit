@@ -28,42 +28,15 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { encodePktLine } from "@/protocol/pkt-line"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
-
-function receiveBody(commands: string[], pack: Buffer): Buffer {
-	const lines = commands.map((c, i) =>
-		encodePktLine(
-			Buffer.from(
-				i === 0 ? `${c}\0report-status object-format=sha1\n` : `${c}\n`,
-				"utf8",
-			),
-		),
-	)
-	return Buffer.concat([...lines, Buffer.from("0000"), pack])
-}
-
-async function postReceivePack(
-	app: ReturnType<typeof createGitApp>,
-	repo: string,
-	body: Buffer,
-): Promise<{ status: number; text: string }> {
-	const res = await app.request(`/${repo}/git-receive-pack`, {
-		body: new Uint8Array(body),
-		method: "POST",
-	})
-	return {
-		status: res.status,
-		text: Buffer.from(await res.arrayBuffer()).toString("utf8"),
-	}
-}
 
 /**
  * nam01 — the ref-name cap in both directions, and the state a rejection leaves.
@@ -146,10 +119,14 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 		const atCap = await postReceivePack(
 			app,
 			repo,
-			receiveBody([`${ZERO} ${commitOid} ${refAtCap}`], pack),
+			receivePackRequest(
+				[`${ZERO} ${commitOid} ${refAtCap}\0report-status object-format=sha1\n`],
+				pack,
+			),
 		)
 		expect(atCap.status).toBe(200)
-		expect(atCap.text, "a name AT the cap must be accepted").toContain(`ok ${refAtCap}`)
+		const atCapReport = atCap.body.toString("utf8")
+		expect(atCapReport, "a name AT the cap must be accepted").toContain(`ok ${refAtCap}`)
 		expect((await refs.listRefs(repo)).map((r) => r.name)).toContain(refAtCap)
 
 		// One byte over: rejected in-band with git's `funny refname` wording, and no
@@ -157,10 +134,14 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 		const overCap = await postReceivePack(
 			app,
 			repo,
-			receiveBody([`${ZERO} ${commitOid} ${refOverCap}`], pack),
+			receivePackRequest(
+				[`${ZERO} ${commitOid} ${refOverCap}\0report-status object-format=sha1\n`],
+				pack,
+			),
 		)
 		expect(overCap.status).toBe(200)
-		expect(overCap.text, "one byte over the cap must be `ng`'d").toContain(
+		const overCapReport = overCap.body.toString("utf8")
+		expect(overCapReport, "one byte over the cap must be `ng`'d").toContain(
 			`ng ${refOverCap} funny refname (too long to store)`,
 		)
 		expect((await refs.listRefs(repo)).map((r) => r.name)).not.toContain(refOverCap)
@@ -171,21 +152,25 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 		const res = await postReceivePack(
 			app,
 			repo,
-			receiveBody([`${ZERO} ${commitOid} ${longRef}`], pack),
+			receivePackRequest(
+				[`${ZERO} ${commitOid} ${longRef}\0report-status object-format=sha1\n`],
+				pack,
+			),
 		)
+		const report = res.body.toString("utf8")
 
 		// Contract 1: a storage limit on the ref name is an in-band rejection, not a
 		// transport-level 500 — exactly like the file:// oracle's "cannot lock ref".
 		expect(
 			res.status,
-			`expected HTTP 200 report-status, got ${res.status} body=${res.text.slice(0, 120)}`,
+			`expected HTTP 200 report-status, got ${res.status} body=${report.slice(0, 120)}`,
 		).toBe(200)
-		expect(res.text, "must not leak a 500 / internal server error").not.toContain(
+		expect(report, "must not leak a 500 / internal server error").not.toContain(
 			"internal server error",
 		)
 		// The ref must be reported as failed (ng) naming the ref and git's reason,
 		// never silently dropped or ok'd.
-		expect(res.text, "over-long ref must be reported `ng`").toContain(
+		expect(report, "over-long ref must be reported `ng`").toContain(
 			`ng ${longRef} funny refname (too long to store)`,
 		)
 

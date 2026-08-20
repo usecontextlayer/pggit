@@ -15,7 +15,7 @@ import { createHash } from "node:crypto"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { requireGitOid } from "@/testing/git-fixtures"
+import { parseRevListObjectOids, requireGitOid } from "@/testing/git-fixtures"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
 /** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
@@ -39,6 +39,11 @@ function filler(salt: string, len: number): string {
 		out += createHash("sha1").update(`${salt}-${out.length}`).digest("hex")
 	}
 	return out.slice(0, len)
+}
+
+function uuidName(seed: string): string {
+	const h = createHash("sha1").update(seed).digest("hex")
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
 }
 
 /** A uuid-shaped run directory name — 36 chars, so a tree entry costs ~63 bytes,
@@ -94,6 +99,117 @@ export async function createAppendOnlyRepo(opts: AppendOnlyRepoOptions): Promise
 	return dir
 }
 
+/** Build the fixed append-only source shared by the lifecycle breakage suites. */
+export async function buildLifecycleSource(
+	dir: string,
+	mainCommits: number,
+): Promise<void> {
+	const out: string[] = []
+	let mark = 0
+	const next = () => ++mark
+	const blob = (content: string): number => {
+		const m = next()
+		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
+		return m
+	}
+
+	const seeded: string[] = []
+	for (let i = 0; i < 6; i++) {
+		const m = blob(`# doc ${i}\n\n${filler(`doc-${i}-v0`, 600)}\n`)
+		seeded.push(`M 100644 :${m} docs/doc-${i}.md`)
+	}
+	let prev = next()
+	out.push(
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
+	)
+	for (let i = 0; i < mainCommits; i++) {
+		const run = uuidName(`m-run-${i}`)
+		const record = blob(`{"run":"${run}","payload":"${filler(`m-rec-${i}`, 400)}"}\n`)
+		const stderr = blob(`${filler(`m-err-${i}`, 120)}\n`)
+		const commit = next()
+		const message = `main run ${i}`
+		out.push(
+			`commit refs/heads/main\nmark :${commit}\ncommitter ${COMMITTER}\ndata ${message.length}\n${message}\nfrom :${prev}\n` +
+				`M 100644 :${record} ${RUNS_DIR}/${run}/record.json\n` +
+				`M 100644 :${stderr} ${RUNS_DIR}/${run}/stderr\n`,
+		)
+		prev = commit
+	}
+
+	await spawnGit(["init", "-q", "-b", "main", dir])
+	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: out.join("") })
+}
+
+/** Append the two-file run shape used by destructive lifecycle lineages. */
+export async function appendLifecycleLineage(
+	dir: string,
+	branch: string,
+	fromOid: string,
+	salt: string,
+	count: number,
+): Promise<void> {
+	const out: string[] = []
+	let mark = 0
+	const next = () => ++mark
+	const blob = (content: string): number => {
+		const m = next()
+		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
+		return m
+	}
+	let prev: string | number = requireGitOid(fromOid, "lifecycle lineage base")
+	for (let i = 0; i < count; i++) {
+		const run = uuidName(`${salt}-${i}`)
+		const record = blob(
+			`{"run":"${run}","payload":"${filler(`${salt}-rec-${i}`, 400)}"}\n`,
+		)
+		const stderr = blob(`${filler(`${salt}-err-${i}`, 120)}\n`)
+		const commit = next()
+		const message = `${salt} ${i}`
+		out.push(
+			`commit refs/heads/${branch}\nmark :${commit}\ncommitter ${COMMITTER}\ndata ${message.length}\n${message}\n` +
+				`from ${typeof prev === "string" ? prev : `:${prev}`}\n` +
+				`M 100644 :${record} ${RUNS_DIR}/${run}/record.json\n` +
+				`M 100644 :${stderr} ${RUNS_DIR}/${run}/stderr\n`,
+		)
+		prev = commit
+	}
+	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: out.join("") })
+}
+
+/** Append the single-file run shape used by branch-producing lifecycle suites. */
+export async function appendLifecycleBranch(
+	dir: string,
+	branch: string,
+	fromOid: string,
+	salt: string,
+	count: number,
+): Promise<string> {
+	const out: string[] = []
+	let mark = 0
+	const next = () => ++mark
+	const blob = (content: string): number => {
+		const m = next()
+		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
+		return m
+	}
+	let prev: string | number = requireGitOid(fromOid, "lifecycle branch base")
+	for (let i = 0; i < count; i++) {
+		const run = uuidName(`${salt}-${i}`)
+		const record = blob(`{"run":"${run}","payload":"${filler(`${salt}-r-${i}`, 300)}"}\n`)
+		const commit = next()
+		const message = `${salt} ${i}`
+		out.push(
+			`commit refs/heads/${branch}\nmark :${commit}\ncommitter ${COMMITTER}\ndata ${message.length}\n${message}\n` +
+				`from ${typeof prev === "string" ? prev : `:${prev}`}\n` +
+				`M 100644 :${record} ${RUNS_DIR}/${run}/record.json\n`,
+		)
+		prev = commit
+	}
+	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: out.join("") })
+	const tip = await spawnGit(["rev-parse", branch], { cwd: dir })
+	return requireGitOid(tip.stdout.trim(), `rev-parse ${branch}`)
+}
+
 /** The OID of the append-only directory's tree at a given revision — the object whose
  * successive versions the delta encoder must collapse. */
 export async function runsTreeAt(dir: string, rev: string): Promise<string> {
@@ -101,14 +217,13 @@ export async function runsTreeAt(dir: string, rev: string): Promise<string> {
 	return requireGitOid(out.stdout.trim(), `rev-parse ${rev}:${RUNS_DIR}`)
 }
 
-/** Commit OIDs oldest-first. */
-export async function commitsOldestFirst(dir: string): Promise<string[]> {
-	const out = await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: dir })
-	return out.stdout
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.map((oid) => requireGitOid(oid, "rev-list --reverse HEAD"))
+/** Commit OIDs for one revision, oldest-first. */
+export async function commitsOldestFirst(
+	dir: string,
+	revision = "HEAD",
+): Promise<string[]> {
+	const out = await spawnGit(["rev-list", "--reverse", revision], { cwd: dir })
+	return parseRevListObjectOids(out.stdout)
 }
 
 /** One object's raw bytes, binary-safe. */

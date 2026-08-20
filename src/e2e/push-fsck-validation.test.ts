@@ -20,12 +20,12 @@ import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { computeOid } from "@/object/object"
 import { writePack } from "@/pack/write-pack"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -37,11 +37,10 @@ function pushBody(
 	branch: string,
 	objects: { type: "blob" | "commit" | "tag" | "tree"; content: Buffer }[],
 ): Buffer {
-	return Buffer.concat([
-		encodePktLine(Buffer.from(`${ZERO} ${newOid} refs/heads/${branch}\0report-status`)),
-		encodePkt({ type: "flush" }),
+	return receivePackRequest(
+		[`${ZERO} ${newOid} refs/heads/${branch}\0report-status`],
 		writePack(objects),
-	])
+	)
 }
 
 /**
@@ -117,12 +116,9 @@ describe("M2 — ingest rejects fsck-malformed objects", () => {
 			{ content: Buffer.alloc(0), type: "tree" }, // the empty tree (present)
 			{ content, type: "commit" },
 		])
-		const res = await app.request("/r/git-receive-pack", {
-			body: new Uint8Array(body),
-			method: "POST",
-		})
+		const res = await postReceivePack(app, "r", body)
 		expect(res.status).toBe(200)
-		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
+		const report = pktLineUnpack(res.body)
 		expect(report).not.toContain("unpack ok")
 		expect(report).toContain("ng refs/heads/twotrees")
 		expect(
@@ -139,12 +135,9 @@ describe("M2 — ingest rejects fsck-malformed objects", () => {
 
 		const newOid = computeOid("tag", content)
 		const body = pushBody(newOid, "badtag", [{ content, type: "tag" }])
-		const res = await app.request("/r2/git-receive-pack", {
-			body: new Uint8Array(body),
-			method: "POST",
-		})
+		const res = await postReceivePack(app, "r2", body)
 		expect(res.status).toBe(200)
-		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
+		const report = pktLineUnpack(res.body)
 		expect(report).not.toContain("unpack ok")
 		expect(report).toContain("ng refs/heads/badtag")
 		expect(
@@ -175,12 +168,9 @@ describe("M2 — ingest rejects fsck-malformed objects", () => {
 			{ content: b2, type: "blob" },
 			{ content, type: "tag" },
 		])
-		const res = await app.request("/r3/git-receive-pack", {
-			body: new Uint8Array(body),
-			method: "POST",
-		})
+		const res = await postReceivePack(app, "r3", body)
 		expect(res.status).toBe(200)
-		const report = pktLineUnpack(Buffer.from(await res.arrayBuffer()))
+		const report = pktLineUnpack(res.body)
 		expect(report).not.toContain("unpack ok")
 		expect(report).toContain("ng refs/heads/dbltag")
 		expect(

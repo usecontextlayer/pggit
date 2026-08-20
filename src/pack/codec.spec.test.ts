@@ -228,9 +228,17 @@ describe("§8.4 codec round-trips (pure)", () => {
 							{ baseOid, delta, kind: "ref" },
 						]),
 					)
-					expect(parsedIn[0]?.content.equals(base)).toBe(true)
-					expect(parsedIn[1]?.content.equals(target)).toBe(true)
-					expect(parsedIn[1]?.type).toBe(baseType) // a delta inherits its base's type
+					const [parsedBase, parsedTarget] = parsedIn
+					if (
+						parsedBase === undefined ||
+						parsedTarget === undefined ||
+						parsedIn.length !== 2
+					) {
+						throw new Error(`two-object pack parsed as ${parsedIn.length} objects`)
+					}
+					expect(parsedBase.content.equals(base)).toBe(true)
+					expect(parsedTarget.content.equals(target)).toBe(true)
+					expect(parsedTarget.type).toBe(baseType) // a delta inherits its base's type
 
 					// (2) base ABSENT (thin pack) → the external resolver supplies it.
 					const thin = buildPack([{ baseOid, delta, kind: "ref" }])
@@ -238,7 +246,10 @@ describe("§8.4 codec round-trips (pure)", () => {
 						oid === baseOid ? { content: base, type: baseType } : null,
 					)
 					expect(resolved.length).toBe(1)
-					expect(resolved[0]?.content.equals(target)).toBe(true)
+					const [resolvedTarget] = resolved
+					if (resolvedTarget === undefined)
+						throw new Error("thin pack resolved no object")
+					expect(resolvedTarget.content.equals(target)).toBe(true)
 
 					// (3) thin pack with NO resolver → hard error, never a silent miss.
 					await expect(readPack(thin)).rejects.toMatchObject({ code: "unresolved-base" })

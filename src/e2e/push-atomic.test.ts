@@ -4,13 +4,13 @@ import { join } from "node:path"
 import type { Hono } from "hono"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
 const WRONG = "f".repeat(40) // a deliberately stale advertised old-oid
@@ -103,19 +103,15 @@ describe("M2 — atomic vs non-atomic ref updates", () => {
 
 			// Atomic batch: a valid create (feature) + an update whose advertised old-oid
 			// is stale (main is c1, not WRONG). Caps (incl. `atomic`) ride the first line.
-			const body = Buffer.concat([
-				encodePktLine(
-					Buffer.from(`${ZERO} ${c2} refs/heads/feature\0report-status atomic\n`),
-				),
-				encodePktLine(Buffer.from(`${WRONG} ${c2} refs/heads/main\n`)),
-				encodePkt({ type: "flush" }),
+			const body = receivePackRequest(
+				[
+					`${ZERO} ${c2} refs/heads/feature\0report-status atomic\n`,
+					`${WRONG} ${c2} refs/heads/main\n`,
+				],
 				pack,
-			])
-			const res = await app.request("/repo-atomic-wire/git-receive-pack", {
-				body,
-				method: "POST",
-			})
-			const report = Buffer.from(await res.arrayBuffer()).toString("utf8")
+			)
+			const response = await postReceivePack(app, "repo-atomic-wire", body)
+			const report = response.body.toString("utf8")
 
 			// The pack unpacked, but the atomic batch rolls back wholesale: both ng.
 			expect(report).toContain("unpack ok")

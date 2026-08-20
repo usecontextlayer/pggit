@@ -21,11 +21,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { encodePktLine } from "@/protocol/pkt-line"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const ZERO = "0".repeat(40)
 
@@ -35,29 +35,13 @@ function atomicBody(
 	r2: { old: string; new: string },
 	pack: Buffer,
 ): Buffer {
-	return Buffer.concat([
-		encodePktLine(
-			Buffer.from(`${r1.old} ${r1.new} refs/heads/r1\0report-status atomic\n`, "utf8"),
-		),
-		encodePktLine(Buffer.from(`${r2.old} ${r2.new} refs/heads/r2\n`, "utf8")),
-		Buffer.from("0000"),
+	return receivePackRequest(
+		[
+			`${r1.old} ${r1.new} refs/heads/r1\0report-status atomic\n`,
+			`${r2.old} ${r2.new} refs/heads/r2\n`,
+		],
 		pack,
-	])
-}
-
-async function postReceivePack(
-	app: ReturnType<typeof createGitApp>,
-	repo: string,
-	body: Buffer,
-): Promise<{ status: number; text: string }> {
-	const res = await app.request(`/${repo}/git-receive-pack`, {
-		body: new Uint8Array(body),
-		method: "POST",
-	})
-	return {
-		status: res.status,
-		text: Buffer.from(await res.arrayBuffer()).toString("utf8"),
-	}
+	)
 }
 
 describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
@@ -121,34 +105,28 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 			await postReceivePack(
 				app,
 				repo,
-				Buffer.concat([
-					encodePktLine(
-						Buffer.from(`${ZERO} ${base} refs/heads/r1\0report-status\n`, "utf8"),
-					),
-					Buffer.from("0000"),
+				receivePackRequest(
+					[`${ZERO} ${base} refs/heads/r1\0report-status\n`],
 					(
 						await spawnGit(["pack-objects", "--stdout", "--revs"], {
 							cwd: src,
 							input: `${base}\n`,
 						})
 					).stdoutBytes,
-				]),
+				),
 			)
 			await postReceivePack(
 				app,
 				repo,
-				Buffer.concat([
-					encodePktLine(
-						Buffer.from(`${ZERO} ${base} refs/heads/r2\0report-status\n`, "utf8"),
-					),
-					Buffer.from("0000"),
+				receivePackRequest(
+					[`${ZERO} ${base} refs/heads/r2\0report-status\n`],
 					(
 						await spawnGit(["pack-objects", "--stdout", "--revs"], {
 							cwd: src,
 							input: `${base}\n`,
 						})
 					).stdoutBytes,
-				]),
+				),
 			)
 
 			// Batch A locks r1 then r2; batch B locks r2 then r1 — opposite order.
@@ -157,14 +135,13 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 				{ new: tips.a2, old: base },
 				packA,
 			)
-			const bodyB = Buffer.concat([
-				encodePktLine(
-					Buffer.from(`${base} ${tips.b2} refs/heads/r2\0report-status atomic\n`, "utf8"),
-				),
-				encodePktLine(Buffer.from(`${base} ${tips.b1} refs/heads/r1\n`, "utf8")),
-				Buffer.from("0000"),
+			const bodyB = receivePackRequest(
+				[
+					`${base} ${tips.b2} refs/heads/r2\0report-status atomic\n`,
+					`${base} ${tips.b1} refs/heads/r1\n`,
+				],
 				packB,
-			])
+			)
 
 			const [resA, resB] = await Promise.all([
 				postReceivePack(app, repo, bodyA),
@@ -172,7 +149,7 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 			])
 
 			for (const r of [resA, resB]) {
-				if (r.status === 500 || r.text.includes("internal server error")) saw500 = true
+				if (r.status === 500 || r.body.includes("internal server error")) saw500 = true
 			}
 			// The contention signal: one response rejecting the WHOLE batch in-band.
 			// Both batches move the same two refs off `base`, so a loser is inevitable
@@ -180,7 +157,7 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 			if (
 				[resA, resB].some(
 					(r) =>
-						r.text.includes("ng refs/heads/r1") && r.text.includes("ng refs/heads/r2"),
+						r.body.includes("ng refs/heads/r1") && r.body.includes("ng refs/heads/r2"),
 				)
 			) {
 				contended++

@@ -14,13 +14,13 @@
  * a new rule learned the hard way still belongs here, by name.
  */
 import { describe, expect, it } from "vitest"
-import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import {
 	handleReceivePack,
 	type ReceiveBackend,
 	refNameProblem,
 } from "@/protocol/receive-pack"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
+import { receivePackRequest } from "@/testing/wire-receive"
 
 const A = "a".repeat(40)
 const Z = "0".repeat(40)
@@ -82,12 +82,9 @@ function recordingReceive(existing: string[] = []) {
 }
 
 function push(...lines: string[]): Buffer {
-	return Buffer.concat([
-		...lines.map((l, i) =>
-			encodePktLine(Buffer.from(i === 0 ? `${l}\0report-status` : l)),
-		),
-		encodePkt({ type: "flush" }),
-	])
+	const [first, ...rest] = lines
+	if (first === undefined) throw new Error("push requires at least one command")
+	return receivePackRequest([`${first}\0report-status`, ...rest])
 }
 
 describe("handleReceivePack — funny names get per-ref ng, never a ref", () => {

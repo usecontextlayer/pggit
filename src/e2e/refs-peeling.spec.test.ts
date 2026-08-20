@@ -17,6 +17,12 @@ import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
+function requireRef(byName: Map<string, RefRow>, name: string): RefRow {
+	const ref = byName.get(name)
+	if (ref === undefined) throw new Error(`listRefs omitted ${name}`)
+	return ref
+}
+
 describe("peeled_oid at ref-write", () => {
 	let db: IsolatedDb
 	let dir = ""
@@ -70,15 +76,15 @@ describe("peeled_oid at ref-write", () => {
 
 	it("listRefs peels annotated tags (incl. tag-of-tag) to their commit, leaving branches/lightweight tags unpeeled", async () => {
 		const byName = new Map((await refs.listRefs("repo")).map((r: RefRow) => [r.name, r]))
-		expect(byName.get("refs/heads/main")?.peeled).toBeUndefined()
-		expect(byName.get("refs/tags/lv")?.peeled).toBeUndefined()
-		expect(byName.get("refs/tags/av")?.peeled).toBe(c1)
-		expect(byName.get("refs/tags/av2")?.peeled).toBe(c1)
+		expect(requireRef(byName, "refs/heads/main").peeled).toBeUndefined()
+		expect(requireRef(byName, "refs/tags/lv").peeled).toBeUndefined()
+		expect(requireRef(byName, "refs/tags/av").peeled).toBe(c1)
+		expect(requireRef(byName, "refs/tags/av2").peeled).toBe(c1)
 	})
 
 	it("peels a tag chain deeper than any fixed cap (git imposes no peel-depth limit)", async () => {
 		const byName = new Map((await refs.listRefs("repo")).map((r: RefRow) => [r.name, r]))
-		expect(byName.get("refs/tags/deep17")?.peeled).toBe(c1)
+		expect(requireRef(byName, "refs/tags/deep17").peeled).toBe(c1)
 	})
 
 	it("ls-refs emits `peeled:` only for annotated tags", async () => {

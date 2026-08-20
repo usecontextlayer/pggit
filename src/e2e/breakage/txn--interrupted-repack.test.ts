@@ -40,6 +40,11 @@ import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const RUNS = 400 // ~3.4k objects => several WRITE_BATCH flushes per pass
 /** Flush boundaries to die on. Each is < the pass's flush count at this scale, so
@@ -112,7 +117,7 @@ async function coverageViolations(db: IsolatedDb): Promise<string[]> {
 }
 
 /** What one clone of the served repo observed. */
-type CloneVerdict = { fsck: string; identical: boolean }
+type CloneVerdict = TestResult<{ fsckOutput: string; identical: boolean }>
 
 type KillOutcome = {
 	killAt: number
@@ -150,17 +155,14 @@ describe("repack × crash — an interrupted pass and what it leaves behind", ()
 		}
 
 		async function cloneVerdict(url: string, dest: string): Promise<CloneVerdict> {
-			try {
+			return captureTestResult(async () => {
 				await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 				const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-				const out = `${fsck.stdout}${fsck.stderr}`.trim()
 				return {
-					fsck: out || "clean",
+					fsckOutput: `${fsck.stdout}${fsck.stderr}`.trim(),
 					identical: (await allObjectOids(dest)).join() === srcOids.join(),
 				}
-			} catch (err) {
-				return { fsck: `*** CLONE FAILED: ${(err as Error).message}`, identical: false }
-			}
+			})
 		}
 
 		// Reference: one uninterrupted pass, for the convergence check (I6).
@@ -242,8 +244,12 @@ describe("repack × crash — an interrupted pass and what it leaves behind", ()
 
 	it("I5: a clone from the HALF-BUILT tier is fsck-clean and object-identical", () => {
 		for (const o of outcomes) {
-			expect(o.halfBuilt.fsck, `kill@${o.killAt}`).toBe("clean")
-			expect(o.halfBuilt.identical, `kill@${o.killAt}`).toBe(true)
+			const at = `kill@${o.killAt}`
+			expect(o.halfBuilt.kind, testResultContext(o.halfBuilt, at)).toBe("succeeded")
+			if (o.halfBuilt.kind === "succeeded") {
+				expect(o.halfBuilt.value.fsckOutput, at).toBe("")
+				expect(o.halfBuilt.value.identical, at).toBe(true)
+			}
 		}
 	}, 300_000)
 
@@ -256,8 +262,12 @@ describe("repack × crash — an interrupted pass and what it leaves behind", ()
 
 	it("I5: a clone after the resume is fsck-clean and object-identical", () => {
 		for (const o of outcomes) {
-			expect(o.resumed.fsck, `kill@${o.killAt}`).toBe("clean")
-			expect(o.resumed.identical, `kill@${o.killAt}`).toBe(true)
+			const at = `kill@${o.killAt}`
+			expect(o.resumed.kind, testResultContext(o.resumed, at)).toBe("succeeded")
+			if (o.resumed.kind === "succeeded") {
+				expect(o.resumed.value.fsckOutput, at).toBe("")
+				expect(o.resumed.value.identical, at).toBe(true)
+			}
 		}
 	}, 300_000)
 

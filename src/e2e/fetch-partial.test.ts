@@ -120,9 +120,10 @@ describe("M1 — blobless partial clone (real git)", () => {
 				})),
 			)
 			const initial = packs.find((p) => p.oids.includes(tip))
-			expect(initial, "no pack in the clone carries the tip commit").toBeDefined()
+			if (initial === undefined)
+				throw new Error("no pack in the clone carries the tip commit")
 			expect(
-				srcBlobs.filter((oid) => initial?.oids.includes(oid)),
+				srcBlobs.filter((oid) => initial.oids.includes(oid)),
 				"the initial fetch shipped blobs — `blob:none` was not honored",
 			).toEqual([])
 			const headBlobs = parseLsTree(

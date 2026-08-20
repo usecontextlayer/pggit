@@ -30,12 +30,16 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { inflateSync } from "node:zlib"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { applyDelta } from "@/pack/delta"
-import { type GitServer, serveOnPort } from "@/server"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/fidelity"
@@ -166,9 +170,10 @@ describe("pg-corrupt — byte fidelity through ingest, derive, and serve", () =>
 			`  mined oid leads: ${[...minedOids.values()].map((o) => o.slice(0, 2)).join(" ")}`,
 		)
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		url = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		url = repoUrl(server, REPO)
 
 		await spawnGit(["push", "-q", url, "refs/heads/main:refs/heads/main"], { cwd: src })
 		const r = await createRepack(db.sql).repack(REPO)
@@ -248,8 +253,7 @@ describe("pg-corrupt — byte fidelity through ingest, derive, and serve", () =>
 	}, 1_800_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of dirs) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -299,11 +303,7 @@ describe("pg-corrupt — byte fidelity through ingest, derive, and serve", () =>
 		// The mined-oid blobs, read out of the clone's object store by oid.
 		const lost: string[] = []
 		for (const [fname, oid] of minedOids) {
-			const got = (
-				await spawnGit(["cat-file", "blob", oid], { cwd: dest }).catch((e: unknown) => ({
-					stdoutBytes: Buffer.from(`<unreadable: ${String(e)}>`),
-				}))
-			).stdoutBytes
+			const got = (await spawnGit(["cat-file", "blob", oid], { cwd: dest })).stdoutBytes
 			if (!got.equals(readFileSync(join(src, fname)))) {
 				lost.push(`mined-oid blob ${oid} (${fname}) did not survive the round-trip`)
 			}

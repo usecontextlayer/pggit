@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 describe("spawnGit", () => {
 	it("runs git and captures stdout + exit code", async () => {
@@ -15,6 +15,17 @@ describe("spawnGit", () => {
 		await expect(spawnGit(["totally-not-a-git-command"])).rejects.toThrow(
 			/totally-not-a-git-command/,
 		)
+	})
+
+	it("returns named success and ordinary nonzero outcomes when failure is data", async () => {
+		expect(await attemptGit(["--version"])).toEqual(
+			expect.objectContaining({ code: 0, ok: true }),
+		)
+		const failed = await attemptGit(["totally-not-a-git-command"])
+		expect(failed.ok).toBe(false)
+		if (failed.ok) throw new Error("attemptGit unexpectedly succeeded")
+		expect(failed.code).toBeGreaterThan(0)
+		expect(failed.stderr).toContain("totally-not-a-git-command")
 	})
 
 	it("rejects when the git child is killed by a signal", async () => {

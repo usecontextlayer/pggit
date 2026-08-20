@@ -23,7 +23,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import type { GitObjectType } from "@/object/object"
+import type { PackInputObject } from "@/pack/write-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
@@ -34,9 +34,18 @@ import {
 	createAppendOnlyRepo,
 	RUNS_DIR,
 } from "@/testing/append-only-repo"
-import { seedRepoIntoStore } from "@/testing/git-fixtures"
+import {
+	objectsByType,
+	parseRevListObjectOids,
+	seedRepoIntoStore,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "r"
 const RUNS = 150
@@ -79,8 +88,8 @@ async function tierViolations(db: IsolatedDb): Promise<string[]> {
 }
 
 /** A mirror clone of the served repo, judged by canonical git. */
-async function cloneVerdict(port: number, dest: string): Promise<string> {
-	try {
+async function cloneVerdict(port: number, dest: string): Promise<TestResult<string>> {
+	return captureTestResult(async () => {
 		await spawnGit([
 			"-c",
 			"protocol.version=2",
@@ -91,25 +100,30 @@ async function cloneVerdict(port: number, dest: string): Promise<string> {
 			dest,
 		])
 		const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-		return `${fsck.stdout}${fsck.stderr}`.trim() || "clean"
-	} catch (err) {
-		return `*** FAILED: ${(err as Error).message.slice(0, 200)}`
-	}
+		return `${fsck.stdout}${fsck.stderr}`.trim()
+	})
 }
 
 const settled = (r: PromiseSettledResult<unknown>): string =>
-	r.status === "fulfilled"
-		? JSON.stringify(r.value)
-		: `THREW ${(r.reason as Error).message}`
+	r.status === "fulfilled" ? JSON.stringify(r.value) : `THREW ${String(r.reason)}`
 
-type ScenarioOutcome = { notes: string[]; clone: string; violations: string[] }
+const cloneNote = (result: TestResult<string>): string =>
+	result.kind === "succeeded"
+		? `succeeded with output ${JSON.stringify(result.value)}`
+		: `failed: ${String(result.error)}`
+
+type ScenarioOutcome = {
+	notes: string[]
+	clone: TestResult<string>
+	violations: string[]
+}
 
 describe("repack × GC × clone — overlapping actors on one repo", () => {
 	let pgBaseUrl = ""
 	let src = ""
 	let root = ""
 	let forkTip = ""
-	const forkOnly: { type: GitObjectType; content: Buffer }[] = []
+	const forkOnly: PackInputObject[] = []
 
 	beforeAll(async () => {
 		pgBaseUrl = inject("pgBaseUrl")
@@ -144,11 +158,12 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 		const list = await spawnGit(["rev-list", "--objects", forkTip, `^${forkBase}`], {
 			cwd: fork,
 		})
-		for (const line of list.stdout.trim().split("\n").filter(Boolean)) {
-			const oid = line.slice(0, 40)
-			const type = (
-				await spawnGit(["cat-file", "-t", oid], { cwd: fork })
-			).stdout.trim() as GitObjectType
+		const typeByOid = new Map(
+			(await objectsByType(fork)).map((object) => [object.oid, object.type]),
+		)
+		for (const oid of parseRevListObjectOids(list.stdout)) {
+			const type = typeByOid.get(oid)
+			if (type === undefined) throw new Error(`git object inventory omitted ${oid}`)
 			forkOnly.push({
 				content: (await spawnGit(["cat-file", type, oid], { cwd: fork })).stdoutBytes,
 				type,
@@ -166,7 +181,7 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 	async function scenario(
 		body: (ctx: { db: IsolatedDb; port: number; refs: RefStore }) => Promise<{
 			notes: string[]
-			clone: string
+			clone: TestResult<string>
 		}>,
 	): Promise<ScenarioOutcome> {
 		const db = await createIsolatedSchema(pgBaseUrl)
@@ -193,7 +208,8 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 	function expectSound(name: string, o: ScenarioOutcome): void {
 		const context = `${name}\n  ${o.notes.join("\n  ")}`
 		expect(o.violations, context).toEqual([])
-		expect(o.clone, context).toBe("clean")
+		expect(o.clone.kind, testResultContext(o.clone, context)).toBe("succeeded")
+		if (o.clone.kind === "succeeded") expect(o.clone.value, context).toBe("")
 	}
 
 	it("S1 repack || repack — the tier stays sound and the repo still clones", async () => {
@@ -205,7 +221,11 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 			const clone = await cloneVerdict(port, join(root, "s1"))
 			return {
 				clone,
-				notes: [`pass A: ${settled(a)}`, `pass B: ${settled(b)}`, `clone: ${clone}`],
+				notes: [
+					`pass A: ${settled(a)}`,
+					`pass B: ${settled(b)}`,
+					`clone: ${cloneNote(clone)}`,
+				],
 			}
 		})
 		expectSound("S1 repack || repack", outcome)
@@ -222,7 +242,11 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 			const clone = await cloneVerdict(port, join(root, "s2"))
 			return {
 				clone,
-				notes: [`repack: ${settled(a)}`, `gc: ${settled(b)}`, `clone: ${clone}`],
+				notes: [
+					`repack: ${settled(a)}`,
+					`gc: ${settled(b)}`,
+					`clone: ${cloneNote(clone)}`,
+				],
 			}
 		})
 		expectSound("S2 repack || gc", outcome)
@@ -237,11 +261,19 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 				createRepack(db.sql).repack(REPO),
 				createGc(db.sql).gc(REPO, { graceSeconds: 0, maintain: false }),
 			])
-			// `cloneVerdict` never rejects — it reports its own failure as the verdict.
-			const clone = c.status === "fulfilled" ? c.value : `THREW ${String(c.reason)}`
+			// `cloneVerdict` normally fulfills with a retained result; preserve an
+			// unexpected wrapper rejection as the same explicit failed state.
+			const clone: TestResult<string> =
+				c.status === "fulfilled"
+					? c.value
+					: { error: c.reason as unknown, kind: "failed" }
 			return {
 				clone,
-				notes: [`clone: ${settled(c)}`, `repack: ${settled(a)}`, `gc: ${settled(b)}`],
+				notes: [
+					`clone: ${cloneNote(clone)}`,
+					`repack: ${settled(a)}`,
+					`gc: ${settled(b)}`,
+				],
 			}
 		})
 		expectSound("S3 clone || repack || gc", outcome)

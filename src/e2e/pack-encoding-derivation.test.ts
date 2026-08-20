@@ -87,8 +87,9 @@ describe("repack — derivation of the encoding tier", () => {
 					where e.repo_id = ${id}::bigint and not exists (
 						select 1 from git_object o
 						where o.repo_id = e.repo_id and o.oid = e.oid))::text as orphans`
-		expect(counts?.encodings).toBe(counts?.objects)
-		expect(counts?.orphans).toBe("0")
+		if (counts === undefined) throw new Error("inventory count query returned no row")
+		expect(counts.encodings).toBe(counts.objects)
+		expect(counts.orphans).toBe("0")
 	})
 
 	it("resolves every encoding back to canonical bytes, with an honest data_size", async () => {
@@ -123,8 +124,9 @@ describe("repack — derivation of the encoding tier", () => {
 						and not exists (
 							select 1 from git_pack_encoding b
 							where b.repo_id = d.repo_id and b.oid = d.base_oid))::text as baseless`
-		expect(violations?.chained).toBe("0") // a delta whose base is itself a delta = a chain
-		expect(violations?.baseless).toBe("0") // a delta whose base has no encoding at all
+		if (violations === undefined) throw new Error("star-invariant query returned no row")
+		expect(violations.chained).toBe("0") // a delta whose base is itself a delta = a chain
+		expect(violations.baseless).toBe("0") // a delta whose base has no encoding at all
 	})
 
 	it("actually compresses the trees — deltified bytes well under whole bytes", async () => {
@@ -141,8 +143,9 @@ describe("repack — derivation of the encoding tier", () => {
 			from git_pack_encoding e
 				join git_object o on o.repo_id = e.repo_id and o.oid = e.oid
 			where e.repo_id = ${id}::bigint and o.type = 2`
-		expect(Number(stored?.bytes)).toBeGreaterThan(0)
-		expect(Number(stored?.bytes)).toBeLessThan(wholeTrees / 2)
+		if (stored === undefined) throw new Error("stored-byte query returned no row")
+		expect(Number(stored.bytes)).toBeGreaterThan(0)
+		expect(Number(stored.bytes)).toBeLessThan(wholeTrees / 2)
 	})
 
 	it("is idempotent: a second pass writes nothing and changes nothing", async () => {

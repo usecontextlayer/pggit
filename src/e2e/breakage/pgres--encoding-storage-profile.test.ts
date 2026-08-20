@@ -280,7 +280,8 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 		const cols = await dataColumnStorage()
 		const parent = cols.find((c) => c.relkind === "p")
 		const leaves = cols.filter((c) => c.relkind === "r")
-		expect(parent?.attstorage).toBe("e") // 'e' = EXTERNAL: out of line, UNCOMPRESSED
+		if (parent === undefined) throw new Error("catalog omitted git_pack_encoding parent")
+		expect(parent.attstorage).toBe("e") // 'e' = EXTERNAL: out of line, UNCOMPRESSED
 		expect(leaves.length).toBeGreaterThan(0)
 		expect(
 			leaves.filter((l) => l.attstorage !== "e").map((l) => l.relname),
@@ -312,11 +313,14 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 		// bites: unset means the reclaim is throttled at the instance's cost_delay.
 		const [gd] = await db.sql<{ setting: string }[]>`
 			select setting from pg_settings where name = 'autovacuum_vacuum_cost_delay'`
+		if (gd === undefined) {
+			throw new Error("pg_settings omitted autovacuum_vacuum_cost_delay")
+		}
 
 		expect(obj.size).toBeGreaterThan(0) // the comparator itself must exist
 		expect(
 			missing,
-			`reloptions on git_object_p0 but MISSING on git_pack_encoding_p0 (instance autovacuum_vacuum_cost_delay = ${gd?.setting}ms applies where unset); keys only on the encoding leaf: ${
+			`reloptions on git_object_p0 but MISSING on git_pack_encoding_p0 (instance autovacuum_vacuum_cost_delay = ${gd.setting}ms applies where unset); keys only on the encoding leaf: ${
 				[...enc].filter((k) => !obj.has(k)).join(", ") || "(none)"
 			}`,
 		).toEqual([])
@@ -366,13 +370,15 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 		const [big] = await db.sql<{ bytes: string; n: string }[]>`
 			select coalesce(sum(octet_length(data)), 0)::text as bytes, count(*)::text as n
 			from git_pack_encoding where octet_length(data) > 2000`
-		if (big === undefined) throw new Error("oversize encoding aggregate returned no row")
+		if (d === undefined || big === undefined) {
+			throw new Error("encoding size aggregate returned no row")
+		}
 		const bigBytes = Number(big.bytes)
 
 		const evidence =
 			`narrow: ${narrow.rows} rows, ${narrow.data}B deflated, heap ${narrow.heap}B / TOAST ${narrow.toast}B / idx ${narrow.idx}B · ` +
 			`wide: ${wide.rows - narrow.rows} rows, ${wideData}B deflated, heap ${wideHeap}B / TOAST ${wideToast}B · ` +
-			`sizes p50=${d?.p50}B p99=${d?.p99}B max=${d?.maxv}B rows>2KB=${d?.over2k}`
+			`sizes p50=${d.p50}B p99=${d.p99}B max=${d.maxv}B rows>2KB=${d.over2k}`
 
 		// The fixture precondition the source probe used as its FAIL gate: without a
 		// megabyte of oversize rows the placement check would be vacuous.

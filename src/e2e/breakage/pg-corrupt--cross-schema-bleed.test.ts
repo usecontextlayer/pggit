@@ -34,13 +34,17 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { parseRevListObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** IDENTICAL on both sides — so both schemas mint the same `repos.id`. */
@@ -83,15 +87,14 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 
 	async function makeSide(tag: string): Promise<Side> {
 		const { dir, tip } = await buildSource(tag)
-		const db = await createIsolatedSchema(inject("pgBaseUrl"))
-		const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+		const { db, server } = await setupGitServerFixture()
 		return {
 			db,
 			server,
 			src: dir,
 			tag,
 			tip,
-			url: `http://127.0.0.1:${server.port}/${REPO}`,
+			url: repoUrl(server, REPO),
 		}
 	}
 
@@ -147,8 +150,7 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 
 	afterAll(async () => {
 		for (const s of sides) {
-			await s.server.close()
-			await s.db.drop()
+			await teardownGitServerFixture(s)
 		}
 		for (const d of dirs) rmSync(d, { force: true, recursive: true })
 	})

@@ -20,7 +20,11 @@ import { createGitApp, createGitDeps, type GitDeps } from "@/index"
 import { readPack } from "@/pack/read-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids, parseVerifyPackObjects } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	parseRevListObjectOids,
+	parseVerifyPackObjects,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
@@ -69,7 +73,8 @@ describe("thin-pack serve — external bases only when negotiated", () => {
 		// stored-delta serve path has its own suites (pack-encoding-serve).
 		const [encRow] = await db.sql<{ n: string }[]>`
 			select count(*)::text as n from git_pack_encoding`
-		if (encRow?.n !== "0") throw new Error("fixture expects an empty encoding tier")
+		if (encRow === undefined) throw new Error("encoding-tier count query returned no row")
+		if (encRow.n !== "0") throw new Error("fixture expects an empty encoding tier")
 	}, 600_000)
 
 	afterAll(async () => {
@@ -208,13 +213,13 @@ describe("thin-pack serve — external bases only when negotiated", () => {
 		const fetched = (await allObjectOids(client)).filter((o) => !before.has(o))
 
 		// The expected transfer, from git itself on the source repo.
-		const expected = (
-			await spawnGit(["rev-list", "--objects", newTip, `^${oldTip}`], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((l) => l.slice(0, 40))
+		const expected = parseRevListObjectOids(
+			(
+				await spawnGit(["rev-list", "--objects", newTip, `^${oldTip}`], {
+					cwd: src,
+				})
+			).stdout,
+		)
 		expect(fetched.sort()).toEqual(expected.sort())
 	})
 })

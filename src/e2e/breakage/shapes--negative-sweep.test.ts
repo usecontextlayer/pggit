@@ -25,13 +25,17 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import { createRepack, type Repack } from "@/store/repack"
 import { parseVerifyPackObjects } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 /** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
@@ -96,7 +100,9 @@ async function servedDeltaCount(dir: string): Promise<number> {
 	let deltas = 0
 	for (const file of indexes) {
 		const out = await spawnGit(["verify-pack", "-v", join(packDir, file)], { cwd: dir })
-		deltas += parseVerifyPackObjects(out.stdout).filter((object) => object.delta).length
+		deltas += parseVerifyPackObjects(out.stdout).filter(
+			(object) => object.kind === "delta",
+		).length
 	}
 	return deltas
 }
@@ -893,15 +899,15 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 	let gc: Gc
 
 	beforeAll(async () => {
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
 		repack = createRepack(db.sql)
 		gc = createGc(db.sql)
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 	})
 
 	/**
@@ -940,7 +946,7 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: ctl })
 			const ctlObjs = await objectList(ctl)
 
-			const url = `http://127.0.0.1:${server.port}/${name}`
+			const url = repoUrl(server, name)
 			await spawnGit(["push", "-q", url, ...PUSH_REFSPECS], { cwd: src })
 
 			const pre = join(mk(`${name}-pre`), "c.git")

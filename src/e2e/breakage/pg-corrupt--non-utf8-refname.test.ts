@@ -29,10 +29,14 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/badref"
@@ -123,9 +127,10 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 		oracleRefs = refLines((await spawnGit(["show-ref"], { cwd: oracleDir })).stdoutBytes)
 
 		// ── SUBJECT: pggit rejects the same push at the boundary. ─────────────────
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const url = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		const url = repoUrl(server, REPO)
 
 		push = await attemptGit(["push", url, "refs/heads/*:refs/heads/*"], src)
 
@@ -163,7 +168,7 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 			cwd: solo,
 			input: createRefStdin(REF_E9, sc),
 		})
-		const soloUrl = `http://127.0.0.1:${server.port}/${SOLO_REPO}`
+		const soloUrl = repoUrl(server, SOLO_REPO)
 		soloPush = await attemptGit(["push", soloUrl, "refs/heads/*:refs/heads/*"], solo)
 		const soloRows = await db.sql<{ h: string }[]>`
 			select encode(convert_to(g.name, 'UTF8'), 'hex') as h
@@ -173,8 +178,7 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 	}, 300_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of dirs) rmSync(d, { force: true, recursive: true })
 	})
 

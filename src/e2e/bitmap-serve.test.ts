@@ -31,7 +31,7 @@ import {
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { allObjectOids, parseRevListObjectOids } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "epoch/serve"
@@ -137,14 +137,9 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 
 	it("a single-branch fetch (want subset of tips) is unchanged by the drain", async () => {
 		const oids = await fetchOneOids("refs/heads/side:refs/heads/side")
-		const expected = (
-			await spawnGit(["rev-list", "--objects", "side"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((l) => l.slice(0, 40))
-			.sort()
+		const expected = parseRevListObjectOids(
+			(await spawnGit(["rev-list", "--objects", "side"], { cwd: src })).stdout,
+		).sort()
 		expect(oids).toEqual(expected)
 	})
 
@@ -155,14 +150,9 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 		await spawnGit(["push", "-q", url, "main"], { cwd: src })
 
 		const got = await cloneOids()
-		const expected = (
-			await spawnGit(["rev-list", "--objects", "--all"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((l) => l.slice(0, 40))
-			.sort()
+		const expected = parseRevListObjectOids(
+			(await spawnGit(["rev-list", "--objects", "--all"], { cwd: src })).stdout,
+		).sort()
 		expect(got).toEqual(expected)
 	})
 
@@ -178,14 +168,9 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 		await spawnGit(["checkout", "-q", "main"], { cwd: src })
 
 		const oids = await fetchOneOids("refs/heads/forked:refs/heads/forked")
-		const expected = (
-			await spawnGit(["rev-list", "--objects", "forked"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((l) => l.slice(0, 40))
-			.sort()
+		const expected = parseRevListObjectOids(
+			(await spawnGit(["rev-list", "--objects", "forked"], { cwd: src })).stdout,
+		).sort()
 		expect(oids).toEqual(expected)
 	})
 
@@ -219,16 +204,13 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 			.map((l) => l.slice(1, 41))
 		expect(blobs.length).toBeGreaterThan(0)
 		for (const b of blobs) expect(filtered).not.toContain(b)
-		const commitsAndTrees = (
-			await spawnGit(["rev-list", "--objects", "--filter=blob:none", "--all"], {
-				cwd: src,
-			})
-		).stdout
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((l) => l.slice(0, 40))
-			.sort()
+		const commitsAndTrees = parseRevListObjectOids(
+			(
+				await spawnGit(["rev-list", "--objects", "--filter=blob:none", "--all"], {
+					cwd: src,
+				})
+			).stdout,
+		).sort()
 		for (const o of commitsAndTrees) expect(filtered).toContain(o)
 	})
 
@@ -245,14 +227,9 @@ describe("bitmap-served fetches (chunk 5b)", () => {
 		await spawnGit(["checkout", "-q", "main"], { cwd: src })
 
 		const bare = await fetchOneOids("refs/heads/atbase:refs/heads/atbase")
-		const expected = (
-			await spawnGit(["rev-list", "--objects", "atbase"], { cwd: src })
-		).stdout
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((l) => l.slice(0, 40))
-			.sort()
+		const expected = parseRevListObjectOids(
+			(await spawnGit(["rev-list", "--objects", "atbase"], { cwd: src })).stdout,
+		).sort()
 		expect(bare).toEqual(expected)
 		const v1Oid = (
 			await spawnGit(["rev-parse", "refs/tags/v1"], { cwd: src })

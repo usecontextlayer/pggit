@@ -42,6 +42,14 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		await teardownGcFixture(fx)
 	})
 
+	async function pushedAt(repo: string): Promise<Date> {
+		const state = await repoGcState(fx.db, repo)
+		if (state.kind !== "pushed-never-drained") {
+			throw new Error(`expected pushed, undrained repo ${repo}; got ${state.kind}`)
+		}
+		return state.pushedAt
+	}
+
 	// SCH-1 — Any storage mutation stamps activity. A never-pushed repo's
 	// `last_pushed_at` is NULL; the first push (create) makes it non-null; a
 	// fast-forward update and a store-level rewind each strictly advance it. Pins
@@ -51,14 +59,12 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 	it("SCH-1: a create push, a fast-forward push, and a store rewind each stamp/advance last_pushed_at", async () => {
 		const repo = "sch1-activity"
 
-		// Never pushed → no activity recorded yet (row absent or column unset; the
-		// helper returns null for both). This is the NULL baseline SCH-5 keys off.
-		expect((await repoGcState(fx.db, repo)).lastPushedAt).toBeNull()
+		// Never pushed → no repo row and therefore no activity recorded yet.
+		expect(await repoGcState(fx.db, repo)).toEqual({ kind: "absent" })
 
 		// First push (create): the column becomes non-null.
 		await pushFile(fx, repo, { content: "first\n" })
-		const afterCreate = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(afterCreate).not.toBeNull()
+		const afterCreate = await pushedAt(repo)
 
 		// Fast-forward update: build a real descendant of the current tip by fetching
 		// it back, committing on top, and pushing the (fast-forward) child. A ff push
@@ -78,17 +84,15 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		} finally {
 			rmSync(ffDir, { force: true, recursive: true })
 		}
-		const afterFf = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(afterFf).not.toBeNull()
-		expect((afterFf as Date).getTime()).toBeGreaterThan((afterCreate as Date).getTime())
+		const afterFf = await pushedAt(repo)
+		expect(afterFf.getTime()).toBeGreaterThan(afterCreate.getTime())
 
 		// A store-level rewind (the retired force-commit workload's internal twin):
 		// an independent root orphans the prior tip and re-stamps the column,
 		// strictly later than the ff stamp (applyRefUpdates stamps on mutation).
 		await pushFile(fx, repo, { content: "third (rewind)\n", rewind: true })
-		const afterRewind = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(afterRewind).not.toBeNull()
-		expect((afterRewind as Date).getTime()).toBeGreaterThan((afterFf as Date).getTime())
+		const afterRewind = await pushedAt(repo)
+		expect(afterRewind.getTime()).toBeGreaterThan(afterFf.getTime())
 	})
 
 	// SCH-2 — Delete is captured (and a DENIED wire delete is not). Create a second
@@ -115,8 +119,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		} finally {
 			rmSync(topicDir, { force: true, recursive: true })
 		}
-		const afterCreateTopic = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(afterCreateTopic).not.toBeNull()
+		const afterCreateTopic = await pushedAt(repo)
 
 		// A WIRE delete is denied outright now (deny-non-FF policy) and, being a
 		// pure refusal, must NOT advance the stamp.
@@ -129,7 +132,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		} finally {
 			rmSync(delDir, { force: true, recursive: true })
 		}
-		expect((await repoGcState(fx.db, repo)).lastPushedAt).toEqual(afterCreateTopic)
+		expect(await pushedAt(repo)).toEqual(afterCreateTopic)
 
 		// The STORE-level delete (the internal path a retired ref takes) is a ref
 		// update with no pack, no new object — and must still stamp activity.
@@ -147,11 +150,8 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 
 		// The delete still moved the stamp forward (it is a storage mutation: a ref
 		// disappeared, orphaning its commit). Strictly greater than the create.
-		const afterDelete = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(afterDelete).not.toBeNull()
-		expect((afterDelete as Date).getTime()).toBeGreaterThan(
-			(afterCreateTopic as Date).getTime(),
-		)
+		const afterDelete = await pushedAt(repo)
+		expect(afterDelete.getTime()).toBeGreaterThan(afterCreateTopic.getTime())
 	})
 
 	// SCH-1 (negative) — a no-op ref op leaves `last_pushed_at` UNCHANGED. The §6
@@ -168,8 +168,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		const zero = "0".repeat(40)
 
 		await pushFile(fx, repo, { content: "seed\n" })
-		const before = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(before).not.toBeNull()
+		const before = await pushedAt(repo)
 
 		// Unconditional delete (zero old-oid) of a ref that was never created: a
 		// no-op success that mutates no storage.
@@ -181,8 +180,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		expect(results).toEqual([true])
 
 		// The stamp must be byte-identical: a non-mutating op records no activity.
-		const after = (await repoGcState(fx.db, repo)).lastPushedAt
-		expect(after).not.toBeNull()
-		expect((after as Date).getTime()).toBe((before as Date).getTime())
+		const after = await pushedAt(repo)
+		expect(after.getTime()).toBe(before.getTime())
 	})
 })

@@ -136,20 +136,21 @@ describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", (
 
 		// Before any drain: pushed (eligible), never GC'd.
 		const beforeDrain = await repoGcState(fx.db, repo)
-		expect(beforeDrain.lastPushedAt).not.toBeNull()
-		expect(beforeDrain.lastGcAt).toBeNull()
+		if (beforeDrain.kind !== "pushed-never-drained") {
+			throw new Error(`expected pushed, undrained repo ${repo}; got ${beforeDrain.kind}`)
+		}
 
 		// First pass processes the repo and stamps last_gc_at.
 		const first = await sched.drainOnce()
 		expect(summaryRepos(first)).toContain(repo)
 
 		const afterDrain = await repoGcState(fx.db, repo)
-		expect(afterDrain.lastGcAt).not.toBeNull()
+		if (afterDrain.kind !== "pushed-and-drained") {
+			throw new Error(`expected drained repo ${repo}; got ${afterDrain.kind}`)
+		}
 		// The stamp advanced past the last_pushed_at that made the repo eligible, so
 		// the eligibility predicate (last_pushed_at > last_gc_at) is now false.
-		const lastPushedAt = beforeDrain.lastPushedAt as Date
-		const lastGcAt = afterDrain.lastGcAt as Date
-		expect(lastGcAt.getTime()).toBeGreaterThan(lastPushedAt.getTime())
+		expect(afterDrain.gcAt.getTime()).toBeGreaterThan(beforeDrain.pushedAt.getTime())
 
 		// Second pass with NO intervening push: the repo is no longer eligible, so the
 		// summary does not list it (self-terminating).
@@ -175,11 +176,8 @@ describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", (
 		expect(summaryRepos(drainOne)).toEqual([idleDrained])
 
 		// `idleNeverPushed` is created lazily in Postgres by a push, so to model a
-		// genuinely never-pushed repo we simply never push it: its row is absent and
-		// repoGcState reports both timestamps NULL.
-		const neverState = await repoGcState(fx.db, idleNeverPushed)
-		expect(neverState.lastPushedAt).toBeNull()
-		expect(neverState.lastGcAt).toBeNull()
+		// genuinely never-pushed repo we simply never push it: its row is absent.
+		expect(await repoGcState(fx.db, idleNeverPushed)).toEqual({ kind: "absent" })
 
 		// Now push the discriminating eligible repo so the pass has real work to do.
 		await pushFile(fx, eligible, { content: "fresh\n" })

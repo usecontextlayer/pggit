@@ -2,13 +2,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import {
-	commitTreeOid,
-	computeOid,
-	type GitObjectType,
-	treeEntries,
-} from "@/object/object"
+import { commitTreeOid, computeOid, treeEntries } from "@/object/object"
 import { expectGitFormatError } from "@/testing/format-error"
+import { requireGitObjectType } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** A well-formed tree entry: `<mode> <name>\0<20-byte oid>`. */
@@ -38,7 +34,12 @@ describe("computeOid", () => {
 				const [oid, type] = line.split(" ")
 				if (!oid || !type) throw new Error(`unexpected batch-check line: ${line}`)
 				const raw = await spawnGit(["cat-file", type, oid], { cwd: dir })
-				expect(computeOid(type as GitObjectType, raw.stdoutBytes)).toBe(oid)
+				expect(
+					computeOid(
+						requireGitObjectType(type, `batch-check line ${JSON.stringify(line)}`),
+						raw.stdoutBytes,
+					),
+				).toBe(oid)
 				typesSeen.add(type)
 			}
 			expect(typesSeen).toEqual(new Set(["blob", "tree", "commit", "tag"]))

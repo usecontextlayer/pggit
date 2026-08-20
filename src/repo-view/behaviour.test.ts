@@ -22,6 +22,14 @@ import { parseLsTree } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
+function requireOnly<T>(rows: T[], context: string): T {
+	const [row] = rows
+	if (row === undefined || rows.length !== 1) {
+		throw new Error(`${context}: expected exactly one row, got ${rows.length}`)
+	}
+	return row
+}
+
 // The EXTERNAL contract of the queryable file view, end to end: real `git push`
 // is the input; the documented SQL surface — `repo_file` joined to `git_object`
 // for content (resolving the wire repo name via `repos`) — is the read interface
@@ -155,9 +163,12 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			writeFileSync(join(dir, "f.txt"), "version one\n")
 			await commitAll(dir, "v1")
 			await push(dir, "modify", "HEAD:refs/heads/main")
-			expect((await queryFiles("modify", "refs/heads/main"))[0]?.content.toString()).toBe(
-				"version one\n",
-			)
+			expect(
+				requireOnly(
+					await queryFiles("modify", "refs/heads/main"),
+					"initial modify projection",
+				).content.toString(),
+			).toBe("version one\n")
 
 			writeFileSync(join(dir, "f.txt"), "version two\n")
 			await commitAll(dir, "v2")
@@ -165,9 +176,12 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			expect(await queryFiles("modify", "refs/heads/main")).toEqual(
 				await lsTreeFiles(dir, "HEAD"),
 			)
-			expect((await queryFiles("modify", "refs/heads/main"))[0]?.content.toString()).toBe(
-				"version two\n",
-			)
+			expect(
+				requireOnly(
+					await queryFiles("modify", "refs/heads/main"),
+					"updated modify projection",
+				).content.toString(),
+			).toBe("version two\n")
 		} finally {
 			rmSync(dir, { force: true, recursive: true })
 		}
@@ -288,7 +302,10 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			// store keeps history; the projection does not).
 			expect(await fileRowCount("rewrite", "refs/heads/main")).toBe(1)
 			expect(
-				(await queryFiles("rewrite", "refs/heads/main"))[0]?.content.toString(),
+				requireOnly(
+					await queryFiles("rewrite", "refs/heads/main"),
+					"rewritten projection",
+				).content.toString(),
 			).toBe("three\n")
 		} finally {
 			rmSync(dir, { force: true, recursive: true })
@@ -314,7 +331,9 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			expect(main.map((f) => f.path)).toEqual(["a.txt"])
 			expect(dev.map((f) => f.path)).toEqual(["b.txt"])
 			// Same content → same OID → both index rows point at one git_object blob.
-			expect(main[0]?.blobOid).toBe(dev[0]?.blobOid)
+			expect(requireOnly(main, "main projection").blobOid).toBe(
+				requireOnly(dev, "dev projection").blobOid,
+			)
 		} finally {
 			rmSync(dir, { force: true, recursive: true })
 		}

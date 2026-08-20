@@ -112,7 +112,7 @@ describe("packObjectCount", () => {
 			FLUSH,
 		])
 
-		expect(packObjectCount(response)).toBe(37)
+		expect(packObjectCount(response)).toEqual({ kind: "pack", objectCount: 37 })
 	})
 
 	it("does not mistake PACK bytes in protocol text or progress for a pack", () => {
@@ -126,7 +126,7 @@ describe("packObjectCount", () => {
 			FLUSH,
 		])
 
-		expect(packObjectCount(response)).toBeNull()
+		expect(packObjectCount(response)).toEqual({ kind: "no-pack" })
 	})
 })
 

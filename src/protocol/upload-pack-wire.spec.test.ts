@@ -142,10 +142,12 @@ describe("§8.1 upload-pack wire — surface 5: packfile section", () => {
 		const pack = Buffer.from([0x50, 0x41, 0x43, 0x4b, 0x00, 0x01, 0xff, 0x00])
 		const out = encodePackfileResponse(pack)
 		const { packets } = decodePktStream(out)
-		expect(
-			(packets[0] as { type: "data"; payload: Buffer }).payload.toString("utf8"),
-		).toBe("packfile\n")
-		expect(packets.at(-1)?.type).toBe("flush")
+		const [header] = packets
+		if (header?.type !== "data") throw new Error("packfile response omitted its header")
+		const tail = packets.at(-1)
+		if (tail === undefined) throw new Error("packfile response emitted no packets")
+		expect(header.payload.toString("utf8")).toBe("packfile\n")
+		expect(tail.type).toBe("flush")
 		expect(sidebandDemux(out).band1).toEqual(pack) // demux recovers the pack byte-identical
 	})
 

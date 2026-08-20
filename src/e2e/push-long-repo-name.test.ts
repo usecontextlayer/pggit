@@ -104,7 +104,9 @@ describe("nam03 — over-long incompressible repo name fails clean (in-band, ato
 		const rows = await db.sql<{ n: number }[]>`
 			SELECT count(*)::int AS n FROM repos WHERE name = ${longName}
 		`
-		expect(rows[0]?.n).toBe(0)
+		const [row] = rows
+		if (row === undefined) throw new Error("repo-count aggregate returned no row")
+		expect(row.n).toBe(0)
 	})
 
 	it("stays healthy: a normal short-named push afterward still succeeds and round-trips", async () => {

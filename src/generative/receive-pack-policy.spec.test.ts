@@ -101,16 +101,19 @@ type Draw =
 type Kind = Draw["k"]
 
 /** The two command kinds pggit denies as policy where canonical git applies them. */
-const DIVERGENT: Record<Kind, string | null> = {
-	clientRefused: null,
-	create: null,
-	deleteExisting: "deletion-denied",
-	deleteMissing: "deletion-denied",
-	dfExisting: null,
-	fastForward: null,
-	forceNonFF: "non-ff",
-	funnyTransmitted: null,
-	typedTip: null,
+type PolicyRelation = { kind: "matches-canonical" } | { kind: "denied"; reason: string }
+
+const MATCHES_CANONICAL = { kind: "matches-canonical" } as const
+const DIVERGENT: Record<Kind, PolicyRelation> = {
+	clientRefused: MATCHES_CANONICAL,
+	create: MATCHES_CANONICAL,
+	deleteExisting: { kind: "denied", reason: "deletion-denied" },
+	deleteMissing: { kind: "denied", reason: "deletion-denied" },
+	dfExisting: MATCHES_CANONICAL,
+	fastForward: MATCHES_CANONICAL,
+	forceNonFF: { kind: "denied", reason: "non-ff" },
+	funnyTransmitted: MATCHES_CANONICAL,
+	typedTip: MATCHES_CANONICAL,
 }
 
 /** NOTE for anyone editing this arbitrary: an `fc.record`'s KEY ORDER decides the
@@ -166,14 +169,16 @@ type Fixture = {
 }
 
 /** One materialized push command: exactly the argv token, its destination ref, the
- * value that lands if the command is applied (null = a deletion), and the corpus keys
+ * ref change if the command is applied, and the corpus keys
  * this command realizes (a `typedTip` proves nothing about the branch-tip rule unless
  * the corpus reached BOTH namespaces with all three object types). */
+type RefChange = { kind: "delete" } | { kind: "write"; oid: string }
+
 type Command = {
 	census: string[]
+	change: RefChange
 	dest: string
 	kind: Kind
-	newOid: string | null
 	refspec: string
 }
 
@@ -182,42 +187,42 @@ function materialize(draw: Draw, i: number, fx: Fixture): Command {
 		case "create":
 			return {
 				census: [draw.k],
+				change: { kind: "write", oid: fx.c },
 				dest: `refs/heads/created${i}`,
 				kind: draw.k,
-				newOid: fx.c,
 				refspec: `${fx.c}:refs/heads/created${i}`,
 			}
 		case "fastForward":
 			return {
 				census: [draw.k],
+				change: { kind: "write", oid: fx.c },
 				dest: `refs/heads/pre${i}`,
 				kind: draw.k,
-				newOid: fx.c,
 				refspec: `${fx.c}:refs/heads/pre${i}`,
 			}
 		case "forceNonFF":
 			return {
 				census: [draw.k],
+				change: { kind: "write", oid: fx.x },
 				dest: `refs/heads/pre${i}`,
 				kind: draw.k,
-				newOid: fx.x,
 				// `+` — without it the CLIENT refuses locally and the server never judges.
 				refspec: `+${fx.x}:refs/heads/pre${i}`,
 			}
 		case "deleteExisting":
 			return {
 				census: [draw.k],
+				change: { kind: "delete" },
 				dest: `refs/heads/pre${i}`,
 				kind: draw.k,
-				newOid: null,
 				refspec: `:refs/heads/pre${i}`,
 			}
 		case "deleteMissing":
 			return {
 				census: [draw.k],
+				change: { kind: "delete" },
 				dest: `refs/heads/ghost${i}`,
 				kind: draw.k,
-				newOid: null,
 				refspec: `:refs/heads/ghost${i}`,
 			}
 		case "typedTip": {
@@ -231,9 +236,9 @@ function materialize(draw: Draw, i: number, fx: Fixture): Command {
 							: assertNever(draw.obj)
 			return {
 				census: [`typedTip:${draw.ns}`, `tipObject:${draw.obj}`],
+				change: { kind: "write", oid },
 				dest: `refs/${draw.ns}/typed${i}`,
 				kind: draw.k,
-				newOid: oid,
 				refspec: `${oid}:refs/${draw.ns}/typed${i}`,
 			}
 		}
@@ -241,17 +246,17 @@ function materialize(draw: Draw, i: number, fx: Fixture): Command {
 		case "clientRefused":
 			return {
 				census: [draw.k],
+				change: { kind: "write", oid: fx.c },
 				dest: draw.name,
 				kind: draw.k,
-				newOid: fx.c,
 				refspec: `${fx.c}:${draw.name}`,
 			}
 		case "dfExisting":
 			return {
 				census: [draw.k],
+				change: { kind: "write", oid: fx.c },
 				dest: `refs/heads/dfbase${i}/sub`,
 				kind: draw.k,
-				newOid: fx.c,
 				refspec: `${fx.c}:refs/heads/dfbase${i}/sub`,
 			}
 	}
@@ -259,7 +264,7 @@ function materialize(draw: Draw, i: number, fx: Fixture): Command {
 }
 
 /** `git push --porcelain` per-ref verdict, reduced to what is contractual. */
-type Verdict = { klass: string; ok: boolean }
+type Verdict = { kind: "accepted" } | { kind: "rejected"; reason: string }
 
 /**
  * The rejection REASON, as a class. The two remotes word the same policy differently
@@ -320,15 +325,29 @@ function parsePorcelain(stdout: string): Map<string, Verdict> {
 		if (verdicts.has(dest)) {
 			throw new Error(`duplicate porcelain verdict for ${dest}`)
 		}
-		verdicts.set(dest, {
-			klass: flag === "!" ? reasonClass(summary) : "ok",
-			ok: flag !== "!",
-		})
+		verdicts.set(
+			dest,
+			flag === "!"
+				? { kind: "rejected", reason: reasonClass(summary) }
+				: { kind: "accepted" },
+		)
 	}
 	return verdicts
 }
 
-type PushRun = { clientRefused: boolean; code: number; stderr: string; stdout: string }
+function requireVerdict(
+	verdicts: ReadonlyMap<string, Verdict>,
+	dest: string,
+	remote: string,
+): Verdict {
+	const verdict = verdicts.get(dest)
+	if (verdict === undefined) throw new Error(`${remote} reported nothing for ${dest}`)
+	return verdict
+}
+
+type PushRun =
+	| { kind: "client-refused"; code: number; stderr: string; stdout: string }
+	| { kind: "remote-result"; code: number; stderr: string; stdout: string }
 
 /** Run the identical push argv against one remote. A non-zero exit is an outcome here. */
 async function pushBatch(
@@ -339,9 +358,17 @@ async function pushBatch(
 ): Promise<PushRun> {
 	const args = ["push", "--porcelain", ...(atomic ? ["--atomic"] : []), url]
 	const run = await attemptGit([...args, ...commands.map((c) => c.refspec)], cwd)
+	if (!run.ok && /fatal: invalid refspec/.test(run.stderr)) {
+		return {
+			code: run.code,
+			kind: "client-refused",
+			stderr: run.stderr,
+			stdout: run.stdout,
+		}
+	}
 	return {
-		clientRefused: /fatal: invalid refspec/.test(run.stderr),
 		code: run.code,
+		kind: "remote-result",
 		stderr: run.stderr,
 		stdout: run.stdout,
 	}
@@ -360,11 +387,11 @@ async function pggitRefs(refs: RefStore, repoId: string): Promise<string[]> {
 	return (await refs.listRefs(repoId)).map((r) => `${r.name} ${r.oid}`).sort()
 }
 
-/** The ref set a remote holds after applying exactly the commands flagged `ok`. */
+/** The ref set a remote holds after applying exactly the commands accepted. */
 function applyCommands(
 	baseline: string[],
 	commands: Command[],
-	ok: (c: Command) => boolean,
+	accepted: (c: Command) => boolean,
 ): string[] {
 	const state = new Map(
 		baseline.map((line) => {
@@ -373,9 +400,9 @@ function applyCommands(
 		}),
 	)
 	for (const c of commands) {
-		if (!ok(c)) continue
-		if (c.newOid === null) state.delete(c.dest)
-		else state.set(c.dest, c.newOid)
+		if (!accepted(c)) continue
+		if (c.change.kind === "delete") state.delete(c.dest)
+		else state.set(c.dest, c.change.oid)
 	}
 	return [...state].map(([name, oid]) => `${name} ${oid}`).sort()
 }
@@ -481,16 +508,19 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 					const afterControl = await controlRefs(bare)
 					const afterPggit = await pggitRefs(refs, repoId)
 
-					if (control.clientRefused) {
+					if (control.kind === "client-refused") {
 						// The client dies at refspec-parse time: neither remote is contacted, so
 						// the only observable is that both die identically and nothing moved.
 						bump("client-refused-batch")
-						expect(pggit.clientRefused, pggit.stderr).toBe(true)
+						expect(pggit.kind, pggit.stderr).toBe("client-refused")
 						expect(pggit.code).toBe(control.code)
 						expect(pggit.stderr).toBe(control.stderr)
 						expect(afterControl).toEqual(baseline)
 						expect(afterPggit).toEqual(baseline)
 						return
+					}
+					if (pggit.kind !== "remote-result") {
+						throw new Error("pggit refused a refspec canonical git transmitted")
 					}
 
 					const controlVerdicts = parsePorcelain(control.stdout)
@@ -502,26 +532,28 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 						// The `--atomic` contract is all-or-nothing; the per-ref reasons under a
 						// failed batch are git's transaction ORDER, not a contract (see header).
 						const verdicts = commands.map((c) => {
-							const v = controlVerdicts.get(c.dest)
-							expect(v, `control reported nothing for ${label(c)}`).toBeDefined()
-							return v as Verdict
+							return requireVerdict(controlVerdicts, c.dest, "control")
 						})
-						const controlAllOk = verdicts.every((v) => v.ok)
+						const controlAllOk = verdicts.every((v) => v.kind === "accepted")
 						expect(
-							controlAllOk || verdicts.every((v) => !v.ok),
+							controlAllOk || verdicts.every((v) => v.kind === "rejected"),
 							"canonical git applied an atomic batch PARTIALLY",
 						).toBe(true)
 						const pggitRejectsAll =
-							!controlAllOk || commands.some((c) => DIVERGENT[c.kind] !== null)
+							!controlAllOk || commands.some((c) => DIVERGENT[c.kind].kind === "denied")
 						for (const c of commands) {
-							const v = pggitVerdicts.get(c.dest)
-							expect(v, `pggit reported nothing for ${label(c)}`).toBeDefined()
-							expect(v?.ok, label(c)).toBe(!pggitRejectsAll)
+							const v = requireVerdict(pggitVerdicts, c.dest, "pggit")
+							expect(v.kind, label(c)).toBe(pggitRejectsAll ? "rejected" : "accepted")
 							// pggit reports every rejected command's OWN reason (git only reports
 							// the first failure's), so the documented policy denial is still pinned
 							// per ref here — that half is pggit's contract, not git's ordering.
-							const denied = DIVERGENT[c.kind]
-							if (denied !== null) expect(v?.klass, label(c)).toBe(denied)
+							const relation = DIVERGENT[c.kind]
+							if (relation.kind === "denied") {
+								expect(v, label(c)).toEqual({
+									kind: "rejected",
+									reason: relation.reason,
+								})
+							}
 						}
 						expect(afterControl).toEqual(
 							applyCommands(baseline, commands, () => controlAllOk),
@@ -534,17 +566,18 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 
 					const expected = new Map<string, Verdict>()
 					for (const c of commands) {
-						const canonical = controlVerdicts.get(c.dest)
-						expect(canonical, `control reported nothing for ${label(c)}`).toBeDefined()
-						const denied = DIVERGENT[c.kind]
-						if (denied === null) {
-							expected.set(c.dest, canonical as Verdict)
+						const canonical = requireVerdict(controlVerdicts, c.dest, "control")
+						const relation = DIVERGENT[c.kind]
+						if (relation.kind === "matches-canonical") {
+							expected.set(c.dest, canonical)
 							continue
 						}
 						// The divergence must be LIVE: canonical git applied this command. A
 						// shared refusal would make the encoded policy vacuous.
-						expect(canonical?.ok, `canonical git did not apply ${label(c)}`).toBe(true)
-						expected.set(c.dest, { klass: denied, ok: false })
+						expect(canonical.kind, `canonical git did not apply ${label(c)}`).toBe(
+							"accepted",
+						)
+						expected.set(c.dest, { kind: "rejected", reason: relation.reason })
 					}
 					for (const c of commands) {
 						expect(pggitVerdicts.get(c.dest), label(c)).toEqual(expected.get(c.dest))
@@ -553,11 +586,15 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 						applyCommands(
 							baseline,
 							commands,
-							(c) => controlVerdicts.get(c.dest)?.ok === true,
+							(c) => controlVerdicts.get(c.dest)?.kind === "accepted",
 						),
 					)
 					expect(afterPggit).toEqual(
-						applyCommands(baseline, commands, (c) => expected.get(c.dest)?.ok === true),
+						applyCommands(
+							baseline,
+							commands,
+							(c) => expected.get(c.dest)?.kind === "accepted",
+						),
 					)
 				} finally {
 					rmSync(bare, { force: true, recursive: true })
@@ -622,9 +659,9 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 
 			const pair = (name: string): Command => ({
 				census: [],
+				change: { kind: "write", oid: fx.c },
 				dest: name,
 				kind: "create",
-				newOid: fx.c,
 				refspec: `${fx.c}:${name}`,
 			})
 			const commands = [pair("refs/heads/pair"), pair("refs/heads/pair/sub")]
@@ -640,12 +677,11 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 				["pggit", observed],
 			] as const) {
 				expect(report.get("refs/heads/pair/sub"), name).toEqual({
-					klass: "ok",
-					ok: true,
+					kind: "accepted",
 				})
 				expect(report.get("refs/heads/pair"), name).toEqual({
-					klass: "df-conflict",
-					ok: false,
+					kind: "rejected",
+					reason: "df-conflict",
 				})
 			}
 			const survivors = [`refs/heads/base ${fx.b}`, `refs/heads/pair/sub ${fx.c}`].sort()

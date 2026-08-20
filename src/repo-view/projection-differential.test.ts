@@ -71,12 +71,13 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 		return rows.map((r) => r.line).sort()
 	}
 
-	async function projectedHead(repo: string): Promise<string | null> {
+	async function projectedHead(repo: string): Promise<string> {
 		const [row] = await db.sql<{ oid: string }[]>`
 			select encode(h.commit_oid, 'hex') as oid
 			from repo_file_head h join repos r on r.id = h.repo_id
 			where r.name = ${repo} and h.ref_name = ${REF}`
-		return row?.oid ?? null
+		if (row === undefined) throw new Error(`projection head missing for ${repo}`)
+		return row.oid
 	}
 
 	/** Canonical git's file rows at one revision, in the projection's text form. */
@@ -86,12 +87,14 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 			.sort()
 	}
 
-	/** Apply ops in a workdir; commit; return the new tip (null if nothing changed). */
+	type CommitResult = { kind: "committed"; tip: string } | { kind: "unchanged" }
+
+	/** Apply ops in a workdir and report whether they produced a new committed tip. */
 	async function applyAndCommit(
 		dir: string,
 		ops: Op[],
 		n: number,
-	): Promise<string | null> {
+	): Promise<CommitResult> {
 		for (const op of ops) {
 			const full = join(dir, op.path)
 			if (op.kind === "set") {
@@ -138,9 +141,12 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 				(e.stdout + e.stderr).includes("nothing to commit") &&
 				status.stdout.trim() === ""
 			if (!nothingToCommit) throw e
-			return null
+			return { kind: "unchanged" }
 		}
-		return (await spawnGit(["rev-parse", "HEAD"], { cwd: dir })).stdout.trim()
+		return {
+			kind: "committed",
+			tip: (await spawnGit(["rev-parse", "HEAD"], { cwd: dir })).stdout.trim(),
+		}
 	}
 
 	/** Ingest the repo's objects and advance the projection to `tip`. */
@@ -179,8 +185,8 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 
 						for (const [n, ops] of pushes.entries()) {
 							const next = await applyAndCommit(dir, ops, n)
-							if (next === null) continue
-							tip = next
+							if (next.kind === "unchanged") continue
+							tip = next.tip
 							await pushAndProject(repo, dir, tip)
 
 							// The oracle: real git's own file list at the same tip. Anchoring the

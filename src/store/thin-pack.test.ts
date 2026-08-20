@@ -69,7 +69,8 @@ describe("M2 — thin-pack ingest: external REF_DELTA base from the store", () =
 				await spawnGit(["rev-parse", `${c2}:big.txt`], { cwd: src })
 			).stdout.trim()
 			const stored = await objects.getObject("repo-base", blobOid)
-			expect(stored?.content.toString("utf8")).toBe(bigFile("EDITED"))
+			if (stored === null) throw new Error(`reconstructed blob ${blobOid} is missing`)
+			expect(stored.content.toString("utf8")).toBe(bigFile("EDITED"))
 		} finally {
 			rmSync(src, { force: true, recursive: true })
 		}

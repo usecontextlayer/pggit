@@ -99,7 +99,7 @@ describe("readPack", () => {
 					cwd: dir,
 				})
 				const baseOids = parseVerifyPackObjects(verify.stdout).flatMap((object) =>
-					object.baseOid === undefined ? [] : [object.baseOid],
+					object.kind === "delta" ? [object.baseOid] : [],
 				)
 				expect(baseOids.length).toBeGreaterThan(0)
 				// …and every delta in it is THIS test's wire form.

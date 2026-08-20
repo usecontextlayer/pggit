@@ -46,6 +46,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
+import { requiredAt } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -102,20 +103,14 @@ function stream(runs: number): string {
 async function clonedPackBytes(url: string, dest: string): Promise<number> {
 	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-	const kb = Number(
-		(await spawnGit(["count-objects", "-v"], { cwd: dest })).stdout.match(
-			/size-pack: (\d+)/,
-		)?.[1] ?? 0,
-	)
+	const countObjects = await spawnGit(["count-objects", "-v"], { cwd: dest })
+	const sizePack = countObjects.stdout.match(/^size-pack: (\d+)$/m)?.[1]
+	if (sizePack === undefined) {
+		throw new Error(`git count-objects omitted size-pack: ${countObjects.stdout}`)
+	}
+	const kb = Number(sizePack)
 	rmSync(dest, { force: true, recursive: true })
 	return kb * 1024
-}
-
-/** Index into a fixture list, loudly (`noUncheckedIndexedAccess`). */
-function at<T>(xs: T[], i: number): T {
-	const v = xs[i]
-	if (v === undefined) throw new Error(`fixture too short: index ${i} of ${xs.length}`)
-	return v
 }
 
 describe("lifecycle breakage — silent no-op repack after repo recreate", () => {
@@ -141,8 +136,8 @@ describe("lifecycle breakage — silent no-op repack after repo recreate", () =>
 		).stdout
 			.trim()
 			.split("\n")
-		const tip = at(commits, commits.length - 1)
-		const mid = at(commits, 80)
+		const tip = requiredAt(commits, commits.length - 1, "main commit history")
+		const mid = requiredAt(commits, 80, "main commit history")
 
 		const deps = createGitDeps(db.sql)
 		server = await serveOnPort(createGitApp(deps), 0)

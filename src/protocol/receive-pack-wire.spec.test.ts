@@ -29,9 +29,14 @@ const A = "a".repeat(40)
 const B = "b".repeat(40)
 
 // A rejected command cannot exist without the reason report-status must emit.
-// @ts-expect-error CommandResult's failure arm requires reason
-const FAILURE_WITHOUT_REASON: CommandResult = { ok: false, ref: "refs/heads/x" }
-void FAILURE_WITHOUT_REASON
+type FailureWithoutReasonIsValid = {
+	ok: false
+	ref: string
+} extends CommandResult
+	? true
+	: false
+const FAILURE_WITHOUT_REASON_IS_VALID: FailureWithoutReasonIsValid = false
+void FAILURE_WITHOUT_REASON_IS_VALID
 
 // The push caps we expect to be advertised, in canonical order (authored here,
 // independent of the handler). AGENT is an external input → imported.

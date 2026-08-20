@@ -26,12 +26,22 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { objectsByType } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const SHAPES = 8
 const SEED0 = 1
@@ -41,14 +51,15 @@ const SINGLE_REF_FETCHES = ["refs/heads/main", "refs/tags/outer", "refs/tags/ont
 
 type ShapeResult = {
 	seed: number
-	cloneError: string | null
-	fsckError: string | null
-	pggitInventory: string
-	gitInventory: string
-	pggitBytes: string
-	gitBytes: string
-	bloblessError: string | null
-	singleRefErrors: Map<string, string | null>
+	clone: TestResult<{
+		fsck: TestResult<void>
+		pggitInventory: string
+		gitInventory: string
+		pggitBytes: string
+		gitBytes: string
+		blobless: TestResult<void>
+		singleRefs: Map<string, TestResult<void>>
+	}>
 }
 
 /** mulberry32 — a tiny deterministic PRNG so a failing shape is reproducible. */
@@ -289,21 +300,12 @@ async function inventory(dir: string): Promise<string> {
 
 /** sha256 over every object's raw bytes, in oid order — the byte-level oracle. */
 async function bytesDigest(dir: string): Promise<string> {
-	const oids = (await inventory(dir)).split("\n").map((l) => l.split(" ")[0] as string)
+	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
 	const res = await spawnGit(["cat-file", "--batch"], {
 		cwd: dir,
 		input: `${oids.join("\n")}\n`,
 	})
 	return createHash("sha256").update(res.stdoutBytes).digest("hex")
-}
-
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
 }
 
 describe("wire — generated repository shapes match a plain git remote exactly", () => {
@@ -319,8 +321,9 @@ describe("wire — generated repository shapes match a plain git remote exactly"
 	const shapes: ShapeResult[] = []
 
 	beforeAll(async () => {
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
 		const repack = createRepack(db.sql)
 
 		for (let s = 0; s < SHAPES; s++) {
@@ -345,7 +348,7 @@ describe("wire — generated repository shapes match a plain git remote exactly"
 			// Each shape gets its own repo NAME in the one schema — repack, GC and the
 			// serve path are all per-repo, so the shapes cannot see each other.
 			const repo = `workspace/fuzz/s${seed}`
-			const url = `http://127.0.0.1:${server.port}/${repo}`
+			const url = repoUrl(server, repo)
 			await spawnGit(
 				["push", "-q", url, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"],
 				{ cwd: src },
@@ -354,7 +357,7 @@ describe("wire — generated repository shapes match a plain git remote exactly"
 
 			const dP = join(mk(`cP${seed}`), "c")
 			const dG = join(mk(`cG${seed}`), "c")
-			const cloneError = await errorOf(() =>
+			const clone = await captureTestResult(() =>
 				spawnGit([
 					"-c",
 					"protocol.version=2",
@@ -370,28 +373,18 @@ describe("wire — generated repository shapes match a plain git remote exactly"
 				]),
 			)
 			await spawnGit(["clone", "-q", "--no-checkout", `file://${bare}`, dG])
-			if (cloneError !== null) {
-				shapes.push({
-					bloblessError: null,
-					cloneError,
-					fsckError: null,
-					gitBytes: "",
-					gitInventory: "",
-					pggitBytes: "",
-					pggitInventory: "",
-					seed,
-					singleRefErrors: new Map(),
-				})
+			if (clone.kind === "failed") {
+				shapes.push({ clone, seed })
 				continue
 			}
 
-			const fsckError = await errorOf(() =>
-				spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dP }),
-			)
+			const fsck = await captureTestResult(async () => {
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dP })
+			})
 
 			// Blobless clone over the same state.
 			const dF = join(mk(`cF${seed}`), "c")
-			const bloblessError = await errorOf(async () => {
+			const blobless = await captureTestResult(async () => {
 				await spawnGit([
 					"-c",
 					"protocol.version=2",
@@ -409,13 +402,13 @@ describe("wire — generated repository shapes match a plain git remote exactly"
 
 			// Single-ref fetches: each ref's own closure is a different served set, so
 			// each exercises the delta-eligibility rule differently.
-			const singleRefErrors = new Map<string, string | null>()
+			const singleRefs = new Map<string, TestResult<void>>()
 			for (const ref of SINGLE_REF_FETCHES) {
 				const one = join(mk(`one${seed}`), "c")
 				await spawnGit(["init", "-q", one])
-				singleRefErrors.set(
+				singleRefs.set(
 					ref,
-					await errorOf(async () => {
+					await captureTestResult(async () => {
 						await spawnGit(
 							[
 								"-c",
@@ -435,48 +428,69 @@ describe("wire — generated repository shapes match a plain git remote exactly"
 			}
 
 			shapes.push({
-				bloblessError,
-				cloneError,
-				fsckError,
-				gitBytes: await bytesDigest(dG),
-				gitInventory: await inventory(dG),
-				pggitBytes: await bytesDigest(dP),
-				pggitInventory: await inventory(dP),
+				clone: {
+					kind: "succeeded",
+					value: {
+						blobless,
+						fsck,
+						gitBytes: await bytesDigest(dG),
+						gitInventory: await inventory(dG),
+						pggitBytes: await bytesDigest(dP),
+						pggitInventory: await inventory(dP),
+						singleRefs,
+					},
+				},
 				seed,
-				singleRefErrors,
 			})
 		}
 	}, 1_200_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
 	it("clones every generated shape from pggit, fsck-clean", () => {
 		expect(shapes.length).toBe(SHAPES)
 		for (const s of shapes) {
-			expect(s.cloneError, `seed ${s.seed}`).toBeNull()
-			expect(s.fsckError, `seed ${s.seed}`).toBeNull()
+			const at = `seed ${s.seed}`
+			expect(s.clone.kind, testResultContext(s.clone, at)).toBe("succeeded")
+			if (s.clone.kind === "succeeded") {
+				expect(
+					s.clone.value.fsck.kind,
+					testResultContext(s.clone.value.fsck, `${at} fsck`),
+				).toBe("succeeded")
+			}
 		}
 	})
 
 	it("serves the same object set and the same object BYTES as a plain git remote", () => {
 		for (const s of shapes) {
-			expect(s.pggitInventory, `seed ${s.seed}`).toBe(s.gitInventory)
-			expect(s.pggitBytes, `seed ${s.seed}`).toBe(s.gitBytes)
+			if (s.clone.kind === "failed") continue
+			expect(s.clone.value.pggitInventory, `seed ${s.seed}`).toBe(
+				s.clone.value.gitInventory,
+			)
+			expect(s.clone.value.pggitBytes, `seed ${s.seed}`).toBe(s.clone.value.gitBytes)
 		}
 	})
 
 	it("serves a blobless clone of every generated shape", () => {
-		for (const s of shapes) expect(s.bloblessError, `seed ${s.seed}`).toBeNull()
+		for (const s of shapes) {
+			if (s.clone.kind === "failed") continue
+			const result = s.clone.value.blobless
+			expect(result.kind, testResultContext(result, `seed ${s.seed}`)).toBe("succeeded")
+		}
 	})
 
 	it("serves each ref's own closure on a single-ref fetch of every shape", () => {
 		for (const s of shapes) {
+			if (s.clone.kind === "failed") continue
 			for (const ref of SINGLE_REF_FETCHES) {
-				expect(s.singleRefErrors.get(ref), `seed ${s.seed} — ${ref}`).toBeNull()
+				const result = s.clone.value.singleRefs.get(ref)
+				const at = `seed ${s.seed} — ${ref}`
+				expect(result?.kind, result ? testResultContext(result, at) : at).toBe(
+					"succeeded",
+				)
 			}
 		}
 	})

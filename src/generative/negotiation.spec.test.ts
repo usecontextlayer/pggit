@@ -262,15 +262,17 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 								const out = await handleUploadPack(body, backend)
 								const oracle = await spawnUploadPack(src, body)
 								const where = `want=${want} haves=[${haves.join(",")}]`
-								// Pack counts must agree in BOTH directions: null===null pins
-								// "no pack", equal counts pin the served set's size.
-								expect(packObjectCount(out), `pack count: ${where}`).toBe(
+								// Pack states must agree in BOTH directions: no-pack===no-pack pins
+								// absence, equal object counts pin a present served set's size.
+								expect(packObjectCount(out), `pack count: ${where}`).toEqual(
 									packObjectCount(oracle),
 								)
 								if (haves.length === 0) {
 									// Zero-have: a pack response with no delim — the ack helper
 									// would eat pack bytes, and there is no section to compare.
-									expect(packObjectCount(oracle), where).not.toBeNull()
+									expect(packObjectCount(oracle), where).toEqual(
+										expect.objectContaining({ kind: "pack" }),
+									)
 									shape.pairs++
 									shape.withPack++
 									continue
@@ -283,7 +285,7 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 								else shape.notReady++
 								if (transcript.includes("NAK\n")) shape.nak++
 								if (transcript.split("ACK ").length > 2) shape.multiAck++
-								if (packObjectCount(oracle) !== null) shape.withPack++
+								if (packObjectCount(oracle).kind === "pack") shape.withPack++
 							}
 						} finally {
 							await isolated.drop()

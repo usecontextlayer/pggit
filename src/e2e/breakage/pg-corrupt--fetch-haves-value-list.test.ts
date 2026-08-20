@@ -232,10 +232,17 @@ describe("pg-corrupt — the unbatched fetch `have` value list", () => {
 		)
 		const maxHaves = seen.reduce((a, b) => Math.max(a, b), 0)
 		const cumulative = seen.reduce((a, b) => a + b, 0)
+		let resentCommons = false
+		let previous = seen[0]
+		for (const value of seen.slice(1)) {
+			if (previous === undefined) throw new Error("missing first have-count sample")
+			if (value > previous * 1.9) resentCommons = true
+			previous = value
+		}
 		console.log(`  requests: ${seen.length}; haves per request: ${seen.join(", ")}`)
 		console.log(`  max haves in ONE request: ${maxHaves} (client tips: ${WIDTH + 1})`)
 		console.log(
-			`  resent-commons? ${seen.some((v, i) => i > 0 && v > (seen[i - 1] as number) * 1.9) ? "growing per round" : "flat/per-batch"}` +
+			`  resent-commons? ${resentCommons ? "growing per round" : "flat/per-batch"}` +
 				` (total haves across all requests: ${cumulative})`,
 		)
 		const ratio = maxHaves / (WIDTH + 1)

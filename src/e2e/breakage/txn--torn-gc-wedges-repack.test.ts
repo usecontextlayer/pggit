@@ -24,7 +24,7 @@ import { join } from "node:path"
 import type { Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import type { GitObjectType } from "@/object/object"
+import type { PackInputObject } from "@/pack/write-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
@@ -36,9 +36,18 @@ import {
 	RUNS_DIR,
 	runDirName,
 } from "@/testing/append-only-repo"
-import { seedRepoIntoStore } from "@/testing/git-fixtures"
+import {
+	objectsByType,
+	parseRevListObjectOids,
+	seedRepoIntoStore,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "torn-gc"
 const RUNS = 50 // anchors land at lineage index 0 and 32; 33..50 is a PARTIAL segment
@@ -83,17 +92,7 @@ function killBeforeCleanup(pg: Sql): Sql {
 	return wrapUnsafe(pg)
 }
 
-/** Whether a repack pass survived, and what it reported. */
-type PassOutcome = { ok: boolean; detail: string }
-
-async function repackOutcome(run: () => Promise<{ wholes: number; deltas: number }>) {
-	try {
-		const r = await run()
-		return { detail: `${r.wholes} wholes, ${r.deltas} deltas`, ok: true }
-	} catch (err) {
-		return { detail: `*** REPACK THREW: ${(err as Error).message}`, ok: false }
-	}
-}
+type RepackCounts = { wholes: number; deltas: number }
 
 describe("GC × crash — the tier stays whole through a mid-pass death", () => {
 	let db: IsolatedDb
@@ -102,9 +101,9 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 	let server: GitServer | undefined
 	let torn: { orphaned: number; ghosts: number } = { ghosts: -1, orphaned: -1 }
 	let anchorGone = false
-	let q1Fsck = ""
-	let q2: PassOutcome = { detail: "not run", ok: false }
-	let q3: PassOutcome = { detail: "not run", ok: false }
+	let q1: TestResult<string>
+	let q2: TestResult<RepackCounts>
+	let q3: TestResult<RepackCounts>
 
 	beforeAll(async () => {
 		root = mkdtempSync(join(tmpdir(), "pggit-breakage-torn-gc-"))
@@ -148,7 +147,8 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 		const [keptRow] = await db.sql<{ base: string | null }[]>`
 			select encode(base_oid,'hex') as base from git_pack_encoding
 			where oid = ${Buffer.from(keptTree, "hex")}`
-		const keptAnchor = keptRow?.base ?? null
+		if (keptRow === undefined) throw new Error("fixture wrong: kept tree has no encoding")
+		const keptAnchor = keptRow.base
 		if (keptAnchor === null) throw new Error("fixture wrong: kept tree is not a delta")
 
 		// ── The force push: main rewinds far below the anchor, `keep` survives.
@@ -182,19 +182,18 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 		const [anchorRow] = await db.sql<{ n: number }[]>`
 			select count(*)::int as n from git_object
 			where oid = ${Buffer.from(keptAnchor, "hex")}`
-		anchorGone = anchorRow?.n === 0
+		if (anchorRow === undefined) throw new Error("anchor count query returned no row")
+		anchorGone = anchorRow.n === 0
 
 		// ── Q1: does the serve path survive the torn state?
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 		const dest = join(root, "clone")
-		try {
+		q1 = await captureTestResult(async () => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 			const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			q1Fsck = `${fsck.stdout}${fsck.stderr}`.trim() || "clean"
-		} catch (err) {
-			q1Fsck = `*** CLONE FAILED: ${(err as Error).message}`
-		}
+			return `${fsck.stdout}${fsck.stderr}`.trim()
+		})
 
 		// ── Q2: the repo gets a new push extending the kept lineage, then repack.
 		await spawnGit(["checkout", "-q", "keep"], { cwd: src })
@@ -210,12 +209,13 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 		const list = await spawnGit(["rev-list", "--objects", newTip, `^${keepCommit}`], {
 			cwd: src,
 		})
-		const fresh: { type: GitObjectType; content: Buffer }[] = []
-		for (const line of list.stdout.trim().split("\n").filter(Boolean)) {
-			const oid = line.slice(0, 40)
-			const type = (
-				await spawnGit(["cat-file", "-t", oid], { cwd: src })
-			).stdout.trim() as GitObjectType
+		const fresh: PackInputObject[] = []
+		const typeByOid = new Map(
+			(await objectsByType(src)).map((object) => [object.oid, object.type]),
+		)
+		for (const oid of parseRevListObjectOids(list.stdout)) {
+			const type = typeByOid.get(oid)
+			if (type === undefined) throw new Error(`git object inventory omitted ${oid}`)
 			fresh.push({
 				content: (await spawnGit(["cat-file", type, oid], { cwd: src })).stdoutBytes,
 				type,
@@ -224,11 +224,11 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 		await objects.putPack(REPO, fresh)
 		await refs.setRef(REPO, "refs/heads/keep", newTip)
 
-		q2 = await repackOutcome(() => repack.repack(REPO))
+		q2 = await captureTestResult(() => repack.repack(REPO))
 
 		// Does a SECOND repack (after another clean gc) recover?
 		await gc.gc(REPO, { graceSeconds: 0, maintain: false })
-		q3 = await repackOutcome(() => repack.repack(REPO))
+		q3 = await captureTestResult(() => repack.repack(REPO))
 	}, 300_000)
 
 	afterAll(async () => {
@@ -249,14 +249,15 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 	}, 300_000)
 
 	it("Q1: the torn repo still clones and fsck's clean", () => {
-		expect(q1Fsck).toBe("clean")
+		expect(q1.kind, testResultContext(q1, "torn-state clone")).toBe("succeeded")
+		if (q1.kind === "succeeded") expect(q1.value).toBe("")
 	}, 300_000)
 
 	it("Q2: the next repack pass makes progress on the extended lineage", () => {
-		expect(q2.ok, q2.detail).toBe(true)
+		expect(q2.kind, testResultContext(q2, "post-crash repack")).toBe("succeeded")
 	}, 300_000)
 
 	it("recovery: a clean GC followed by a repack pass succeeds", () => {
-		expect(q3.ok, q3.detail).toBe(true)
+		expect(q3.kind, testResultContext(q3, "recovery repack")).toBe("succeeded")
 	}, 300_000)
 })

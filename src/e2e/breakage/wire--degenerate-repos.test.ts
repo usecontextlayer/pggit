@@ -18,28 +18,25 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "workspace/probe/solo"
 const NEVER_REPO = "workspace/probe/never"
 
 type Counts = { wholes: number; deltas: number }
-
-/** The source probe recorded each failure and kept going; capturing the error the
- * same way keeps one broken arm from hiding every arm after it. */
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
-}
 
 describe("wire — degenerate repository states under the encoding tier", () => {
 	let db: IsolatedDb
@@ -56,20 +53,18 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 	let repackBeforePush: Counts
 	let soloRepack: Counts
 	let secondRepack: Counts
-	let soloCloneError: string | null = null
-	let soloTip = ""
+	let soloClone: TestResult<string>
 	let soloSrcTip = ""
-	let mixedCloneError: string | null = null
-	let mixedTip = ""
+	let mixedClone: TestResult<string>
 	let mixedSrcTip = ""
-	let tagsFetchError: string | null = null
-	let tagsGot = ""
+	let tagsFetch: TestResult<string>
 	let tagsWant = ""
 	let missingWantOutcome = ""
 
 	beforeAll(async () => {
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
 		const base = `http://127.0.0.1:${server.port}`
 		const repack = createRepack(db.sql)
 
@@ -107,13 +102,11 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 		secondRepack = await repack.repack(REPO)
 
 		const solo = join(mk("solo"), "c")
-		soloCloneError = await errorOf(async () => {
+		soloClone = await captureTestResult(async () => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", url, solo])
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: solo })
+			return (await spawnGit(["rev-parse", "HEAD"], { cwd: solo })).stdout.trim()
 		})
-		if (soloCloneError === null) {
-			soloTip = (await spawnGit(["rev-parse", "HEAD"], { cwd: solo })).stdout.trim()
-		}
 		soloSrcTip = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 
 		// 5 (second half). Push MORE without repacking: a mixed encoded/unencoded state.
@@ -124,7 +117,7 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 		await spawnGit(["push", "-q", url, "refs/heads/main:refs/heads/main"], { cwd: src })
 
 		const mixed = join(mk("mixed"), "c")
-		mixedCloneError = await errorOf(async () => {
+		mixedClone = await captureTestResult(async () => {
 			await spawnGit([
 				"-c",
 				"protocol.version=2",
@@ -136,10 +129,8 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 				mixed,
 			])
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: mixed })
+			return (await spawnGit(["rev-parse", "HEAD"], { cwd: mixed })).stdout.trim()
 		})
-		if (mixedCloneError === null) {
-			mixedTip = (await spawnGit(["rev-parse", "HEAD"], { cwd: mixed })).stdout.trim()
-		}
 		mixedSrcTip = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 
 		// 6. Tags-only fetch against a repacked repo.
@@ -148,7 +139,7 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 		await repack.repack(REPO)
 		const tagsOnly = join(mk("tags"), "c")
 		await spawnGit(["init", "-q", tagsOnly])
-		tagsFetchError = await errorOf(async () => {
+		tagsFetch = await captureTestResult(async () => {
 			await spawnGit(
 				[
 					"-c",
@@ -163,12 +154,10 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 				{ cwd: tagsOnly },
 			)
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: tagsOnly })
-		})
-		if (tagsFetchError === null) {
-			tagsGot = (
+			return (
 				await spawnGit(["rev-parse", "refs/tags/v1"], { cwd: tagsOnly })
 			).stdout.trim()
-		}
+		})
 		tagsWant = (await spawnGit(["rev-parse", "refs/tags/v1"], { cwd: src })).stdout.trim()
 
 		// 7. A want the repo does not have — must be a clean in-band ERR, not a 500.
@@ -183,8 +172,7 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 	}, 300_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -209,18 +197,22 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 	})
 
 	it("the one-commit repo clones fsck-clean at the source tip", () => {
-		expect(soloCloneError).toBeNull()
-		expect(soloTip).toBe(soloSrcTip)
+		expect(soloClone.kind, testResultContext(soloClone, "solo clone")).toBe("succeeded")
+		if (soloClone.kind === "succeeded") expect(soloClone.value).toBe(soloSrcTip)
 	})
 
 	it("a mixed encoded/unencoded repo clones fsck-clean at the source tip", () => {
-		expect(mixedCloneError).toBeNull()
-		expect(mixedTip).toBe(mixedSrcTip)
+		expect(mixedClone.kind, testResultContext(mixedClone, "mixed clone")).toBe(
+			"succeeded",
+		)
+		if (mixedClone.kind === "succeeded") expect(mixedClone.value).toBe(mixedSrcTip)
 	})
 
 	it("a tags-only fetch against a repacked repo lands the exact tag", () => {
-		expect(tagsFetchError).toBeNull()
-		expect(tagsGot).toBe(tagsWant)
+		expect(tagsFetch.kind, testResultContext(tagsFetch, "tags-only fetch")).toBe(
+			"succeeded",
+		)
+		if (tagsFetch.kind === "succeeded") expect(tagsFetch.value).toBe(tagsWant)
 	})
 
 	it("a want the repo does not have is refused in-band, never accepted", () => {

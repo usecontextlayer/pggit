@@ -1,18 +1,21 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { inject } from "vitest"
-import { createGitApp } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
-import { createObjectStore, type ObjectStore } from "@/store/object-store"
-import { createRefStore, type RefStore } from "@/store/refs-store"
+import type { ObjectStore } from "@/store/object-store"
+import type { RefStore } from "@/store/refs-store"
 import {
 	allObjectOids,
 	parseRevListObjectOids,
 	requireGitOid,
 } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl as gitServerRepoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 /**
@@ -51,11 +54,9 @@ export type GcFixture = {
  * representative. See the gc-stress suite.
  */
 export async function setupGcFixture(): Promise<GcFixture> {
-	const db = await createIsolatedSchema(inject("pgBaseUrl"))
-	const objects = createObjectStore(db.sql)
-	const refs = createRefStore(db.sql)
+	const { db, deps, server } = await setupGitServerFixture()
+	const { objects, refs } = deps
 	const gc = createGc(db.sql)
-	const server = await serveOnPort(createGitApp({ objects, refs }), 0)
 	return { db, gc, objects, refs, server }
 }
 
@@ -63,14 +64,13 @@ export async function setupGcFixture(): Promise<GcFixture> {
  * drop the schema (which ends its pooled clients). The shared container is left running
  * — `globalSetup` stops it once, after the whole run. */
 export async function teardownGcFixture(fx: GcFixture): Promise<void> {
-	await fx.server.close()
-	await fx.db.drop()
+	await teardownGitServerFixture(fx)
 }
 
 /** The smart-HTTP URL of `repo` on the fixture's server (repo auto-created on
  * first push). */
 export function repoUrl(fx: Pick<GcFixture, "server">, repo: string): string {
-	return `http://127.0.0.1:${fx.server.port}/${repo}`
+	return gitServerRepoUrl(fx.server, repo)
 }
 
 /** Run `fn` inside a fresh `mkdtemp` dir, always removing it afterwards. The
@@ -415,12 +415,16 @@ export async function ageObjects(
 	`
 }
 
-/** The two GC-scheduling timestamps on the `repos` row — the durable activity
+/** The repo's presence plus its two GC-scheduling timestamps — the durable activity
  * signal the background drain polls (docs/2026-06-24-gc-scheduler-design.md §2).
- * Both are `null` when the repo row is absent (never pushed) or the column unset.
+ * An absent row is distinct from a present row whose timestamp is not yet set.
  * Observable surface for SCH-1/SCH-2 (a push stamps `last_pushed_at`) and
  * SCH-3/SCH-4 (a drain advances `last_gc_at`). */
-type RepoGcState = { lastPushedAt: Date | null; lastGcAt: Date | null }
+export type RepoGcState =
+	| { kind: "absent" }
+	| { kind: "present-unpushed" }
+	| { kind: "pushed-never-drained"; pushedAt: Date }
+	| { kind: "pushed-and-drained"; pushedAt: Date; gcAt: Date }
 
 export async function repoGcState(
 	db: Pick<IsolatedDb, "sql">,
@@ -429,8 +433,19 @@ export async function repoGcState(
 	const [row] = await db.sql<{ last_pushed_at: Date | null; last_gc_at: Date | null }[]>`
 		select last_pushed_at, last_gc_at from repos where name = ${repo}
 	`
+	if (row === undefined) return { kind: "absent" }
+	if (row.last_pushed_at === null) {
+		if (row.last_gc_at !== null) {
+			throw new Error(`repoGcState: ${repo} was drained without ever being pushed`)
+		}
+		return { kind: "present-unpushed" }
+	}
+	if (row.last_gc_at === null) {
+		return { kind: "pushed-never-drained", pushedAt: row.last_pushed_at }
+	}
 	return {
-		lastGcAt: row?.last_gc_at ?? null,
-		lastPushedAt: row?.last_pushed_at ?? null,
+		gcAt: row.last_gc_at,
+		kind: "pushed-and-drained",
+		pushedAt: row.last_pushed_at,
 	}
 }

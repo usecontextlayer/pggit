@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process"
+import { z } from "zod"
 
 type SpawnGitResult = {
-	code: number
+	code: 0
 	stdout: string
 	/** Raw stdout bytes — use this for binary git output (packs, tree objects). */
 	stdoutBytes: Buffer
@@ -16,7 +17,7 @@ type SpawnGitOptions = {
 
 export type SpawnGitBoundedResult =
 	| { settled: true; code: number; out: string }
-	| { settled: false; code: null; out: string }
+	| { settled: false; out: string }
 
 /**
  * Pinned author/committer identity + clock. Commit/tag OIDs are a hash of the
@@ -77,17 +78,26 @@ export class GitCommandError extends Error {
 	}
 }
 
-type GitAttempt = { ok: boolean; code: number; stdout: string; stderr: string }
+const nonZeroExitCodeSchema = z.number().int().positive().brand<"NonZeroExitCode">()
+export type NonZeroExitCode = z.infer<typeof nonZeroExitCodeSchema>
+
+export function parseNonZeroExitCode(code: number): NonZeroExitCode {
+	return nonZeroExitCodeSchema.parse(code)
+}
+
+export type GitAttempt =
+	| { ok: true; code: 0; stdout: string; stderr: string }
+	| { ok: false; code: NonZeroExitCode; stdout: string; stderr: string }
 
 /** Run Git when an ordinary nonzero exit is data, while preserving infrastructure faults. */
 export async function attemptGit(args: string[], cwd?: string): Promise<GitAttempt> {
 	try {
 		const result = await spawnGit(args, { cwd })
-		return { code: result.code, ok: true, stderr: result.stderr, stdout: result.stdout }
+		return { code: 0, ok: true, stderr: result.stderr, stdout: result.stdout }
 	} catch (error) {
 		if (!(error instanceof GitCommandError) || error.code < 1) throw error
 		return {
-			code: error.code,
+			code: parseNonZeroExitCode(error.code),
 			ok: false,
 			stderr: error.stderr,
 			stdout: error.stdout,
@@ -116,7 +126,7 @@ export function spawnGitBounded(
 			if (finished) return
 			finished = true
 			child.kill("SIGKILL")
-			resolve({ code: null, out, settled: false })
+			resolve({ out, settled: false })
 		}, limitMs)
 		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
 			if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED" || finished)

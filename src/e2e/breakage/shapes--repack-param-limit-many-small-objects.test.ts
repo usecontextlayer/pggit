@@ -44,11 +44,15 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack, type Repack } from "@/store/repack"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const WHO = "A U Thor <author@example.com> 1700000000 +0000"
@@ -115,14 +119,14 @@ describe("repack — the bind-parameter ceiling on many small objects", () => {
 	let repack: Repack
 
 	beforeAll(async () => {
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
 		repack = createRepack(db.sql)
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 	})
 
 	/**
@@ -162,7 +166,7 @@ describe("repack — the bind-parameter ceiling on many small objects", () => {
 			expect(await objectList(ctl)).toBe(srcObjs)
 
 			// pggit's wire path: push + pre-repack clone are already correct today.
-			const url = `http://127.0.0.1:${server.port}/${tag}`
+			const url = repoUrl(server, tag)
 			await spawnGit(["push", "-q", url, "refs/heads/*:refs/heads/*"], { cwd: src })
 			const pre = join(mk("pre"), "c.git")
 			await spawnGit(["clone", "-q", "--bare", url, pre])

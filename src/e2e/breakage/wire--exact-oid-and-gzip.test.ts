@@ -19,31 +19,32 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { objectsByType } from "@/testing/git-fixtures"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "workspace/probe/exactoid"
 const RUNS = 200
 /** Branch count: enough `want` lines that git gzips the request body. */
 const BRANCHES = 400
 
-async function inventory(dir: string): Promise<string[]> {
-	return (
-		await spawnGit(["cat-file", "--batch-check", "--batch-all-objects"], { cwd: dir })
-	).stdout
-		.split("\n")
-		.filter(Boolean)
-		.sort()
-}
-
 /** sha256 over every local object's raw bytes, in oid order — the byte-level oracle. */
 async function bytesDigest(dir: string): Promise<string> {
-	const oids = (await inventory(dir)).map((l) => l.split(" ")[0] as string)
+	const oids = (await objectsByType(dir)).map((object) => object.oid).sort()
 	const res = await spawnGit(["cat-file", "--batch"], {
 		cwd: dir,
 		input: `${oids.join("\n")}\n`,
@@ -51,14 +52,7 @@ async function bytesDigest(dir: string): Promise<string> {
 	return createHash("sha256").update(res.stdoutBytes).digest("hex")
 }
 
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
-}
+type ManyRefResult = TestResult<{ refetch: TestResult<string> }>
 
 describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", () => {
 	let db: IsolatedDb
@@ -70,15 +64,10 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 		return d
 	}
 
-	const exactOidError = new Map<string, string | null>()
-	const exactOidCommitMatches = new Map<string, boolean>()
-	const havesError = new Map<string, string | null>()
-	const havesDigest = new Map<string, string>()
-	const manyRefCloneError = new Map<string, string | null>()
-	const refetchError = new Map<string, string | null>()
-	const manyRefDigest = new Map<string, string>()
-	let mirrorError: string | null = null
-	let mirrorRefCount = 0
+	const exactOid = new Map<string, TestResult<boolean>>()
+	const haves = new Map<string, TestResult<string>>()
+	const manyRefs = new Map<string, ManyRefResult>()
+	let mirror: TestResult<number>
 
 	beforeAll(async () => {
 		const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS })
@@ -99,9 +88,10 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 		await spawnGit(["config", "uploadpack.allowAnySHA1InWant", "true"], { cwd: bare })
 		await spawnGit(["repack", "-a", "-d", "-q"], { cwd: bare })
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const pggitUrl = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		const pggitUrl = repoUrl(server, REPO)
 		const bareUrl = `file://${bare}`
 		const remotes = [
 			["pggit", pggitUrl],
@@ -116,29 +106,30 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 		for (const [label, url] of remotes) {
 			const dest = join(mk(`oid-${label}`), "c")
 			await spawnGit(["init", "-q", dest])
-			const err = await errorOf(async () => {
-				await spawnGit(
-					[
-						"-c",
-						"protocol.version=2",
-						"-c",
-						"transfer.fsckobjects=true",
-						"fetch",
-						"-q",
-						url,
-						oldCommit,
-					],
-					{ cwd: dest },
-				)
-				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			})
-			exactOidError.set(label, err)
-			if (err !== null) continue
-			const got = (await spawnGit(["cat-file", "commit", oldCommit], { cwd: dest }))
-				.stdoutBytes
-			const want = (await spawnGit(["cat-file", "commit", oldCommit], { cwd: src }))
-				.stdoutBytes
-			exactOidCommitMatches.set(label, got.equals(want))
+			exactOid.set(
+				label,
+				await captureTestResult(async () => {
+					await spawnGit(
+						[
+							"-c",
+							"protocol.version=2",
+							"-c",
+							"transfer.fsckobjects=true",
+							"fetch",
+							"-q",
+							url,
+							oldCommit,
+						],
+						{ cwd: dest },
+					)
+					await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+					const got = (await spawnGit(["cat-file", "commit", oldCommit], { cwd: dest }))
+						.stdoutBytes
+					const want = (await spawnGit(["cat-file", "commit", oldCommit], { cwd: src }))
+						.stdoutBytes
+					return got.equals(want)
+				}),
+			)
 		}
 
 		// 2. The same want against a client that already holds an ancestor.
@@ -150,30 +141,32 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 				cwd: dest,
 			})
 			await spawnGit(["update-ref", "refs/heads/base", ancestor], { cwd: dest })
-			const err = await errorOf(async () => {
-				await spawnGit(
-					[
-						"-c",
-						"protocol.version=2",
-						"-c",
-						"transfer.fsckobjects=true",
-						"fetch",
-						"-q",
-						url,
-						oldCommit,
-					],
-					{ cwd: dest },
-				)
-				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			})
-			havesError.set(label, err)
-			if (err === null) havesDigest.set(label, await bytesDigest(dest))
+			haves.set(
+				label,
+				await captureTestResult(async () => {
+					await spawnGit(
+						[
+							"-c",
+							"protocol.version=2",
+							"-c",
+							"transfer.fsckobjects=true",
+							"fetch",
+							"-q",
+							url,
+							oldCommit,
+						],
+						{ cwd: dest },
+					)
+					await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+					return bytesDigest(dest)
+				}),
+			)
 		}
 
 		// 3. Many-ref clone (git gzips a request body this long) + a long-have fetch.
 		for (const [label, url] of remotes) {
 			const dest = join(mk(`many-${label}`), "c")
-			const cloneErr = await errorOf(async () => {
+			const cloned = await captureTestResult(async () => {
 				await spawnGit([
 					"-c",
 					"protocol.version=2",
@@ -187,36 +180,37 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 					dest,
 				])
 				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+				return dest
 			})
-			manyRefCloneError.set(label, cloneErr)
-			if (cloneErr !== null) continue
+			if (cloned.kind === "failed") {
+				manyRefs.set(label, cloned)
+				continue
+			}
 			// A second fetch from a fully-populated clone: the have list is now every
 			// local ref, so the request body is long AND the negotiation is non-trivial.
-			refetchError.set(
-				label,
-				await errorOf(async () => {
-					await spawnGit(
-						[
-							"-c",
-							"protocol.version=2",
-							"-c",
-							"fetch.negotiationAlgorithm=skipping",
-							"fetch",
-							"-q",
-							"--refetch",
-							"origin",
-						],
-						{ cwd: dest },
-					)
-					await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-				}),
-			)
-			manyRefDigest.set(label, await bytesDigest(dest))
+			const refetch = await captureTestResult(async () => {
+				await spawnGit(
+					[
+						"-c",
+						"protocol.version=2",
+						"-c",
+						"fetch.negotiationAlgorithm=skipping",
+						"fetch",
+						"-q",
+						"--refetch",
+						"origin",
+					],
+					{ cwd: dest },
+				)
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+				return bytesDigest(dest)
+			})
+			manyRefs.set(label, { kind: "succeeded", value: { refetch } })
 		}
 
 		// 4. Mirror clone (refs/*:refs/*).
-		const mirror = join(mk("mirror"), "m.git")
-		mirrorError = await errorOf(async () => {
+		const mirrorDir = join(mk("mirror"), "m.git")
+		mirror = await captureTestResult(async () => {
 			await spawnGit([
 				"-c",
 				"protocol.version=2",
@@ -226,46 +220,70 @@ describe("wire — exact-oid wants, long gzipped negotiations, mirror clones", (
 				"-q",
 				"--mirror",
 				pggitUrl,
-				mirror,
+				mirrorDir,
 			])
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: mirror })
+			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: mirrorDir })
+			return (await spawnGit(["show-ref"], { cwd: mirrorDir })).stdout.trim().split("\n")
+				.length
 		})
-		if (mirrorError === null) {
-			mirrorRefCount = (await spawnGit(["show-ref"], { cwd: mirror })).stdout
-				.trim()
-				.split("\n").length
-		}
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
 	it("serves a want for an exact non-tip OID, byte-identical to the source", () => {
 		for (const label of ["pggit", "git"]) {
-			expect(exactOidError.get(label), label).toBeNull()
-			expect(exactOidCommitMatches.get(label), label).toBe(true)
+			const result = exactOid.get(label)
+			expect(result?.kind, result ? testResultContext(result, label) : label).toBe(
+				"succeeded",
+			)
+			if (result?.kind === "succeeded") expect(result.value, label).toBe(true)
 		}
 	})
 
 	it("serves a want whose anchor the client's haves cut out of the served set", () => {
 		for (const label of ["pggit", "git"]) {
-			expect(havesError.get(label), label).toBeNull()
+			const result = haves.get(label)
+			expect(result?.kind, result ? testResultContext(result, label) : label).toBe(
+				"succeeded",
+			)
 		}
-		expect(havesDigest.get("pggit")).toBe(havesDigest.get("git"))
+		const pggit = haves.get("pggit")
+		const git = haves.get("git")
+		if (pggit?.kind === "succeeded" && git?.kind === "succeeded") {
+			expect(pggit.value).toBe(git.value)
+		}
 	})
 
 	it("serves a gzipped many-ref clone and a long-have refetch, matching git", () => {
 		for (const label of ["pggit", "git"]) {
-			expect(manyRefCloneError.get(label), label).toBeNull()
-			expect(refetchError.get(label), label).toBeNull()
+			const result = manyRefs.get(label)
+			expect(result?.kind, result ? testResultContext(result, label) : label).toBe(
+				"succeeded",
+			)
+			if (result?.kind === "succeeded") {
+				expect(
+					result.value.refetch.kind,
+					testResultContext(result.value.refetch, `${label} refetch`),
+				).toBe("succeeded")
+			}
 		}
-		expect(manyRefDigest.get("pggit")).toBe(manyRefDigest.get("git"))
+		const pggit = manyRefs.get("pggit")
+		const git = manyRefs.get("git")
+		if (
+			pggit?.kind === "succeeded" &&
+			git?.kind === "succeeded" &&
+			pggit.value.refetch.kind === "succeeded" &&
+			git.value.refetch.kind === "succeeded"
+		) {
+			expect(pggit.value.refetch.value).toBe(git.value.refetch.value)
+		}
 	})
 
 	it("serves a mirror clone (refs/*:refs/*) fsck-clean", () => {
-		expect(mirrorError, `${mirrorRefCount} refs mirrored`).toBeNull()
+		expect(mirror.kind, testResultContext(mirror, "mirror clone")).toBe("succeeded")
+		if (mirror.kind === "succeeded") expect(mirror.value).toBeGreaterThan(0)
 	})
 })

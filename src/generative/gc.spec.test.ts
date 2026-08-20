@@ -42,6 +42,7 @@ import { rmSync } from "node:fs"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
+import { IS_CI } from "@/testing/ci"
 import {
 	ageObjects,
 	cloneAndFsck,
@@ -52,7 +53,7 @@ import {
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
-import { loadAllObjects, refsOf } from "@/testing/git-fixtures"
+import { loadAllObjects, parseRevListObjectOids, refsOf } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 /**
@@ -67,12 +68,7 @@ import { spawnGit } from "@/testing/spawn-git"
 async function gitClosureOver(dir: string, tipOids: string[]): Promise<string[]> {
 	if (tipOids.length === 0) return []
 	const out = await spawnGit(["rev-list", "--objects", ...tipOids], { cwd: dir })
-	const oids = new Set<string>()
-	for (const line of out.stdout.trim().split("\n")) {
-		const oid = line.split(" ", 1)[0]
-		if (oid) oids.add(oid)
-	}
-	return [...oids].sort()
+	return [...new Set(parseRevListObjectOids(out.stdout))].sort()
 }
 
 /** Fetch `ref` into a throwaway dir and `fsck --full` it (throws on any dangling /
@@ -271,8 +267,8 @@ function expectShapeFloors(label: string, cov: ShapeCoverage): void {
 /**
  * Run counts: keep the PG-round-trip cost low LOCALLY, but let CI sample BROADLY so
  * the annotated-tag / nested-tree / dropped-ref corners are actually hit (GAP-3). The
- * seed stays pinned (424_242) so every run — local or CI — is reproducible.
- * `process.env.CI` is read defensively (it may be undefined).
+ * seed stays pinned (424_242) so every run — local or CI — is reproducible. The
+ * environment distinction is parsed once by the shared test-configuration boundary.
  *
  * The local count is 30 because MEASUREMENT set it, not taste: at the historical 12 the
  * corpus realizes ZERO candidates with a dropped-ref unreachable set, so PBT-1 and
@@ -280,7 +276,6 @@ function expectShapeFloors(label: string, cov: ShapeCoverage): void {
  * the smallest round count at this seed that reaches that corner (see `SHAPE_FLOORS`,
  * which is what now holds it there); it costs a few seconds per property.
  */
-const IS_CI = process.env.CI !== undefined && process.env.CI !== ""
 const NUM_RUNS = IS_CI ? 200 : 30
 // PBT-2 drives a per-cycle push+GC loop (heavier per candidate), so it scales lower.
 const NUM_RUNS_REWIND = IS_CI ? 120 : 8

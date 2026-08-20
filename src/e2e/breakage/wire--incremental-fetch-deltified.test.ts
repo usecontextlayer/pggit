@@ -17,14 +17,23 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
-import { type GitServer, serveOnPort } from "@/server"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import type { GitServer } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { parseRevListObjectOids } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const REPO = "workspace/probe/incremental"
 const RUNS_1 = 140
@@ -33,14 +42,15 @@ const ALGORITHMS = ["default", "skipping", "noop"] as const
 
 type FetchRound = {
 	algo: string
-	fetchError: string | null
-	fsckError: string | null
-	pggitInventory: string
-	gitInventory: string
-	pggitDigest: string
-	gitDigest: string
-	pggitTip: string
-	gitTip: string
+	result: TestResult<{
+		fsck: TestResult<void>
+		pggitInventory: string
+		gitInventory: string
+		pggitDigest: string
+		gitDigest: string
+		pggitTip: string
+		gitTip: string
+	}>
 }
 
 /** Every reachable object's oid+type+size, as one comparable sorted blob. */
@@ -65,15 +75,6 @@ async function contentDigest(dir: string): Promise<string> {
 	return createHash("sha256").update(res.stdoutBytes).digest("hex")
 }
 
-async function errorOf(run: () => Promise<unknown>): Promise<string | null> {
-	try {
-		await run()
-		return null
-	} catch (err) {
-		return String(err)
-	}
-}
-
 describe("wire — incremental fetch against the deltified serve path", () => {
 	let db: IsolatedDb
 	let server: GitServer
@@ -96,9 +97,10 @@ describe("wire — incremental fetch against the deltified serve path", () => {
 		const bare = join(mk("bare"), "oracle.git")
 		await spawnGit(["clone", "--bare", "-q", src, bare])
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
-		const pggitUrl = `http://127.0.0.1:${server.port}/${REPO}`
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		const pggitUrl = repoUrl(server, REPO)
 		const bareUrl = `file://${bare}`
 
 		// ---- seed pggit over the real wire (v0 push) --------------------------
@@ -138,46 +140,41 @@ describe("wire — incremental fetch against the deltified serve path", () => {
 					? ["-c", "protocol.version=2"]
 					: ["-c", "protocol.version=2", "-c", `fetch.negotiationAlgorithm=${algo}`]
 
-			const fetchError = await errorOf(() =>
+			const fetch = await captureTestResult(() =>
 				spawnGit([...cfg, "fetch", "-q", "origin"], { cwd: dP }),
 			)
-			if (fetchError !== null) {
-				rounds.push({
-					algo,
-					fetchError,
-					fsckError: null,
-					gitDigest: "",
-					gitInventory: "",
-					gitTip: "",
-					pggitDigest: "",
-					pggitInventory: "",
-					pggitTip: "",
-				})
+			if (fetch.kind === "failed") {
+				rounds.push({ algo, result: fetch })
 				continue
 			}
 			await spawnGit([...cfg, "fetch", "-q", "origin"], { cwd: dG })
-			const fsckError = await errorOf(() =>
-				spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dP }),
-			)
+			const fsck = await captureTestResult(async () => {
+				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dP })
+			})
 			rounds.push({
 				algo,
-				fetchError,
-				fsckError,
-				gitDigest: await contentDigest(dG),
-				gitInventory: await objectInventory(dG),
-				gitTip: (await spawnGit(["rev-parse", "origin/main"], { cwd: dG })).stdout.trim(),
-				pggitDigest: await contentDigest(dP),
-				pggitInventory: await objectInventory(dP),
-				pggitTip: (
-					await spawnGit(["rev-parse", "origin/main"], { cwd: dP })
-				).stdout.trim(),
+				result: {
+					kind: "succeeded",
+					value: {
+						fsck,
+						gitDigest: await contentDigest(dG),
+						gitInventory: await objectInventory(dG),
+						gitTip: (
+							await spawnGit(["rev-parse", "origin/main"], { cwd: dG })
+						).stdout.trim(),
+						pggitDigest: await contentDigest(dP),
+						pggitInventory: await objectInventory(dP),
+						pggitTip: (
+							await spawnGit(["rev-parse", "origin/main"], { cwd: dP })
+						).stdout.trim(),
+					},
+				},
 			})
 		}
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -188,16 +185,22 @@ describe("wire — incremental fetch against the deltified serve path", () => {
 	it("takes an incremental fetch under every negotiation algorithm, fsck-clean", () => {
 		expect(rounds.length).toBe(ALGORITHMS.length)
 		for (const r of rounds) {
-			expect(r.fetchError, r.algo).toBeNull()
-			expect(r.fsckError, r.algo).toBeNull()
+			expect(r.result.kind, testResultContext(r.result, r.algo)).toBe("succeeded")
+			if (r.result.kind === "succeeded") {
+				expect(
+					r.result.value.fsck.kind,
+					testResultContext(r.result.value.fsck, `${r.algo} fsck`),
+				).toBe("succeeded")
+			}
 		}
 	})
 
 	it("ends each incremental fetch at git's object set, bytes and tip", () => {
 		for (const r of rounds) {
-			expect(r.pggitInventory, r.algo).toBe(r.gitInventory)
-			expect(r.pggitDigest, r.algo).toBe(r.gitDigest)
-			expect(r.pggitTip, r.algo).toBe(r.gitTip)
+			if (r.result.kind === "failed") continue
+			expect(r.result.value.pggitInventory, r.algo).toBe(r.result.value.gitInventory)
+			expect(r.result.value.pggitDigest, r.algo).toBe(r.result.value.gitDigest)
+			expect(r.result.value.pggitTip, r.algo).toBe(r.result.value.gitTip)
 		}
 	})
 })

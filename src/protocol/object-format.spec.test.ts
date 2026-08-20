@@ -12,6 +12,7 @@ import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { handleReceivePack, type ReceiveBackend } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { packObjectCount } from "@/testing/pkt-oracle"
+import { receivePackRequest } from "@/testing/wire-receive"
 
 const A = "a".repeat(40)
 const Z = "0".repeat(40)
@@ -66,11 +67,8 @@ describe("upload-pack rejects a SHA-256 client cleanly", () => {
 
 describe("receive-pack rejects a SHA-256 client cleanly", () => {
 	it("throws GitProtocolError and never ingests the pack", async () => {
-		const body = Buffer.concat([
-			encodePktLine(
-				Buffer.from(`${Z} ${A} refs/heads/main\0report-status object-format=sha256`),
-			),
-			encodePkt({ type: "flush" }),
+		const body = receivePackRequest([
+			`${Z} ${A} refs/heads/main\0report-status object-format=sha256`,
 		])
 		const { backend, calls } = recordingReceive()
 		await expect(handleReceivePack(body, backend)).rejects.toThrow(GitProtocolError)
@@ -101,6 +99,6 @@ describe("fetch with zero wants is a no-op (matches git's oracle)", () => {
 		const out = await handleUploadPack(body, backend)
 		// An empty but valid pack rides band 1. Checking only its PACK magic would
 		// also accept an arbitrary non-empty response and would not pin the no-op.
-		expect(packObjectCount(out)).toBe(0)
+		expect(packObjectCount(out)).toEqual({ kind: "pack", objectCount: 0 })
 	})
 })

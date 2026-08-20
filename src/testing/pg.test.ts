@@ -7,8 +7,9 @@ describe("postgres test fixture", () => {
 		try {
 			await db.sql`create table item (id int primary key, name text)`
 			await db.sql`insert into item ${db.sql({ id: 1, name: "hello" })}`
-			const rows = await db.sql`select name from item where id = 1`
-			expect(rows[0]?.name).toBe("hello")
+			const [row] = await db.sql<{ name: string }[]>`select name from item where id = 1`
+			if (row === undefined) throw new Error("inserted item is missing")
+			expect(row.name).toBe("hello")
 		} finally {
 			await db.drop()
 		}

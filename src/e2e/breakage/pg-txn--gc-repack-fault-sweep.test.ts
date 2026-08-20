@@ -344,23 +344,19 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 					onnotice: () => {},
 				})
 			const gcSql = mkFaulty()
-			// The pid fetch itself can trip a very tight statement_timeout under load.
-			let pid = 0
-			try {
-				const [pp] = await gcSql<{ pid: number }[]>`select pg_backend_pid() as pid`
-				pid = pp?.pid ?? 0
-			} catch {
-				pid = 0
-			}
 			// Abort ONLY the pid this test opened, and only once it is inside the
 			// targeted statement. `stop` ends the watch as soon as the pass settles, so a
 			// case whose target never appears costs one more poll, not the whole bound —
 			// and reports `aimHit: false`, which the barrier below turns into a failure.
 			const stop = { now: false }
-			const aimed =
-				c.fault.kind === "timeout"
-					? Promise.resolve(false)
-					: abortWhenInside(admin, pid, c.fault, stop, 45_000)
+			let aimed: Promise<boolean>
+			if (c.fault.kind === "timeout") {
+				aimed = Promise.resolve(false)
+			} else {
+				const [pidRow] = await gcSql<{ pid: number }[]>`select pg_backend_pid() as pid`
+				if (pidRow === undefined) throw new Error("pg_backend_pid returned no row")
+				aimed = abortWhenInside(admin, pidRow.pid, c.fault, stop, 45_000)
+			}
 			let gcErr = "none"
 			let repackErr = "none"
 			try {

@@ -23,17 +23,21 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
-import { createGitApp, createGitDeps } from "@/index"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import type { PackInputObject } from "@/pack/write-pack"
-import { type GitServer, serveOnPort } from "@/server"
+import type { GitServer } from "@/server"
 import { createGc, type Gc, type GcResult } from "@/store/gc"
-import { createObjectStore, type ObjectStore } from "@/store/object-store"
-import { createRefStore, type RefStore } from "@/store/refs-store"
+import type { ObjectStore } from "@/store/object-store"
+import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { loadReachableObjects } from "@/testing/git-fixtures"
-import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import {
+	repoUrl,
+	setupGitServerFixture,
+	teardownGitServerFixture,
+} from "@/testing/git-server-fixture"
+import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const ITERS = 25
@@ -68,17 +72,17 @@ describe("race — two concurrent gc() passes on one repo", () => {
 		objects = await loadReachableObjects(src, ["--all"])
 		tip = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 
-		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		store = createObjectStore(db.sql)
-		refs = createRefStore(db.sql)
+		const fixture = await setupGitServerFixture()
+		db = fixture.db
+		server = fixture.server
+		store = fixture.deps.objects
+		refs = fixture.deps.refs
 		gc = createGc(db.sql)
 		repack = createRepack(db.sql)
-		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 	}, 600_000)
 
 	afterAll(async () => {
-		await server?.close()
-		await db?.drop()
+		await teardownGitServerFixture({ db, server })
 		for (const d of scratch) rmSync(d, { force: true, recursive: true })
 	})
 
@@ -91,7 +95,7 @@ describe("race — two concurrent gc() passes on one repo", () => {
 
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const repo = `race/gcgc/${i}`
-			const url = `http://127.0.0.1:${server.port}/${repo}`
+			const url = repoUrl(server, repo)
 			await store.putPack(repo, objects)
 			await refs.setRef(repo, "refs/heads/main", tip)
 			await refs.setSymref(repo, "HEAD", "refs/heads/main")

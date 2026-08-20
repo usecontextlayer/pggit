@@ -86,6 +86,7 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".."
 const CHILD_SOURCE = `/** Emitted at runtime by src/e2e/breakage/pg-txn--txn-death-kills-host-process.test.ts. */
 import { readFileSync } from "node:fs"
 import postgres from "postgres"
+import { z } from "zod"
 import { createObjectStore } from "@/store/object-store"
 
 const FAULT_POINTS = {
@@ -93,13 +94,20 @@ const FAULT_POINTS = {
 	"object-insert": "insert into git_object",
 	"plain-query": "select pg_sleep",
 	"txn-sleep": "select pg_sleep",
-}
+} as const
 
-const PG = process.env.BK_PG
-const schema = process.env.BK_SCHEMA
-const mode = process.env.BK_MODE
-const packPath = process.env.BK_PACK
-const repo = process.env.BK_REPO
+const env = z.object({
+	BK_MODE: z.enum(["plain-query", "txn-sleep", "copy-stream", "object-insert"]),
+	BK_PACK: z.string().min(1),
+	BK_PG: z.string().min(1),
+	BK_REPO: z.string().min(1),
+	BK_SCHEMA: z.string().min(1),
+}).parse(process.env)
+const PG = env.BK_PG
+const schema = env.BK_SCHEMA
+const mode = env.BK_MODE
+const packPath = env.BK_PACK
+const repo = env.BK_REPO
 const needle = FAULT_POINTS[mode]
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -147,10 +155,12 @@ await admin.end({ timeout: 2 }).catch(() => {})
 process.stdout.write("CHILD exiting cleanly\\n")
 `
 
-type Outcome = { code: number | null; signal: string | null; tail: string }
+type Outcome =
+	| { kind: "exited"; code: number; tail: string }
+	| { kind: "signaled"; signal: NodeJS.Signals; tail: string }
 
 function runChild(childPath: string, env: Record<string, string>): Promise<Outcome> {
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
 		const child = spawn("npx", ["tsx", childPath], {
 			cwd: REPO_ROOT,
 			env: { ...process.env, ...env },
@@ -162,21 +172,32 @@ function runChild(childPath: string, env: Record<string, string>): Promise<Outco
 		child.stderr.on("data", (d) => {
 			out += d
 		})
-		child.on("close", (code, signal) =>
-			resolve({
-				code,
-				signal,
-				tail: out
-					.split("\n")
-					.filter((l) => l.trim())
-					.slice(-8)
-					.join(" | "),
-			}),
-		)
+		child.on("error", reject)
+		child.on("close", (code, signal) => {
+			const tail = out
+				.split("\n")
+				.filter((line) => line.trim())
+				.slice(-8)
+				.join(" | ")
+			if (code !== null && signal === null) {
+				resolve({ code, kind: "exited", tail })
+				return
+			}
+			if (code === null && signal !== null) {
+				resolve({ kind: "signaled", signal, tail })
+				return
+			}
+			reject(
+				new Error(
+					`child closed with invalid code/signal state: code=${code}, signal=${signal}`,
+				),
+			)
+		})
 	})
 }
 
-type ModeResult = { mode: string; crashes: number; firstTail: string }
+type Mode = (typeof MODES)[number]
+type ModeResult = { mode: Mode; crashes: number; firstTail: string }
 
 describe("breakage/pg-txn — a killed backend must not kill the host process", () => {
 	let db: IsolatedDb
@@ -219,9 +240,13 @@ describe("breakage/pg-txn — a killed backend must not kill the host process", 
 					BK_REPO: `txn/copykill-${mode}-${i}`,
 					BK_SCHEMA: db.schema,
 				})
-				if (r.code !== 0) {
+				const crashed = r.kind === "signaled" || r.code !== 0
+				if (crashed) {
 					crashes++
-					if (!firstTail) firstTail = `exit=${r.code} signal=${r.signal} — ${r.tail}`
+					if (!firstTail) {
+						const status = r.kind === "exited" ? `exit=${r.code}` : `signal=${r.signal}`
+						firstTail = `${status} — ${r.tail}`
+					}
 				}
 			}
 			results.push({ crashes, firstTail, mode })

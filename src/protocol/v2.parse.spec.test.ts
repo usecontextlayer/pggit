@@ -14,18 +14,11 @@ import { encodePkt, encodePktLine } from "@/protocol/pkt-line"
 import { parseReceivePack } from "@/protocol/receive-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { parseFetch, parseV2Request } from "@/protocol/v2"
+import { receivePackRequest } from "@/testing/wire-receive"
 
 const A = "a".repeat(40)
 const B = "b".repeat(40)
 const Z = "0".repeat(40)
-
-/** A receive-pack body: command lines, a flush, then the (here empty) pack. */
-function receiveBody(lines: string[]): Buffer {
-	return Buffer.concat([
-		...lines.map((l) => encodePktLine(Buffer.from(l))),
-		encodePkt({ type: "flush" }),
-	])
-}
 
 /** A benign read-only stub. (upload-pack's backend has no mutating methods, so
  * "no side effect" is structural; we assert the observable contract — an
@@ -66,7 +59,7 @@ describe("parseFetch — argument dispatch", () => {
 
 describe("parseReceivePack — command-list decode", () => {
 	it("parses a valid command, splitting caps off the first line only", () => {
-		const body = receiveBody([`${Z} ${A} refs/heads/main\0report-status atomic`])
+		const body = receivePackRequest([`${Z} ${A} refs/heads/main\0report-status atomic`])
 		const req = parseReceivePack(body)
 		expect(req.commands).toEqual([{ newOid: A, oldOid: Z, ref: "refs/heads/main" }])
 		expect(req.caps).toEqual(["report-status", "atomic"])
@@ -74,14 +67,14 @@ describe("parseReceivePack — command-list decode", () => {
 	})
 
 	it("a delete-only push (flush, no pack) parses with an empty pack", () => {
-		const body = receiveBody([`${A} ${Z} refs/heads/gone\0report-status`])
+		const body = receivePackRequest([`${A} ${Z} refs/heads/gone\0report-status`])
 		const req = parseReceivePack(body)
 		expect(req.commands).toEqual([{ newOid: Z, oldOid: A, ref: "refs/heads/gone" }])
 		expect(req.pack.length).toBe(0)
 	})
 
 	it("caps ride the first line; later command lines are plain", () => {
-		const body = receiveBody([
+		const body = receivePackRequest([
 			`${Z} ${A} refs/heads/main\0report-status`,
 			`${Z} ${B} refs/heads/dev`,
 		])
@@ -91,14 +84,14 @@ describe("parseReceivePack — command-list decode", () => {
 	})
 
 	it("throws on a 2-token command line (fail loud, not silently dropped)", () => {
-		expect(() => parseReceivePack(receiveBody([`${A} refs/heads/main`]))).toThrow(
+		expect(() => parseReceivePack(receivePackRequest([`${A} refs/heads/main`]))).toThrow(
 			GitProtocolError,
 		)
 	})
 
 	it("throws on a 4-token command line", () => {
 		expect(() =>
-			parseReceivePack(receiveBody([`${Z} ${A} refs/heads/main extra`])),
+			parseReceivePack(receivePackRequest([`${Z} ${A} refs/heads/main extra`])),
 		).toThrow(GitProtocolError)
 	})
 
@@ -109,10 +102,10 @@ describe("parseReceivePack — command-list decode", () => {
 	it("throws on a malformed object id in either position (non-hex, short, uppercase)", () => {
 		for (const bad of ["z".repeat(40), "a".repeat(39), "A".repeat(40)]) {
 			expect(() =>
-				parseReceivePack(receiveBody([`${bad} ${A} refs/heads/main`])),
+				parseReceivePack(receivePackRequest([`${bad} ${A} refs/heads/main`])),
 			).toThrow(/malformed object id/)
 			expect(() =>
-				parseReceivePack(receiveBody([`${A} ${bad} refs/heads/main`])),
+				parseReceivePack(receivePackRequest([`${A} ${bad} refs/heads/main`])),
 			).toThrow(/malformed object id/)
 		}
 	})
