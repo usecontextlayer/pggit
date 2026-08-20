@@ -104,12 +104,11 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 		// differential quietly lost that dimension. Raising a floor is fine (a richer
 		// corpus); dropping one is the regression these exist to red.
 		//
-		// MERGE IS DELIBERATELY NOT FLOORED HERE: at seed 424_242 / 30 runs the corpus
-		// realizes ZERO merge commits (logged below), so a positive floor would be a
-		// false claim and a zero floor would assert nothing. Merge reachability is
-		// instead pinned by the hand-picked case below — the only place in the corpus
-		// where a multi-parent commit is guaranteed. Making the RANDOM corpus reach
-		// merges needs a generator change, which is not this pass.
+		// MERGE is floored on the RANDOM corpus, which is the only floor that protects
+		// the six consumers: the hand-picked case below proves the vocabulary can reach
+		// a merge, but the consumers never replay it. Before `divergeAndMerge` existed
+		// this corpus realized ZERO merge commits, so every differential built on this
+		// generator had only ever seen single-parent history.
 		console.log(
 			`[repoCommands corpus] candidates=${shape.candidates} merge=${shape.withMerge} ` +
 				`tag-object=${shape.withTagObject} second-branch=${shape.withSecondBranch} ` +
@@ -117,23 +116,27 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 		)
 		expect(shape.candidates, "the property sampled nothing").toBe(30)
 		expect(
+			shape.withMerge,
+			"no candidate produced a multi-parent commit — every consuming differential is running on linear history",
+		).toBeGreaterThanOrEqual(7)
+		expect(
 			shape.withTagObject,
 			"no candidate produced an annotated-tag object",
-		).toBeGreaterThanOrEqual(1)
+		).toBeGreaterThanOrEqual(6)
 		expect(
 			shape.withSecondBranch,
 			"no candidate produced a second branch",
-		).toBeGreaterThanOrEqual(4)
-		expect(shape.withTag, "no candidate produced a tag").toBeGreaterThanOrEqual(2)
+		).toBeGreaterThanOrEqual(9)
+		expect(shape.withTag, "no candidate produced a tag").toBeGreaterThanOrEqual(7)
 	}, 180_000)
 
 	it("can generate a repo with commits, a branch, a MERGE, and a tag (coverage smoke)", async () => {
-		// A hand-picked sequence proving the vocabulary actually produces graph shape.
-		// The merge half is load-bearing: the random corpus above realizes zero merge
-		// commits at the pinned seed, so this is the ONLY place a multi-parent commit
-		// is guaranteed — if `step`'s merge guard ever starts skipping unconditionally,
-		// this is what goes red. The two branches must DIVERGE (each gets its own
-		// commit) or git fast-forwards and records no merge commit at all.
+		// A hand-picked sequence proving the PRIMITIVE vocabulary produces graph shape
+		// on its own. The corpus floor above is satisfied by `divergeAndMerge` alone,
+		// so this is the only thing that reds if the primitive `merge` command starts
+		// skipping unconditionally while the macro still lands. The two branches must
+		// DIVERGE (each gets its own commit) or git fast-forwards and records no merge
+		// commit at all.
 		const { dir, model } = await buildRepoFromCommands([
 			{ content: { kind: "text", value: "alpha\n" }, kind: "writeFile", path: "a.txt" },
 			{ kind: "commit" },
@@ -155,6 +158,43 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 				await spawnGit(["rev-list", "--all", "--merges"], { cwd: dir })
 			).stdout.trim()
 			expect(merges, "the merge command produced no multi-parent commit").not.toBe("")
+			await spawnGit(["fsck", "--full"], { cwd: dir })
+		} finally {
+			rmSync(dir, { force: true, recursive: true })
+		}
+	}, 60_000)
+
+	it("branches off a HEAD whose branch name is ALSO a tag (ambiguous-refname regression)", async () => {
+		// Branches and tags share the NAMES pool, so `x` can be both. With HEAD on
+		// branch `dev` and a tag `dev` present, a bare `git branch <new>` exits 128
+		// (`ambiguous object name: 'dev'`) — which breaks the generator's contract that
+		// a replay never makes git exit non-zero, and did: the sequence below is the
+		// shape fast-check shrank a gc.spec PBT-1 failure down to. The replay throwing
+		// is the regression; `buildRepoFromCommands` propagates it.
+		const { dir, model } = await buildRepoFromCommands([
+			{ content: { kind: "text", value: "alpha\n" }, kind: "writeFile", path: "a.txt" },
+			{ kind: "commit" },
+			{ idx: 2, kind: "branch" }, // "dev"
+			{ annotated: false, idx: 2, kind: "tag" }, // a TAG also called "dev"
+			{ idx: 1, kind: "checkout" }, // HEAD onto branch "dev"
+			{ idx: 0, kind: "branch" }, // "feature" — the call that used to fatal
+		])
+		try {
+			expect([...model.existingBranches].sort()).toEqual(["dev", "feature", "main"])
+			expect([...model.tags]).toEqual(["dev"])
+			const refs = (
+				await spawnGit(["for-each-ref", "--format=%(refname)"], { cwd: dir })
+			).stdout
+				.split("\n")
+				.map((s) => s.trim())
+				.filter(Boolean)
+				.sort()
+			expect(refs).toEqual([
+				"refs/heads/dev",
+				"refs/heads/feature",
+				"refs/heads/main",
+				"refs/tags/dev",
+			])
 			await spawnGit(["fsck", "--full"], { cwd: dir })
 		} finally {
 			rmSync(dir, { force: true, recursive: true })

@@ -38,12 +38,25 @@
  * COPY is the longest single statement it ever issues — exactly the statement a
  * timeout is most likely to hit.
  *
- * FAULT INJECTED: a `statement_timeout` on the server's own connection. No pggit
- * code is modified. (A `pg_cancel_backend` against the same pid does the same.)
+ * FAULT INJECTED: `pg_cancel_backend` against the server's own connection, fired
+ * the moment that connection is inside the ingest COPY. No pggit code is modified.
+ *
+ * WHY NOT A `statement_timeout`, which is what the source script used and what the
+ * paragraph above calls the realistic production trigger: a wall-clock timeout
+ * cannot be AIMED. Measured on this fixture (RUNS=700), the whole push completes
+ * in ~1.9 s and its COPY finishes far inside the 500 ms timeout the suite used to
+ * set — so the fault never fired, the push exited 0, and every assertion below was
+ * satisfied by a plainly successful push. Sizing the fixture until a COPY outlives
+ * a fixed timeout would make the whole suite a hardware race. Polling
+ * `pg_stat_activity` for the COPY itself lands the abort exactly where the finding
+ * is, on any machine, and raises the SAME error class a timeout would (SQLSTATE
+ * 57014, `canceling statement …`) — which is why the assertion accepts either
+ * wording. `copyCancelled` is the barrier that keeps this honest.
  *
  * The source script exits non-zero when the hang reproduces; the assertions below
- * encode the CORRECT contract (the push settles, the connection comes back, the
- * pool keeps serving, shutdown completes), so a reproduction is a red test.
+ * encode the CORRECT contract (the push settles and reports the cancel, the
+ * connection comes back, the pool keeps serving, shutdown completes), so a
+ * reproduction is a red test.
  */
 import { spawn } from "node:child_process"
 import { rmSync } from "node:fs"
@@ -58,8 +71,46 @@ import { buildGitEnv } from "@/testing/spawn-git"
 const RUNS = 700
 const WAIT_S = 25
 const REPO = "txn/copy-hang"
+/**
+ * The ingest COPY, as `pg_stat_activity.query` shows it. `copyInsert` stages into
+ * `copy_stg_<target>`, and `git_object` is the largest target a push COPYs into —
+ * but the staging table's NAME appears in three consecutive statements (the
+ * `create temp table`, the COPY, then `insert into git_object … from copy_stg_…`),
+ * and only the middle one is the finding's subject. The QUOTED form is what tells
+ * them apart: `copyInto` interpolates the table through `sql(table)`, so the COPY
+ * — and nothing around it — reads `copy "copy_stg_git_object" (…) from stdin`.
+ * Measured on this fixture: the create is gone within ~2 ms (a cancel aimed at it
+ * lands on an idle backend and does nothing, which is exactly how this suite first
+ * came back with the fault "fired" and the push still exiting 0), while the COPY
+ * itself stays active for a few hundred ms.
+ */
+const COPY_NEEDLE = 'copy "copy_stg_git_object"'
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 type BoundedGit = { settled: boolean; code: number | null; ms: number; out: string }
+
+/** Poll `pid` until it is executing the ingest COPY, then cancel THAT statement;
+ * report whether it ever fired. Bounded by `limitMs` so a push that never reaches
+ * the COPY ends the watch instead of hanging the suite — and reports `false`, which
+ * the barrier turns into a failure rather than a silent green. */
+async function cancelIngestCopy(
+	admin: Sql,
+	pid: number,
+	limitMs: number,
+): Promise<boolean> {
+	const t0 = Date.now()
+	while (Date.now() - t0 < limitMs) {
+		const [act] = await admin<{ q: string }[]>`
+			select query as q from pg_stat_activity where pid = ${pid} and state = 'active'`
+		if (act?.q?.includes(COPY_NEEDLE)) {
+			await admin`select pg_cancel_backend(${pid})`
+			return true
+		}
+		await sleep(1)
+	}
+	return false
+}
 
 /** Run git with a hard wall-clock bound; report whether it settled on its own.
  * `spawnGit` cannot be used here — it waits for `close` forever, which is exactly
@@ -98,13 +149,15 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 	let pid = 0
 
 	let push: BoundedGit
+	let copyCancelled = false
 	let backendState = ""
 	let backendQuery = ""
 	let probe: BoundedGit
 	let closed = false
 	/** Diagnostic the source printed: nothing lands, so this is availability, not
-	 * corruption. Kept as evidence, not as a verdict — a push that settles cleanly
-	 * may legitimately land everything or nothing. */
+	 * corruption. Kept as evidence, not as a verdict — the ingest runs in ONE
+	 * transaction, so "the cancelled push stored nothing" restates the rollback
+	 * rather than testing the settle behaviour this suite exists for. */
 	let storedObjects = 0
 	let storedRefs = 0
 
@@ -117,10 +170,10 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 			max: 2,
 			onnotice: () => {},
 		})
-		// The server's connection: max 1 so the capacity consequence is visible, with
-		// an ordinary statement_timeout.
+		// The server's connection: max 1 so the capacity consequence is visible, and so
+		// the pid read here is the one the push will run on.
 		appSql = postgres(baseUrl, {
-			connection: { search_path: db.schema, statement_timeout: 500 },
+			connection: { search_path: db.schema },
 			max: 1,
 			onnotice: () => {},
 		})
@@ -129,13 +182,15 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 		server = await serveOnPort(createGitApp(createGitDeps(appSql)), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 
-		// FAULT POINT: statement_timeout cancels the ingest COPY. The push is large
-		// enough that its COPY outlives the timeout.
+		// FAULT POINT: the watcher cancels the ingest COPY as soon as the server is
+		// inside it. Started BEFORE the push so it cannot miss a fast COPY.
+		const watcher = cancelIngestCopy(admin, pid, WAIT_S * 1000)
 		push = await gitBounded(
 			["push", url, "refs/heads/main:refs/heads/main"],
 			src,
 			WAIT_S * 1000,
 		)
+		copyCancelled = await watcher
 
 		const [act] = await admin<{ state: string; q: string }[]>`
 			select state, left(query, 55) as q
@@ -174,11 +229,34 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 		if (src) rmSync(src, { force: true, recursive: true })
 	})
 
+	// The fault barrier. Everything below is a claim about how a CANCELLED COPY
+	// settles; with no cancel they are all claims about a successful push, which is
+	// how this suite ran green while proving nothing.
+	it("the ingest COPY was actually cancelled", () => {
+		expect(
+			copyCancelled,
+			`pid ${pid} was never observed inside \`${COPY_NEEDLE}\` within ${WAIT_S}s — the fault never fired, so every assertion below would be judging an ordinary successful push (git said: ${push.out.trim().slice(-200)})`,
+		).toBe(true)
+	})
+
 	it("the push settles instead of blocking forever with no output", () => {
 		expect(
 			push.settled,
 			`git push produced NO output and NO error for ${WAIT_S}s — the ingest promise never settles, so nothing downstream (pg.begin rollback, unpack error, ng line, HTTP 500) ever fires; git said: ${push.out.trim().slice(-200)}`,
 		).toBe(true)
+	})
+
+	it("the push reports the cancel rather than exiting 0", () => {
+		// A settled push is only half the contract: a cancelled ingest must reach the
+		// client as a failure carrying the reason (receive-pack turns the ingest error
+		// into its `unpack <status>` line), never as a success that silently stored
+		// nothing. 57014 is worded "canceling statement due to …" whether the abort
+		// came from a statement_timeout or a cancel request.
+		expect(
+			push.code,
+			`git push exited 0 with the ingest COPY cancelled: ${push.out.trim().slice(-300)}`,
+		).not.toBe(0)
+		expect(push.out).toMatch(/statement timeout|canceling statement/i)
 	})
 
 	it("the pooled connection is not stranded in an aborted transaction", () => {

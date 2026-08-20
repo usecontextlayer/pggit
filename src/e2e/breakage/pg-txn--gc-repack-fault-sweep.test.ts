@@ -15,12 +15,36 @@
  * batched COPY inserts each in their own transaction. Neither pass is atomic, so
  * every batch boundary is a crash point.
  *
- * FAULTS INJECTED
- *   - a `statement_timeout` sweep (T = 50 … 6400ms) on the connection driving
- *     gc()/repack(): each T lands the abort in a different batch;
- *   - `pg_terminate_backend` against ONLY the pid read from this test's own gc
- *     connection, fired while that pid is inside `delete from git_object …` —
- *     mid-sweep, where a batch has committed and the rest has not.
+ * FAULTS INJECTED — every one against ONLY the pid this test opened, and every one
+ * required to have actually ABORTED the pass (`it("every fault point actually
+ * fired")`). Two kinds:
+ *   - a short `statement_timeout` on the connection driving gc()/repack();
+ *   - an AIMED abort: poll `pg_stat_activity` until that pid is inside a NAMED
+ *     statement (having already run `skip` of them) and then `pg_cancel_backend`
+ *     it — the statement dies, its batch rolls back, the batches before it stay
+ *     committed — or `pg_terminate_backend` it, which kills the connection under
+ *     the pass instead.
+ *
+ * WHY AIMED, when the source script swept `statement_timeout` T = 50 … 6400ms and
+ * called each T "a different batch": a statement_timeout fires when a SINGLE
+ * statement outlives T, never when the PASS does. gc's longest statement here is
+ * one sweep DELETE, so the whole ladder collapses onto that one statement, and
+ * measured at RUNS=600 every rung from 400ms up never fired AT ALL — those five
+ * cases asserted their "does not tear" negative over a completely undisturbed
+ * store. Worse, WHICH rungs fire is a property of the hardware: on an idle box
+ * 100ms and 200ms stopped firing too. Naming the statement and its occurrence
+ * index expresses the intended axis ("every batch boundary") directly and lands
+ * identically whatever the machine is doing; ONE wall-clock rung survives (see
+ * `TIMEOUTS`) for the abort this file does not aim.
+ *
+ * WHAT THIS FIXTURE DOES *NOT* FAULT: repack. The priming `repack()` below encodes
+ * every object in the store, and GC only ever removes objects, so the faulted
+ * repack pass has NOTHING pending — measured, 6 statements in ~200ms with no COPY
+ * and no insert. Its abort points are therefore unreachable here whatever fault is
+ * injected, and this suite exercises repack as the RECOVERY pass (C/D below), not
+ * as a fault site. Faulting repack needs a fixture that leaves it real work
+ * (objects pushed AFTER the priming pass) — a different fixture, not a different
+ * timeout.
  *
  * CHECKED after every fault, on the RAW torn state (before any repair):
  *   A. a fresh mirror clone succeeds, is fsck --strict clean, and carries the
@@ -51,7 +75,28 @@ import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
 const RUNS = 600
-const TIMEOUTS = [50, 100, 200, 400, 800, 1600, 3200, 6400]
+/**
+ * The one wall-clock rung. It is the only case whose abort point this file does
+ * NOT choose — the clock picks whichever statement it lands on — which is worth
+ * exactly one case and cannot be worth more: a `statement_timeout` fires only when
+ * a SINGLE statement outlives T, so the rungs are not independent fault points,
+ * they are one question ("is any statement slower than T?") asked at eight
+ * thresholds. Measured here: at RUNS=600 under load, 50/100/200 fired and 400+
+ * never did; on the same box IDLE, only 50 fired. Every rung above the machine's
+ * slowest statement asserts this file's whole negative over a store that nothing
+ * touched — which is what five of the original nine were doing. 50ms fired in
+ * every run measured; if a faster box outgrows it, the barrier below says so out
+ * loud instead of quietly passing, and the aimed cases carry the file regardless.
+ */
+const TIMEOUTS = [50]
+/** Per-batch DELETE cap for the faulted sweep. Stated, not defaulted (10_000),
+ * because the aimed cases below index sweep batches: at this fixture's orphan
+ * count the default sweeps everything in one DELETE, and "abort at batch 2" would
+ * have no batch 2 to abort at. */
+const SWEEP_BATCH_LIMIT = 500
+/** `pg_stat_activity.query` fragments, lowercased and whitespace-collapsed. */
+const SWEEP = "delete from git_object"
+const ANALYZE = "analyze git_object"
 const ZERO_OID = "0".repeat(40)
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -161,11 +206,28 @@ async function liveClosure(url: string, dest: string): Promise<Set<string> | str
 	)
 }
 
-type FaultCase = { label: string; timeout?: number; kill?: string }
+/**
+ * How one case's abort is delivered. `timeout` sets a `statement_timeout` on the
+ * pass's connection and lets the wall clock decide which statement dies. The two
+ * AIMED kinds instead wait for the pass to be inside `needle` for the
+ * (`skip`+1)-th time and then kill the statement (`cancel`) or the whole
+ * connection (`terminate`).
+ */
+type Fault =
+	| { kind: "timeout"; ms: number }
+	| { kind: "cancel" | "terminate"; needle: string; skip: number }
+type FaultCase = { label: string; fault: Fault }
 type CaseResult = {
 	label: string
 	gcErr: string
 	repackErr: string
+	/** The aimed watcher reached its target and issued the abort (always false for
+	 * a `timeout` case, which has no watcher). Attribution only. */
+	aimHit: boolean
+	/** THE BARRIER: the pass actually aborted. Every assertion in this file is a
+	 * claim about a TORN store, so a case that ran to completion has been asserting
+	 * its negative over an undisturbed one. */
+	faultObserved: boolean
 	torn: Counts
 	tornCloneError: string | null
 	after: Counts
@@ -174,6 +236,77 @@ type CaseResult = {
 	finalCloneError: string | null
 	lostVsTorn: number
 }
+
+/**
+ * Watch ONE pid and abort it once it is inside the targeted statement. Statements
+ * are told apart by `query_start` — each sweep batch is its own statement, so
+ * counting distinct starts is what makes "abort at the Nth batch boundary"
+ * expressible at all. Returns whether the abort was issued; `stop.now` lets the
+ * caller end the watch the moment the pass settles, so a miss costs one poll
+ * rather than the whole bound.
+ */
+async function abortWhenInside(
+	admin: Sql,
+	pid: number,
+	fault: { kind: "cancel" | "terminate"; needle: string; skip: number },
+	stop: { now: boolean },
+	limitMs: number,
+): Promise<boolean> {
+	const starts = new Set<string>()
+	const t0 = Date.now()
+	while (!stop.now && Date.now() - t0 < limitMs) {
+		const [act] = await admin<{ s: string; q: string }[]>`
+			select query_start::text as s, query as q
+			from pg_stat_activity where pid = ${pid} and state = 'active'`
+		if (act?.s && act.q.toLowerCase().replace(/\s+/g, " ").includes(fault.needle)) {
+			starts.add(act.s)
+			if (starts.size > fault.skip) {
+				if (fault.kind === "cancel") await admin`select pg_cancel_backend(${pid})`
+				else await admin`select pg_terminate_backend(${pid})`
+				return true
+			}
+		}
+		await sleep(1)
+	}
+	return false
+}
+
+// No encoding/commit/tag kill points: since the 0008/0009 FK cascades, GC
+// issues no statement touching those tables to be killed inside — their rows
+// die atomically within the object sweep's own DELETEs. The aimed cases walk
+// the sweep instead: batch 0 has committed nothing, batch 1 and 2 leave a
+// PARTIALLY swept inventory, and `analyze git_object` dies before the sweep
+// starts at all.
+const CASES: FaultCase[] = [
+	...TIMEOUTS.map<FaultCase>((ms) => ({
+		fault: { kind: "timeout", ms },
+		label: `statement_timeout=${ms}ms`,
+	})),
+	{
+		fault: { kind: "cancel", needle: ANALYZE, skip: 0 },
+		label: "cancel during ANALYZE, before the sweep",
+	},
+	{
+		fault: { kind: "cancel", needle: SWEEP, skip: 0 },
+		label: "cancel during sweep batch 0",
+	},
+	{
+		fault: { kind: "cancel", needle: SWEEP, skip: 1 },
+		label: "cancel during sweep batch 1",
+	},
+	{
+		fault: { kind: "cancel", needle: SWEEP, skip: 2 },
+		label: "cancel during sweep batch 2",
+	},
+	{
+		fault: { kind: "terminate", needle: SWEEP, skip: 0 },
+		label: "kill during the OBJECT sweep",
+	},
+	{
+		fault: { kind: "terminate", needle: SWEEP, skip: 1 },
+		label: "kill mid-sweep, after a batch committed",
+	},
+]
 
 describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => {
 	let db: IsolatedDb
@@ -217,15 +350,7 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 		const mid = commits[Math.floor(commits.length / 2)]
 		if (!tip || !mid) throw new Error("fixture too short to orphan")
 
-		// No encoding/commit/tag kill points: since the 0008/0009 FK cascades, GC
-		// issues no statement touching those tables to be killed inside — their rows
-		// die atomically within the object sweep's own DELETEs.
-		const cases: FaultCase[] = [
-			...TIMEOUTS.map((t) => ({ label: `statement_timeout=${t}ms`, timeout: t })),
-			{ kill: "delete from git_object", label: "kill during the OBJECT sweep" },
-		]
-
-		for (const [i, c] of cases.entries()) {
+		for (const [i, c] of CASES.entries()) {
 			const repo = `txn/gcrp-${i}`
 			const url = `http://127.0.0.1:${server.port}/${repo}`
 
@@ -251,9 +376,10 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 			// the row-level convergence question this sweep is asking.
 			const mkFaulty = () =>
 				postgres(baseUrl, {
-					connection: c.timeout
-						? { search_path: db.schema, statement_timeout: c.timeout }
-						: { search_path: db.schema },
+					connection:
+						c.fault.kind === "timeout"
+							? { search_path: db.schema, statement_timeout: c.fault.ms }
+							: { search_path: db.schema },
 					max: 1,
 					onnotice: () => {},
 				})
@@ -266,32 +392,28 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 			} catch {
 				pid = 0
 			}
-			// Terminate ONLY the pid this test opened, and only once it is inside the
-			// targeted sweep statement.
-			let killerDone: Promise<void> = Promise.resolve()
-			const killNeedle = c.kill
-			if (killNeedle) {
-				killerDone = (async () => {
-					const t0 = Date.now()
-					while (Date.now() - t0 < 45_000) {
-						const [a] = await admin<{ q: string }[]>`
-							select query as q from pg_stat_activity where pid = ${pid}`
-						if (a?.q?.toLowerCase().replace(/\s+/g, " ").includes(killNeedle)) {
-							await admin`select pg_terminate_backend(${pid})`
-							return
-						}
-						await sleep(1)
-					}
-				})()
-			}
+			// Abort ONLY the pid this test opened, and only once it is inside the
+			// targeted statement. `stop` ends the watch as soon as the pass settles, so a
+			// case whose target never appears costs one more poll, not the whole bound —
+			// and reports `aimHit: false`, which the barrier below turns into a failure.
+			const stop = { now: false }
+			const aimed =
+				c.fault.kind === "timeout"
+					? Promise.resolve(false)
+					: abortWhenInside(admin, pid, c.fault, stop, 45_000)
 			let gcErr = "none"
 			let repackErr = "none"
 			try {
-				await createGc(gcSql).gc(repo, { graceSeconds: 0, maintain: false })
+				await createGc(gcSql).gc(repo, {
+					batchLimit: SWEEP_BATCH_LIMIT,
+					graceSeconds: 0,
+					maintain: false,
+				})
 			} catch (e) {
 				gcErr = short(e)
 			}
-			await killerDone
+			stop.now = true
+			const aimHit = await aimed
 			await Promise.race([gcSql.end({ timeout: 3 }).catch(() => {}), sleep(4000)])
 			const rpSql = mkFaulty()
 			try {
@@ -324,6 +446,8 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 
 			results.push({
 				after,
+				aimHit,
+				faultObserved: gcErr !== "none" || repackErr !== "none",
 				finalCloneError: typeof finalClone === "string" ? finalClone : null,
 				gc3,
 				gcErr,
@@ -348,7 +472,37 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 	})
 
 	it("swept every fault point", () => {
-		expect(results.map((r) => r.label)).toHaveLength(TIMEOUTS.length + 1)
+		expect(results.map((r) => r.label)).toEqual(CASES.map((c) => c.label))
+	})
+
+	// THE BARRIER. Every other assertion in this file is a claim about a store that
+	// a fault TORE, and each is satisfied trivially by a store nothing happened to —
+	// which is how five of the nine original rungs passed while never firing. A case
+	// that reaches here without an aborted pass is not a negative result, it is an
+	// unrun experiment.
+	it("every fault point actually fired", () => {
+		expect(
+			results
+				.filter((r) => !r.faultObserved)
+				.map(
+					(r) =>
+						`${r.label}: gc and repack both completed (aimHit=${r.aimHit}) — nothing was torn, so this case's negative is vacuous`,
+				),
+		).toEqual([])
+	})
+
+	// And the aimed cases fired where they were AIMED: a `cancel during sweep batch 2`
+	// that never found batch 2, yet aborted somewhere else, would satisfy the barrier
+	// above while sweeping a fault point that does not exist.
+	it("every aimed fault reached its target statement", () => {
+		const aimedLabels = CASES.filter((c) => c.fault.kind !== "timeout").map(
+			(c) => c.label,
+		)
+		expect(
+			results
+				.filter((r) => aimedLabels.includes(r.label) && !r.aimHit)
+				.map((r) => `${r.label}: the watcher never saw its target statement`),
+		).toEqual([])
 	})
 
 	it("never leaves a delta-of-a-delta encoding (design says depth ≤ 1)", () => {
