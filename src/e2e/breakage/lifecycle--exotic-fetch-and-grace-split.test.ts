@@ -28,6 +28,7 @@ import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -100,15 +101,6 @@ async function revList(dir: string, rev: string): Promise<string[]> {
 	return out.stdout.trim().split("\n").filter(Boolean)
 }
 
-/** Sorted oids of every object reachable from any ref. */
-async function objectsIn(dir: string): Promise<string[]> {
-	return (await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout
-		.split("\n")
-		.map((l) => l.slice(0, 40))
-		.filter((o) => /^[0-9a-f]{40}$/.test(o))
-		.sort()
-}
-
 function diffLists(a: string[], b: string[]): { onlyA: string[]; onlyB: string[] } {
 	const sa = new Set(a)
 	const sb = new Set(b)
@@ -144,7 +136,11 @@ const PROBES: Probe[] = [
 		run: async (url, dest) => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			return `${(await objectsIn(dest)).length} objects`
+			return `${
+				parseRevListObjectOids(
+					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
+				).sort().length
+			} objects`
 		},
 	},
 	{
@@ -173,7 +169,11 @@ const PROBES: Probe[] = [
 		run: async (url, dest) => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--depth=1", url, dest])
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			return `${(await objectsIn(dest)).length} objects`
+			return `${
+				parseRevListObjectOids(
+					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
+				).sort().length
+			} objects`
 		},
 	},
 	{
@@ -185,7 +185,11 @@ const PROBES: Probe[] = [
 				cwd: dest,
 			})
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			return `${(await objectsIn(dest)).length} objects`
+			return `${
+				parseRevListObjectOids(
+					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
+				).sort().length
+			} objects`
 		},
 	},
 ]
@@ -336,7 +340,13 @@ describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, a])
 			await spawnGit(["clone", "-q", "--mirror", `file://${ref}`, b])
 			const f = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: a })
-			const d = diffLists(await objectsIn(a), await objectsIn(b))
+			const aObjects = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: a })).stdout,
+			).sort()
+			const bObjects = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: b })).stdout,
+			).sort()
+			const d = diffLists(aObjects, bObjects)
 			graceOnlyPg = d.onlyA.length
 			graceOnlyRef = d.onlyB.length
 			graceFsck = `${f.stdout}${f.stderr}`.trim()

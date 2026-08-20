@@ -76,7 +76,7 @@ import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit } from "@/testing/spawn-git"
 
 const RUNS = 700
 const PROBES = 8
@@ -86,23 +86,6 @@ const appName = `pggit-poison-${randomUUID().slice(0, 8)}`
 
 const short = (e: unknown) =>
 	`${(e as { code?: string }).code ?? ""} ${(e as Error).message}`.trim().slice(0, 110)
-
-type GitAttempt = { ok: boolean; code: number; stdout: string; stderr: string }
-
-async function tryGit(args: string[], cwd?: string): Promise<GitAttempt> {
-	try {
-		const r = await spawnGit(args, { cwd })
-		return { code: 0, ok: true, stderr: r.stderr, stdout: r.stdout }
-	} catch (e) {
-		const err = e as { code?: number; stderr?: string; message: string }
-		return {
-			code: err.code ?? -1,
-			ok: false,
-			stderr: err.stderr ?? err.message,
-			stdout: "",
-		}
-	}
-}
 
 describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () => {
 	let db: IsolatedDb
@@ -159,7 +142,7 @@ describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () =
 			onnotice: () => {},
 		})
 		const seedServer = await serveOnPort(createGitApp(createGitDeps(seedSql)), 0)
-		const seeded = await tryGit(
+		const seeded = await attemptGit(
 			[
 				"push",
 				"-q",
@@ -175,7 +158,7 @@ describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () =
 
 		// Baseline: the shared pool serves a clone fine before the fault.
 		const base = join(root, "base")
-		const baseline = await tryGit([
+		const baseline = await attemptGit([
 			"-c",
 			"protocol.version=2",
 			"clone",
@@ -233,7 +216,7 @@ describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () =
 		const seen = new Set<string>()
 		for (let i = 0; i < PROBES; i++) {
 			const dest = join(root, `probe-${i}`)
-			const c = await tryGit([
+			const c = await attemptGit([
 				"-c",
 				"protocol.version=2",
 				"clone",
@@ -268,7 +251,7 @@ describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () =
 		}
 		for (let i = 0; i < PROBES; i++) {
 			const dest = join(root, `after-${i}`)
-			const c = await tryGit([
+			const c = await attemptGit([
 				"-c",
 				"protocol.version=2",
 				"clone",
@@ -321,13 +304,10 @@ describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () =
 
 	it("GC and repack still work on the same pool after an aborted pass", () => {
 		expect(
-			secondGcErr.includes("aborted"),
+			secondGcErr,
 			`GC is dead: a fresh pass on the same pool fails with "${secondGcErr}"`,
-		).toBe(false)
-		expect(
-			repackErr.includes("aborted"),
-			`repack on the same pool fails with "${repackErr}"`,
-		).toBe(false)
+		).toBe("none")
+		expect(repackErr, `repack on the same pool fails with "${repackErr}"`).toBe("none")
 	})
 
 	it("ordinary clones through the shared pool are untouched", () => {

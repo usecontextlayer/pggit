@@ -23,6 +23,7 @@ import {
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 const REPO = "epoch/producer"
@@ -62,7 +63,8 @@ describe("reach-epoch producer (chunk 5b)", () => {
 		await spawnGit(["push", "-q", url, "main", "feature", "refs/tags/v1"], { cwd: src })
 		const [row] = await fx.db.sql<{ id: string }[]>`
 			select id::text as id from repos where name = ${REPO}`
-		id = row?.id as unknown as ReposId
+		if (row === undefined) throw new Error(`repo row missing for ${REPO}`)
+		id = row.id as unknown as ReposId
 	}, 120_000)
 
 	afterAll(async () => {
@@ -100,19 +102,12 @@ describe("reach-epoch producer (chunk 5b)", () => {
 			expect(missing.size).toBe(0)
 			expect(named).toEqual([...present].sort())
 			for (const o of named) all.add(o)
-			const inSrc = await spawnGit(["cat-file", "-t", tip], { cwd: src }).catch(
-				() => null,
-			)
-			if (inSrc?.stdout.trim() === "commit") {
+			const inSrc = await spawnGit(["cat-file", "-t", tip], { cwd: src })
+			if (inSrc.stdout.trim() === "commit") {
 				anchored++
-				const expected = (
-					await spawnGit(["rev-list", "--objects", tip], { cwd: src })
-				).stdout
-					.trim()
-					.split("\n")
-					.filter(Boolean)
-					.map((l) => l.slice(0, 40))
-					.sort()
+				const expected = parseRevListObjectOids(
+					(await spawnGit(["rev-list", "--objects", tip], { cwd: src })).stdout,
+				).sort()
 				expect(named, `git oracle for tip ${tip}`).toEqual(expected)
 			}
 		}

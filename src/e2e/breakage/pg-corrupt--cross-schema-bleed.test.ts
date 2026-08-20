@@ -39,6 +39,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -105,12 +106,7 @@ describe("pg-corrupt — two same-named repos in two schemas of one database", (
 	/** Every reachable object oid in a real repo working copy. */
 	async function repoOids(dir: string): Promise<Set<string>> {
 		const out = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-		return new Set(
-			out.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		)
+		return new Set(parseRevListObjectOids(out.stdout))
 	}
 
 	beforeAll(async () => {

@@ -22,6 +22,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -45,14 +46,7 @@ type FetchRound = {
 /** Every reachable object's oid+type+size, as one comparable sorted blob. */
 async function objectInventory(dir: string): Promise<string> {
 	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
+	const oids = [...new Set(parseRevListObjectOids(list.stdout))]
 	const info = await spawnGit(["cat-file", "--batch-check"], {
 		cwd: dir,
 		input: `${oids.join("\n")}\n`,
@@ -63,14 +57,7 @@ async function objectInventory(dir: string): Promise<string> {
 /** A content fingerprint over every reachable object's raw bytes. */
 async function contentDigest(dir: string): Promise<string> {
 	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	].sort()
+	const oids = [...new Set(parseRevListObjectOids(list.stdout))].sort()
 	const res = await spawnGit(["cat-file", "--batch"], {
 		cwd: dir,
 		input: `${oids.join("\n")}\n`,

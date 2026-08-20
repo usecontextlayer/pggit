@@ -29,7 +29,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 
 // A well-formed 40-hex OID a seeded repo does not (and cannot) contain.
@@ -116,19 +116,13 @@ describe("mal01 — fetch of a want absent from a non-empty repo errors cleanly 
 		const dest = mkdtempSync(join(tmpdir(), "pggit-mal01-dest-"))
 		try {
 			await spawnGit(["init", "-q"], { cwd: dest })
-			const outcome = await spawnGit(
+			const outcome = await attemptGit(
 				["-c", "protocol.version=2", "fetch", url, ABSENT_OID],
-				{ cwd: dest },
-			).then(
-				() => ({ failed: false, stderr: "" }),
-				(e) => ({
-					failed: true,
-					stderr: e instanceof GitCommandError ? e.stderr : String(e),
-				}),
+				dest,
 			)
 
 			// The fetch MUST fail: the ref genuinely is not ours.
-			expect(outcome.failed).toBe(true)
+			expect(outcome.ok).toBe(false)
 
 			// ...but it must fail like the ORACLE — a clean, client-readable protocol
 			// error (`fatal: remote error: upload-pack: not our ref <oid>`), NOT the

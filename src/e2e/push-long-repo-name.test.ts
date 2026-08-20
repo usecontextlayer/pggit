@@ -43,7 +43,7 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 /**
  * Deterministic, INCOMPRESSIBLE repo name. Concatenating sha256 hex of distinct
@@ -88,16 +88,10 @@ describe("nam03 — over-long incompressible repo name fails clean (in-band, ato
 
 	it("rejects the over-long name loudly and in-band (not a 500 / not a silent half-success)", async () => {
 		const url = `http://127.0.0.1:${server.port}/${longName}`
-		const outcome = await spawnGit(["push", url, "main"], { cwd: src }).then(
-			() => ({ failed: false, stderr: "" }),
-			(e) => ({
-				failed: true,
-				stderr: e instanceof GitCommandError ? e.stderr : String(e),
-			}),
-		)
+		const outcome = await attemptGit(["push", url, "main"], src)
 
 		// LOUD: the push must fail non-zero, not silently half-succeed.
-		expect(outcome.failed).toBe(true)
+		expect(outcome.ok).toBe(false)
 		// IN-BAND: git parsed a report-status `unpacker error` (HTTP 200), which it
 		// could not do if the server had 500'd / dropped the connection. A transport
 		// 500 surfaces in git's stderr as "HTTP 500" / "RPC failed", never the

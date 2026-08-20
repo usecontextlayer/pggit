@@ -48,12 +48,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 /** Max commands per batch. Also the size of the seeded `pre<i>` / `dfbase<i>` pools:
  * a command's destination is keyed by its POSITION in the batch, so two commands can
@@ -220,7 +221,14 @@ function materialize(draw: Draw, i: number, fx: Fixture): Command {
 				refspec: `:refs/heads/ghost${i}`,
 			}
 		case "typedTip": {
-			const oid = draw.obj === "blob" ? fx.blob : draw.obj === "tree" ? fx.tree : fx.tag
+			const oid =
+				draw.obj === "blob"
+					? fx.blob
+					: draw.obj === "tree"
+						? fx.tree
+						: draw.obj === "tag"
+							? fx.tag
+							: assertNever(draw.obj)
 			return {
 				census: [`typedTip:${draw.ns}`, `tipObject:${draw.obj}`],
 				dest: `refs/${draw.ns}/typed${i}`,
@@ -247,6 +255,7 @@ function materialize(draw: Draw, i: number, fx: Fixture): Command {
 				refspec: `${fx.c}:refs/heads/dfbase${i}/sub`,
 			}
 	}
+	return assertNever(draw)
 }
 
 /** `git push --porcelain` per-ref verdict, reduced to what is contractual. */
@@ -284,8 +293,19 @@ const PORCELAIN_FLAGS = new Set([" ", "+", "-", "*", "=", "!"])
  */
 function parsePorcelain(stdout: string): Map<string, Verdict> {
 	const verdicts = new Map<string, Verdict>()
-	for (const line of stdout.split("\n")) {
-		if (!line.includes("\t")) continue
+	const lines = (stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout).split("\n")
+	const first = lines.shift()
+	if (first === undefined || !/^To .+$/.test(first)) {
+		throw new Error(`porcelain output lacks a valid To header: ${JSON.stringify(first)}`)
+	}
+	const last = lines.pop()
+	if (last !== "Done") {
+		throw new Error(`porcelain output lacks its Done trailer: ${JSON.stringify(last)}`)
+	}
+	for (const line of lines) {
+		if (!line.includes("\t")) {
+			throw new Error(`unexpected non-status porcelain line: ${JSON.stringify(line)}`)
+		}
 		const parts = line.split("\t")
 		if (parts.length !== 3) {
 			throw new Error(`unexpected porcelain line: ${JSON.stringify(line)}`)
@@ -297,6 +317,9 @@ function parsePorcelain(stdout: string): Map<string, Verdict> {
 		const colon = refspec.indexOf(":")
 		const dest = colon < 0 ? "" : refspec.slice(colon + 1)
 		if (dest === "") throw new Error(`unexpected porcelain refspec: ${refspec}`)
+		if (verdicts.has(dest)) {
+			throw new Error(`duplicate porcelain verdict for ${dest}`)
+		}
 		verdicts.set(dest, {
 			klass: flag === "!" ? reasonClass(summary) : "ok",
 			ok: flag !== "!",
@@ -307,9 +330,7 @@ function parsePorcelain(stdout: string): Map<string, Verdict> {
 
 type PushRun = { clientRefused: boolean; code: number; stderr: string; stdout: string }
 
-/** Run the identical push argv against one remote. A non-zero exit is an OUTCOME here
- * (a rejected ref exits 1), so `GitCommandError` is unwrapped rather than thrown; any
- * other failure (git missing, killed by signal) still fails the property loudly. */
+/** Run the identical push argv against one remote. A non-zero exit is an outcome here. */
 async function pushBatch(
 	cwd: string,
 	url: string,
@@ -317,14 +338,7 @@ async function pushBatch(
 	atomic: boolean,
 ): Promise<PushRun> {
 	const args = ["push", "--porcelain", ...(atomic ? ["--atomic"] : []), url]
-	const run = await spawnGit([...args, ...commands.map((c) => c.refspec)], { cwd }).catch(
-		(e) => {
-			if (e instanceof GitCommandError) {
-				return { code: e.code, stderr: e.stderr, stdout: e.stdout }
-			}
-			throw e
-		},
-	)
+	const run = await attemptGit([...args, ...commands.map((c) => c.refspec)], cwd)
 	return {
 		clientRefused: /fatal: invalid refspec/.test(run.stderr),
 		code: run.code,

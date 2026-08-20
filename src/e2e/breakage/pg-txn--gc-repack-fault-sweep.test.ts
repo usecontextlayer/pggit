@@ -71,8 +71,9 @@ import { createGc, type GcResult } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const RUNS = 600
 /**
@@ -103,27 +104,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const short = (e: unknown) =>
 	`${(e as { code?: string }).code ?? ""} ${(e as Error).message}`.trim().slice(0, 90)
 
-type GitAttempt = { ok: boolean; code: number; stdout: string; stderr: string }
-
-async function tryGit(args: string[], cwd?: string): Promise<GitAttempt> {
-	try {
-		const r = await spawnGit(args, { cwd })
-		return { code: 0, ok: true, stderr: r.stderr, stdout: r.stdout }
-	} catch (e) {
-		const err = e as { code?: number; stderr?: string; message: string }
-		return {
-			code: err.code ?? -1,
-			ok: false,
-			stderr: err.stderr ?? err.message,
-			stdout: "",
-		}
-	}
-}
-
 type Counts = {
-	objects: number
-	derivedRows: number
-	encodings: number
 	orphanRows: number
 	encNoObject: number
 	encNoBase: number
@@ -133,23 +114,14 @@ type Counts = {
 async function counts(admin: Sql, repo: string): Promise<Counts> {
 	const [row] = await admin<
 		{
-			objects: number
-			derived_rows: number
-			encodings: number
 			orphan_rows: number
 			enc_no_object: number
 			enc_no_base: number
 			delta_of_delta: number
 		}[]
 	>`
-		with r as (select id from repos where name = ${repo})
+	with r as (select id from repos where name = ${repo})
 		select
-			(select count(*)::int from git_object where repo_id = (select id from r)) as objects,
-			((select count(*) from git_commit where repo_id = (select id from r))
-				+ (select count(*) from git_tag where repo_id = (select id from r)))::int
-				as derived_rows,
-			(select count(*)::int from git_pack_encoding where repo_id = (select id from r))
-				as encodings,
 			((select count(*) from git_commit c
 				where c.repo_id = (select id from r) and not exists (
 					select 1 from git_object o
@@ -170,21 +142,19 @@ async function counts(admin: Sql, repo: string): Promise<Counts> {
 				join git_pack_encoding b on b.repo_id = g.repo_id and b.oid = g.base_oid
 				where g.repo_id = (select id from r)
 					and g.base_oid is not null and b.base_oid is not null) as delta_of_delta`
+	if (row === undefined) throw new Error(`counts: aggregate returned no row for ${repo}`)
 	return {
-		deltaOfDelta: row?.delta_of_delta ?? 0,
-		derivedRows: row?.derived_rows ?? 0,
-		encNoBase: row?.enc_no_base ?? 0,
-		encNoObject: row?.enc_no_object ?? 0,
-		encodings: row?.encodings ?? 0,
-		objects: row?.objects ?? 0,
-		orphanRows: row?.orphan_rows ?? 0,
+		deltaOfDelta: row.delta_of_delta,
+		encNoBase: row.enc_no_base,
+		encNoObject: row.enc_no_object,
+		orphanRows: row.orphan_rows,
 	}
 }
 
 /** Every object reachable from every live ref, per canonical git in a scratch
  * mirror — the set a correct clone MUST carry. A string is the failure reason. */
 async function liveClosure(url: string, dest: string): Promise<Set<string> | string> {
-	const cl = await tryGit([
+	const cl = await attemptGit([
 		"-c",
 		"protocol.version=2",
 		"clone",
@@ -196,13 +166,12 @@ async function liveClosure(url: string, dest: string): Promise<Set<string> | str
 	if (!cl.ok) {
 		return `clone failed: ${cl.stderr.trim().split("\n").slice(-2).join(" | ")}`
 	}
-	const fsck = await tryGit(["fsck", "--strict", "--no-dangling"], dest)
+	const fsck = await attemptGit(["fsck", "--strict", "--no-dangling"], dest)
 	if (!fsck.ok) return `fsck DIRTY: ${fsck.stderr.trim().slice(0, 200)}`
 	return new Set(
-		(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout
-			.split("\n")
-			.map((l) => l.slice(0, 40))
-			.filter((o) => /^[0-9a-f]{40}$/.test(o)),
+		parseRevListObjectOids(
+			(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
+		),
 	)
 }
 
@@ -219,8 +188,6 @@ type Fault =
 type FaultCase = { label: string; fault: Fault }
 type CaseResult = {
 	label: string
-	gcErr: string
-	repackErr: string
 	/** The aimed watcher reached its target and issued the abort (always false for
 	 * a `timeout` case, which has no watcher). Attribution only. */
 	aimHit: boolean
@@ -316,15 +283,8 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 	let src = ""
 	let root = ""
 	const results: CaseResult[] = []
-	// An aborted gc()/repack() can leak an unhandled rejection (see
-	// pg-txn--gc-poisons-pooled-connection.test.ts); record it rather than dying on it.
-	const leaked: string[] = []
-	const onLeak = (e: unknown) => {
-		leaked.push(short(e))
-	}
 
 	beforeAll(async () => {
-		process.on("unhandledRejection", onLeak)
 		const baseUrl = inject("pgBaseUrl")
 		db = await createIsolatedSchema(baseUrl)
 		root = mkdtempSync(join(tmpdir(), "pggit-txn-gcrp-"))
@@ -356,9 +316,9 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 
 			// Fresh repo: full history on main + a side branch, then REWIND side to
 			// mid-history through the store's own RefStore, orphaning half of it.
-			const p = await tryGit(["push", "-q", url, `${tip}:refs/heads/main`], src)
+			const p = await attemptGit(["push", "-q", url, `${tip}:refs/heads/main`], src)
 			if (!p.ok) throw new Error(`seed push failed: ${p.stderr}`)
-			const p2 = await tryGit(["push", "-q", url, `${tip}:refs/heads/side`], src)
+			const p2 = await attemptGit(["push", "-q", url, `${tip}:refs/heads/side`], src)
 			if (!p2.ok) throw new Error(`side push failed: ${p2.stderr}`)
 			// Advance main only to mid, then drop side -> everything past mid is garbage.
 			await createRefStore(admin).setRef(repo, "refs/heads/main", mid)
@@ -450,10 +410,8 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 				faultObserved: gcErr !== "none" || repackErr !== "none",
 				finalCloneError: typeof finalClone === "string" ? finalClone : null,
 				gc3,
-				gcErr,
 				label: c.label,
 				lostVsTorn,
-				repackErr,
 				rp3,
 				torn,
 				tornCloneError: typeof tornClone === "string" ? tornClone : null,
@@ -462,9 +420,8 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 	}, 3_600_000)
 
 	afterAll(async () => {
-		process.off("unhandledRejection", onLeak)
 		await server?.close()
-		await appSql?.end().catch(() => {})
+		await appSql?.end()
 		await admin?.end()
 		await db?.drop()
 		if (root) rmSync(root, { force: true, recursive: true })
@@ -563,11 +520,4 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 				.map((r) => `${r.label}: lost ${r.lostVsTorn}`),
 		).toEqual([])
 	})
-
-	// The source RECORDED unhandled rejections into `leaked` (via the beforeAll
-	// listener) but deliberately never made them a verdict — an aborted gc()/repack()
-	// can legitimately surface an async rejection the store still tolerates. That
-	// listener stays (it suppresses stray rejections so the run stays attributable),
-	// but asserting `leaked === []` would fail this GREEN negative for behavior the
-	// source classified as non-verdict, so it is intentionally not asserted here.
 })

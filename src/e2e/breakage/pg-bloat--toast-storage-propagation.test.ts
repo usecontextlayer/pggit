@@ -189,18 +189,20 @@ describe("TOAST storage propagation on the partitioned encoding tier (C4)", () =
 		const [repo] = await db.sql<
 			{ id: string }[]
 		>`insert into repos (name) values ('probe/storage') returning id::text as id`
+		if (repo === undefined) throw new Error("probe repo insert returned no row")
 		const probeOid = Buffer.alloc(20, 0x7f)
 		// The 0008 FK cascades demand a real inventory row behind every encoding
 		// row, synthetic probes included — that DDL-level hygiene is the design.
 		await db.sql`insert into git_object (repo_id, oid, type, size, content)
-			values (${repo?.id as string}::bigint, ${probeOid}, 3, ${squishy.length}, ${squishy})`
+			values (${repo.id}::bigint, ${probeOid}, 3, ${squishy.length}, ${squishy})`
 		await db.sql`insert into git_pack_encoding (repo_id, oid, base_oid, data_size, data)
-			values (${repo?.id as string}::bigint, ${probeOid}, null, ${squishy.length}, ${squishy})`
+			values (${repo.id}::bigint, ${probeOid}, null, ${squishy.length}, ${squishy})`
 		const [probe] = await db.sql<{ oct: string; col: string }[]>`
 			select octet_length(data)::text as oct, pg_column_size(data)::text as col
 			from git_pack_encoding where oid = ${probeOid}`
-		const probeOct = Number(probe?.oct ?? 0)
-		const probeCol = Number(probe?.col ?? 0)
+		if (probe === undefined) throw new Error("storage probe returned no row")
+		const probeOct = Number(probe.oct)
+		const probeCol = Number(probe.col)
 		await db.sql`delete from git_pack_encoding where oid = ${probeOid}`
 		await db.sql`delete from repos where name = 'probe/storage'`
 		expect(probeOct).toBe(squishy.length)
@@ -221,8 +223,9 @@ describe("TOAST storage propagation on the partitioned encoding tier (C4)", () =
 				count(*) filter (where octet_length(data) <= 2000)::text as inline_n,
 				count(*) filter (where octet_length(data) > 2000)::text as big_n
 			from git_pack_encoding`
-		expect(Number(agg?.n)).toBe(repacked.wholes + repacked.deltas)
-		expect(Number(agg?.col)).toBeGreaterThanOrEqual(Number(agg?.oct))
+		if (agg === undefined) throw new Error("encoding aggregate returned no row")
+		expect(Number(agg.n)).toBe(repacked.wholes + repacked.deltas)
+		expect(Number(agg.col)).toBeGreaterThanOrEqual(Number(agg.oct))
 
 		// Values over ~2 kB are the ones that go out-of-line under EXTERNAL; nothing
 		// smaller can, so the out-of-line population can never exceed them.
@@ -238,9 +241,11 @@ describe("TOAST storage propagation on the partitioned encoding tier (C4)", () =
 			const [cnt] = await db.sql.unsafe<{ d: string }[]>(
 				`select count(distinct chunk_id)::text as d from pg_toast.${r.toastname}`,
 			)
-			toastDistinct += Number(cnt?.d ?? 0)
+			if (cnt === undefined)
+				throw new Error(`TOAST aggregate returned no row for ${r.toastname}`)
+			toastDistinct += Number(cnt.d)
 		}
-		expect(toastDistinct).toBeLessThanOrEqual(Number(agg?.big_n))
+		expect(toastDistinct).toBeLessThanOrEqual(Number(agg.big_n))
 
 		// The entire prize EXTERNAL gives up (and the entire CPU bill EXTENDED would
 		// charge): deflate each encoding once more and total the result.

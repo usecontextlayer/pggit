@@ -25,18 +25,18 @@
  * --passes=6 --push=0`). Probabilistic: the iteration count, the pass count and
  * the swept start offsets (including their randomized jitter) are frozen exactly.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
-import type { GitObjectType } from "@/object/object"
+import type { PackInputObject } from "@/pack/write-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
-import { createAppendOnlyRepo, RUNS_DIR, runDirName } from "@/testing/append-only-repo"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { allObjectOids, loadReachableObjects, refsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -46,51 +46,7 @@ const RUNS = 400
  * the gap between a pass's `pending` read and its `existing` read, and pool
  * contention (the isolated schema's porsager pool is max:4) is what widens it. */
 const PASSES = 6
-/** The script's `--push=0` default. Flipping it also fires a REAL wire push into
- * the same lineage mid-race — the only way the two passes can see DIFFERENT
- * commit sets, and therefore the only way `commitDiffOrder`'s topological order
- * (Kahn, ties by oid) can differ between them: the one input that makes D4's
- * frozen base policy non-replayable. */
-const WITH_PUSH = false
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
-
-type Obj = { oid: string; type: GitObjectType; content: Buffer }
-
-/** Every reachable object of a real repo, in ONE `cat-file --batch` (no per-object spawn). */
-async function loadObjects(dir: string): Promise<Obj[]> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const out: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		out.push({
-			content: buf.subarray(start, start + size),
-			oid,
-			type: type as GitObjectType,
-		})
-		pos = start + size + 1
-	}
-	return out
-}
 
 describe("race — concurrent repack passes on one repo", () => {
 	let db: IsolatedDb
@@ -99,29 +55,19 @@ describe("race — concurrent repack passes on one repo", () => {
 	let refs: RefStore
 	let repack: Repack
 	let src = ""
-	let client = ""
-	let srcTip = ""
-	let objects: Obj[] = []
+	let objects: PackInputObject[] = []
 	let srcOids: string[] = []
-	let refLines: string[] = []
+	let sourceRefs: { name: string; oid: string }[] = []
 	let head = ""
 	const scratch: string[] = []
 
 	beforeAll(async () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		scratch.push(src)
-		objects = await loadObjects(src)
+		objects = await loadReachableObjects(src, ["--all"])
 		srcOids = await allObjectOids(src)
-		refLines = (await spawnGit(["show-ref"], { cwd: src })).stdout.trim().split("\n")
+		sourceRefs = await refsOf(src)
 		head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
-
-		// A client checkout for the optional mid-race push (real receive-pack).
-		if (WITH_PUSH) {
-			client = join(mkdtempSync(join(tmpdir(), "race-repack-client-")), "c")
-			scratch.push(client)
-			await spawnGit(["clone", "-q", src, client])
-			srcTip = (await spawnGit(["rev-parse", "HEAD"], { cwd: client })).stdout.trim()
-		}
 
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		store = createObjectStore(db.sql)
@@ -144,9 +90,8 @@ describe("race — concurrent repack passes on one repo", () => {
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const repo = `race/repack/${i}`
 			await store.putPack(repo, objects)
-			for (const line of refLines) {
-				const [oid, name] = line.split(" ")
-				if (oid && name) await refs.setRef(repo, name, oid)
+			for (const { name, oid } of sourceRefs) {
+				await refs.setRef(repo, name, oid)
 			}
 			await refs.setSymref(repo, "HEAD", head)
 
@@ -156,34 +101,9 @@ describe("race — concurrent repack passes on one repo", () => {
 			const delays = Array.from({ length: PASSES }, (_, k) =>
 				k === 0 ? 0 : Math.round(k * spread + Math.random() * spread),
 			)
-			// A real push into the SAME append-only lineage the encoder deltifies,
-			// landing between the passes' reads so their commit sets differ.
-			const pushTask: Promise<unknown>[] = []
-			if (WITH_PUSH) {
-				await spawnGit(["reset", "-q", "--hard", srcTip], { cwd: client })
-				const run = join(client, RUNS_DIR, runDirName(RUNS + i))
-				mkdirSync(run, { recursive: true })
-				writeFileSync(join(run, "record.json"), `{"n":${RUNS + i}}\n`)
-				await spawnGit(["add", "-A"], { cwd: client })
-				await spawnGit(["commit", "-q", "-m", `race ${i}`], { cwd: client })
-				pushTask.push(
-					sleep(Math.round(spread * 1.5)).then(() =>
-						spawnGit(
-							[
-								"push",
-								"-q",
-								`http://127.0.0.1:${server.port}/${repo}`,
-								"HEAD:refs/heads/main",
-							],
-							{ cwd: client },
-						),
-					),
-				)
-			}
-			const settled = await Promise.allSettled([
-				...delays.map((d) => sleep(d).then(() => repack.repack(repo))),
-				...pushTask,
-			])
+			const settled = await Promise.allSettled(
+				delays.map((d) => sleep(d).then(() => repack.repack(repo))),
+			)
 			const thrown = settled.filter((s) => s.status === "rejected")
 
 			// DIAGNOSTIC ONLY (never the verdict): did the race actually break the
@@ -204,8 +124,10 @@ describe("race — concurrent repack passes on one repo", () => {
 				)
 				select coalesce(max(d), 0)::int as n,
 					coalesce(sum(case when cyc then 1 else 0 end), 0)::int as cyc from chain`
-			const maxDepth = depth?.n ?? 0
-			const cycles = depth?.cyc ?? 0
+			if (depth === undefined)
+				throw new Error("concurrent repack diagnostics returned no row")
+			const maxDepth = depth.n
+			const cycles = depth.cyc
 			if (maxDepth > 1 || cycles > 0) divergedIters++
 
 			// ---- the verdict: what a real git client observes ----
@@ -226,22 +148,7 @@ describe("race — concurrent repack passes on one repo", () => {
 				])
 				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 				const got = await allObjectOids(dest)
-				if (WITH_PUSH) {
-					// The push adds objects, so the clone must be a SUPERSET of the seed
-					// and its HEAD must be exactly what the ref says.
-					const have = new Set(got)
-					const absent = srcOids.filter((o) => !have.has(o))
-					if (absent.length > 0) {
-						problems.push(`clone is missing ${absent.length} seeded objects`)
-					}
-					const ls = await spawnGit(
-						["ls-remote", `http://127.0.0.1:${server.port}/${repo}`, "refs/heads/main"],
-						{ cwd: dest },
-					)
-					const refTip = ls.stdout.trim().split(/\s+/)[0] ?? ""
-					const h = (await spawnGit(["rev-parse", "HEAD"], { cwd: dest })).stdout.trim()
-					if (h !== refTip) problems.push(`clone HEAD ${h} != ref ${refTip}`)
-				} else if (got.join(",") !== srcOids.join(",")) {
+				if (got.join(",") !== srcOids.join(",")) {
 					problems.push(`object set mismatch: ${got.length} vs ${srcOids.length}`)
 				}
 			} catch (err) {

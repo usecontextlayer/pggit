@@ -12,10 +12,11 @@
  * boundary stays the single source of the GIT_* scrub, pinned identity and clock.
  */
 import { spawn } from "node:child_process"
+import { assertNever } from "@/assert-never"
 import { decodePktStream } from "@/protocol/pkt-line"
 import { buildGitEnv } from "@/testing/spawn-git"
 
-export type ExpectedUploadPackError = { code: number; out: Buffer }
+type ExpectedUploadPackError = { code: number; out: Buffer }
 
 type SpawnUploadPackOptions = { expectInBandError: true }
 
@@ -122,9 +123,32 @@ export function ackSection(out: Buffer): string {
 		throw new Error(`truncated upload-pack response (${rest.length} undecoded bytes)`)
 	}
 	const delim = packets.findIndex((p) => p.type === "delim")
-	const end = delim < 0 ? packets.length : delim
-	return packets
-		.slice(0, end)
-		.map((p) => (p.type === "data" ? p.payload.toString("utf8") : ""))
-		.join("")
+	let end = delim
+	if (delim < 0) {
+		if (packets.at(-1)?.type !== "flush") {
+			throw new Error("upload-pack acknowledgment response lacks a terminal flush")
+		}
+		end = packets.length - 1
+	}
+	let text = ""
+	for (const packet of packets.slice(0, end)) {
+		switch (packet.type) {
+			case "data":
+				text += packet.payload.toString("utf8")
+				break
+			case "flush":
+				throw new Error("unexpected flush inside upload-pack acknowledgment section")
+			case "delim":
+				throw new Error(
+					"unexpected second delimiter inside upload-pack acknowledgment section",
+				)
+			case "response-end":
+				throw new Error(
+					"unexpected response-end inside upload-pack acknowledgment section",
+				)
+			default:
+				assertNever(packet)
+		}
+	}
+	return text
 }

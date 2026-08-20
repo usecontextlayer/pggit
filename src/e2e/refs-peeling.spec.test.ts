@@ -89,19 +89,30 @@ describe("peeled_oid at ref-write", () => {
 			encodePkt({ type: "flush" }),
 		])
 		const out = await handleUploadPack(body, backend)
+		const decoded = decodePktStream(out)
+		if (decoded.rest.length > 0) {
+			throw new Error(`ls-refs response has ${decoded.rest.length} trailing bytes`)
+		}
 		// Each ls-refs line is `<oid> <refname>[ peeled:<oid>]`; key by the exact ref
 		// token so refs/tags/av is not confused with refs/tags/av2.
 		const byName = new Map<string, string>()
-		for (const p of decodePktStream(out).packets) {
+		for (const p of decoded.packets) {
 			if (p.type !== "data") continue
-			const line = (p as { payload: Buffer }).payload.toString("utf8").replace(/\n$/, "")
-			const name = line.split(" ")[1]
-			if (name) byName.set(name, line)
+			const line = p.payload.toString("utf8").replace(/\n$/, "")
+			const match = line.match(/^[0-9a-f]{40} ([^ ]+)(?: .*)?$/)
+			if (match?.[1] === undefined) {
+				throw new Error(`malformed ls-refs row: ${JSON.stringify(line)}`)
+			}
+			byName.set(match[1], line)
 		}
 
 		expect(byName.get("refs/tags/av")).toContain(`peeled:${c1}`)
 		expect(byName.get("refs/tags/av2")).toContain(`peeled:${c1}`)
-		expect(byName.get("refs/tags/lv") ?? "").not.toContain("peeled:")
-		expect(byName.get("refs/heads/main") ?? "").not.toContain("peeled:")
+		const lightweight = byName.get("refs/tags/lv")
+		if (lightweight === undefined) throw new Error("ls-refs omitted refs/tags/lv")
+		const main = byName.get("refs/heads/main")
+		if (main === undefined) throw new Error("ls-refs omitted refs/heads/main")
+		expect(lightweight).not.toContain("peeled:")
+		expect(main).not.toContain("peeled:")
 	})
 })

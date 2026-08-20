@@ -18,10 +18,8 @@ export type IsolatedDb = {
 }
 
 /** Start one real Postgres container (slow; share across a file's tests). */
-export async function startPostgres(
-	image = DEFAULT_IMAGE,
-): Promise<StartedPostgreSqlContainer> {
-	return new PostgreSqlContainer(image).start()
+export async function startPostgres(): Promise<StartedPostgreSqlContainer> {
+	return new PostgreSqlContainer(DEFAULT_IMAGE).start()
 }
 
 /**

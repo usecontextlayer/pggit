@@ -25,7 +25,7 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import type { IsolatedDb } from "@/testing/pg"
 import { createIsolatedSchema } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
 	let db: IsolatedDb
@@ -55,37 +55,24 @@ describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
 	})
 
 	it("rejects a protocol.version=0 ls-remote loudly (not a silent empty result)", async () => {
-		const outcome = await spawnGit(["-c", "protocol.version=0", "ls-remote", url]).then(
-			(r) => ({ failed: false, stderr: "", stdout: r.stdout }),
-			(e) => ({
-				failed: true,
-				stderr: e instanceof GitCommandError ? e.stderr : String(e),
-				stdout: "",
-			}),
-		)
+		const outcome = await attemptGit(["-c", "protocol.version=0", "ls-remote", url])
 		// A v0 client must hit the v2-only gate (HTTP 400), not get an empty advert.
-		expect(outcome.failed).toBe(true)
+		expect(outcome.ok).toBe(false)
 		expect(outcome.stderr).toMatch(/40[03]/)
 	})
 
 	it("rejects a protocol.version=0 clone loudly (not a silent empty repo)", async () => {
 		const dest = mkdtempSync(join(tmpdir(), "pggit-a12-v0-dest-"))
 		try {
-			const outcome = await spawnGit([
+			const outcome = await attemptGit([
 				"-c",
 				"protocol.version=0",
 				"clone",
 				"--quiet",
 				url,
 				dest,
-			]).then(
-				() => ({ failed: false, stderr: "" }),
-				(e) => ({
-					failed: true,
-					stderr: e instanceof GitCommandError ? e.stderr : String(e),
-				}),
-			)
-			expect(outcome.failed).toBe(true)
+			])
+			expect(outcome.ok).toBe(false)
 			expect(outcome.stderr).toMatch(/40[03]/)
 		} finally {
 			rmSync(dest, { force: true, recursive: true })

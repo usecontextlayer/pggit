@@ -58,7 +58,6 @@
  * connection comes back, the pool keeps serving, shutdown completes), so a
  * reproduction is a red test.
  */
-import { spawn } from "node:child_process"
 import { rmSync } from "node:fs"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
@@ -66,7 +65,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { buildGitEnv } from "@/testing/spawn-git"
+import { type SpawnGitBoundedResult, spawnGitBounded } from "@/testing/spawn-git"
 
 const RUNS = 700
 const WAIT_S = 25
@@ -88,19 +87,13 @@ const COPY_NEEDLE = 'copy "copy_stg_git_object"'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-type BoundedGit = { settled: boolean; code: number | null; ms: number; out: string }
-
 /** Poll `pid` until it is executing the ingest COPY, then cancel THAT statement;
- * report whether it ever fired. Bounded by `limitMs` so a push that never reaches
+ * report whether it ever fired. Bounded by `WAIT_S` so a push that never reaches
  * the COPY ends the watch instead of hanging the suite — and reports `false`, which
  * the barrier turns into a failure rather than a silent green. */
-async function cancelIngestCopy(
-	admin: Sql,
-	pid: number,
-	limitMs: number,
-): Promise<boolean> {
+async function cancelIngestCopy(admin: Sql, pid: number): Promise<boolean> {
 	const t0 = Date.now()
-	while (Date.now() - t0 < limitMs) {
+	while (Date.now() - t0 < WAIT_S * 1000) {
 		const [act] = await admin<{ q: string }[]>`
 			select query as q from pg_stat_activity where pid = ${pid} and state = 'active'`
 		if (act?.q?.includes(COPY_NEEDLE)) {
@@ -112,34 +105,6 @@ async function cancelIngestCopy(
 	return false
 }
 
-/** Run git with a hard wall-clock bound; report whether it settled on its own.
- * `spawnGit` cannot be used here — it waits for `close` forever, which is exactly
- * the failure mode under test. */
-function gitBounded(args: string[], cwd: string, limitMs: number): Promise<BoundedGit> {
-	return new Promise((resolve) => {
-		const t0 = Date.now()
-		const child = spawn("git", ["-c", "gc.auto=0", ...args], {
-			cwd,
-			env: buildGitEnv(),
-		})
-		let out = ""
-		child.stdout.on("data", (d) => {
-			out += d
-		})
-		child.stderr.on("data", (d) => {
-			out += d
-		})
-		const timer = setTimeout(() => {
-			child.kill("SIGKILL")
-			resolve({ code: null, ms: Date.now() - t0, out, settled: false })
-		}, limitMs)
-		child.on("close", (code) => {
-			clearTimeout(timer)
-			resolve({ code, ms: Date.now() - t0, out, settled: true })
-		})
-	})
-}
-
 describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", () => {
 	let db: IsolatedDb
 	let admin: Sql
@@ -148,11 +113,11 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 	let src = ""
 	let pid = 0
 
-	let push: BoundedGit
+	let push: SpawnGitBoundedResult
 	let copyCancelled = false
 	let backendState = ""
 	let backendQuery = ""
-	let probe: BoundedGit
+	let probe: SpawnGitBoundedResult
 	let closed = false
 	/** Diagnostic the source printed: nothing lands, so this is availability, not
 	 * corruption. Kept as evidence, not as a verdict — the ingest runs in ONE
@@ -184,8 +149,8 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 
 		// FAULT POINT: the watcher cancels the ingest COPY as soon as the server is
 		// inside it. Started BEFORE the push so it cannot miss a fast COPY.
-		const watcher = cancelIngestCopy(admin, pid, WAIT_S * 1000)
-		push = await gitBounded(
+		const watcher = cancelIngestCopy(admin, pid)
+		push = await spawnGitBounded(
 			["push", url, "refs/heads/main:refs/heads/main"],
 			src,
 			WAIT_S * 1000,
@@ -204,7 +169,7 @@ describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", (
 		storedRefs = (await admin<{ name: string }[]>`select name from git_ref`).length
 
 		// The capacity consequence: the pool is gone, so every later request queues.
-		probe = await gitBounded(["ls-remote", url], src, 10_000)
+		probe = await spawnGitBounded(["ls-remote", url], src, 10_000)
 
 		// And a graceful shutdown cannot complete either.
 		closed = await Promise.race([

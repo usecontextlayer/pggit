@@ -25,7 +25,7 @@ const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 /** The flat, append-only directory whose tree object is the expensive one. */
 export const RUNS_DIR = ".engine/runs/planner-updates"
 
-export type AppendOnlyRepoOptions = {
+type AppendOnlyRepoOptions = {
 	/** Commits that append a run directory (each adds two blobs + a subtree). */
 	runs: number
 	/** Files in the `docs/` tree laid down by the seeding commit. */

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { buildFileList } from "@/repo-view/build-file-list"
 import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
@@ -110,14 +111,17 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 				} catch (e) {
 					const knownNoop =
 						e instanceof GitCommandError &&
+						e.code > 0 &&
 						e.stderr.includes(`Unable to process path ${op.path}`)
 					if (!knownNoop) throw e
 				}
-			} else {
+			} else if (op.kind === "swap") {
 				// file↔directory swap at one fixed path.
 				rmSync(full, { force: true, recursive: true })
 				mkdirSync(full, { recursive: true })
 				writeFileSync(join(full, "nested.txt"), `swap-${n}\n`)
+			} else {
+				assertNever(op)
 			}
 		}
 		await spawnGit(["add", "-A"], { cwd: dir })
@@ -130,6 +134,7 @@ describe("repo_file incremental ≡ full rebuild (spine S3 differential)", () =>
 			const status = await spawnGit(["status", "--porcelain"], { cwd: dir })
 			const nothingToCommit =
 				e instanceof GitCommandError &&
+				e.code > 0 &&
 				(e.stdout + e.stderr).includes("nothing to commit") &&
 				status.stdout.trim() === ""
 			if (!nothingToCommit) throw e

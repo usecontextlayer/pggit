@@ -24,7 +24,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 describe("a10 — shallow clone (--depth=1) fails loudly, never a silent empty repo", () => {
 	let db: IsolatedDb
@@ -56,16 +56,10 @@ describe("a10 — shallow clone (--depth=1) fails loudly, never a silent empty r
 		const dest = mkdtempSync(join(tmpdir(), "a10-shallow-dest-"))
 		try {
 			const url = `http://127.0.0.1:${server.port}/repo`
-			const outcome = await spawnGit(["clone", "--depth=1", url, dest]).then(
-				() => ({ failed: false, stderr: "" }),
-				(e) => ({
-					failed: true,
-					stderr: e instanceof GitCommandError ? e.stderr : String(e),
-				}),
-			)
+			const outcome = await attemptGit(["clone", "--depth=1", url, dest])
 
 			// The clone must fail loudly — not silently exit 0 with an empty repo.
-			expect(outcome.failed).toBe(true)
+			expect(outcome.ok).toBe(false)
 			// And specifically because shallow is unsupported, not some unrelated error.
 			expect(outcome.stderr).toMatch(/shallow/i)
 		} finally {

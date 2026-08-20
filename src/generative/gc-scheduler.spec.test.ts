@@ -44,6 +44,7 @@ import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { createGcScheduler } from "@/gc-scheduler"
 import {
 	ageObjects,
@@ -224,6 +225,7 @@ async function applyStep(
 			return
 		}
 	}
+	return assertNever(op)
 }
 
 /**
@@ -269,7 +271,9 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 						const idx = repoIdx % repoCount
 						const repo = repos[idx]
 						const state = states[idx]
-						if (repo === undefined || state === undefined) continue
+						if (repo === undefined || state === undefined) {
+							throw new Error(`missing generated repo state at index ${idx}`)
+						}
 						await applyStep(fx, repo, state, op)
 					}
 
@@ -293,7 +297,14 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 					// candidate's pass reappearing. It cannot catch draining too many: a repo
 					// row exists only once something pushed to it, so an "untouched repo" has
 					// no row to be wrongly selected. (d) is where over-selection is pinned.
-					const touched = repos.filter((_, i) => states[i]?.touched).sort()
+					const touched = repos
+						.filter((_, i) => {
+							const state = states[i]
+							if (state === undefined)
+								throw new Error(`missing generated state at index ${i}`)
+							return state.touched
+						})
+						.sort()
 					const drained = summary.map((entry) => entry.repo).sort()
 					expect(drained).toEqual(touched)
 

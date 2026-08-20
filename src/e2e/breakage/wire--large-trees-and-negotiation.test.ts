@@ -26,6 +26,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo, RUNS_DIR } from "@/testing/append-only-repo"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -64,10 +65,9 @@ async function digest(dir: string): Promise<string> {
 async function closureDigest(dir: string, rev: string): Promise<string> {
 	const objects = [
 		...new Set(
-			(await spawnGit(["rev-list", "--objects", rev], { cwd: dir })).stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
+			parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", rev], { cwd: dir })).stdout,
+			),
 		),
 	].sort()
 	const bytes = await spawnGit(["cat-file", "--batch"], {

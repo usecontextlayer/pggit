@@ -63,29 +63,12 @@ import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { parseLsTree } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `pggit oracle <oracle@pggit.test> ${WHEN}`
 const FAULT_POINTS = ["A-post-commit-stamp", "B-second-ref-in-batch"] as const
 type FaultPoint = (typeof FAULT_POINTS)[number]
-
-type GitAttempt = { ok: boolean; code: number; stdout: string; stderr: string }
-
-async function tryGit(args: string[], cwd?: string): Promise<GitAttempt> {
-	try {
-		const r = await spawnGit(args, { cwd })
-		return { code: 0, ok: true, stderr: r.stderr, stdout: r.stdout }
-	} catch (e) {
-		const err = e as { code?: number; stderr?: string; message: string }
-		return {
-			code: err.code ?? -1,
-			ok: false,
-			stderr: err.stderr ?? err.message,
-			stdout: "",
-		}
-	}
-}
 
 /** A revision's worktree as sorted `path\0mode\0oid` — the same shape `repo_file`
  * stores, so the projection and a real clone are directly comparable. */
@@ -115,7 +98,6 @@ type PointResult = {
 	pushOk: boolean
 	targeted: string[]
 	rejectedRefs: string[]
-	pushCode: number
 	pushTail: string
 	/** refs whose oid changed across the "failed" push. */
 	advanced: string[]
@@ -173,11 +155,11 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 				// Setup: main at c1 (projection built), and every c2 object already
 				// ingested via a side branch (so the faulted push ships an empty pack).
 				for (const spec of [`${c1}:refs/heads/main`, `${c2}:refs/heads/side`]) {
-					const r = await tryGit(["push", "-q", url, spec], src)
+					const r = await attemptGit(["push", "-q", url, spec], src)
 					if (!r.ok) throw new Error(`setup push ${spec} failed: ${r.stderr}`)
 				}
 				if (point === "B-second-ref-in-batch") {
-					const r = await tryGit(["push", "-q", url, `${c1}:refs/heads/zz`], src)
+					const r = await attemptGit(["push", "-q", url, `${c1}:refs/heads/zz`], src)
 					if (!r.ok) throw new Error(`setup push zz failed: ${r.stderr}`)
 				}
 
@@ -216,7 +198,7 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 						? ["refs/heads/main"]
 						: ["refs/heads/main", "refs/heads/zz"]
 				const args = ["push", url, ...targeted.map((t) => `${c2}:${t}`)]
-				const push = await tryGit(args, src)
+				const push = await attemptGit(args, src)
 				// Per-ref verdicts straight from the client's report-status echo.
 				const rejectedRefs = [
 					...push.stderr.matchAll(/\[remote rejected\] \S+ -> (\S+)/g),
@@ -244,7 +226,6 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 						convergenceGap: null,
 						point,
 						projectionTorn: null,
-						pushCode: push.code,
 						pushOk: true,
 						pushTail: "",
 						rejectedRefs,
@@ -263,12 +244,19 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 				const watermarkLost = stampAfter?.t === stampBefore?.t && advanced.length > 0
 
 				// CONVERGENCE: retry, then gc + repack + a fresh clone.
-				await tryGit(args, src)
+				await attemptGit(args, src)
 				await createGc(admin).gc(repo, { graceSeconds: 0, maintain: false })
 				await createRepack(admin).repack(repo)
 				const dest = join(root, `clone-${point}`)
 				rmSync(dest, { force: true, recursive: true })
-				const cl = await tryGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
+				const cl = await attemptGit([
+					"-c",
+					"protocol.version=2",
+					"clone",
+					"-q",
+					url,
+					dest,
+				])
 				let cloneError: string | null = null
 				let convergenceGap: { clone: string[]; projection: string[] } | null = null
 				if (!cl.ok) {
@@ -288,7 +276,6 @@ describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => 
 					convergenceGap,
 					point,
 					projectionTorn,
-					pushCode: push.code,
 					pushOk: false,
 					pushTail: push.stderr.trim().split("\n").filter(Boolean).slice(-2).join(" | "),
 					rejectedRefs,

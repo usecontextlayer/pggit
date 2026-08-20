@@ -42,7 +42,6 @@
  * NEGATIVE result, so this suite is expected GREEN. The negative IS the finding:
  * these ingest fault points do not tear the object⟺derived-rows invariant.
  */
-import { spawn } from "node:child_process"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -54,47 +53,19 @@ import { deriveCommitRow, deriveTagRow } from "@/object/derive"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { type GitServer, serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { buildGitEnv, spawnGit } from "@/testing/spawn-git"
+import { spawnGit, spawnGitBounded } from "@/testing/spawn-git"
 
 const RUNS = 700
 const BOUND_MS = 45_000
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-type BoundedGit = { settled: boolean; code: number | null; ms: number; out: string }
-
 /** git with a hard wall-clock bound, so a hang is observed rather than waited on. */
-function gitBounded(
-	args: string[],
-	cwd: string,
-	limitMs = BOUND_MS,
-): Promise<BoundedGit> {
-	return new Promise((resolve) => {
-		const t0 = Date.now()
-		const child = spawn("git", ["-c", "gc.auto=0", ...args], {
-			cwd,
-			env: buildGitEnv(),
-		})
-		let out = ""
-		child.stdout.on("data", (d) => {
-			out += d
-		})
-		child.stderr.on("data", (d) => {
-			out += d
-		})
-		const timer = setTimeout(() => {
-			child.kill("SIGKILL")
-			resolve({ code: null, ms: Date.now() - t0, out, settled: false })
-		}, limitMs)
-		child.on("close", (code) => {
-			clearTimeout(timer)
-			resolve({ code, ms: Date.now() - t0, out, settled: true })
-		})
-	})
-}
+const gitBounded = (args: string[], cwd: string) => spawnGitBounded(args, cwd, BOUND_MS)
 
-type Inv = { missing: string[]; dangling: string[]; objects: number; rows: number }
+type Inv = { missing: string[]; dangling: string[] }
 
 /** The §10.1 invariant, both directions, re-derived from stored content: every
  * stored commit/tag object has its EXACT derived row (tree, ordered parents,
@@ -145,8 +116,6 @@ async function invariant(admin: Sql, repo: string): Promise<Inv> {
 			(oid) => !present.has(oid),
 		),
 		missing,
-		objects: objects.length,
-		rows: commitRows.length + tagRows.length,
 	}
 }
 
@@ -184,13 +153,8 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 	let src = ""
 	let root = ""
 	const results: PointResult[] = []
-	const leaked: string[] = []
-	const onLeak = (e: unknown) => {
-		leaked.push(`${(e as Error).message}`.slice(0, 80))
-	}
 
 	beforeAll(async () => {
-		process.on("unhandledRejection", onLeak)
 		const baseUrl = inject("pgBaseUrl")
 		db = await createIsolatedSchema(baseUrl)
 		root = mkdtempSync(join(tmpdir(), "pggit-txn-ingest-"))
@@ -207,13 +171,9 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 		})
 		clean = await serveOnPort(createGitApp(createGitDeps(cleanSql)), 0)
 
-		const srcObjects = (
-			await spawnGit(["rev-list", "--objects", "--all"], { cwd: src })
-		).stdout
-			.split("\n")
-			.map((l) => l.slice(0, 40))
-			.filter((o) => /^[0-9a-f]{40}$/.test(o))
-			.sort()
+		const srcObjects = parseRevListObjectOids(
+			(await spawnGit(["rev-list", "--objects", "--all"], { cwd: src })).stdout,
+		).sort()
 
 		for (const [i, point] of POINTS.entries()) {
 			const repo = `txn/ingest-${i}`
@@ -282,10 +242,10 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 						fsckClean = fsck.code === 0
 						fsckTail = fsck.out.trim().slice(0, 200)
 						const got = new Set(
-							(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout
-								.split("\n")
-								.map((l) => l.slice(0, 40))
-								.filter((o) => /^[0-9a-f]{40}$/.test(o)),
+							parseRevListObjectOids(
+								(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest }))
+									.stdout,
+							),
 						)
 						lostObjects = srcObjects.filter((o) => !got.has(o)).length
 					}
@@ -315,9 +275,8 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 	}, 1_800_000)
 
 	afterAll(async () => {
-		process.off("unhandledRejection", onLeak)
-		await Promise.race([clean?.close().catch(() => {}), sleep(4000)])
-		await cleanSql?.end().catch(() => {})
+		await clean?.close()
+		await cleanSql?.end()
 		await admin?.end()
 		await db?.drop()
 		if (root) rmSync(root, { force: true, recursive: true })
@@ -400,11 +359,4 @@ describe("breakage/pg-txn — a cancel on every ingest statement", () => {
 				.map((r) => `${r.label}: clone missing ${r.lostObjects} source objects`),
 		).toEqual([])
 	})
-
-	// The source RECORDED unhandled rejections into `leaked` (via the beforeAll
-	// listener) but deliberately never made them a verdict — an aborted ingest can
-	// legitimately surface an async rejection the store still tolerates. That
-	// listener stays (it suppresses stray rejections so the run stays attributable),
-	// but asserting `leaked === []` would fail this GREEN negative for behavior the
-	// source classified as non-verdict, so it is intentionally not asserted here.
 })

@@ -26,7 +26,7 @@ import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { allObjectOids, loadAllObjects } from "@/testing/git-fixtures"
+import { allObjectOids, seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -85,14 +85,7 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 			await spawnGit(["branch", `b${i}`], { cwd: src })
 		}
 
-		await objects.putPack("repo1", await loadAllObjects(src))
-		const showRef = await spawnGit(["show-ref"], { cwd: src })
-		for (const line of showRef.stdout.trim().split("\n")) {
-			const [oid, name] = line.split(" ")
-			if (oid && name) await refs.setRef("repo1", name, oid)
-		}
-		const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
-		await refs.setSymref("repo1", "HEAD", head)
+		await seedRepoIntoStore("repo1", src, { objects, refs })
 
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
 	}, 180_000)

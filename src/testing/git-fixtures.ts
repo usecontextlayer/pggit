@@ -23,24 +23,95 @@ export function requireGitOid(value: string, context: string): string {
 	return value
 }
 
+/** Parse every `<oid>[ <path>]` row emitted by `git rev-list --objects`. */
+export function parseRevListObjectOids(stdout: string): string[] {
+	return stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			const space = line.indexOf(" ")
+			const oid = space < 0 ? line : line.slice(0, space)
+			return requireGitOid(oid, `rev-list line ${JSON.stringify(line)}`)
+		})
+}
+
+/** Read the requested objects through one binary-safe `cat-file --batch` process. */
+async function loadObjects(
+	dir: string,
+	oids: readonly string[],
+): Promise<PackInputObject[]> {
+	if (oids.length === 0) return []
+	const requested = oids.map((oid) => requireGitOid(oid, "cat-file --batch request"))
+	const batch = await spawnGit(["cat-file", "--batch"], {
+		cwd: dir,
+		input: `${requested.join("\n")}\n`,
+	})
+	const objects: PackInputObject[] = []
+	let pos = 0
+	for (const expectedOid of requested) {
+		const newline = batch.stdoutBytes.indexOf(0x0a, pos)
+		if (newline < 0) {
+			throw new Error(`cat-file --batch: missing header at byte ${pos}`)
+		}
+		const header = batch.stdoutBytes.toString("ascii", pos, newline)
+		const match = header.match(/^([0-9a-f]{40}) (blob|commit|tag|tree) ([0-9]+)$/)
+		if (match === null) {
+			throw new Error(`cat-file --batch: unexpected header ${JSON.stringify(header)}`)
+		}
+		const [, returnedOid, rawType, rawSize] = match as [string, string, string, string]
+		if (returnedOid !== expectedOid) {
+			throw new Error(
+				`cat-file --batch: returned ${returnedOid} while reading ${expectedOid}`,
+			)
+		}
+		const size = Number(rawSize)
+		if (!Number.isSafeInteger(size)) {
+			throw new Error(`cat-file --batch: invalid size in ${JSON.stringify(header)}`)
+		}
+		const contentStart = newline + 1
+		const contentEnd = contentStart + size
+		if (
+			contentEnd >= batch.stdoutBytes.length ||
+			batch.stdoutBytes[contentEnd] !== 0x0a
+		) {
+			throw new Error(`cat-file --batch: truncated record for ${expectedOid}`)
+		}
+		objects.push({
+			content: batch.stdoutBytes.subarray(contentStart, contentEnd),
+			type: objectType(rawType, header),
+		})
+		pos = contentEnd + 1
+	}
+	if (pos !== batch.stdoutBytes.length) {
+		throw new Error(
+			`cat-file --batch: ${batch.stdoutBytes.length - pos} unexpected trailing bytes`,
+		)
+	}
+	return objects
+}
+
 /** Every object in a real repo, as pack inputs (content read binary-safe). */
 export async function loadAllObjects(dir: string): Promise<PackInputObject[]> {
 	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
 		{ cwd: dir },
 	)
-	const objs: PackInputObject[] = []
-	for (const line of list.stdout.trim().split("\n").filter(Boolean)) {
-		const [oid, type] = line.split(" ")
-		if (oid === undefined || type === undefined || line.split(" ").length !== 2) {
-			throw new Error(`unexpected git object-list line: ${line}`)
-		}
-		const parsedOid = requireGitOid(oid, `object-list line ${JSON.stringify(line)}`)
-		const parsedType = objectType(type, line)
-		const raw = await spawnGit(["cat-file", parsedType, parsedOid], { cwd: dir })
-		objs.push({ content: raw.stdoutBytes, type: parsedType })
-	}
-	return objs
+	const oids = list.stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => requireGitOid(line, `object-list line ${JSON.stringify(line)}`))
+	return loadObjects(dir, oids)
+}
+
+/** Every object reachable from the supplied revisions, as pack inputs. */
+export async function loadReachableObjects(
+	dir: string,
+	revisions: readonly string[],
+): Promise<PackInputObject[]> {
+	const list = await spawnGit(["rev-list", "--objects", ...revisions], { cwd: dir })
+	return loadObjects(dir, [...new Set(parseRevListObjectOids(list.stdout))])
 }
 
 /** Parse `git ls-tree[-r]` output: `<mode> <type> <oid>\t<name-or-path>`. */
@@ -150,7 +221,21 @@ export function packFiles(dir: string): string[] {
 	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
 }
 
-export type VerifyPackObject = { oid: string; delta: boolean }
+type VerifyPackObject = {
+	baseOid?: string
+	delta: boolean
+	depth?: number
+	oid: string
+	offset: number
+}
+
+function verifyPackInteger(value: string, field: string, line: string): number {
+	const parsed = Number(value)
+	if (!Number.isSafeInteger(parsed)) {
+		throw new Error(`invalid verify-pack ${field} in line: ${line}`)
+	}
+	return parsed
+}
 
 /** Every object row inside one `git verify-pack -v` report, including whether it
  * is deltified. Summary rows are validated and omitted from the result. */
@@ -158,10 +243,33 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 	const objects: VerifyPackObject[] = []
 	for (const line of stdout.trim().split("\n").filter(Boolean)) {
 		const object = line.match(
-			/^([0-9a-f]{40})\s+(commit|tree|blob|tag)\s+\d+\s+\d+\s+\d+(?:\s+(\d+)\s+([0-9a-f]{40}))?$/,
+			/^([0-9a-f]{40})\s+(commit|tree|blob|tag)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)(?:\s+([0-9]+)\s+([0-9a-f]{40}))?$/,
 		)
 		if (object?.[1]) {
-			objects.push({ delta: object[3] !== undefined, oid: object[1] })
+			const [, rawOid, , rawSize, rawPackedSize, rawOffset, rawDepth, rawBaseOid] =
+				object as [string, string, string, string, string, string, string?, string?]
+			const oid = requireGitOid(rawOid, `verify-pack line ${JSON.stringify(line)}`)
+			verifyPackInteger(rawSize, "object size", line)
+			verifyPackInteger(rawPackedSize, "packed size", line)
+			const offset = verifyPackInteger(rawOffset, "offset", line)
+			if (rawDepth === undefined || rawBaseOid === undefined) {
+				objects.push({ delta: false, offset, oid })
+				continue
+			}
+			const depth = verifyPackInteger(rawDepth, "delta depth", line)
+			if (depth === 0) {
+				throw new Error(`invalid verify-pack delta depth in line: ${line}`)
+			}
+			objects.push({
+				baseOid: requireGitOid(
+					rawBaseOid,
+					`verify-pack base in line ${JSON.stringify(line)}`,
+				),
+				delta: true,
+				depth,
+				offset,
+				oid,
+			})
 			continue
 		}
 		if (

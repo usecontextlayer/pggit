@@ -28,7 +28,7 @@ describe("§8.4 generative — full clone (M0) differential", () => {
 		const baseUrl = inject("pgBaseUrl")
 
 		await fc.assert(
-			fc.asyncProperty(repoCommands({ maxCommands: 25 }), async (commands) => {
+			fc.asyncProperty(repoCommands(25), async (commands) => {
 				const { dir: src, model } = await buildRepoFromCommands(commands)
 				try {
 					// Empty-repo clone (unborn HEAD) has its own dedicated M0 test; the

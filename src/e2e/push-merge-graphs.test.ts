@@ -15,7 +15,7 @@ import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
-import { refsOf } from "@/testing/git-fixtures"
+import { parseRevListObjectOids, refsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -36,14 +36,9 @@ async function commitFile(
  * DB, which a clone correctly omits — so the serve invariant is reachable-set
  * equality, not raw object-DB equality.
  */
-async function reachableOids(dir: string): Promise<string[]> {
+async function reachableObjectOids(dir: string): Promise<string[]> {
 	const out = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = out.stdout
-		.trim()
-		.split("\n")
-		.map((l) => l.split(" ")[0])
-		.filter((o): o is string => Boolean(o))
-	return [...new Set(oids)].sort()
+	return [...new Set(parseRevListObjectOids(out.stdout))].sort()
 }
 
 describe("merge graph shapes — octopus + criss-cross differential", () => {
@@ -81,7 +76,7 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 				back,
 			])
 			await spawnGit(["fsck", "--full"], { cwd: back })
-			expect(await reachableOids(back)).toEqual(await reachableOids(src))
+			expect(await reachableObjectOids(back)).toEqual(await reachableObjectOids(src))
 			const stored = (await createRefStore(db.sql).listRefs(repoId)).sort((a, b) =>
 				a.name.localeCompare(b.name),
 			)

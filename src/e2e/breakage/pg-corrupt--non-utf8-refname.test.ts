@@ -33,7 +33,7 @@ import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/badref"
 const SOLO_REPO = `${REPO}-solo`
@@ -63,24 +63,18 @@ function refLines(bytes: Buffer): string[] {
 		.sort()
 }
 
-/** A push whose failure is data, not a thrown error. */
-type PushOutcome = { code: number; stderr: string }
-async function tryPush(args: string[], cwd: string): Promise<PushOutcome> {
-	return spawnGit(args, { cwd }).catch((e: unknown) => ({ code: 1, stderr: String(e) }))
-}
-
 describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let srcRefs: string[] = []
 	let oracleRefs: string[] = []
-	let push: PushOutcome = { code: 0, stderr: "" }
+	let push = { code: 0, stderr: "" }
 	let storedNamesHex: string[] = []
 	let storedObjects = -1
-	let retryPush: PushOutcome = { code: 1, stderr: "not run" }
+	let retryPush = { code: 1, stderr: "not run" }
 	let advertisedAfterRetry: string[] = []
 	let mainOid = ""
-	let soloPush: PushOutcome = { code: 0, stderr: "" }
+	let soloPush = { code: 0, stderr: "" }
 	let soloStoredHex: string[] = []
 	const dirs: string[] = []
 	const mk = (tag: string): string => {
@@ -133,7 +127,7 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 
-		push = await tryPush(["push", url, "refs/heads/*:refs/heads/*"], src)
+		push = await attemptGit(["push", url, "refs/heads/*:refs/heads/*"], src)
 
 		// What actually landed, as bytes (bypassing every text decode): must be
 		// nothing — no oid-bearing ref rows, no ingested objects.
@@ -148,7 +142,7 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 		storedObjects = objs?.n ?? -1
 
 		// The repo is not wedged: the same objects under an all-UTF-8 refspec land.
-		retryPush = await tryPush(["push", url, "refs/heads/main:refs/heads/main"], src)
+		retryPush = await attemptGit(["push", url, "refs/heads/main:refs/heads/main"], src)
 		advertisedAfterRetry = refLines(
 			(await spawnGit(["-c", "protocol.version=2", "ls-remote", url])).stdoutBytes,
 		)
@@ -170,7 +164,7 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 			input: createRefStdin(REF_E9, sc),
 		})
 		const soloUrl = `http://127.0.0.1:${server.port}/${SOLO_REPO}`
-		soloPush = await tryPush(["push", soloUrl, "refs/heads/*:refs/heads/*"], solo)
+		soloPush = await attemptGit(["push", soloUrl, "refs/heads/*:refs/heads/*"], solo)
 		const soloRows = await db.sql<{ h: string }[]>`
 			select encode(convert_to(g.name, 'UTF8'), 'hex') as h
 			from git_ref g join repos r on r.id = g.repo_id
@@ -190,6 +184,7 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 
 	it("pggit REJECTS the push carrying non-UTF-8 refnames", () => {
 		expect(push.code, push.stderr).not.toBe(0)
+		expect(push.stderr).toMatch(/HTTP 400/)
 	})
 
 	it("nothing landed: no ref rows (exact OR mangled), no ingested objects", () => {
@@ -205,6 +200,7 @@ describe("pg-corrupt — non-UTF-8 refnames are rejected at the push boundary", 
 
 	it("a lone non-UTF-8 refname is rejected the same way, nothing stored", () => {
 		expect(soloPush.code, soloPush.stderr).not.toBe(0)
+		expect(soloPush.stderr).toMatch(/HTTP 400/)
 		expect(soloStoredHex).toEqual([])
 	})
 })

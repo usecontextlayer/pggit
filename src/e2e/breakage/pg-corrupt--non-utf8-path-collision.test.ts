@@ -28,7 +28,7 @@ import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/badpath"
 
@@ -112,9 +112,7 @@ describe("pg-corrupt — colliding non-UTF-8 paths are rejected at the boundary"
 		server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 
-		push = await spawnGit(["push", url, "refs/heads/main:refs/heads/main"], {
-			cwd: src,
-		}).catch((e: unknown) => ({ code: 1, stderr: String(e) }))
+		push = await attemptGit(["push", url, "refs/heads/main:refs/heads/main"], src)
 
 		const [counts] = await db.sql<{ refs: number; objs: number; files: number }[]>`
 			select
@@ -140,6 +138,8 @@ describe("pg-corrupt — colliding non-UTF-8 paths are rejected at the boundary"
 
 	it("pggit REJECTS the push whose tree carries non-UTF-8 entry names", () => {
 		expect(push.code, push.stderr).not.toBe(0)
+		expect(push.stderr).toMatch(/not valid UTF-8/)
+		expect(push.stderr).toMatch(/unpack/)
 	})
 
 	it("nothing landed — the silent-drop state cannot be reached", () => {

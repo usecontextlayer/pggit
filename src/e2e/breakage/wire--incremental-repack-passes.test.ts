@@ -24,6 +24,7 @@ import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
+import { parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -43,11 +44,10 @@ async function depthOf(dir: string): Promise<{ maxDepth: number; deltas: number 
 	let deltas = 0
 	for (const f of readdirSync(p).filter((x) => x.endsWith(".idx"))) {
 		const out = await spawnGit(["verify-pack", "-v", join(p, f)], { cwd: dir })
-		for (const line of out.stdout.split("\n")) {
-			const parts = line.trim().split(/\s+/)
-			if (parts.length < 7 || !/^[0-9a-f]{40}$/.test(parts[0] as string)) continue
+		for (const object of parseVerifyPackObjects(out.stdout)) {
+			if (object.depth === undefined) continue
 			deltas++
-			maxDepth = Math.max(maxDepth, Number(parts[5]))
+			maxDepth = Math.max(maxDepth, object.depth)
 		}
 	}
 	return { deltas, maxDepth }

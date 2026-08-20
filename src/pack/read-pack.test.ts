@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest"
 import { computeOid } from "@/object/object"
 import { readPack } from "@/pack/read-pack"
 import { writePack } from "@/pack/write-pack"
+import { parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 describe("readPack", () => {
@@ -97,10 +98,9 @@ describe("readPack", () => {
 				const verify = await spawnGit(["verify-pack", "-v", join(packDir, idxName)], {
 					cwd: dir,
 				})
-				const baseOids = verify.stdout
-					.split("\n")
-					.map((l) => /^[0-9a-f]{40} \S.* ([0-9a-f]{40})$/.exec(l)?.[1])
-					.filter((oid): oid is string => oid !== undefined)
+				const baseOids = parseVerifyPackObjects(verify.stdout).flatMap((object) =>
+					object.baseOid === undefined ? [] : [object.baseOid],
+				)
 				expect(baseOids.length).toBeGreaterThan(0)
 				// …and every delta in it is THIS test's wire form.
 				for (const base of baseOids) {

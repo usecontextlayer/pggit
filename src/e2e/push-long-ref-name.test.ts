@@ -34,7 +34,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const ZERO = "0".repeat(40)
 
@@ -197,8 +197,10 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 			join repos r on r.id = o.repo_id
 			where r.name = ${repo}
 		`
+		const orphanCount = orphans[0]
+		if (orphanCount === undefined) throw new Error("orphan aggregate returned no row")
 		expect(
-			orphans[0]?.n ?? 0,
+			orphanCount.n,
 			"failed over-long ref push left orphaned (unreachable) objects in git_object",
 		).toBe(0)
 	})
@@ -273,16 +275,9 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 
 	it("does not 500 while silently committing one ref of the batch", async () => {
 		// One non-atomic push of TWO refspecs: a valid branch and an over-long one.
-		const outcome = await spawnGit(
+		const outcome = await attemptGit(
 			["push", url, "main:refs/heads/ok", `main:${longRef}`],
-			{ cwd: src },
-		).then(
-			(r) => ({ failed: false, stderr: r.stderr, stdout: r.stdout }),
-			(e) => ({
-				failed: true,
-				stderr: e instanceof GitCommandError ? e.stderr : String(e),
-				stdout: e instanceof GitCommandError ? e.stdout : "",
-			}),
+			src,
 		)
 
 		// Whatever the pushing client observed, read the server's durable state and
@@ -321,8 +316,8 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 			outcome.stderr,
 			"refs/heads/ok landed server-side, so the client must have been told in-band ([new branch]), not seen a wholesale failure",
 		).toMatch(/\[new branch]/)
-		expect(outcome.failed, "one rejected command must make git push exit non-zero").toBe(
-			true,
+		expect(outcome.ok, "one rejected command must make git push exit non-zero").toBe(
+			false,
 		)
 		expect(
 			outcome.stderr,

@@ -75,7 +75,9 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			join repos r on r.id = f.repo_id
 			where r.name = ${repoId} and f.ref_name = ${ref}
 		`
-		return rows[0]?.n ?? 0
+		const [row] = rows
+		if (row === undefined) throw new Error("file row count aggregate returned no row")
+		return row.n
 	}
 
 	/** Path + blob oid per file at a ref — the same direct-SQL read surface a consumer

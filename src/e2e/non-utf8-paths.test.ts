@@ -31,7 +31,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact", () => {
 	let isolated: IsolatedDb
@@ -97,12 +97,7 @@ describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact
 		// fails every ref command; the client exits non-zero. Only a git failure is
 		// expected here: a spawn fault or transport error must propagate rather than
 		// be laundered into the non-zero exit the assertions below read.
-		const push = await spawnGit(["push", url, "refs/heads/main:refs/heads/main"], {
-			cwd: src,
-		}).catch((e: unknown) => {
-			if (e instanceof GitCommandError) return e
-			throw e
-		})
+		const push = await attemptGit(["push", url, "refs/heads/main:refs/heads/main"], src)
 		expect(push.code, push.stderr).not.toBe(0)
 		// The REASON, not just the failure: pggit's D16 path rule, reported in-band on
 		// the unpack status line the client prints back.

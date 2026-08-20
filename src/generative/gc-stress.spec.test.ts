@@ -62,7 +62,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
-import type { GitObjectType } from "@/object/object"
 import type { PackInputObject } from "@/pack/write-pack"
 import {
 	ageObjects,
@@ -75,6 +74,7 @@ import {
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
+import { loadAllObjects } from "@/testing/git-fixtures"
 import { PINNED_DATE, PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
 // fast-import's committer line wants `<unix-seconds> <tz>`, NOT git's `@<seconds>`
@@ -146,9 +146,7 @@ function fastImportStream(spec: HistorySpec): string {
 	// every ref but `main` would not change one assertion in this file — the multi-tip
 	// live-set materialization would go unexercised while the header advertised it.
 	const branches = spec.branches ?? []
-	for (let i = 0; i < branches.length; i++) {
-		const branch = branches[i]
-		if (branch === undefined) continue
+	for (const [i, branch] of branches.entries()) {
 		out.push(`commit refs/heads/${branch}`, `committer ${FI_COMMITTER}`)
 		const msg = `branch ${branch} salt ${spec.salt}`
 		out.push(`data ${Buffer.byteLength(msg)}`, msg)
@@ -167,60 +165,6 @@ async function fastImport(dir: string, stream: string): Promise<void> {
 	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: stream })
 }
 
-/**
- * Load EVERY object of a repo as pack inputs through a SINGLE `cat-file --batch`
- * process — the scale-critical alternative to `loadAllObjects` (which spawns one
- * `git` per object: ~128s for 6.5k objects vs ~120ms here). The `--batch` stream is
- * `<oid> <type> <size>\n<raw bytes>\n` per object; binary-safe (sizes drive the
- * cut, never newlines), which is why it reads `stdoutBytes` and never `stdout`.
- * Idempotent re-seeds in pggit dedupe by OID, so loading the full object set
- * (reachable + churned) is exactly the orphan-bearing seed GC must reclaim down to
- * the reachable closure.
- *
- * The parse is LOUD in both directions — a short or malformed record throws instead
- * of resolving a truncated list. A silently-truncated ORPHAN load is invisible
- * downstream (fewer orphans just means less for GC to reclaim, and every assertion
- * still passes), so the parser is the only place that failure can be caught.
- */
-async function loadAllObjectsBatched(dir: string): Promise<PackInputObject[]> {
-	const listed = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-		{ cwd: dir },
-	)
-	const oids = listed.stdout.trim().split("\n").filter(Boolean)
-	if (oids.length === 0) return []
-
-	const batch = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = batch.stdoutBytes
-	const objs: PackInputObject[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl === -1) throw new Error(`cat-file --batch: no record header at byte ${pos}`)
-		const header = buf.toString("utf8", pos, nl)
-		const [, type, sizeStr] = header.split(" ")
-		const size = Number.parseInt(sizeStr ?? "", 10)
-		if (type === undefined || !Number.isSafeInteger(size)) {
-			throw new Error(`cat-file --batch: unparseable header ${JSON.stringify(header)}`)
-		}
-		const start = nl + 1
-		objs.push({ content: buf.subarray(start, start + size), type: type as GitObjectType })
-		pos = start + size + 1 // skip the record's trailing LF
-	}
-	if (pos !== buf.length) {
-		throw new Error(`cat-file --batch: stream ended mid-record (${pos} vs ${buf.length})`)
-	}
-	if (objs.length !== oids.length) {
-		throw new Error(
-			`cat-file --batch: read ${objs.length} objects, asked for ${oids.length}`,
-		)
-	}
-	return objs
-}
-
 /** Build one deep/wide history on disk (fast-import), load all its objects, capture
  * its main tip, then DISCARD the dir. Returns the objects + the `refs/heads/main`
  * tip oid (for seeding a live ref, or — when seeded ref-less — an orphan set). */
@@ -232,7 +176,7 @@ async function buildHistory(
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 		await fastImport(dir, fastImportStream(spec))
 		const tip = (await spawnGit(["rev-parse", "main"], { cwd: dir })).stdout.trim()
-		return { objects: await loadAllObjectsBatched(dir), tip }
+		return { objects: await loadAllObjects(dir), tip }
 	} finally {
 		rmSync(dir, { force: true, recursive: true })
 	}
@@ -315,7 +259,7 @@ async function seedDeepWideRepo(
 		"the branch tips reach nothing main does not — the WIDE-ref axis is not exercised",
 	).toBeGreaterThan(mainClosure)
 
-	await fx.objects.putPack(repo, await loadAllObjectsBatched(liveDir))
+	await fx.objects.putPack(repo, await loadAllObjects(liveDir))
 	for (const ref of liveRefs) await fx.refs.setRef(repo, ref.name, ref.oid)
 
 	// ORPHAN axis: independent salted deep/wide histories, seeded ref-LESS → every

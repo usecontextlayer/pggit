@@ -34,6 +34,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -53,21 +54,18 @@ async function ordering(dir: string): Promise<Ordering> {
 		if (f.endsWith(".pack")) bytes += statSync(join(p, f)).size
 		if (!f.endsWith(".idx")) continue
 		const out = await spawnGit(["verify-pack", "-v", join(p, f)], { cwd: dir })
-		const offsetOf = new Map<string, number>()
-		const rows: { offset: number; base: string }[] = []
-		for (const line of out.stdout.split("\n")) {
-			// `<sha1> <type> <size> <packed-size> <offset> [<depth> <base-sha1>]`
-			const parts = line.trim().split(/\s+/)
-			if (parts.length < 5 || !/^[0-9a-f]{40}$/.test(parts[0] as string)) continue
-			offsetOf.set(parts[0] as string, Number(parts[4]))
-			if (parts.length >= 7) {
-				rows.push({ base: parts[6] as string, offset: Number(parts[4]) })
-			}
-		}
-		for (const r of rows) {
+		const objects = parseVerifyPackObjects(out.stdout)
+		const offsetOf = new Map(objects.map((object) => [object.oid, object.offset]))
+		for (const object of objects) {
+			if (object.baseOid === undefined) continue
 			deltas++
-			const b = offsetOf.get(r.base)
-			if (b !== undefined && r.offset < b) ahead++
+			const baseOffset = offsetOf.get(object.baseOid)
+			if (baseOffset === undefined) {
+				throw new Error(
+					`verify-pack delta ${object.oid} names absent base ${object.baseOid}`,
+				)
+			}
+			if (object.offset < baseOffset) ahead++
 		}
 	}
 	return { ahead, bytes, deltas }

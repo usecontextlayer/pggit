@@ -39,7 +39,7 @@ describe("§8.4 generative — incremental fetch (M1) differential", () => {
 
 		await fc.assert(
 			fc.asyncProperty(
-				fc.tuple(repoCommands({ maxCommands: 20 }), repoCommands({ maxCommands: 15 })),
+				fc.tuple(repoCommands(20), repoCommands(15)),
 				async ([baseCommands, divergeCommands]) => {
 					const { dir: src, model } = await buildRepoFromCommands(baseCommands)
 					try {

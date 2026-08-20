@@ -41,7 +41,7 @@ import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const ITERS = 12
 const RUNS = 1200
@@ -70,23 +70,6 @@ const CLEAN = [
 ]
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-
-type GitAttempt = { ok: boolean; code: number; stdout: string; stderr: string }
-
-async function tryGit(args: string[], cwd?: string): Promise<GitAttempt> {
-	try {
-		const r = await spawnGit(args, { cwd })
-		return { code: 0, ok: true, stderr: r.stderr, stdout: r.stdout }
-	} catch (e) {
-		const err = e as { code?: number; stderr?: string; message: string }
-		return {
-			code: err.code ?? -1,
-			ok: false,
-			stderr: err.stderr ?? err.message,
-			stdout: "",
-		}
-	}
-}
 
 type Verdict =
 	| "complete"
@@ -140,7 +123,7 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 		for (let i = 0; i < ITERS; i++) {
 			const repo = `txn/clonerace-${i}`
 			const url = `http://127.0.0.1:${server.port}/${repo}`
-			const push = await tryGit(["push", "-q", url, `${tip}:refs/heads/main`], src)
+			const push = await attemptGit(["push", "-q", url, `${tip}:refs/heads/main`], src)
 			if (!push.ok) throw new Error(`seed push failed: ${push.stderr}`)
 			// Half the runs carry an encoding tier, so the delta path is raced too.
 			if (i % 2 === 1) await createRepack(admin).repack(repo)
@@ -149,7 +132,7 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 
 			const dest = join(root, `c-${i}`)
 			const delayMs = 40 + ((i * 97) % 900)
-			const clone = tryGit([
+			const clone = attemptGit([
 				"-c",
 				"protocol.version=2",
 				"clone",
@@ -167,8 +150,8 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 			let verdict: Verdict
 			let detail = ""
 			if (res.ok) {
-				const fsck = await tryGit(["fsck", "--strict", "--no-dangling"], dest)
-				const revList = await tryGit(["rev-list", "--objects", "--all"], dest)
+				const fsck = await attemptGit(["fsck", "--strict", "--no-dangling"], dest)
+				const revList = await attemptGit(["rev-list", "--objects", "--all"], dest)
 				if (!fsck.ok || !revList.ok) {
 					verdict = "broken-clone"
 					detail = `clone exited 0 but ${
@@ -201,7 +184,7 @@ describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
 
 	afterAll(async () => {
 		await server?.close()
-		await appSql?.end().catch(() => {})
+		await appSql?.end()
 		await admin?.end()
 		await db?.drop()
 		if (root) rmSync(root, { force: true, recursive: true })

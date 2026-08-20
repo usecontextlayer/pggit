@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 
-export type SpawnGitResult = {
+type SpawnGitResult = {
 	code: number
 	stdout: string
 	/** Raw stdout bytes — use this for binary git output (packs, tree objects). */
@@ -8,11 +8,15 @@ export type SpawnGitResult = {
 	stderr: string
 }
 
-export type SpawnGitOptions = {
+type SpawnGitOptions = {
 	cwd?: string
 	/** Bytes to write to git's stdin (e.g. rev-list args for `pack-objects --revs`). */
 	input?: Buffer | string
 }
+
+export type SpawnGitBoundedResult =
+	| { settled: true; code: number; out: string }
+	| { settled: false; code: null; out: string }
 
 /**
  * Pinned author/committer identity + clock. Commit/tag OIDs are a hash of the
@@ -71,6 +75,74 @@ export class GitCommandError extends Error {
 		super(`git ${args.join(" ")} exited ${code}: ${stderr.trim()}`)
 		this.name = "GitCommandError"
 	}
+}
+
+type GitAttempt = { ok: boolean; code: number; stdout: string; stderr: string }
+
+/** Run Git when an ordinary nonzero exit is data, while preserving infrastructure faults. */
+export async function attemptGit(args: string[], cwd?: string): Promise<GitAttempt> {
+	try {
+		const result = await spawnGit(args, { cwd })
+		return { code: result.code, ok: true, stderr: result.stderr, stdout: result.stdout }
+	} catch (error) {
+		if (!(error instanceof GitCommandError) || error.code < 1) throw error
+		return {
+			code: error.code,
+			ok: false,
+			stderr: error.stderr,
+			stdout: error.stdout,
+		}
+	}
+}
+
+/** Run Git with a hard wall-clock bound, preserving ordinary nonzero exits as data. */
+export function spawnGitBounded(
+	args: string[],
+	cwd: string,
+	limitMs: number,
+): Promise<SpawnGitBoundedResult> {
+	const fullArgs = [...PINNED_CONFIG_ARGS, ...args]
+	return new Promise((resolve, reject) => {
+		const child = spawn("git", fullArgs, { cwd, env: buildGitEnv() })
+		let out = ""
+		let finished = false
+		child.stdout.on("data", (chunk: Buffer) => {
+			out += chunk.toString("utf8")
+		})
+		child.stderr.on("data", (chunk: Buffer) => {
+			out += chunk.toString("utf8")
+		})
+		const timer = setTimeout(() => {
+			if (finished) return
+			finished = true
+			child.kill("SIGKILL")
+			resolve({ code: null, out, settled: false })
+		}, limitMs)
+		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED" || finished)
+				return
+			finished = true
+			clearTimeout(timer)
+			reject(error)
+		})
+		child.stdin.end()
+		child.on("error", (error) => {
+			if (finished) return
+			finished = true
+			clearTimeout(timer)
+			reject(error)
+		})
+		child.on("close", (code, signal) => {
+			if (finished) return
+			finished = true
+			clearTimeout(timer)
+			if (code !== null) {
+				resolve({ code, out, settled: true })
+				return
+			}
+			reject(new GitCommandError(args, -1, out, `killed by ${signal ?? "signal"}`))
+		})
+	})
 }
 
 /**

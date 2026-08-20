@@ -24,6 +24,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack, type RepackResult } from "@/store/repack"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -137,15 +138,6 @@ async function revParse(dir: string, rev: string): Promise<string> {
 	return (await spawnGit(["rev-parse", rev], { cwd: dir })).stdout.trim()
 }
 
-/** Sorted oids of every object reachable from any ref. */
-async function objectsIn(dir: string): Promise<string[]> {
-	return (await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout
-		.split("\n")
-		.map((l) => l.slice(0, 40))
-		.filter((o) => /^[0-9a-f]{40}$/.test(o))
-		.sort()
-}
-
 type MirrorState = { refs: string[]; objects: string[]; fsck: string }
 
 /** Mirror-clone `url` into `dest`, fsck --strict, and return the observable state. */
@@ -167,7 +159,10 @@ async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
 		.split("\n")
 		.map((l) => l.trim())
 		.filter((l) => l.length > 0 && !l.startsWith("notice:"))
-	return { fsck: fsckLines.join("\n"), objects: await objectsIn(dest), refs }
+	const objects = parseRevListObjectOids(
+		(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
+	).sort()
+	return { fsck: fsckLines.join("\n"), objects, refs }
 }
 
 /**
@@ -176,7 +171,13 @@ async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
  * oid order. Two repos agree here iff every reachable object is byte-identical.
  */
 async function objectBytesDigest(dir: string): Promise<string> {
-	const unique = [...new Set(await objectsIn(dir))]
+	const unique = [
+		...new Set(
+			parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
+			),
+		),
+	].sort()
 	if (unique.length === 0) return "empty"
 	const res = await spawnGit(["cat-file", "--batch"], {
 		cwd: dir,

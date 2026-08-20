@@ -7,9 +7,13 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
-import { allObjectOids, requireGitOid } from "@/testing/git-fixtures"
+import {
+	allObjectOids,
+	parseRevListObjectOids,
+	requireGitOid,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 /**
  * Shared scaffolding for the GC behavioural suite
@@ -57,10 +61,10 @@ export async function setupGcFixture(): Promise<GcFixture> {
 
 /** Tear the fixture down (call in `afterAll`, or per-candidate): close the server and
  * drop the schema (which ends its pooled clients). The shared container is left running
- * — `globalSetup` stops it once, after the whole run. Tolerant of a partial setup. */
-export async function teardownGcFixture(fx: Partial<GcFixture>): Promise<void> {
-	await fx.server?.close()
-	await fx.db?.drop()
+ * — `globalSetup` stops it once, after the whole run. */
+export async function teardownGcFixture(fx: GcFixture): Promise<void> {
+	await fx.server.close()
+	await fx.db.drop()
 }
 
 /** The smart-HTTP URL of `repo` on the fixture's server (repo auto-created on
@@ -84,7 +88,7 @@ export async function withTempDir<T>(
 }
 
 /** The file one push writes — the options `pushFile` and `pushDenied` share. */
-export type PushContent = {
+type PushContent = {
 	path?: string
 	content: string
 }
@@ -102,7 +106,7 @@ export type PushContent = {
  * through the store, and the throwaway ref is store-deleted. The DENIED-push
  * orphan flow (the production orphan source) is covered separately by
  * `pushDenied` (gc-denied-push / gc-integrity). */
-export type PushOpts = PushContent & {
+type PushOpts = PushContent & {
 	rewind?: boolean
 }
 
@@ -191,15 +195,12 @@ export async function pushDenied(
 		writeFileSync(join(src, path), opts.content)
 		await spawnGit(["add", "."], { cwd: src })
 		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
-		let denied = false
-		try {
-			await spawnGit(["push", "--force", url, "HEAD:refs/heads/main"], { cwd: src })
-		} catch (e) {
-			if (!/non-fast-forward/i.test(e instanceof Error ? e.message : "")) throw e
-			denied = true
-		}
-		if (!denied) {
+		const push = await attemptGit(["push", "--force", url, "HEAD:refs/heads/main"], src)
+		if (push.ok) {
 			throw new Error("pushDenied: the force push unexpectedly succeeded")
+		}
+		if (!/non-fast-forward/i.test(push.stderr)) {
+			throw new Error(`pushDenied: unexpected git failure: ${push.stderr.trim()}`)
 		}
 		const head = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
 		const reachable = await gitReachableOids(src)
@@ -210,7 +211,7 @@ export async function pushDenied(
 /** The result of cloning/fetching a ref back: the FETCH_HEAD oid, the full sorted
  * object set fetched, and the checked-out content of `file`. fsck has already
  * passed (this throws otherwise). */
-export type CloneResult = { head: string; objects: string[]; fileContent: string }
+type CloneResult = { head: string; objects: string[]; fileContent: string }
 
 /**
  * Fetch `ref` (default `refs/heads/main`) into a throwaway back dir, run
@@ -251,14 +252,7 @@ export async function cloneAndFsck(
  */
 export async function gitReachableOids(dir: string): Promise<string[]> {
 	const revList = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = new Set<string>()
-	for (const line of revList.stdout.trim().split("\n")) {
-		if (!line) continue
-		// `--objects` lines are `<oid>` or `<oid> <path>` — take the leading oid.
-		const split = line.indexOf(" ")
-		const oid = split < 0 ? line : line.slice(0, split)
-		oids.add(requireGitOid(oid, `rev-list line ${JSON.stringify(line)}`))
-	}
+	const oids = new Set(parseRevListObjectOids(revList.stdout))
 	// Annotated-tag OBJECTS: `rev-list --objects --all` lists a tag ref's peeled
 	// target, not the tag object, so add every ref oid that is itself a tag object.
 	const refLines = await spawnGit(
@@ -272,7 +266,17 @@ export async function gitReachableOids(dir: string): Promise<string[]> {
 		}
 		const [type, oid] = fields as [string, string]
 		const parsedOid = requireGitOid(oid, `for-each-ref line ${JSON.stringify(line)}`)
-		if (type === "tag") oids.add(parsedOid)
+		switch (type) {
+			case "tag":
+				oids.add(parsedOid)
+				break
+			case "blob":
+			case "commit":
+			case "tree":
+				break
+			default:
+				throw new Error(`unexpected for-each-ref object type: ${line}`)
+		}
 	}
 	return [...oids].sort()
 }
@@ -305,7 +309,9 @@ export async function countObjects(
 		join repos r on r.id = o.repo_id
 		where r.name = ${repo}
 	`
-	return row?.n ?? 0
+	if (row === undefined)
+		throw new Error(`countObjects: aggregate returned no row for ${repo}`)
+	return row.n
 }
 
 /**
@@ -350,7 +356,10 @@ export async function countDerivedRows(
 		select (select count(*) from git_commit c join repos r on r.id = c.repo_id where r.name = ${repo})::int
 			+ (select count(*) from git_tag t join repos r on r.id = t.repo_id where r.name = ${repo})::int as n
 	`
-	return row?.n ?? 0
+	if (row === undefined) {
+		throw new Error(`countDerivedRows: aggregate returned no row for ${repo}`)
+	}
+	return row.n
 }
 
 /** Commit/tag OBJECTS with no derived row, plus derived rows whose object is
@@ -411,7 +420,7 @@ export async function ageObjects(
  * Both are `null` when the repo row is absent (never pushed) or the column unset.
  * Observable surface for SCH-1/SCH-2 (a push stamps `last_pushed_at`) and
  * SCH-3/SCH-4 (a drain advances `last_gc_at`). */
-export type RepoGcState = { lastPushedAt: Date | null; lastGcAt: Date | null }
+type RepoGcState = { lastPushedAt: Date | null; lastGcAt: Date | null }
 
 export async function repoGcState(
 	db: Pick<IsolatedDb, "sql">,

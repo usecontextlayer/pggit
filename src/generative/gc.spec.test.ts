@@ -304,7 +304,7 @@ describe("§4 PBT — property-based GC differential", () => {
 		const cov = newCoverage()
 		await fc.assert(
 			fc.asyncProperty(
-				repoCommands({ maxCommands: 25 }),
+				repoCommands(25),
 				fc.array(fc.boolean(), { maxLength: 8, minLength: 1 }),
 				async (commands, keepMask) => {
 					const { dir: src, model } = await buildRepoFromCommands(commands)
@@ -330,7 +330,8 @@ describe("§4 PBT — property-based GC differential", () => {
 
 						// And a fetch of a kept ref is fsck-clean (liveness preserved end-to-end).
 						const keptRef = kept[0]
-						if (keptRef) await fetchAndFsck(fx, repo, keptRef.name)
+						if (keptRef === undefined) throw new Error("seedSubset kept no ref")
+						await fetchAndFsck(fx, repo, keptRef.name)
 					} finally {
 						rmSync(src, { force: true, recursive: true })
 					}
@@ -404,7 +405,7 @@ describe("§4 PBT — property-based GC differential", () => {
 		const cov = newCoverage()
 		await fc.assert(
 			fc.asyncProperty(
-				repoCommands({ maxCommands: 25 }),
+				repoCommands(25),
 				fc.array(fc.boolean(), { maxLength: 8, minLength: 1 }),
 				async (commands, keepMask) => {
 					const { dir: src, model } = await buildRepoFromCommands(commands)
@@ -443,7 +444,8 @@ describe("§4 PBT — property-based GC differential", () => {
 						expect(await objectOids(fx.db, repo)).toEqual(afterFirst)
 
 						const keptRef = kept[0]
-						if (keptRef) await fetchAndFsck(fx, repo, keptRef.name)
+						if (keptRef === undefined) throw new Error("seedSubset kept no ref")
+						await fetchAndFsck(fx, repo, keptRef.name)
 					} finally {
 						rmSync(src, { force: true, recursive: true })
 					}

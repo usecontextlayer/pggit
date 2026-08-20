@@ -46,7 +46,7 @@ import { describe, expect, it } from "vitest"
 import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/derive"
 import { GitFormatError } from "@/object/format-error"
 import type { GitObjectType } from "@/object/object"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const NUL = Buffer.from([0])
 const PINNED = { numRuns: 80, seed: 424_242 } as const
@@ -154,12 +154,7 @@ async function gitVerdict(
 	try {
 		cpSync(fixture.dir, dir, { recursive: true })
 		await writeObject(dir, type, content)
-		const fsck = await spawnGit(["fsck", "--strict"], { cwd: dir }).catch(
-			(e: unknown) => {
-				if (e instanceof GitCommandError) return e
-				throw e
-			},
-		)
+		const fsck = await attemptGit(["fsck", "--strict"], dir)
 		return parseFsck(`${fsck.stdout}${fsck.stderr}`)
 	} finally {
 		rmSync(dir, { force: true, recursive: true })

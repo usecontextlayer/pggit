@@ -44,7 +44,7 @@ describe("§8.4 generative — blobless partial clone (M1) differential", () => 
 		let candidatesWithBlobs = 0
 
 		await fc.assert(
-			fc.asyncProperty(repoCommands({ maxCommands: 25 }), async (commands) => {
+			fc.asyncProperty(repoCommands(25), async (commands) => {
 				const { dir: src, model } = await buildRepoFromCommands(commands)
 				try {
 					fc.pre(model.commitCount > 0)

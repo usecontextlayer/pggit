@@ -40,6 +40,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { createGitApp, createGitDeps } from "@/index"
 import { ZERO_OID } from "@/oid"
 import { type GitServer, serveOnPort } from "@/server"
@@ -47,6 +48,7 @@ import { createGc } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import { ageObjects } from "@/testing/gc-helpers"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -159,15 +161,6 @@ async function revList(dir: string, rev: string): Promise<string[]> {
 	return out.stdout.trim().split("\n").filter(Boolean)
 }
 
-/** Sorted oids of every object reachable from any ref. */
-async function objectsIn(dir: string): Promise<string[]> {
-	return (await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout
-		.split("\n")
-		.map((l) => l.slice(0, 40))
-		.filter((o) => /^[0-9a-f]{40}$/.test(o))
-		.sort()
-}
-
 /**
  * A byte-exact digest of a repo's whole reachable object set: one `cat-file
  * --batch` pass, hashing every object's `<oid> <type> <size>\n<raw bytes>` in
@@ -205,7 +198,9 @@ async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
 		.split("\n")
 		.map((l) => l.trim())
 		.filter((l) => l.length > 0 && !l.startsWith("notice:"))
-	const objects = await objectsIn(dest)
+	const objects = parseRevListObjectOids(
+		(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
+	).sort()
 	return {
 		digest: await objectBytesDigest(dest, objects),
 		fsck: fsckLines.join("\n"),
@@ -516,6 +511,8 @@ async function runSequence(
 					note = `repack ${first.wholes}w/${first.deltas}d`
 					break
 				}
+				default:
+					assertNever(command)
 			}
 			if (note === null) continue
 

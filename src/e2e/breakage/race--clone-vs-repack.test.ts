@@ -29,13 +29,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
-import type { GitObjectType } from "@/object/object"
+import type { PackInputObject } from "@/pack/write-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { allObjectOids, loadReachableObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -45,43 +45,6 @@ const MODES = ["clone", "half", "fetch"] as const
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
-type Obj = { oid: string; type: GitObjectType; content: Buffer }
-
-/** Every reachable object of a real repo, in ONE `cat-file --batch`. */
-async function loadObjects(dir: string): Promise<Obj[]> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const out: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		out.push({
-			content: buf.subarray(start, start + size),
-			oid,
-			type: type as GitObjectType,
-		})
-		pos = start + size + 1
-	}
-	return out
-}
-
 describe("race — repack committing mid-clone / mid-fetch", () => {
 	let db: IsolatedDb
 	let server: GitServer
@@ -90,8 +53,8 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 	let repack: Repack
 	let srcBase = ""
 	let src = ""
-	let baseObjects: Obj[] = []
-	let fullObjects: Obj[] = []
+	let baseObjects: PackInputObject[] = []
+	let fullObjects: PackInputObject[] = []
 	let baseRefs: string[] = []
 	let fullRefs: string[] = []
 	let srcOidsFull: string[] = []
@@ -106,10 +69,10 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 		srcBase = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS + 40 })
 		scratch.push(srcBase, src)
-		baseObjects = await loadObjects(srcBase)
+		baseObjects = await loadReachableObjects(srcBase, ["--all"])
 		baseRefs = (await spawnGit(["show-ref"], { cwd: srcBase })).stdout.trim().split("\n")
 		head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
-		fullObjects = await loadObjects(src)
+		fullObjects = await loadReachableObjects(src, ["--all"])
 		fullRefs = (await spawnGit(["show-ref"], { cwd: src })).stdout.trim().split("\n")
 		srcOidsFull = await allObjectOids(src)
 		const baseTip = (

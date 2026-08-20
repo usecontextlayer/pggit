@@ -25,7 +25,7 @@ import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack } from "@/testing/pkt-oracle"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const ZERO = "0".repeat(40)
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -65,12 +65,7 @@ async function gitFsckVerdict(
 			).stdout.trim()
 		for (const p of prerequisites) await write(p.type, p.content)
 		const oid = await write(malformed.type, malformed.content)
-		const fsck = await spawnGit(["fsck", "--strict"], { cwd: dir }).catch(
-			(e: unknown) => {
-				if (e instanceof GitCommandError) return e
-				throw e
-			},
-		)
+		const fsck = await attemptGit(["fsck", "--strict"], dir)
 		return { code: fsck.code, oid, out: `${fsck.stdout}${fsck.stderr}` }
 	} finally {
 		rmSync(dir, { force: true, recursive: true })

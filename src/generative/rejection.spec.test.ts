@@ -42,7 +42,7 @@ describe("§8.4 generative — connectivity rejection over random graphs", () =>
 	it("rejects a pack missing the tip's reachable objects, leaving the ref unset", async () => {
 		const baseUrl = inject("pgBaseUrl")
 		await fc.assert(
-			fc.asyncProperty(repoCommands({ maxCommands: 20 }), async (commands) => {
+			fc.asyncProperty(repoCommands(20), async (commands) => {
 				const { dir, model } = await buildRepoFromCommands(commands)
 				try {
 					fc.pre(model.commitCount > 0)

@@ -7,12 +7,6 @@
  * CORRECTNESS property over hermetically-built repos, so it lands here as a plain
  * e2e test — one `it` per shape, GREEN today, and a regression detector forever.
  *
- * The sweep runs every shape EXCEPT `many-tiny-objects`, which is the one
- * confirmed defect and has its own destination test
- * (`shapes--repack-param-limit-many-small-objects.test.ts`). Its definition is
- * kept below so the shape catalogue stays whole; only the sweep list excludes it,
- * exactly as the source script's default did.
- *
  * Each shape builds a REAL git repo in $TMPDIR and drives the whole pipeline over
  * the real wire — `git push` → `createRepack().repack()` → `git clone` →
  * incremental `git fetch` → `createGc().gc()` → repack → clone — judging ONLY what
@@ -38,7 +32,7 @@ import { createGc, type Gc } from "@/store/gc"
 import { createRepack, type Repack } from "@/store/repack"
 import { parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 /** Matches `PINNED_DATE` (@1700000000 +0000) in fast-import's own `when` grammar. */
 const WHEN = "1700000000 +0000"
@@ -49,7 +43,6 @@ const PUSH_REFSPECS = ["refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"]
 // Fixture scale. These were the source script's env-overridable defaults; the
 // shapes are only adversarial AT these sizes (a 20-level nest or a 200-commit
 // linear history exercises nothing), so they are pinned constants here.
-const TINY_N = 66_000
 const DEPTH = 2000
 const WIDE = 20_000
 const LINEAR = 10_000
@@ -61,12 +54,6 @@ type Shape = {
 	extend?: (dir: string) => Promise<void>
 	/** arbitrary ref surgery pushed to BOTH remotes (deletes, orphan refs, …) */
 	mutate?: (dir: string, url: string, mirror: string, mk: Mk) => Promise<void>
-	/** `extend` rewrites history — push with --force and compare fresh clones.
-	 * NOTE: pggit REFUSES every non-fast-forward push and every ref deletion
-	 * ("refs only advance", src/protocol/receive-pack.ts), so no wire client can
-	 * rewind a ref; the only orphan generator over the wire is a DENIED push,
-	 * which `orphan-anchor-tree-reuse` uses. */
-	force?: boolean
 	/** Floor on the REF_DELTA entries the post-repack clone must be served. Set on
 	 * every shape built so "the delta actually wins"; omitted where a shape
 	 * legitimately serves none (`tags`, `blob-edges`), so that exception is stated
@@ -133,28 +120,7 @@ function filler(salt: string, len: number): string {
 
 // ───────────────────────── the shapes ─────────────────────────
 
-// 1. Many tiny objects — the phase-2 coverage sweep batches by BYTES only.
-//    THE ONE CONFIRMED DEFECT: excluded from the sweep list below, converted in
-//    `shapes--repack-param-limit-many-small-objects.test.ts`.
-shape("many-tiny-objects", {
-	async build(dir) {
-		const N = TINY_N
-		const out: string[] = []
-		let mark = 0
-		const changes: string[] = []
-		for (let i = 0; i < N; i++) {
-			const m = ++mark
-			out.push(`blob\nmark :${m}\ndata ${String(i).length + 1}\n${i}\n\n`)
-			changes.push(`M 100644 :${m} f/${i}.txt`)
-		}
-		out.push(
-			`commit refs/heads/main\nmark :${++mark}\ncommitter ${WHO}\ndata 4\nseed\n${changes.join("\n")}\n\n`,
-		)
-		await fastImport(dir, out.join(""))
-	},
-})
-
-// 2. Deep nesting: a/a/a/... N levels, changed across two commits.
+// 1. Deep nesting: a/a/a/... N levels, changed across two commits.
 shape("deep-nesting", {
 	async build(dir) {
 		const path = `${Array.from({ length: DEPTH }, () => "a").join("/")}/f.txt`
@@ -181,7 +147,7 @@ shape("deep-nesting", {
 	},
 })
 
-// 3. Gitlinks (submodule entries) evolving across commits, inside a nested dir.
+// 2. Gitlinks (submodule entries) evolving across commits, inside a nested dir.
 shape("gitlinks", {
 	async build(dir) {
 		const out: string[] = []
@@ -206,7 +172,7 @@ shape("gitlinks", {
 	},
 })
 
-// 4. Mode churn at one path: file ↔ exec ↔ symlink ↔ directory.
+// 3. Mode churn at one path: file ↔ exec ↔ symlink ↔ directory.
 shape("mode-churn", {
 	async build(dir) {
 		const out: string[] = []
@@ -234,7 +200,7 @@ shape("mode-churn", {
 	},
 })
 
-// 5. Adversarially-sorted / weird names, wide tree, exotic (valid-UTF-8) names.
+// 4. Adversarially-sorted / weird names, wide tree, exotic (valid-UTF-8) names.
 shape("weird-names", {
 	async build(dir) {
 		const names = [
@@ -278,7 +244,7 @@ shape("weird-names", {
 	},
 })
 
-// 6. Content toggle: one file alternating between exactly two contents.
+// 5. Content toggle: one file alternating between exactly two contents.
 shape("toggle", {
 	async build(dir) {
 		const out: string[] = []
@@ -319,7 +285,7 @@ shape("toggle", {
 	},
 })
 
-// 7. Merges: octopus, criss-cross, orphan roots merged in mid-history.
+// 6. Merges: octopus, criss-cross, orphan roots merged in mid-history.
 shape("merges", {
 	async build(dir) {
 		const out: string[] = []
@@ -374,7 +340,7 @@ shape("merges", {
 	},
 })
 
-// 8. Tag chains: tag→tag→tag→commit, tags on trees and blobs, lightweight mixed.
+// 7. Tag chains: tag→tag→tag→commit, tags on trees and blobs, lightweight mixed.
 shape("tags", {
 	async build(dir) {
 		const b = (
@@ -401,7 +367,7 @@ shape("tags", {
 	},
 })
 
-// 9. Blob edge cases: empty blob, 1-byte, huge zero run, identical blobs at paths.
+// 8. Blob edge cases: empty blob, 1-byte, huge zero run, identical blobs at paths.
 shape("blob-edges", {
 	async build(dir) {
 		const out: string[] = []
@@ -434,7 +400,7 @@ shape("blob-edges", {
 	},
 })
 
-// 10. Wide tree churn: 20k entries in one directory, mutated across commits.
+// 9. Wide tree churn: 20k entries in one directory, mutated across commits.
 shape("wide-tree", {
 	async build(dir) {
 		const out: string[] = []
@@ -462,7 +428,7 @@ shape("wide-tree", {
 	},
 })
 
-// 11. Orphan branches sharing identical trees (tree reuse across unrelated history).
+// 10. Orphan branches sharing identical trees (tree reuse across unrelated history).
 shape("orphan-shared-trees", {
 	async build(dir) {
 		const out: string[] = []
@@ -485,7 +451,7 @@ shape("orphan-shared-trees", {
 	},
 })
 
-// 12. First-parent chain diverging from topo order + root commit appearing mid-history.
+// 11. First-parent chain diverging from topo order + root commit appearing mid-history.
 shape("mid-history-roots", {
 	async build(dir) {
 		const out: string[] = []
@@ -527,7 +493,6 @@ function growing(opts: {
 	extraChanges?: (i: number, blob: (s: string) => number) => string[]
 	/** entry added at commit `i` inside the growing dir */
 	entry: (i: number, blob: (s: string) => number) => string
-	branch?: string
 }): (dir: string) => Promise<void> {
 	return async (dir: string) => {
 		const out: string[] = []
@@ -542,7 +507,7 @@ function growing(opts: {
 			const changes = [opts.entry(i, blob), ...(opts.extraChanges?.(i, blob) ?? [])]
 			const cm = ++mark
 			out.push(
-				`commit refs/heads/${opts.branch ?? "main"}\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${i % 10}\n` +
+				`commit refs/heads/main\nmark :${cm}\ncommitter ${WHO}\ndata 3\nc${i % 10}\n` +
 					(prev ? `from :${prev}\n` : "") +
 					`${changes.join("\n")}\n\n`,
 			)
@@ -728,11 +693,13 @@ shape("orphan-anchor-tree-reuse", {
 			prev = cm
 		}
 		await fastImport(side, out.join(""))
-		await spawnGit(["push", "-q", "--force", url, "refs/heads/main:refs/heads/main"], {
-			cwd: side,
-		}).catch(() => {
-			/* expected: refs only advance — but the pack was ingested */
-		})
+		const denied = await attemptGit(
+			["push", "-q", "--force", url, "refs/heads/main:refs/heads/main"],
+			side,
+		)
+		if (denied.ok || !/non-fast-forward/.test(denied.stderr)) {
+			throw new Error(`expected a non-fast-forward rejection: ${denied.stderr}`)
+		}
 	},
 })
 
@@ -916,9 +883,8 @@ shape("growing-repetitive-names", {
 	minDeltasServed: 1,
 })
 
-/** The sweep list: every shape EXCEPT the one confirmed defect, which has its own
- * destination test. This is exactly the source script's no-argument default. */
-const SWEEP = [...shapes.keys()].filter((k) => k !== "many-tiny-objects")
+/** The sweep list: every registered adversarial shape. */
+const SWEEP = [...shapes.keys()]
 
 describe("shapes — the adversarial repo-shape sweep (negative results)", () => {
 	let db: IsolatedDb
@@ -1042,9 +1008,8 @@ describe("shapes — the adversarial repo-shape sweep (negative results)", () =>
 
 			if (s.extend) {
 				await s.extend(src)
-				const pushArgs = s.force ? ["push", "-q", "--force"] : ["push", "-q"]
-				await spawnGit([...pushArgs, mirror, ...PUSH_REFSPECS], { cwd: src })
-				await spawnGit([...pushArgs, url, ...PUSH_REFSPECS], { cwd: src })
+				await spawnGit(["push", "-q", mirror, ...PUSH_REFSPECS], { cwd: src })
+				await spawnGit(["push", "-q", url, ...PUSH_REFSPECS], { cwd: src })
 				const res2 = await repack.repack(name)
 				console.log(
 					`shape ${name} — repack2: ${res2.wholes} wholes + ${res2.deltas} deltas`,

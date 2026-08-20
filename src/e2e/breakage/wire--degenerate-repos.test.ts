@@ -23,7 +23,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/solo"
 const NEVER_REPO = "workspace/probe/never"
@@ -52,8 +52,7 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 	}
 
 	let unknownRepack: Counts
-	/** null = the clone of an unknown repo was rejected outright (also correct). */
-	let unknownCloneRefs: string | null = null
+	let unknownCloneRefs = ""
 	let repackBeforePush: Counts
 	let soloRepack: Counts
 	let secondRepack: Counts
@@ -77,26 +76,19 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 		// 1. A repo name never written.
 		unknownRepack = await repack.repack(NEVER_REPO)
 		const neverDest = join(mk("empty"), "c")
-		const neverCloneError = await errorOf(() =>
-			spawnGit([
-				"-c",
-				"protocol.version=2",
-				"clone",
-				"-q",
-				`${base}/${NEVER_REPO}`,
-				neverDest,
-			]),
-		)
-		if (neverCloneError === null) {
-			// `show-ref` exits 1 on a repo with no refs — that is the empty case, not a fault.
-			try {
-				unknownCloneRefs = (
-					await spawnGit(["show-ref"], { cwd: neverDest })
-				).stdout.trim()
-			} catch (error) {
-				if (!(error instanceof GitCommandError) || error.code !== 1) throw error
-				unknownCloneRefs = ""
-			}
+		await spawnGit([
+			"-c",
+			"protocol.version=2",
+			"clone",
+			"-q",
+			`${base}/${NEVER_REPO}`,
+			neverDest,
+		])
+		// `show-ref` exits 1 on a repo with no refs — that is the empty case, not a fault.
+		try {
+			unknownCloneRefs = (await spawnGit(["show-ref"], { cwd: neverDest })).stdout.trim()
+		} catch (error) {
+			if (!(error instanceof GitCommandError) || error.code !== 1) throw error
 		}
 
 		// 2/3 + 5 (first half). A single orphan commit; repack BEFORE the push has
@@ -183,13 +175,11 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 		const missing = `${"0".repeat(39)}1`
 		const errDest = join(mk("err"), "c")
 		await spawnGit(["init", "-q", errDest])
-		missingWantOutcome = await spawnGit(
+		const missingWant = await attemptGit(
 			["-c", "protocol.version=2", "fetch", "-q", url, missing],
-			{ cwd: errDest },
-		).then(
-			() => "ACCEPTED",
-			(e: unknown) => (e as { stderr?: string }).stderr ?? String(e),
+			errDest,
 		)
+		missingWantOutcome = missingWant.ok ? "ACCEPTED" : missingWant.stderr
 	}, 300_000)
 
 	afterAll(async () => {
@@ -203,7 +193,7 @@ describe("wire — degenerate repository states under the encoding tier", () => 
 	})
 
 	it("a clone of a repo name never written produces no refs", () => {
-		expect(unknownCloneRefs ?? "").toBe("")
+		expect(unknownCloneRefs).toBe("")
 	})
 
 	it("repack before any push writes nothing", () => {

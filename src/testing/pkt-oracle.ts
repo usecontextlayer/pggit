@@ -12,6 +12,7 @@
  * §8.1 goldens, so their own tests (`pkt-oracle.test.ts`) are a normal `*.test.ts`
  * and stay GREEN on the gate — never a `*.spec.test.ts`.
  */
+import { assertNever } from "@/assert-never"
 import { decodePktStream } from "@/protocol/pkt-line"
 
 /** Decode a stream the caller claims is COMPLETE: undecoded trailing bytes are
@@ -32,10 +33,6 @@ export const ZERO_OID = "0".repeat(40)
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 export const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 export const ALGO = "sha1"
-export const HEXSZ = 40
-
-/** The text `pktLineUnpack` renders a flush packet as (handy for building goldens). */
-export const FLUSH_LINE = "0000\n"
 
 /**
  * Mirror of git's `test-tool pkt-line unpack` (`t/helper/test-pkt-line.c:42-67`).
@@ -61,6 +58,8 @@ export function pktLineUnpack(buf: Buffer): string {
 			case "response-end":
 				out += "0002\n"
 				break
+			default:
+				assertNever(p)
 		}
 	}
 	return out
@@ -93,6 +92,8 @@ export function framedPktLines(buf: Buffer): string {
 			case "response-end":
 				out += "0002"
 				break
+			default:
+				assertNever(p)
 		}
 	}
 	return out
@@ -144,7 +145,7 @@ export function sidebandDemux(buf: Buffer): {
 	}
 }
 
-export type RefAdvertV0 = {
+type RefAdvertV0 = {
 	refs: { oid: string; name: string; caps?: string[] }[]
 	endsWithFlush: boolean
 }
@@ -161,21 +162,39 @@ export type RefAdvertV0 = {
 export function renderRefAdvertV0(buf: Buffer): RefAdvertV0 {
 	const { packets } = decodeComplete(buf)
 	const refs: RefAdvertV0["refs"] = []
-	for (const p of packets) {
-		if (p.type !== "data") continue
+	for (const [index, p] of packets.entries()) {
+		switch (p.type) {
+			case "flush":
+				if (index !== packets.length - 1) {
+					throw new Error("ref-advert v0: flush packet was not terminal")
+				}
+				continue
+			case "delim":
+			case "response-end":
+				throw new Error(`ref-advert v0: unexpected ${p.type} packet`)
+			case "data":
+				break
+			default:
+				assertNever(p)
+		}
 		const text = p.payload.toString("latin1").replace(/\n$/, "")
 		const nul = text.indexOf("\0")
-		const refPart = nul >= 0 ? text.slice(0, nul) : text
-		const sp = refPart.indexOf(" ")
-		const ref: RefAdvertV0["refs"][number] = {
-			name: refPart.slice(sp + 1),
-			oid: refPart.slice(0, sp),
+		if (nul >= 0 && refs.length > 0) {
+			throw new Error("ref-advert v0: capabilities appeared after the first ref")
 		}
-		if (nul >= 0)
+		const refPart = nul >= 0 ? text.slice(0, nul) : text
+		const match = refPart.match(/^([0-9a-f]{40}) ([^ ]+)$/)
+		if (match === null) {
+			throw new Error(`ref-advert v0: malformed ref row ${JSON.stringify(text)}`)
+		}
+		const [, oid, name] = match as [string, string, string]
+		const ref: RefAdvertV0["refs"][number] = { name, oid }
+		if (nul >= 0) {
 			ref.caps = text
 				.slice(nul + 1)
 				.split(" ")
 				.filter(Boolean)
+		}
 		refs.push(ref)
 	}
 	return { endsWithFlush: packets.at(-1)?.type === "flush", refs }
@@ -189,6 +208,13 @@ export function renderRefAdvertV0(buf: Buffer): RefAdvertV0 {
  */
 export function packObjectCount(body: Buffer): number | null {
 	const pack = sidebandDemux(body).band1
-	if (pack.length < 12 || pack.subarray(0, 4).toString("ascii") !== "PACK") return null
+	if (pack.length === 0) return null
+	if (pack.length < 12) {
+		throw new Error(`packObjectCount: truncated ${pack.length}-byte band-1 stream`)
+	}
+	const magic = pack.subarray(0, 4).toString("ascii")
+	if (magic !== "PACK") {
+		throw new Error(`packObjectCount: unexpected band-1 magic ${JSON.stringify(magic)}`)
+	}
 	return pack.readUInt32BE(8)
 }

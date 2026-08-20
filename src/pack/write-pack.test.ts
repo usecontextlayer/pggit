@@ -5,6 +5,7 @@ import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import { computeOid, type GitObjectType } from "@/object/object"
 import { type PackInputObject, writePack } from "@/pack/write-pack"
+import { parseVerifyPackObjectOids } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** Index our pack with real git; return the OIDs git resolved from it (sorted). */
@@ -20,12 +21,7 @@ async function oidsGitResolves(pack: Buffer): Promise<string[]> {
 		const verify = await spawnGit(["verify-pack", "-v", join(dir, "test.idx")], {
 			cwd: dir,
 		})
-		const oids: string[] = []
-		for (const line of verify.stdout.split("\n")) {
-			const oid = /^([0-9a-f]{40}) (commit|tree|blob|tag)/.exec(line)?.[1]
-			if (oid) oids.push(oid)
-		}
-		return oids.sort()
+		return parseVerifyPackObjectOids(verify.stdout)
 	} finally {
 		rmSync(dir, { force: true, recursive: true })
 	}

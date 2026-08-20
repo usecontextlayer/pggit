@@ -29,7 +29,7 @@ describe("§8.4 generative — push to an empty repo (M2) differential", () => {
 		const baseUrl = inject("pgBaseUrl")
 
 		await fc.assert(
-			fc.asyncProperty(repoCommands({ maxCommands: 25 }), async (commands) => {
+			fc.asyncProperty(repoCommands(25), async (commands) => {
 				const { dir: client, model } = await buildRepoFromCommands(commands)
 				try {
 					fc.pre(model.commitCount > 0) // need at least one ref to push

@@ -15,6 +15,7 @@ import {
 	teardownGcFixture,
 	withTempDir,
 } from "@/testing/gc-helpers"
+import { objectsByType, requireGitOid } from "@/testing/git-fixtures"
 import { spawnGit } from "@/testing/spawn-git"
 
 /**
@@ -45,40 +46,56 @@ const TYPE_CODE: Record<string, number> = { blob: 3, commit: 1, tag: 4, tree: 2 
  * derivation suite pins it (commit-graph-derivation.test.ts).
  */
 async function gitDerivedRows(dir: string): Promise<string[]> {
-	const list = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
-		{ cwd: dir },
-	)
 	const reachable = new Set(await gitReachableOids(dir))
 	const lines: string[] = []
-	for (const line of list.stdout.trim().split("\n")) {
-		const [oid, type] = line.split(" ")
-		if (!oid || !type || !reachable.has(oid)) continue
+	for (const { oid, type } of await objectsByType(dir)) {
+		if (!reachable.has(oid)) continue
 		if (type === "commit") {
 			const out = (
-				await spawnGit(["log", "-1", "--format=%T %P %ct", oid], { cwd: dir })
-			).stdout.trim()
-			const tokens = out.split(/\s+/)
-			const tree = tokens[0]
-			const time = tokens[tokens.length - 1]
-			const parents = tokens.slice(1, -1)
+				await spawnGit(["log", "-1", "--format=%T%x00%P%x00%ct", oid], { cwd: dir })
+			).stdout
+			if (!out.endsWith("\n")) {
+				throw new Error(`gitDerivedRows: commit ${oid} record lacks a terminal newline`)
+			}
+			const fields = out.slice(0, -1).split("\0")
+			if (fields.length !== 3) {
+				throw new Error(`gitDerivedRows: malformed commit ${oid} oracle record`)
+			}
+			const [rawTree, rawParents, time] = fields as [string, string, string]
+			const tree = requireGitOid(rawTree, `commit ${oid} tree`)
+			const parents =
+				rawParents === ""
+					? []
+					: rawParents
+							.split(" ")
+							.map((parent) => requireGitOid(parent, `commit ${oid} parent`))
+			if (!/^[0-9]+$/.test(time) || !Number.isSafeInteger(Number(time))) {
+				throw new Error(
+					`gitDerivedRows: invalid commit ${oid} time ${JSON.stringify(time)}`,
+				)
+			}
 			lines.push(`commit ${oid} tree=${tree} parents=${parents.join(",")} time=${time}`)
 		} else if (type === "tag") {
 			const body = (await spawnGit(["cat-file", "tag", oid], { cwd: dir })).stdout
-			const target = body
-				.split("\n")
-				.find((l) => l.startsWith("object "))
-				?.slice("object ".length)
-				.trim()
-			const targetType = body
-				.split("\n")
-				.find((l) => l.startsWith("type "))
-				?.slice("type ".length)
-				.trim()
-			const code = targetType === undefined ? undefined : TYPE_CODE[targetType]
-			if (!target || code === undefined) {
+			const headerEnd = body.indexOf("\n\n")
+			if (headerEnd < 0) {
+				throw new Error(`gitDerivedRows: tag ${oid} has no header terminator`)
+			}
+			const headers = body.slice(0, headerEnd).split("\n")
+			const objectHeaders = headers.filter((line) => line.startsWith("object "))
+			const typeHeaders = headers.filter((line) => line.startsWith("type "))
+			if (objectHeaders.length !== 1 || typeHeaders.length !== 1) {
 				throw new Error(`gitDerivedRows: malformed tag ${oid} in oracle repo`)
 			}
+			const targetMatch = objectHeaders[0]?.match(/^object ([0-9a-f]{40})$/)
+			const typeMatch = typeHeaders[0]?.match(/^type (blob|commit|tag|tree)$/)
+			if (targetMatch?.[1] === undefined || typeMatch?.[1] === undefined) {
+				throw new Error(`gitDerivedRows: malformed tag ${oid} in oracle repo`)
+			}
+			const target = requireGitOid(targetMatch[1], `tag ${oid} target`)
+			const code = TYPE_CODE[typeMatch[1]]
+			if (code === undefined)
+				throw new Error(`gitDerivedRows: unknown tag type in ${oid}`)
 			lines.push(`tag ${oid} target=${target} type=${code}`)
 		}
 	}

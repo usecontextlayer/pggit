@@ -31,6 +31,7 @@
  */
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { applyDelta, encodeDelta } from "@/pack/delta"
 
 const SEED = 424_242
@@ -125,9 +126,11 @@ function mutate(base: Buffer, mutations: Mutation[]): Buffer {
 		} else if (m.kind === "overwrite") {
 			const patch = Buffer.from(m.bytes)
 			out = Buffer.concat([out.subarray(0, at), patch, out.subarray(at + patch.length)])
-		} else {
+		} else if (m.kind === "duplicate") {
 			// A target containing the base TWICE — two disjoint COPY runs must both be found.
 			out = Buffer.concat([out, out])
+		} else {
+			assertNever(m)
 		}
 	}
 	return out

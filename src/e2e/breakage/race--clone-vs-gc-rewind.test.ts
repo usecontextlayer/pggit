@@ -32,13 +32,14 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
-import type { GitObjectType } from "@/object/object"
+import type { PackInputObject } from "@/pack/write-pack"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
+import { loadReachableObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
@@ -50,43 +51,6 @@ const REWIND = 60
 const ORACLE_ROUNDS = 6
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
-
-type Obj = { oid: string; type: GitObjectType; content: Buffer }
-
-/** Every reachable object of a real repo, in ONE `cat-file --batch`. */
-async function loadObjects(dir: string): Promise<Obj[]> {
-	const list = await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const out: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		out.push({
-			content: buf.subarray(start, start + size),
-			oid,
-			type: type as GitObjectType,
-		})
-		pos = start + size + 1
-	}
-	return out
-}
 
 type Verdict = "OK" | "PROTO" | "HTTP500" | "CORRUPT" | "OTHER"
 
@@ -127,7 +91,7 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 	let repack: Repack
 	let gc: Gc
 	let src = ""
-	let objects: Obj[] = []
+	let objects: PackInputObject[] = []
 	let tip = ""
 	let rewindTo = ""
 	const scratch: string[] = []
@@ -135,7 +99,7 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 	beforeAll(async () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		scratch.push(src)
-		objects = await loadObjects(src)
+		objects = await loadReachableObjects(src, ["--all"])
 		const commits = (
 			await spawnGit(["rev-list", "--reverse", "HEAD"], { cwd: src })
 		).stdout

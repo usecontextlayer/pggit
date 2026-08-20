@@ -14,25 +14,51 @@ import { spawnGit } from "@/testing/spawn-git"
  * (mode, oid), not oid alone).
  */
 
-type Change = { status: string; path: string; mode: string; oid: string }
+type Change = {
+	status: "A" | "D" | "M" | "T"
+	path: string
+	mode: string
+	oid: string
+}
 
 /** `git diff-tree -r --no-renames A B` parsed: status + AFTER-side mode/oid. */
 async function gitDiff(dir: string, a: string, b: string): Promise<Change[]> {
 	const out = await spawnGit(["diff-tree", "-r", "--no-renames", "-z", a, b], {
 		cwd: dir,
 	})
-	const fields = out.stdout.split("\0").filter(Boolean)
+	const fields = out.stdout.split("\0")
+	if (fields.at(-1) !== "") {
+		throw new Error("git diff-tree output is missing its terminal NUL")
+	}
+	fields.pop()
+	if (fields.length % 2 !== 0) {
+		throw new Error(`git diff-tree emitted an odd number of NUL fields: ${fields.length}`)
+	}
 	const changes: Change[] = []
-	for (let i = 0; i + 1 < fields.length; i += 2) {
-		const meta = fields[i] as string
-		const path = fields[i + 1] as string
+	for (let i = 0; i < fields.length; i += 2) {
+		const meta = fields[i]
+		const path = fields[i + 1]
+		if (meta === undefined || path === undefined || path === "") {
+			throw new Error(`git diff-tree emitted an invalid field pair at index ${i}`)
+		}
 		// :<oldmode> <newmode> <oldoid> <newoid> <status>
-		const [, newMode, , newOid, status] = meta.replace(/^:/, "").split(/\s+/)
+		const match = meta.match(
+			/^:[0-7]{6} ([0-7]{6}) [0-9a-f]{40} ([0-9a-f]{40}) ([ADMT])$/,
+		)
+		if (match === null) {
+			throw new Error(`git diff-tree emitted invalid metadata: ${JSON.stringify(meta)}`)
+		}
+		const [, newMode, newOid, status] = match as [
+			string,
+			string,
+			string,
+			Change["status"],
+		]
 		changes.push({
-			mode: (newMode as string).replace(/^0+/, "") || "0",
-			oid: newOid as string,
+			mode: newMode.replace(/^0+/, "") || "0",
+			oid: newOid,
 			path,
-			status: status as string,
+			status,
 		})
 	}
 	return changes
@@ -114,14 +140,14 @@ describe("diffFileLists — file-level tree diff vs `git diff-tree -r`", () => {
 		const got = await diffFileLists(read, before, after)
 
 		const expected = await gitDiff(dir, commits[i] as string, commits[j] as string)
-		const expectedRemoved = expected
-			.filter((c) => c.status === "D")
-			.map((c) => c.path)
-			.sort()
-		const expectedUpserts = expected
-			.filter((c) => c.status === "A" || c.status === "M" || c.status === "T")
-			.map((c) => `${c.path} ${c.mode} ${c.oid}`)
-			.sort()
+		const expectedRemoved: string[] = []
+		const expectedUpserts: string[] = []
+		for (const change of expected) {
+			if (change.status === "D") expectedRemoved.push(change.path)
+			else expectedUpserts.push(`${change.path} ${change.mode} ${change.oid}`)
+		}
+		expectedRemoved.sort()
+		expectedUpserts.sort()
 
 		// The oracle must have SEEN a change: a fixture step that silently became a
 		// no-op leaves both sides empty and turns every equality below into

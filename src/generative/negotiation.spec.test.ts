@@ -54,6 +54,7 @@
 import { rmSync } from "node:fs"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { createObjectStore } from "@/store/object-store"
@@ -144,7 +145,7 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 
 		await fc.assert(
 			fc.asyncProperty(
-				repoCommands({ maxCommands: 20 }),
+				repoCommands(20),
 				fc.array(pairArb, { maxLength: 5, minLength: 3 }),
 				async (commands, pairs) => {
 					const { dir: src, model } = await buildRepoFromCommands(commands)
@@ -218,6 +219,7 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 									case "any":
 										return pick(commits, h.idx)
 								}
+								return assertNever(h.kind)
 							}
 
 							// One fixed NAK probe ahead of the generated rounds: a want plus a

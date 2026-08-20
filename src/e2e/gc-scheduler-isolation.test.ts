@@ -166,11 +166,13 @@ describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 		// disjoint; a drain that deleted or kept B's rows while GCing A would surface
 		// here as an intersection (a foreign oid bleeding into a survivor set).
 		for (const repo of allRepos) {
-			const mine = survivorsByRepo.get(repo) ?? []
+			const mine = survivorsByRepo.get(repo)
+			if (mine === undefined) throw new Error(`missing survivor set for ${repo}`)
 			const mineSet = new Set(mine)
 			for (const other of allRepos) {
 				if (other === repo) continue
-				const theirs = survivorsByRepo.get(other) ?? []
+				const theirs = survivorsByRepo.get(other)
+				if (theirs === undefined) throw new Error(`missing survivor set for ${other}`)
 				for (const oid of theirs) {
 					expect(mineSet.has(oid)).toBe(false)
 				}

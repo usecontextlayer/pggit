@@ -54,7 +54,8 @@ describe("frontier boundary provenance (chunk 5b)", () => {
 		await spawnGit(["push", "-q", repoUrl(fx, REPO), "main", "fork"], { cwd: src })
 		const [row] = await fx.db.sql<{ id: string }[]>`
 			select id::text as id from repos where name = ${REPO}`
-		id = row?.id as unknown as ReposId
+		if (row === undefined) throw new Error(`repo row missing for ${REPO}`)
+		id = row.id as unknown as ReposId
 	}, 120_000)
 
 	afterAll(async () => {

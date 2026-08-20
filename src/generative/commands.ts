@@ -32,6 +32,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import fc from "fast-check"
+import { assertNever } from "@/assert-never"
 import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 
 // Bounded pools: reuse drives edits/overwrites + nested trees, and keeps the
@@ -48,12 +49,12 @@ const PATHS = [
 ] as const
 const NAMES = ["feature", "topic", "dev", "release", "hotfix"] as const
 
-export type ContentSpec =
+type ContentSpec =
 	| { kind: "empty" }
 	| { kind: "text"; value: string }
 	| { kind: "binary"; bytes: number[] }
 
-export type GenCommand =
+type GenCommand =
 	| { kind: "writeFile"; path: string; content: ContentSpec }
 	| { kind: "deleteFile"; idx: number }
 	| { kind: "commit" }
@@ -65,7 +66,7 @@ export type GenCommand =
 	 * the one command that guarantees a multi-parent commit (see `step`). */
 	| { kind: "divergeAndMerge"; nameIdx: number; pathIdx: number }
 
-export type RepoModel = {
+type RepoModel = {
 	dir: string
 	currentBranch: string
 	/** Branches that point at a commit — i.e. exactly what `git branch` lists. */
@@ -146,24 +147,30 @@ const commandArb: fc.Arbitrary<GenCommand> = fc.oneof(
 )
 
 /** A fast-check arbitrary of git-command lists; each list builds one candidate repo. */
-export function repoCommands(
-	opts: { minCommands?: number; maxCommands?: number } = {},
-): fc.Arbitrary<GenCommand[]> {
+export function repoCommands(maxCommands: number): fc.Arbitrary<GenCommand[]> {
 	return fc.array(commandArb, {
-		maxLength: opts.maxCommands ?? 30,
-		minLength: opts.minCommands ?? 1,
+		maxLength: maxCommands,
+		minLength: 1,
 	})
 }
 
 function writeContent(dir: string, path: string, content: ContentSpec): void {
 	const full = join(dir, path)
 	mkdirSync(dirname(full), { recursive: true })
-	const data =
-		content.kind === "empty"
-			? Buffer.alloc(0)
-			: content.kind === "text"
-				? Buffer.from(content.value, "utf8")
-				: Buffer.from(content.bytes)
+	let data: Buffer
+	switch (content.kind) {
+		case "empty":
+			data = Buffer.alloc(0)
+			break
+		case "text":
+			data = Buffer.from(content.value, "utf8")
+			break
+		case "binary":
+			data = Buffer.from(content.bytes)
+			break
+		default:
+			assertNever(content)
+	}
 	writeFileSync(full, data)
 }
 
@@ -215,6 +222,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 				// tree is then already == HEAD. Anything else is a real error — rethrow.
 				if (
 					!(e instanceof GitCommandError) ||
+					e.code <= 0 ||
 					!/nothing to commit/.test(e.stdout + e.stderr)
 				) {
 					throw e
@@ -275,7 +283,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 				// Every nonzero git exit is a GitCommandError, so the conflict must be
 				// PROVEN (unmerged index entries), not inferred from the error type —
 				// else broken config, corruption, and command regressions all skip.
-				if (!(e instanceof GitCommandError)) throw e
+				if (!(e instanceof GitCommandError) || e.code <= 0) throw e
 				const unmerged = await spawnGit(["ls-files", "-u"], { cwd: model.dir })
 				if (unmerged.stdout.trim() === "") throw e
 				await spawnGit(["merge", "--abort"], { cwd: model.dir })
@@ -350,6 +358,7 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			return
 		}
 	}
+	return assertNever(cmd)
 }
 
 /**

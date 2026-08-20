@@ -2,7 +2,7 @@ import { rmSync } from "node:fs"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 // The generator is the reusable CORE of the §8.4 differentials (spec §6). It must
 // produce only SENSIBLE git command sequences — replaying any generated list
@@ -38,7 +38,7 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 			withTagObject: 0,
 		}
 		await fc.assert(
-			fc.asyncProperty(repoCommands({ maxCommands: 25 }), async (commands) => {
+			fc.asyncProperty(repoCommands(25), async (commands) => {
 				const { dir, model } = await buildRepoFromCommands(commands)
 				try {
 					// 1. The replay never corrupts the repo (and never threw mid-replay).
@@ -61,11 +61,9 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 					expect(actual).toEqual([...model.existingBranches].sort())
 
 					// 3. HEAD resolves iff the model recorded at least one commit.
-					const headResolves = await spawnGit(["rev-parse", "HEAD"], { cwd: dir }).then(
-						() => true,
-						() => false,
-					)
-					expect(headResolves).toBe(model.commitCount > 0)
+					const head = await attemptGit(["rev-parse", "HEAD"], dir)
+					expect(head.ok).toBe(model.commitCount > 0)
+					if (!head.ok) expect(head.stderr).toMatch(/ambiguous argument 'HEAD'/)
 
 					// 4. The model's tags match git's tags.
 					const tags = (await spawnGit(["tag", "--list"], { cwd: dir })).stdout

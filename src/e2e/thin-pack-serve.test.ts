@@ -20,7 +20,7 @@ import { createGitApp, createGitDeps, type GitDeps } from "@/index"
 import { readPack } from "@/pack/read-pack"
 import { handleUploadPack, type RepoBackend } from "@/protocol/upload-pack"
 import { type GitServer, serveOnPort } from "@/server"
-import { allObjectOids } from "@/testing/git-fixtures"
+import { allObjectOids, parseVerifyPackObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { sidebandDemux } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
@@ -115,9 +115,7 @@ describe("thin-pack serve — external bases only when negotiated", () => {
 			["verify-pack", "-v", packPath.replace(/\.pack$/, ".idx")],
 			{ cwd: client },
 		)
-		const indexedCount = verify.stdout
-			.split("\n")
-			.filter((l) => /^[0-9a-f]{40} /.test(l)).length
+		const indexedCount = parseVerifyPackObjects(verify.stdout).length
 		const fsckOut = await spawnGit(["fsck", "--strict", "--no-dangling"], {
 			cwd: client,
 		})

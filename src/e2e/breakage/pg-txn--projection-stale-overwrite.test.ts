@@ -47,7 +47,7 @@ import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import { parseLsTree } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const WHEN = "1700000000 +0000"
 const COMMITTER = `pggit oracle <oracle@pggit.test> ${WHEN}`
@@ -55,23 +55,6 @@ const DIRS = 3000
 const ATTEMPTS = 4
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-
-type GitAttempt = { ok: boolean; code: number; stdout: string; stderr: string }
-
-async function tryGit(args: string[], cwd?: string): Promise<GitAttempt> {
-	try {
-		const r = await spawnGit(args, { cwd })
-		return { code: 0, ok: true, stderr: r.stderr, stdout: r.stdout }
-	} catch (e) {
-		const err = e as { code?: number; stderr?: string; message: string }
-		return {
-			code: err.code ?? -1,
-			ok: false,
-			stderr: err.stderr ?? err.message,
-			stdout: "",
-		}
-	}
-}
 
 /** A revision's worktree as sorted `path\0mode\0oid` — the same shape `repo_file`
  * stores, so the projection and a real clone are directly comparable. */
@@ -183,11 +166,11 @@ describe("breakage/pg-txn — repo_file must never describe a superseded tip", (
 		for (let i = 0; i < ATTEMPTS && reproduced === null; i++) {
 			const repo = `txn/proj-race-${i}`
 			const url = `http://127.0.0.1:${server.port}/${repo}`
-			const seed = await tryGit(["push", "-q", url, `${c0}:refs/heads/main`], src)
+			const seed = await attemptGit(["push", "-q", url, `${c0}:refs/heads/main`], src)
 			if (!seed.ok) throw new Error(`seed push failed: ${seed.stderr}`)
 
 			// Fire A (wide tip → slow tree walk in its post-CAS projection rebuild).
-			const a = tryGit(["push", url, `${x}:refs/heads/main`], src)
+			const a = attemptGit(["push", url, `${x}:refs/heads/main`], src)
 			// The instant A's CAS commits, fire B. Both are ordinary pushes.
 			const t0 = Date.now()
 			for (;;) {
@@ -195,7 +178,7 @@ describe("breakage/pg-txn — repo_file must never describe a superseded tip", (
 				if (Date.now() - t0 > 60_000) throw new Error("timed out waiting for A's CAS")
 				await sleep(2)
 			}
-			const b = await tryGit(["push", url, `${y}:refs/heads/main`], src)
+			const b = await attemptGit(["push", url, `${y}:refs/heads/main`], src)
 			const aRes = await a
 
 			const refTip = await tipOf(repo)
@@ -226,7 +209,7 @@ describe("breakage/pg-txn — repo_file must never describe a superseded tip", (
 			await createRepack(admin).repack(reproduced.repo)
 			const dest = join(root, "clone")
 			rmSync(dest, { force: true, recursive: true })
-			const cl = await tryGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
+			const cl = await attemptGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
 			if (!cl.ok) throw new Error(`clone failed: ${cl.stderr}`)
 			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 			const cloneTree = await lsTree(dest, "HEAD")

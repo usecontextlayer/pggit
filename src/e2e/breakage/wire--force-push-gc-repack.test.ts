@@ -28,8 +28,9 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRepack } from "@/store/repack"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const REPO = "workspace/probe/forcepush"
 /** Long enough that the `dir/` lineage spans several ANCHOR_EVERY=32 segments. */
@@ -97,12 +98,13 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 		// "Only on side" matters twice — it is the garbage a denied push creates, and
 		// it guarantees the chosen tree's anchor is unreachable once the keeper is the
 		// only thing holding the tree alive.
-		const sideOnly = (
-			await spawnGit(["rev-list", "--objects", "side", "--not", "main"], { cwd: src })
-		).stdout
-			.split("\n")
-			.map((l) => l.trim().split(" ")[0] ?? "")
-			.filter((o) => /^[0-9a-f]{40}$/.test(o))
+		const sideOnly = parseRevListObjectOids(
+			(
+				await spawnGit(["rev-list", "--objects", "side", "--not", "main"], {
+					cwd: src,
+				})
+			).stdout,
+		)
 		const types = (
 			await spawnGit(["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
 				cwd: src,
@@ -170,13 +172,11 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 		// Denied by the refs-only-advance policy — but the pack is ingested first, so
 		// every `side` object now sits in the store UNREACHABLE. That is the only
 		// garbage a real client can create against pggit.
-		deniedPush = await spawnGit(
+		const denied = await attemptGit(
 			["push", "-q", "--force", url, "refs/heads/side:refs/heads/main"],
-			{ cwd: src },
-		).then(
-			() => "ACCEPTED",
-			(e) => String(e).split("\n")[1] ?? "denied",
+			src,
 		)
+		deniedPush = denied.ok ? "ACCEPTED" : denied.stderr
 
 		await repack.repack(REPO)
 		// The file's whole subject, established by MEASUREMENT rather than assumed:
@@ -237,6 +237,7 @@ describe("wire — denied push, GC, repack: the tier stays servable", () => {
 
 	it("has the fixture it needs: the divergent push is DENIED, not accepted", () => {
 		expect(deniedPush).not.toBe("ACCEPTED")
+		expect(deniedPush).toMatch(/non-fast-forward/)
 	})
 
 	it("has the fixture it needs: the kept tree is a delta whose anchor GC reclaimed", () => {

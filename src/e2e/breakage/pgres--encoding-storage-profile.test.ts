@@ -42,10 +42,12 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
+import type { PackInputObject } from "@/pack/write-pack"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import { loadReachableObjects } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -155,40 +157,6 @@ function wideStream(width: number, commits: number, blobChars: number): string {
 	return out.join("")
 }
 
-type Obj = { oid: string; type: string; content: Buffer }
-
-/** Every object reachable from `tip`, via ONE `cat-file --batch` (never a spawn each). */
-async function reachableObjects(dir: string, tip: string): Promise<Obj[]> {
-	const list = await spawnGit(["rev-list", "--objects", tip], { cwd: dir })
-	const oids = [
-		...new Set(
-			list.stdout
-				.split("\n")
-				.map((l) => l.slice(0, 40))
-				.filter((o) => /^[0-9a-f]{40}$/.test(o)),
-		),
-	]
-	if (oids.length === 0) return []
-	const res = await spawnGit(["cat-file", "--batch"], {
-		cwd: dir,
-		input: `${oids.join("\n")}\n`,
-	})
-	const buf = res.stdoutBytes
-	const objs: Obj[] = []
-	let pos = 0
-	while (pos < buf.length) {
-		const nl = buf.indexOf(0x0a, pos)
-		if (nl < 0) break
-		const [oid, type, sizeStr] = buf.subarray(pos, nl).toString("latin1").split(" ")
-		if (!oid || !type || !sizeStr) break
-		const size = Number(sizeStr)
-		const start = nl + 1
-		objs.push({ content: buf.subarray(start, start + size), oid, type })
-		pos = start + size + 1
-	}
-	return objs
-}
-
 type Measured = { heap: number; toast: number; idx: number; data: number; rows: number }
 
 describe("encoding tier storage profile — C4 propagation + the 0008 reloptions claim", () => {
@@ -211,10 +179,11 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			from pg_class c join pg_namespace n on n.oid = c.relnamespace
 			where n.nspname = ${db.schema}
 				and c.relkind = 'r' and c.relname like 'git_pack_encoding%'`
+		if (r === undefined) throw new Error("encoding storage aggregate returned no row")
 		return {
-			heap: Number(r?.heap ?? 0),
-			idx: Number(r?.idx ?? 0),
-			toast: Number(r?.toast ?? 0),
+			heap: Number(r.heap),
+			idx: Number(r.idx),
+			toast: Number(r.toast),
 		}
 	}
 
@@ -224,7 +193,8 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			select count(*)::text as rows,
 				coalesce(sum(octet_length(data)), 0)::text as bytes
 			from git_pack_encoding`
-		return { dataBytes: Number(r?.bytes ?? 0), rows: Number(r?.rows ?? 0) }
+		if (r === undefined) throw new Error("encoding census aggregate returned no row")
+		return { dataBytes: Number(r.bytes), rows: Number(r.rows) }
 	}
 
 	/** The `data` column's storage class on the parent and every leaf partition. */
@@ -258,23 +228,18 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 		).stdout.trim()
 
 		const store = createObjectStore(db.sql)
-		let batch: Obj[] = []
+		const objectsToSeed = await loadReachableObjects(dir, [tip])
+		let batch: PackInputObject[] = []
 		let bytes = 0
 		const flush = async (): Promise<void> => {
 			if (batch.length === 0) return
-			await store.putPack(
-				repo,
-				batch.map((o) => ({
-					content: o.content,
-					type: o.type as "blob" | "commit" | "tag" | "tree",
-				})),
-			)
+			await store.putPack(repo, batch)
 			batch = []
 			bytes = 0
 		}
-		for (const o of await reachableObjects(dir, tip)) {
-			batch.push(o)
-			bytes += o.content.length
+		for (const object of objectsToSeed) {
+			batch.push(object)
+			bytes += object.content.length
 			if (bytes >= 12_000_000 || batch.length >= 5000) await flush()
 		}
 		await flush()
@@ -332,12 +297,15 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			where n.nspname = ${db.schema}
 				and c.relname in ('git_pack_encoding_p0', 'git_object_p0', 'git_commit_p0')`
 		const byName = new Map(opts.map((o) => [o.relname, new Set(o.reloptions ?? [])]))
-		const enc = byName.get("git_pack_encoding_p0") ?? new Set<string>()
-		const obj = byName.get("git_object_p0") ?? new Set<string>()
+		const enc = byName.get("git_pack_encoding_p0")
+		const obj = byName.get("git_object_p0")
+		const commit = byName.get("git_commit_p0")
+		if (enc === undefined || obj === undefined || commit === undefined) {
+			throw new Error("expected reloptions rows for object, encoding, and commit leaves")
+		}
 		const missing = [...obj].filter((k) => !enc.has(k))
 		// The 0009 tables cascade-churn on every GC pass too; their leaves carry the
 		// same delete-aware profile (the spine doc's "0005/0008 profile" rule).
-		const commit = byName.get("git_commit_p0") ?? new Set<string>()
 		const missingOnCommit = [...obj].filter((k) => !commit.has(k))
 
 		// The global default the missing key would have overridden — the reason the drift
@@ -367,8 +335,11 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			where n.nspname = ${db.schema}
 				and c.relname in ('git_pack_encoding_p0', 'git_object_p0')`
 		const byName = new Map(toastOpts.map((o) => [o.owner, new Set(o.reloptions ?? [])]))
-		const tEnc = byName.get("git_pack_encoding_p0") ?? new Set<string>()
-		const tObj = byName.get("git_object_p0") ?? new Set<string>()
+		const tEnc = byName.get("git_pack_encoding_p0")
+		const tObj = byName.get("git_object_p0")
+		if (tEnc === undefined || tObj === undefined) {
+			throw new Error("expected TOAST reloptions rows for object and encoding leaves")
+		}
 		expect(
 			[...tObj].filter((k) => !tEnc.has(k)),
 			"reloptions on git_object_p0's TOAST relation but missing on git_pack_encoding_p0's",
@@ -395,7 +366,8 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 		const [big] = await db.sql<{ bytes: string; n: string }[]>`
 			select coalesce(sum(octet_length(data)), 0)::text as bytes, count(*)::text as n
 			from git_pack_encoding where octet_length(data) > 2000`
-		const bigBytes = Number(big?.bytes ?? 0)
+		if (big === undefined) throw new Error("oversize encoding aggregate returned no row")
+		const bigBytes = Number(big.bytes)
 
 		const evidence =
 			`narrow: ${narrow.rows} rows, ${narrow.data}B deflated, heap ${narrow.heap}B / TOAST ${narrow.toast}B / idx ${narrow.idx}B · ` +
@@ -413,7 +385,7 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 		// SMALLER than the >2KB payload it holds ⇒ a second (pglz) pass ran.
 		expect(
 			wide.toast,
-			`TOAST is materially smaller than the out-of-line payload (${bigBytes}B across ${big?.n} rows) — the column is being compressed. ${evidence}`,
+			`TOAST is materially smaller than the out-of-line payload (${bigBytes}B across ${big.n} rows) — the column is being compressed. ${evidence}`,
 		).toBeGreaterThanOrEqual(bigBytes * 0.9)
 	})
 

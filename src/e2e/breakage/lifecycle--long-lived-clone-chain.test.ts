@@ -23,6 +23,7 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 
@@ -95,15 +96,6 @@ async function buildSource(dir: string, mainCommits: number): Promise<void> {
 async function revList(dir: string, rev: string): Promise<string[]> {
 	const out = await spawnGit(["rev-list", "--reverse", rev], { cwd: dir })
 	return out.stdout.trim().split("\n").filter(Boolean)
-}
-
-/** Sorted oids of every object reachable from any ref. */
-async function objectsIn(dir: string): Promise<string[]> {
-	return (await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout
-		.split("\n")
-		.map((l) => l.slice(0, 40))
-		.filter((o) => /^[0-9a-f]{40}$/.test(o))
-		.sort()
 }
 
 function diffLists(a: string[], b: string[]): { onlyA: string[]; onlyB: string[] } {
@@ -188,7 +180,13 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 			}
 			await spawnGit(["fetch", "-q", "--prune", "origin"], { cwd: liveRef })
 			const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: live })
-			const d = diffLists(await objectsIn(live), await objectsIn(liveRef))
+			const liveObjects = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: live })).stdout,
+			).sort()
+			const referenceObjects = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: liveRef })).stdout,
+			).sort()
+			const d = diffLists(liveObjects, referenceObjects)
 			incremental.push({
 				fetchError: null,
 				fsck: `${fsck.stdout}${fsck.stderr}`.trim(),
@@ -233,7 +231,13 @@ describe("lifecycle breakage — long-lived clone chain", () => {
 			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, fresh])
 			await spawnGit(["clone", "-q", "--mirror", `file://${ref}`, freshRef])
 			const f = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: fresh })
-			const d = diffLists(await objectsIn(fresh), await objectsIn(freshRef))
+			const freshObjects = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: fresh })).stdout,
+			).sort()
+			const referenceObjects = parseRevListObjectOids(
+				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: freshRef })).stdout,
+			).sort()
+			const d = diffLists(freshObjects, referenceObjects)
 			rewinds.push({
 				fetchError: null,
 				fsck: `${f.stdout}${f.stderr}`.trim(),

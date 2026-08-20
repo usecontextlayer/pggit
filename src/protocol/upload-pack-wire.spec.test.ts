@@ -22,6 +22,7 @@ import {
 	encodeReadyWithPack,
 } from "@/protocol/v2"
 import { ALGO, pktLineUnpack, sidebandDemux } from "@/testing/pkt-oracle"
+import { ackSection as renderAckSection } from "@/testing/upload-pack-oracle"
 
 // Readable synthetic OIDs for encoder inputs (spec §4.5; the v2.test.ts convention).
 const A = "a".repeat(40)
@@ -109,12 +110,10 @@ describe("§8.1 upload-pack wire — surface 4: ready + packfile (same response)
 	/** The acknowledgments-section text (the data packets up to the delim). */
 	function ackSection(out: Buffer): { text: string; hasDelim: boolean } {
 		const { packets } = decodePktStream(out)
-		const delimIdx = packets.findIndex((p) => p.type === "delim")
-		const text = packets
-			.slice(0, delimIdx)
-			.map((p) => (p.type === "data" ? p.payload.toString("utf8") : ""))
-			.join("")
-		return { hasDelim: delimIdx >= 0, text }
+		return {
+			hasDelim: packets.some((packet) => packet.type === "delim"),
+			text: renderAckSection(out),
+		}
 	}
 
 	it("no common → `acknowledgments` + `ready`, then DELIM, then the pack", () => {

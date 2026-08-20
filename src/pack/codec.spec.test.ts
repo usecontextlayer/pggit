@@ -24,6 +24,7 @@ import { createHash } from "node:crypto"
 import { deflateSync } from "node:zlib"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { computeOid, type GitObjectType } from "@/object/object"
 import { applyDelta } from "@/pack/delta"
 import { encodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
@@ -116,11 +117,13 @@ function buildDelta(base: Buffer, ops: EditOp[]): { delta: Buffer; target: Buffe
 			const size = (op.size % (base.length - offset)) + 1
 			targetParts.push(base.subarray(offset, offset + size))
 			instr.push(...copyInstr(offset, size))
-		} else {
+		} else if (op.kind === "insert") {
 			const lit = Buffer.from(op.bytes)
 			if (lit.length === 0) continue
 			targetParts.push(lit)
 			instr.push(...insertInstrs(lit))
+		} else {
+			assertNever(op)
 		}
 	}
 	const target = Buffer.concat(targetParts)
@@ -144,10 +147,12 @@ function buildPack(entries: PackEntry[]): Buffer {
 		if (e.kind === "base") {
 			parts.push(encodeObjectHeader(PACK_TYPE_CODE[e.type], e.content.length))
 			parts.push(deflateSync(e.content))
-		} else {
+		} else if (e.kind === "ref") {
 			parts.push(encodeObjectHeader(PACK_OBJ_TYPE.REF_DELTA, e.delta.length))
 			parts.push(Buffer.from(e.baseOid, "hex"))
 			parts.push(deflateSync(e.delta))
+		} else {
+			assertNever(e)
 		}
 	}
 	const body = Buffer.concat(parts)

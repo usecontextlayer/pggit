@@ -44,6 +44,10 @@ import {
  * drain was ever started. Both landed per §6; this is their regression gate.
  */
 describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
+	const POLL_TIMEOUT_MS = 8000
+	const POLL_STEP_MS = 100
+	const SCHEDULER_OBSERVATION_WINDOW_MS = 2000
+
 	let db: Kysely<Database>
 	let pg: Sql
 	let baseUrl: string
@@ -95,31 +99,31 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		return { head: r2.head, orphans }
 	}
 
-	/** Poll `predicate` every `stepMs` up to `timeoutMs`; resolve on the first true,
-	 * else throw a clear timeout (never an unbounded wait). The ONLY real-timer wait
+	/** Poll `predicate` on a fixed cadence up to a fixed deadline; resolve on the
+	 * first true, else throw a clear timeout (never an unbounded wait). The ONLY real-timer wait
 	 * in the suite — SCH-10's self-GC reclamation is an asynchronous effect of the
 	 * server's own `setInterval`, so it is polled for, not slept past. */
 	async function pollUntil(
 		label: string,
 		predicate: () => Promise<boolean>,
-		timeoutMs = 8000,
-		stepMs = 100,
 	): Promise<void> {
-		const deadline = Date.now() + timeoutMs
+		const deadline = Date.now() + POLL_TIMEOUT_MS
 		for (;;) {
 			if (await predicate()) return
 			if (Date.now() >= deadline) {
-				throw new Error(`pollUntil timed out after ${timeoutMs}ms waiting for: ${label}`)
+				throw new Error(
+					`pollUntil timed out after ${POLL_TIMEOUT_MS}ms waiting for: ${label}`,
+				)
 			}
-			await new Promise((resolve) => setTimeout(resolve, stepMs))
+			await new Promise((resolve) => setTimeout(resolve, POLL_STEP_MS))
 		}
 	}
 
 	/** A fixed bounded wait — the controlled exception for asserting an ABSENCE (no
 	 * reclamation): there is no event to poll for, so we wait a window comfortably
 	 * larger than the scheduler interval and then assert nothing changed. */
-	async function waitMs(ms: number): Promise<void> {
-		await new Promise((resolve) => setTimeout(resolve, ms))
+	async function waitForSchedulerObservationWindow(): Promise<void> {
+		await new Promise((resolve) => setTimeout(resolve, SCHEDULER_OBSERVATION_WINDOW_MS))
 	}
 
 	// SCH-10 — Standalone server self-GCs on its cadence; the mounted path is
@@ -181,7 +185,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 
 			// Wait comfortably past the interval a wired scheduler would have fired on,
 			// then assert EVERY orphan still present (no reclamation on the mount path).
-			await waitMs(2000)
+			await waitForSchedulerObservationWindow()
 			const mountSurvivors = new Set(await objectOids(sqlDb(), mountRepo))
 			for (const oid of mounted.orphans) expect(mountSurvivors.has(oid)).toBe(true)
 
@@ -212,7 +216,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 
 			// Wait the same bounded window an enabled server would have GC'd within,
 			// then assert NO object was reclaimed — the drain is off.
-			await waitMs(2000)
+			await waitForSchedulerObservationWindow()
 			const survivors = new Set(await objectOids(sqlDb(), repo))
 			for (const oid of orphans) expect(survivors.has(oid)).toBe(true)
 

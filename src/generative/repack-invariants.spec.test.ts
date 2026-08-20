@@ -48,6 +48,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
+import { assertNever } from "@/assert-never"
 import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
@@ -251,7 +252,8 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 				if (live.length === 0) break
 				const path = pick(live, edit.idx)
 				const entry = files.get(path)
-				if (entry === undefined) break
+				if (entry === undefined)
+					throw new Error(`rewrite: live path missing from model: ${path}`)
 				commitMain([
 					write(path, entry.mode, `${entry.content}${filler(`r-${seq}`, 64)}\n`),
 				])
@@ -268,7 +270,8 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 				if (live.length === 0) break
 				const path = pick(live, edit.idx)
 				const entry = files.get(path)
-				if (entry === undefined) break
+				if (entry === undefined)
+					throw new Error(`modeSwap: live path missing from model: ${path}`)
 				const mode = pick(["100644", "100755", "120000"], edit.mode)
 				if (mode === entry.mode) break
 				// A symlink blob IS its target path; swapping back leaves that text as
@@ -282,7 +285,8 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 			case "fileToDir": {
 				if (live.length === 0) break
 				const path = pick(live, edit.idx)
-				if (files.get(path) === undefined) break
+				if (!files.has(path))
+					throw new Error(`fileToDir: live path missing from model: ${path}`)
 				// blob → tree at the SAME name: the tree-diff pairing that repack must
 				// refuse to delta across (a tree paired with a blob is not a lineage).
 				files.delete(path)
@@ -337,6 +341,8 @@ async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 				stream.push(`reset refs/heads/main\nfrom :${target.mark}\n`)
 				break
 			}
+			default:
+				assertNever(edit)
 		}
 	}
 

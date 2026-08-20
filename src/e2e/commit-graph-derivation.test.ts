@@ -150,12 +150,13 @@ describe("spine S1 — git_commit/git_tag derivation", () => {
 		expect(rows.size).toBe(5)
 		for (const [i, c] of commits.entries()) {
 			const row = rows.get(c.oid)
+			if (row === undefined) throw new Error(`commit row missing for ${c.oid}`)
 			// Every expectation but `generation` is git's own reading of the object.
 			const facts = await gitCommitFacts(c.oid)
-			expect(row?.generation).toBe(i + 1)
-			expect(row?.tree).toBe(facts.tree)
-			expect(BigInt(row?.commit_time ?? 0n)).toBe(BigInt(facts.commitTime))
-			expect(row?.parents).toEqual(facts.parents)
+			expect(row.generation).toBe(i + 1)
+			expect(row.tree).toBe(facts.tree)
+			expect(BigInt(row.commit_time)).toBe(BigInt(facts.commitTime))
+			expect(row.parents).toEqual(facts.parents)
 		}
 	})
 
