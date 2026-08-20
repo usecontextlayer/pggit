@@ -854,6 +854,7 @@ export async function frontier(
 		}
 	}
 
+	const edgeTrees = new Set<string>()
 	for (const c of newCommits) {
 		const row = rows.get(c) as CommitRow
 		const boundaryTrees: string[] = []
@@ -866,18 +867,24 @@ export async function frontier(
 				interestingTrees.push(prow.tree)
 			} else {
 				boundaryTrees.push(prow.tree)
+				edgeTrees.add(prow.tree)
 			}
 		}
 		await diffForServe(row.tree, boundaryTrees, interestingTrees)
 	}
 
-	// ── Client-held content over the walked window (R16's priced upgrade). ──
+	// ── Client-held content at the EDGES (R16's priced upgrade). ──
 	// Name-paired diffing prunes same-PATH content, but the client also holds
 	// content at OTHER paths — an object moved or resurrected anywhere under an
-	// uninteresting commit's tree (the empty blob is the degenerate case: any
-	// two empty files are one object). git marks every uninteresting commit's
-	// whole tree; we do the same, bounded to the commits this walk actually
-	// visited, and subtract before serving. Everything expanded here is
+	// edge tree (the empty blob is the degenerate case: any two empty files are
+	// one object). The edge set is exactly canonical git's
+	// mark_edges_uninteresting: the HAVE TIPS plus every boundary parent of a
+	// served commit — never the whole visited uninteresting region (expanding
+	// every visited commit's tree re-reads a near-identical wide root per
+	// negotiated have and measured +54% on the warm-fetch harness, while a
+	// resurrection from BELOW the edge is over-sent by git too, so edge-only is
+	// both the cheap form and the git-matching one; the negotiation and
+	// served-set differentials are the arbiters). Everything expanded here is
 	// reachable from a stated have, so it is also thin-pack provable (D8′).
 	const expandClientHeld = async (treeOid: string): Promise<void> => {
 		if (clientHas.has(treeOid)) return
@@ -889,11 +896,12 @@ export async function frontier(
 			else if (e.mode !== GITLINK_MODE) clientHas.add(e.oid)
 		}
 	}
-	for (const [oid, m] of marks) {
-		if (m.uninterestingBits === 0n) continue
-		const row = rows.get(oid)
-		if (row === null || row === undefined) continue
-		await expandClientHeld(row.tree)
+	for (const h of haves) {
+		const row = rows.get(h)
+		if (row !== null && row !== undefined) edgeTrees.add(row.tree)
+	}
+	for (const treeOid of edgeTrees) {
+		await expandClientHeld(treeOid)
 	}
 	for (const oid of clientHas) {
 		served.delete(oid)
