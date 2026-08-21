@@ -253,6 +253,10 @@ A barrel would preserve the export surface literally — but the split's adverti
 - **repack.ts**: EXPORT `createRepack` from index.ts (option a). It stays at store/repack.ts; scheduling remains the engine-side integration's job per the ledger. Add the export + its doc line in this pass.
 - Step 15 (.spec strip): driver executes the FULL strip with the config-comment rewrite (already within granted latitude).
 
+## DRIVER RULINGS (2026-08-21, delegated — owner: "i trust you on all of them")
+
+- **Step 2's five unhomed perf-root files (the cycle-C additions the addendum flags)**: placed by a fresh import census (2026-08-21) — `args.ts` (33 probes + `delta-probe`/`delta-corpus` + `run.ts`) and `collector-evidence.ts` (7 probes + `delta-probe` + `report.ts`) are genuinely shared across both halves and STAY at `perf/` root; `table.ts` (26 probe-side importers, nothing else) → `perf/probes/_table.ts` and `vacuum-evidence.ts` (3 probes, nothing else) → `perf/probes/_vacuum-evidence.ts`, taking the `_`-prefix library convention the probes folder already uses; `platformatic-flame.d.ts` (ambient types consumed only by `profile.ts`) → `perf/harness/`.
+- **§4's doc-churn policy: CONFIRMED as recommended** — update paths in the live design records; leave the archival ones untouched apart from one dated top line noting the later rename.
 
 ---
 
