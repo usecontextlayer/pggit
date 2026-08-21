@@ -12,7 +12,7 @@
  * boundary stays the single source of the GIT_* scrub, pinned identity and clock.
  */
 import { spawn } from "node:child_process"
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 import { decodePktStream } from "@/protocol/pkt-line"
 import {
 	buildGitEnv,

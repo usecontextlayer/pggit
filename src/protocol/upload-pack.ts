@@ -1,5 +1,5 @@
-import { assertNever } from "@/assert-never"
 import { label, withPhase } from "@/instrument"
+import { assertNever } from "@/lang"
 import type { Oid } from "@/object/oid"
 import { assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError, WantNotFoundError } from "@/protocol/errors"

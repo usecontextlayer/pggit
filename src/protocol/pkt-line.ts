@@ -5,7 +5,7 @@
  * `0002`. See gitprotocol-common + design spec §5.
  */
 
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 import { GitProtocolError } from "@/protocol/errors"
 
 export type Pkt =

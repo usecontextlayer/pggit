@@ -31,7 +31,7 @@
  */
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 import { applyDelta, encodeDelta } from "@/pack/delta"
 
 const SEED = 424_242

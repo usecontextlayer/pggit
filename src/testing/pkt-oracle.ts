@@ -12,7 +12,7 @@
  * §8.1 goldens, so their own tests (`pkt-oracle.test.ts`) are a normal `*.test.ts`
  * and stay GREEN on the gate — never a `*.spec.test.ts`.
  */
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 import { decodePktStream } from "@/protocol/pkt-line"
 
 /** Decode a stream the caller claims is COMPLETE: undecoded trailing bytes are

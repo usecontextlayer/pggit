@@ -22,7 +22,7 @@
  */
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 import { computeOid, type GitObjectType } from "@/object/object"
 import { applyDelta } from "@/pack/delta"
 import { readPack } from "@/pack/read-pack"

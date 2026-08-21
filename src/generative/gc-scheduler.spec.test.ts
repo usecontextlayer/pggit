@@ -44,7 +44,7 @@ import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 import { createGcScheduler } from "@/store/gc-scheduler"
 import { IS_CI } from "@/testing/ci"
 import {

@@ -8,6 +8,7 @@ import { type CopyValue, copyInsert } from "@/database/copy-insert"
 import type { ReposId } from "@/database/models/public/Repos"
 import { OBJECT_TYPE_CODE, objectTypeFromCode } from "@/database/object-type-codes"
 import { count, withPhase } from "@/instrument"
+import { batches } from "@/lang"
 import { computeGenerations, requireGeneration } from "@/object/commit-graph"
 import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/ingest-validation"
 import { computeOid, type GitObjectType } from "@/object/object"
@@ -31,13 +32,6 @@ const PACK_BATCH = 1000
  * limit.
  */
 const READ_CHUNK_BYTES = 100_000_000
-
-/** Split `items` into consecutive batches of at most `size`. */
-function batches<T>(items: T[], size: number): T[][] {
-	const out: T[][] = []
-	for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
-	return out
-}
 
 function assertObjectIds(oids: readonly string[]): void {
 	for (const oid of oids) {

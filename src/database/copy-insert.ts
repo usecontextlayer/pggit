@@ -1,6 +1,6 @@
 import { finished } from "node:stream/promises"
 import type { ISql, TransactionSql } from "postgres"
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 
 /**
  * Bulk binary insert via `COPY … FROM STDIN (FORMAT binary)` into a staging temp

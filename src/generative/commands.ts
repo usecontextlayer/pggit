@@ -32,7 +32,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import fc from "fast-check"
-import { assertNever } from "@/assert-never"
+import { assertNever } from "@/lang"
 import { cyclicAt } from "@/testing/git-fixtures"
 import { GitCommandError, spawnGit } from "@/testing/spawn-git"
 

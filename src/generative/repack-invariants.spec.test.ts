@@ -1,8 +1,8 @@
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
-import { assertNever } from "@/assert-never"
 import { createGitApp, createGitDeps } from "@/index"
+import { assertNever } from "@/lang"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import {

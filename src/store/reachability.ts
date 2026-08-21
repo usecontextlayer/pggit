@@ -3,6 +3,7 @@ import { sql } from "kysely"
 import TinyQueue from "tinyqueue"
 import type { Database } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
+import { batches } from "@/lang"
 import { GITLINK_MODE, isTreeEntryMode, treeEntries } from "@/object/object"
 import { type IndexedTree, indexTreeEntries } from "@/object/tree-diff"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
@@ -17,13 +18,6 @@ import {
 /** Oids looked up per round-trip. Kysely's `in`-expansion spends one bind per
  * oid; the wire caps a statement at 65,534 binds. */
 const LOOKUP_BATCH = 1000
-
-/** Split `items` into consecutive batches of at most `size`. */
-function batches<T>(items: T[], size: number): T[][] {
-	const out: T[][] = []
-	for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
-	return out
-}
 
 /** A loaded `git_commit` row. `gen`/`time` ride along for the frontier — tiny
  * columns, one query shape for every walk. */
