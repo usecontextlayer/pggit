@@ -30,23 +30,41 @@
  * and a ref VANISHING is a hard break in both arms (gc never touches refs).
  *
  * Converted from `breakage/race--push-gc-repack.ts` (`--iters=40 --runs=120
- * --grace=-1 --rewind=40`; grace=-1 alternates 0 / 60 across iterations).
- * Probabilistic: the iteration count and every actor's swept start offset are
- * frozen exactly as the script ran them.
+ * --grace=-1 --rewind=40`; grace=-1 alternates 0 / 60). Probabilistic. Two
+ * things are deliberately NOT the source's:
+ *
+ * - The actor-start offsets were frozen absolute milliseconds; they are now
+ *   FRACTIONS of one measured un-raced clone wall (the longest actor), so the
+ *   four starts keep the same relative stagger on any box under any load.
+ * - The original indexing ALIASED: the 6-row offset matrix cycled `i % 6` while
+ *   grace cycled `i % 2`, and 6 and 2 share a factor — so offset rows 0/2/4
+ *   only ever ran at grace 0 and rows 1/3/5 only at grace 60, and 40 iterations
+ *   never covered the other six combinations. Grace now flips per full matrix
+ *   cycle (`floor(i/6) % 2`), so 12 iterations cover ALL 12 row×grace
+ *   combinations — strictly more coverage than the 40 (ruling 5,
+ *   docs/2026-08-20-test-efficiency.md).
+ *
+ * The per-iteration pre-race state (full history, ref rewound, no tier) is
+ * assembled by COPYING a template repo's rows; the template's first copy is
+ * proven canonical AND byte-faithful.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import type { PackInputObject } from "@/pack/write-pack"
+import { parseOid } from "@/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
+	loadReachableObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -54,10 +72,18 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
-const ITERS = 40
+const ITERS = 12
 const RUNS = 120
 const REWIND = 40
+const TEMPLATE = "race/pgr/template"
+/** Actor-start offsets as fractions of the measured un-raced clone wall — the
+ * same six start-order permutations the source swept, made box-independent. */
+const PUSH_FRACTIONS = [0, 0, 0, 0.007, 0.014, 0.03] as const
+const GC_FRACTIONS = [0, 0.007, 0.02, 0, 0.04, 0.011] as const
+const REPACK_FRACTIONS = [0, 0.02, 0.007, 0.036, 0, 0.057] as const
+const CLONE_FRACTIONS = [0, 0.036, 0.057, 0.014, 0.08, 0] as const
 
 const msg = (e: unknown) =>
 	(e instanceof Error ? e.message : String(e)).split("\n")[0] ?? ""
@@ -71,9 +97,10 @@ describe("race — a wire push, a gc(), a repack() and a clone all in flight", (
 	let gc: Gc
 	let src = ""
 	let client = ""
-	let objects: PackInputObject[] = []
+	let objects: GitObjectWithOid[] = []
 	let tip = ""
 	let rewindTo = ""
+	let cloneMs = 0
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -97,6 +124,42 @@ describe("race — a wire push, a gc(), a repack() and a clone all in flight", (
 		refs = fixture.deps.refs
 		repack = createRepack(db.sql)
 		gc = createGc(db.sql)
+
+		// Template: full history seeded, main rewound (real orphans for the pass to
+		// eat), no encoding tier — the raced repack builds it. Built once, copied
+		// per iteration.
+		await store.putPack(TEMPLATE, objects)
+		await refs.setRef(TEMPLATE, "refs/heads/main", tip)
+		await refs.setSymref(TEMPLATE, "HEAD", "refs/heads/main")
+		await refs.setRef(TEMPLATE, "refs/heads/main", rewindTo)
+		const proof = `${TEMPLATE}/copy-proof`
+		await copyTemplateRepo(db.sql, TEMPLATE, proof)
+		await assertCanonicalStoreFixture(db.sql, proof, {
+			encodings: { kind: "exact", objects: [] },
+			objects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: parseOid(rewindTo) },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
+		await assertTemplateCopyFaithful(db.sql, TEMPLATE, proof)
+
+		// Calibrate: one un-raced clone (the longest actor), timed wall-to-wall.
+		// Every actor's start offset is a fraction of this.
+		const calRepo = "race/pgr/cal"
+		await copyTemplateRepo(db.sql, TEMPLATE, calRepo)
+		const calDest = join(mkdtempSync(join(tmpdir(), "pgr-cal-")), "c")
+		scratch.push(calDest)
+		const calStart = Date.now()
+		await spawnGit([
+			"-c",
+			"protocol.version=2",
+			"clone",
+			"-q",
+			repoUrl(server, calRepo),
+			calDest,
+		])
+		cloneMs = Date.now() - calStart
 	}, 600_000)
 
 	afterAll(async () => {
@@ -110,17 +173,20 @@ describe("race — a wire push, a gc(), a repack() and a clone all in flight", (
 		const bump = (k: string) => {
 			tally[k] = (tally[k] ?? 0) + 1
 		}
+		// Overlap telemetry — recorded, not asserted: how many of the three
+		// mutating actors (push, gc, repack) had their execution window intersect
+		// the raced clone's window, per iteration.
+		const overlaps: Record<string, number> = {}
 
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const repo = `race/pgr/${i}`
 			const url = repoUrl(server, repo)
-			const grace = i % 2 === 0 ? 0 : 60
+			// Grace flips per FULL offset-matrix cycle, never in lockstep with it —
+			// `i % 2` aliased against `i % 6` and starved half the combinations.
+			const grace = Math.floor(i / 6) % 2 === 0 ? 0 : 60
 
-			// Seed the full history, then rewind main so the pass has real orphans.
-			await store.putPack(repo, objects)
-			await refs.setRef(repo, "refs/heads/main", tip)
-			await refs.setSymref(repo, "HEAD", "refs/heads/main")
-			await refs.setRef(repo, "refs/heads/main", rewindTo)
+			// Pre-race state in one copy: full history, main rewound to leave orphans.
+			await copyTemplateRepo(db.sql, TEMPLATE, repo)
 
 			// A brand-new commit on top of the rewound tip — unique per iteration.
 			await spawnGit(["reset", "-q", "--hard", rewindTo], { cwd: client })
@@ -131,10 +197,11 @@ describe("race — a wire push, a gc(), a repack() and a clone all in flight", (
 				await spawnGit(["rev-parse", "HEAD"], { cwd: client })
 			).stdout.trim()
 
-			const dPush = [0, 0, 0, 5, 10, 20][i % 6] as number
-			const dGc = [0, 5, 15, 0, 30, 8][i % 6] as number
-			const dRepack = [0, 15, 5, 25, 0, 40][i % 6] as number
-			const dClone = [0, 25, 40, 10, 55, 0][i % 6] as number
+			const row = i % 6
+			const dPush = Math.round((PUSH_FRACTIONS[row] as number) * cloneMs)
+			const dGc = Math.round((GC_FRACTIONS[row] as number) * cloneMs)
+			const dRepack = Math.round((REPACK_FRACTIONS[row] as number) * cloneMs)
+			const dClone = Math.round((CLONE_FRACTIONS[row] as number) * cloneMs)
 
 			let pushErr: unknown
 			let repackErr: unknown
@@ -143,32 +210,58 @@ describe("race — a wire push, a gc(), a repack() and a clone all in flight", (
 			const dest = join(mkdtempSync(join(tmpdir(), "pgr-dest-")), "c")
 			scratch.push(dest)
 
+			const raceStart = Date.now()
+			const settle = { clone: 0, gc: 0, push: 0, repack: 0 }
 			await Promise.allSettled([
-				sleep(dPush).then(() =>
-					spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd: client }).catch(
-						(e) => {
-							pushErr = e
-						},
-					),
-				),
-				sleep(dGc).then(() =>
-					gc
-						.gc(repo, { batchLimit: 40, graceSeconds: grace, maintain: false })
-						.catch((e) => {
-							gcErr = e
+				sleep(dPush)
+					.then(() =>
+						spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd: client }).catch(
+							(e) => {
+								pushErr = e
+							},
+						),
+					)
+					.finally(() => {
+						settle.push = Date.now() - raceStart
+					}),
+				sleep(dGc)
+					.then(() =>
+						gc
+							.gc(repo, { batchLimit: 40, graceSeconds: grace, maintain: false })
+							.catch((e) => {
+								gcErr = e
+							}),
+					)
+					.finally(() => {
+						settle.gc = Date.now() - raceStart
+					}),
+				sleep(dRepack)
+					.then(() =>
+						repack.repack(repo).catch((e) => {
+							repackErr = e
 						}),
-				),
-				sleep(dRepack).then(() =>
-					repack.repack(repo).catch((e) => {
-						repackErr = e
+					)
+					.finally(() => {
+						settle.repack = Date.now() - raceStart
 					}),
-				),
-				sleep(dClone).then(() =>
-					spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest]).catch((e) => {
-						cloneErr = e
+				sleep(dClone)
+					.then(() =>
+						spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest]).catch(
+							(e) => {
+								cloneErr = e
+							},
+						),
+					)
+					.finally(() => {
+						settle.clone = Date.now() - raceStart
 					}),
-				),
 			])
+			const actorStarts = { gc: dGc, push: dPush, repack: dRepack }
+			const mutatorsInCloneWindow = (
+				Object.keys(actorStarts) as (keyof typeof actorStarts)[]
+			).filter((k) => actorStarts[k] < settle.clone && settle[k] > dClone).length
+			overlaps[`mutators=${mutatorsInCloneWindow}`] =
+				(overlaps[`mutators=${mutatorsInCloneWindow}`] ?? 0) + 1
 
 			const problems: string[] = []
 			const tolerated: string[] = []
@@ -241,6 +334,9 @@ describe("race — a wire push, a gc(), a repack() and a clone all in flight", (
 			}
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): mutating actors intersecting the clone window — ${JSON.stringify(overlaps)}`,
+		)
 		expect(breaks, JSON.stringify(tally, null, 2)).toEqual([])
 	}, 1_800_000)
 })

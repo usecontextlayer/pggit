@@ -19,21 +19,37 @@
  * tier as the race left it AND after one more converging repack.
  *
  * Converted from `breakage/race--two-pushes-repack.ts` (`--iters=25 --runs=400`).
- * Probabilistic: the iteration count, the two modes and the swept repack-start
- * delays are frozen exactly as the script ran them.
+ * Probabilistic. The swept repack-start delays are NOT the source's: it froze
+ * absolute milliseconds ([0..220]ms), which tie the race to one machine's push
+ * speed — the window under attack is the wire push's server-side ingest, and
+ * frozen offsets crowd into its head on any slower or loaded box. Each run
+ * instead times one un-raced calibration push of the same shape and sweeps the
+ * repack's start across FRACTIONS of that measured wall (0–97%), so the arms
+ * land across the whole ingest on any box. That calibration is also why 12
+ * iterations carry the coverage the source spread over 25: one full 12-arm
+ * sweep that lands in-window beats 2.5 sweeps of absolute delays
+ * (docs/2026-08-20-test-efficiency.md, ruling 5). The per-round pre-race state
+ * (full history, tier covering it) is assembled by COPYING a template repo's
+ * rows instead of re-seeding and re-repacking per round; the template's first
+ * copy is proven canonical AND byte-faithful.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import type { PackInputObject } from "@/pack/write-pack"
+import { parseOid } from "@/oid"
 import type { GitServer } from "@/server"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo, RUNS_DIR, runDirName } from "@/testing/append-only-repo"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
+	loadReachableObjects,
+	repackEligibleObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -41,10 +57,17 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
-const ITERS = 25
+const ITERS = 12
 const RUNS = 400
 const MODES = ["same-path", "two-push"] as const
+const TEMPLATE = "race/tpr/template"
+/** Where in the measured un-raced push wall each iteration's repack starts. 0
+ * races the ingest from its first statement; 0.97 races its tail. */
+const DELAY_FRACTIONS = [
+	0, 0.03, 0.08, 0.15, 0.22, 0.3, 0.4, 0.5, 0.6, 0.72, 0.85, 0.97,
+] as const
 
 const msg = (e: unknown) =>
 	(e instanceof Error ? e.message : String(e)).split("\n")[0] ?? ""
@@ -69,8 +92,9 @@ describe("race — wire pushes into the delta lineage while a repack runs", () =
 	let src = ""
 	let a = ""
 	let b = ""
-	let objects: PackInputObject[] = []
+	let objects: GitObjectWithOid[] = []
 	let tip = ""
+	let pushMs = 0
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -92,6 +116,36 @@ describe("race — wire pushes into the delta lineage while a repack runs", () =
 		store = fixture.deps.objects
 		refs = fixture.deps.refs
 		repack = createRepack(db.sql)
+
+		// Template: the per-round pre-race state — full history seeded, refs set,
+		// tier covering the old history — built once, copied per round.
+		await store.putPack(TEMPLATE, objects)
+		await refs.setRef(TEMPLATE, "refs/heads/main", tip)
+		await refs.setSymref(TEMPLATE, "HEAD", "refs/heads/main")
+		await repack.repack(TEMPLATE)
+		const proof = `${TEMPLATE}/copy-proof`
+		await copyTemplateRepo(db.sql, TEMPLATE, proof)
+		await assertCanonicalStoreFixture(db.sql, proof, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+			objects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: parseOid(tip) },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
+		await assertTemplateCopyFaithful(db.sql, TEMPLATE, proof)
+
+		// Calibrate: one un-raced wire push of the same shape the raced rounds
+		// use, timed wall-to-wall. The raced repack delays are fractions of this.
+		const calRepo = "race/tpr/cal"
+		await copyTemplateRepo(db.sql, TEMPLATE, calRepo)
+		await spawnGit(["reset", "-q", "--hard", tip], { cwd: a })
+		await commitRun(a, RUNS + 100, "cal")
+		const calStart = Date.now()
+		await spawnGit(["push", "-q", repoUrl(server, calRepo), "HEAD:refs/heads/main"], {
+			cwd: a,
+		})
+		pushMs = Date.now() - calStart
 	}, 600_000)
 
 	afterAll(async () => {
@@ -105,59 +159,67 @@ describe("race — wire pushes into the delta lineage while a repack runs", () =
 		const bump = (k: string) => {
 			tally[k] = (tally[k] ?? 0) + 1
 		}
+		// Overlap telemetry — recorded, not asserted: whether each round's repack
+		// ran inside the push window it races ("in"), spilled past it ("straddle"),
+		// or started after every push settled ("late", a wasted arm).
+		const overlaps = { in: 0, late: 0, straddle: 0 }
 
 		outer: for (let i = 0; i < ITERS; i++) {
 			for (const mode of MODES) {
 				const repo = `race/tpr/${mode}/${i}`
 				const url = repoUrl(server, repo)
-				await store.putPack(repo, objects)
-				await refs.setRef(repo, "refs/heads/main", tip)
-				await refs.setSymref(repo, "HEAD", "refs/heads/main")
-				// Partially covered tier: the OLD history is encoded, the pushes are not.
-				await repack.repack(repo)
+				// Pre-race state in one copy: full history, tier covering the OLD
+				// history — the pushes are not encoded.
+				await copyTemplateRepo(db.sql, TEMPLATE, repo)
 
 				await spawnGit(["reset", "-q", "--hard", tip], { cwd: a })
 				await spawnGit(["reset", "-q", "--hard", tip], { cwd: b })
 				await commitRun(a, RUNS + i, `a${i}`)
 				await commitRun(b, RUNS + i, `b${i}`)
 
-				const delay = [0, 3, 8, 15, 25, 40, 65, 100, 150, 220][i % 10] as number
+				const fraction = DELAY_FRACTIONS[i % DELAY_FRACTIONS.length] as number
+				const delay = Math.round(fraction * pushMs)
 				const problems: string[] = []
 				let errA: unknown
 				let errB: unknown
 				let repackErr: unknown
-
-				if (mode === "same-path") {
-					await Promise.allSettled([
-						spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd: a }).catch(
-							(e) => {
-								errA = e
-							},
-						),
-						sleep(delay).then(() =>
+				const raceStart = Date.now()
+				let pushSettleMs = 0
+				let racerSettleMs = 0
+				const timedPush = (cwd: string, onErr: (e: unknown) => void) =>
+					spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd })
+						.catch(onErr)
+						.finally(() => {
+							pushSettleMs = Math.max(pushSettleMs, Date.now() - raceStart)
+						})
+				const timedRepack = () =>
+					sleep(delay)
+						.then(() =>
 							repack.repack(repo).catch((e) => {
 								repackErr = e
 							}),
-						),
+						)
+						.finally(() => {
+							racerSettleMs = Date.now() - raceStart
+						})
+
+				if (mode === "same-path") {
+					await Promise.allSettled([
+						timedPush(a, (e) => {
+							errA = e
+						}),
+						timedRepack(),
 					])
 					if (errA !== undefined) problems.push(`push rejected: ${msg(errA)}`)
 				} else {
 					await Promise.allSettled([
-						spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd: a }).catch(
-							(e) => {
-								errA = e
-							},
-						),
-						spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd: b }).catch(
-							(e) => {
-								errB = e
-							},
-						),
-						sleep(delay).then(() =>
-							repack.repack(repo).catch((e) => {
-								repackErr = e
-							}),
-						),
+						timedPush(a, (e) => {
+							errA = e
+						}),
+						timedPush(b, (e) => {
+							errB = e
+						}),
+						timedRepack(),
 					])
 					const winners = [errA === undefined, errB === undefined].filter(Boolean).length
 					// Both pushes are siblings of the same parent, so at most one can be a
@@ -166,6 +228,13 @@ describe("race — wire pushes into the delta lineage while a repack runs", () =
 						problems.push(`expected exactly 1 push to win, got ${winners}`)
 					bump(`two-push winners=${winners}`)
 				}
+				overlaps[
+					delay >= pushSettleMs
+						? "late"
+						: racerSettleMs <= pushSettleMs
+							? "in"
+							: "straddle"
+				]++
 				if (repackErr !== undefined) problems.push(`repack threw: ${msg(repackErr)}`)
 
 				// Whatever the ref says now, the repo must serve it soundly — with the
@@ -200,6 +269,9 @@ describe("race — wire pushes into the delta lineage while a repack runs", () =
 			}
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): repack vs push window — in=${overlaps.in} straddle=${overlaps.straddle} late=${overlaps.late}`,
+		)
 		expect(breaks, JSON.stringify(tally, null, 2)).toEqual([])
 	}, 1_800_000)
 })

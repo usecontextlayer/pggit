@@ -25,8 +25,20 @@
  *
  * Converted from `breakage/race--err-pkt-overflow.ts` (`--iters=20 --runs=1200
  * --rewind=1100`). Part 1 is DETERMINISTIC — above ~1,597 missing oids the
- * refusal is always a 500 — so its N sweep is frozen exactly; part 2's iteration
- * count and swept gc-start delays are frozen too.
+ * refusal is always a 500 — so its N sweep is frozen exactly, and `RUNS`/`REWIND`
+ * stay at the source's scale: the raced half needs the orphaned span to be
+ * thousands of objects for the sweep to cross the ceiling. Part 2's gc-start
+ * delays are NOT frozen: the source's absolute milliseconds ([0..180]ms) tie the
+ * race to one machine's serve speed, so each run times one un-raced fetch of the
+ * same shape and sweeps the gc start across FRACTIONS of that measured wall
+ * (0–16%, the serve's opening phase — the gc must get ahead of the serve's
+ * missing-object check for the refusal to grow). That calibration is also why 12
+ * iterations carry the coverage the source spread over 20 (ruling 5,
+ * docs/2026-08-20-test-efficiency.md). Part 2's per-iteration pre-race state
+ * (full history seeded, tier built, ref rewound) is assembled by COPYING a
+ * template repo's rows — the dominant cost was re-seeding the ~10k-object set
+ * every iteration; the template's first copy is proven canonical AND
+ * byte-faithful.
  */
 import { randomBytes } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -34,14 +46,19 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import type { PackInputObject } from "@/pack/write-pack"
+import { parseOid } from "@/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
+	loadReachableObjects,
+	repackEligibleObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -49,12 +66,20 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
-const ITERS = 20
+const ITERS = 12
 const RUNS = 1200
 const REWIND = 1100
 /** N missing objects per part-1 probe, swept across the ~1,597-oid ceiling. */
 const MISSING_SWEEP = [10, 500, 1500, 1590, 1600, 1700, 4000]
+const TEMPLATE = "errpkt/race/template"
+/** Where in the measured un-raced fetch wall each iteration's gc starts — dense
+ * across the serve's opening phase, where the gc must land to have swept enough
+ * of the orphaned span before the serve's missing-object check reads it. */
+const DELAY_FRACTIONS = [
+	0, 0.002, 0.005, 0.01, 0.018, 0.03, 0.045, 0.06, 0.08, 0.1, 0.13, 0.16,
+] as const
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -74,9 +99,10 @@ describe("race — the in-band refusal path's pkt-line size ceiling", () => {
 	let repack: Repack
 	let gc: Gc
 	let src = ""
-	let objects: PackInputObject[] = []
+	let objects: GitObjectWithOid[] = []
 	let tip = ""
 	let rewindTo = ""
+	let fetchMs = 0
 	const scratch: string[] = []
 
 	// The app logs internal (500) errors with console.error; capture them so the
@@ -106,6 +132,39 @@ describe("race — the in-band refusal path's pkt-line size ceiling", () => {
 		refs = fixture.deps.refs
 		gc = createGc(db.sql)
 		repack = createRepack(db.sql)
+
+		// Template for part 2: the per-iteration pre-race state — full history
+		// seeded, tier built over it, ref rewound to orphan the span GC eats.
+		await store.putPack(TEMPLATE, objects)
+		await refs.setRef(TEMPLATE, "refs/heads/main", tip)
+		await refs.setSymref(TEMPLATE, "HEAD", "refs/heads/main")
+		await repack.repack(TEMPLATE)
+		await refs.setRef(TEMPLATE, "refs/heads/main", rewindTo)
+		const proof = `${TEMPLATE}/copy-proof`
+		await copyTemplateRepo(db.sql, TEMPLATE, proof)
+		await assertCanonicalStoreFixture(db.sql, proof, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+			objects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: parseOid(rewindTo) },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
+		await assertTemplateCopyFaithful(db.sql, TEMPLATE, proof)
+
+		// Calibrate: one un-raced fetch of the exact per-iteration shape, timed
+		// wall-to-wall. The raced gc delays are fractions of this.
+		const calRepo = "errpkt/race/cal"
+		await copyTemplateRepo(db.sql, TEMPLATE, calRepo)
+		const calDest = join(mkdtempSync(join(tmpdir(), "errpkt-cal-")), "c")
+		scratch.push(calDest)
+		await spawnGit(["init", "-q", "-b", "main", calDest])
+		const calStart = Date.now()
+		await spawnGit(
+			["-c", "protocol.version=2", "fetch", "-q", repoUrl(server, calRepo), tip],
+			{ cwd: calDest },
+		)
+		fetchMs = Date.now() - calStart
 	}, 900_000)
 
 	afterAll(async () => {
@@ -158,34 +217,54 @@ describe("race — the in-band refusal path's pkt-line size ceiling", () => {
 	it("a gc(graceSeconds: 0) racing a fetch never degrades the refusal past the writer cap", async () => {
 		const observed: string[] = []
 		const capHits: string[] = []
+		// Overlap telemetry — recorded, not asserted: whether each iteration's gc
+		// ran inside the fetch serve it races ("in"), spilled past it ("straddle"),
+		// or started after the serve finished ("late", a wasted arm).
+		const overlaps = { in: 0, late: 0, straddle: 0 }
 
 		for (let i = 0; i < ITERS; i++) {
 			const repo = `errpkt/race/${i}`
 			const url = repoUrl(server, repo)
-			await store.putPack(repo, objects)
-			await refs.setRef(repo, "refs/heads/main", tip)
-			await refs.setSymref(repo, "HEAD", "refs/heads/main")
-			await repack.repack(repo)
-			await refs.setRef(repo, "refs/heads/main", rewindTo)
+			// Pre-race state in one copy: full history, tier built, ref rewound.
+			await copyTemplateRepo(db.sql, TEMPLATE, repo)
 
 			const dest = join(mkdtempSync(join(tmpdir(), "errpkt-race-")), "c")
 			scratch.push(dest)
 			await spawnGit(["init", "-q", "-b", "main", dest])
-			const delay = [0, 2, 5, 10, 20, 35, 55, 80, 120, 180][i % 10] as number
+			const fraction = DELAY_FRACTIONS[i % DELAY_FRACTIONS.length] as number
+			const delay = Math.round(fraction * fetchMs)
 			drainServerErrors()
 			let err: unknown
+			const raceStart = Date.now()
+			let serveSettleMs = 0
+			let racerSettleMs = 0
 			await Promise.allSettled([
 				spawnGit(["-c", "protocol.version=2", "fetch", "-q", url, tip], {
 					cwd: dest,
-				}).catch((e) => {
-					err = e
-				}),
-				sleep(delay).then(() =>
-					gc
-						.gc(repo, { batchLimit: 500, graceSeconds: 0, maintain: false })
-						.catch(() => undefined),
-				),
+				})
+					.catch((e) => {
+						err = e
+					})
+					.finally(() => {
+						serveSettleMs = Date.now() - raceStart
+					}),
+				sleep(delay)
+					.then(() =>
+						gc
+							.gc(repo, { batchLimit: 500, graceSeconds: 0, maintain: false })
+							.catch(() => undefined),
+					)
+					.finally(() => {
+						racerSettleMs = Date.now() - raceStart
+					}),
 			])
+			overlaps[
+				delay >= serveSettleMs
+					? "late"
+					: racerSettleMs <= serveSettleMs
+						? "in"
+						: "straddle"
+			]++
 			const verdict = classify(err)
 			const srv = drainServerErrors()
 			const capHit = srv.some((s) => /exceeds writer cap/.test(s))
@@ -203,6 +282,9 @@ describe("race — the in-band refusal path's pkt-line size ceiling", () => {
 			}
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): gc vs fetch serve — in=${overlaps.in} straddle=${overlaps.straddle} late=${overlaps.late}`,
+		)
 		expect(capHits, observed.join("\n")).toEqual([])
 		// …and a run where every fetch failed for an unrelated reason is not a pass
 		// either: at least one iteration has to have reached the serve path.

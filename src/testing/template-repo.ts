@@ -98,3 +98,72 @@ export async function copyTemplateRepo(
 		}
 	})
 }
+
+/**
+ * Prove a copy is byte-faithful to its template: for every table in
+ * `COPIED_TABLES` plus the `repos` watermarks, compare the row count and an
+ * order-independent digest of EVERY carried column between template and copy
+ * (`repo_id` excluded — the one column a copy legitimately changes).
+ *
+ * This is the second half of the identity anchor, and the half that makes the
+ * "a copy-path defect cannot pass silently" claim true as built:
+ * `assertCanonicalStoreFixture` proves the TEMPLATE's content is what the
+ * seeding claims, but it models oid sets in a subset of the tables and reads no
+ * non-oid column — not `git_commit.generation`, not `git_object.content`, not
+ * `git_pack_encoding.data`, not the epochs or bitmaps, which is exactly where a
+ * copy defect would hide. This proof reads all of them. Together: seeding
+ * proven canonical + copy proven faithful ⇒ copy canonical. Suites call it once
+ * per template, on the same first copy the canonical proof runs against.
+ */
+export async function assertTemplateCopyFaithful(
+	sql: Sql,
+	sourceName: string,
+	targetName: string,
+): Promise<void> {
+	const named = await sql<{ id: string; name: string }[]>`
+		select id::text as id, name from repos where name in (${sourceName}, ${targetName})`
+	const source = named.find((row) => row.name === sourceName)
+	const target = named.find((row) => row.name === targetName)
+	if (source === undefined) {
+		throw new Error(`template repo ${JSON.stringify(sourceName)} does not exist`)
+	}
+	if (target === undefined) {
+		throw new Error(`copied repo ${JSON.stringify(targetName)} does not exist`)
+	}
+
+	const mismatches: string[] = []
+	const [watermarks] = await sql<{ same: boolean }[]>`
+		select (s.last_pushed_at is not distinct from t.last_pushed_at
+			and s.last_gc_at is not distinct from t.last_gc_at
+			and s.last_repack_at is not distinct from t.last_repack_at) as same
+		from repos s, repos t
+		where s.id = ${source.id}::bigint and t.id = ${target.id}::bigint`
+	if (watermarks === undefined || !watermarks.same) {
+		mismatches.push("repos: watermark columns differ")
+	}
+	for (const { columns, table } of COPIED_TABLES) {
+		const cols = sql.unsafe(columns.join(", "))
+		const digestOf = async (repoId: string) => {
+			const [row] = await sql<{ digest: string | null; n: number }[]>`
+				select count(*)::int as n, md5(string_agg(h, '' order by h)) as digest
+				from (
+					select md5(row(${cols})::text) as h
+					from ${sql(table)} where repo_id = ${repoId}::bigint
+				) hashed`
+			if (row === undefined) throw new Error(`${table}: digest query returned no row`)
+			return row
+		}
+		const templateSide = await digestOf(source.id)
+		const copySide = await digestOf(target.id)
+		if (templateSide.n !== copySide.n || templateSide.digest !== copySide.digest) {
+			mismatches.push(
+				`${table}: template ${templateSide.n} row(s) digest ${templateSide.digest} vs copy ${copySide.n} row(s) digest ${copySide.digest}`,
+			)
+		}
+	}
+	if (mismatches.length > 0) {
+		throw new Error(
+			`copy ${JSON.stringify(targetName)} diverges from template ${JSON.stringify(sourceName)}: ${mismatches.join("; ")}`,
+		)
+	}
+}

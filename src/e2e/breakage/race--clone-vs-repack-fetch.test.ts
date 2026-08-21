@@ -55,7 +55,7 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { copyTemplateRepo } from "@/testing/template-repo"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
 const ITERS = 12
 const RUNS = 600
@@ -157,6 +157,7 @@ describe("race — repack committing mid-incremental-fetch", () => {
 				{ kind: "symbolic", name: "HEAD", target: head },
 			],
 		})
+		await assertTemplateCopyFaithful(db.sql, TEMPLATE, proof)
 
 		// Calibrate: one un-raced incremental fetch of the same shape the raced
 		// iterations run, timed wall-to-wall. The raced delays are fractions of
@@ -181,6 +182,10 @@ describe("race — repack committing mid-incremental-fetch", () => {
 
 	it("an incremental fetch raced by a repack lands complete and fsck-clean", async () => {
 		const breaks: string[] = []
+		// Overlap telemetry — recorded, not asserted: whether each iteration's
+		// repack ran inside the serve it races ("in"), spilled past its end
+		// ("straddle"), or started after the serve finished ("late", a wasted arm).
+		const overlaps = { in: 0, late: 0, straddle: 0 }
 
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const fraction = DELAY_FRACTIONS[i % DELAY_FRACTIONS.length] as number
@@ -199,12 +204,28 @@ describe("race — repack committing mid-incremental-fetch", () => {
 				// haves) while the server is already advanced; race it against a repack.
 				cpSync(fetchClientBase, dest, { recursive: true })
 				await spawnGit(["remote", "set-url", "origin", url], { cwd: dest })
+				const raceStart = Date.now()
+				let serveSettleMs = 0
+				let racerSettleMs = 0
 				const settled = await Promise.allSettled([
 					spawnGit(["-c", "protocol.version=2", "fetch", "-q", "origin"], {
 						cwd: dest,
+					}).finally(() => {
+						serveSettleMs = Date.now() - raceStart
 					}),
-					sleep(delay).then(() => repack.repack(repo)),
+					sleep(delay)
+						.then(() => repack.repack(repo))
+						.finally(() => {
+							racerSettleMs = Date.now() - raceStart
+						}),
 				])
+				overlaps[
+					delay >= serveSettleMs
+						? "late"
+						: racerSettleMs <= serveSettleMs
+							? "in"
+							: "straddle"
+				]++
 				for (const s of settled) {
 					if (s.status === "rejected") problems.push(`${s.reason}`)
 				}
@@ -230,6 +251,9 @@ describe("race — repack committing mid-incremental-fetch", () => {
 			rmSync(dest, { force: true, recursive: true })
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): repack vs incremental-fetch serve — in=${overlaps.in} straddle=${overlaps.straddle} late=${overlaps.late}`,
+		)
 		expect(breaks).toEqual([])
 	}, 1_800_000)
 })

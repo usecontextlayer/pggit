@@ -56,7 +56,7 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
-import { copyTemplateRepo } from "@/testing/template-repo"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
 const ITERS = 12
 const RUNS = 600
@@ -144,6 +144,7 @@ describe("race — repack committing mid-clone (half-repacked repo)", () => {
 				{ kind: "symbolic", name: "HEAD", target: head },
 			],
 		})
+		await assertTemplateCopyFaithful(db.sql, TEMPLATE, proof)
 
 		// Calibrate: one un-raced clone of the template state, timed wall-to-wall.
 		// The raced delays are fractions of this measurement.
@@ -168,6 +169,10 @@ describe("race — repack committing mid-clone (half-repacked repo)", () => {
 
 	it("a clone of a half-repacked repo raced by a repack lands complete and fsck-clean", async () => {
 		const breaks: string[] = []
+		// Overlap telemetry — recorded, not asserted: whether each iteration's
+		// repack ran inside the serve it races ("in"), spilled past its end
+		// ("straddle"), or started after the serve finished ("late", a wasted arm).
+		const overlaps = { in: 0, late: 0, straddle: 0 }
 
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const fraction = DELAY_FRACTIONS[i % DELAY_FRACTIONS.length] as number
@@ -181,6 +186,9 @@ describe("race — repack committing mid-clone (half-repacked repo)", () => {
 				// Objects, derived rows, encodings and refs all land in one copy.
 				await copyTemplateRepo(db.sql, TEMPLATE, repo)
 
+				const raceStart = Date.now()
+				let serveSettleMs = 0
+				let racerSettleMs = 0
 				const settled = await Promise.allSettled([
 					spawnGit([
 						"-c",
@@ -189,9 +197,22 @@ describe("race — repack committing mid-clone (half-repacked repo)", () => {
 						"-q",
 						repoUrl(server, repo),
 						dest,
-					]),
-					sleep(delay).then(() => repack.repack(repo)),
+					]).finally(() => {
+						serveSettleMs = Date.now() - raceStart
+					}),
+					sleep(delay)
+						.then(() => repack.repack(repo))
+						.finally(() => {
+							racerSettleMs = Date.now() - raceStart
+						}),
 				])
+				overlaps[
+					delay >= serveSettleMs
+						? "late"
+						: racerSettleMs <= serveSettleMs
+							? "in"
+							: "straddle"
+				]++
 				for (const s of settled) {
 					if (s.status === "rejected") problems.push(`${s.reason}`)
 				}
@@ -217,6 +238,9 @@ describe("race — repack committing mid-clone (half-repacked repo)", () => {
 			rmSync(dest, { force: true, recursive: true })
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): repack vs clone serve — in=${overlaps.in} straddle=${overlaps.straddle} late=${overlaps.late}`,
+		)
 		expect(breaks).toEqual([])
 	}, 1_800_000)
 })

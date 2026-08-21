@@ -17,22 +17,38 @@
  * plus `git fsck --strict`, and whether the clone's HEAD still matches the ref.
  *
  * Converted from `breakage/race--concurrent-gc.ts` (`--iters=25 --runs=150
- * --passes=2 --hangms=60000`). Probabilistic — it reproduces roughly 1 iteration
- * in 10–30, so the loop and its count ARE the test and are frozen exactly.
+ * --passes=2 --hangms=60000`). Probabilistic — the ORIGINAL defect reproduced
+ * roughly 1 iteration in 10–30, so unlike the serve-window races the iteration
+ * count here is a measured detection-power budget against a regression of a
+ * specific fixed bug, and it is deliberately NOT trimmed (ruling-5 trims were
+ * applied to the rest of the family; this file holds at 25 until a mutation
+ * experiment — re-introducing the shared-live-set defect and measuring the
+ * catch rate — says a smaller count keeps the pin). The swept pass-stagger IS
+ * calibrated: the source froze absolute milliseconds ([0..70]ms), which tie
+ * the overlap shapes to one machine's gc speed; each run instead times one
+ * un-raced pass and sweeps the second pass's start across FRACTIONS of that
+ * measured wall. The per-iteration pre-race state (full history, tier built,
+ * every object reachable) is COPIED from a template proven canonical AND
+ * byte-faithful on its first copy.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import type { PackInputObject } from "@/pack/write-pack"
+import { parseOid } from "@/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc, type GcResult } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
+	loadReachableObjects,
+	repackEligibleObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -40,10 +56,17 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
 const ITERS = 25
 const RUNS = 150
 const PASSES = 2
+const TEMPLATE = "race/gcgc/template"
+/** Where in the measured un-raced pass wall the second pass starts — the same
+ * overlap shapes the source's absolute spread swept, made box-independent. */
+const SPREAD_FRACTIONS = [
+	0, 0.002, 0.004, 0.008, 0.015, 0.025, 0.04, 0.06, 0.09, 0.14,
+] as const
 /** Watchdog: a pass that has not settled in this long is HUNG, not slow — a
  * concurrent round on this fixture completes in well under a second, and an
  * observed hang sat at zero CPU with zero in-flight queries for 25 minutes. */
@@ -62,8 +85,9 @@ describe("race — two concurrent gc() passes on one repo", () => {
 	let repack: Repack
 	let gc: Gc
 	let src = ""
-	let objects: PackInputObject[] = []
+	let objects: GitObjectWithOid[] = []
 	let tip = ""
+	let gcMs = 0
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -79,6 +103,33 @@ describe("race — two concurrent gc() passes on one repo", () => {
 		refs = fixture.deps.refs
 		gc = createGc(db.sql)
 		repack = createRepack(db.sql)
+
+		// Template: full history, tier built, every object reachable from the ref
+		// — the per-iteration pre-race state, built once and copied per iteration.
+		await store.putPack(TEMPLATE, objects)
+		await refs.setRef(TEMPLATE, "refs/heads/main", tip)
+		await refs.setSymref(TEMPLATE, "HEAD", "refs/heads/main")
+		await repack.repack(TEMPLATE)
+		const proof = `${TEMPLATE}/copy-proof`
+		await copyTemplateRepo(db.sql, TEMPLATE, proof)
+		await assertCanonicalStoreFixture(db.sql, proof, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+			objects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: parseOid(tip) },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
+		await assertTemplateCopyFaithful(db.sql, TEMPLATE, proof)
+
+		// Calibrate: one un-raced pass over a copy, timed wall-to-wall — it
+		// deletes nothing (every object is reachable), so it is pure measurement.
+		// The second pass's stagger is a fraction of this.
+		const calRepo = "race/gcgc/cal"
+		await copyTemplateRepo(db.sql, TEMPLATE, calRepo)
+		const calStart = Date.now()
+		await gc.gc(calRepo, { batchLimit: 5, graceSeconds: 0, maintain: false })
+		gcMs = Date.now() - calStart
 	}, 600_000)
 
 	afterAll(async () => {
@@ -92,32 +143,43 @@ describe("race — two concurrent gc() passes on one repo", () => {
 		const breaks: string[] = []
 		const rounds: string[] = []
 		let totalDeleted = 0
+		// Overlap telemetry — recorded, not asserted: iterations where the second
+		// pass started while the first was still running (the collision the pin
+		// exists for).
+		let secondPassOverlapped = 0
 
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const repo = `race/gcgc/${i}`
 			const url = repoUrl(server, repo)
-			await store.putPack(repo, objects)
-			await refs.setRef(repo, "refs/heads/main", tip)
-			await refs.setSymref(repo, "HEAD", "refs/heads/main")
-			await repack.repack(repo)
+			// Pre-race state in one copy: full history, tier built, all reachable.
+			await copyTemplateRepo(db.sql, TEMPLATE, repo)
 
-			const spread = [0, 1, 2, 4, 8, 12, 20, 30, 45, 70][i % 10] as number
+			const fraction = SPREAD_FRACTIONS[i % SPREAD_FRACTIONS.length] as number
+			const spread = Math.round(fraction * gcMs)
 			const HUNG = Symbol("hung")
+			const raceStart = Date.now()
+			const passSettleMs: number[] = []
 			const settled = await Promise.all(
 				Array.from({ length: PASSES }, (_, k) =>
 					Promise.race([
-						sleep(k * spread).then(() =>
-							// batchLimit 5 ⇒ many short sweep transactions ⇒ a long window in
-							// which the sibling pass's truncate/drop can land mid-sweep.
-							gc
-								.gc(repo, { batchLimit: 5, graceSeconds: 0, maintain: false })
-								.then((v) => ({ ok: true as const, v }))
-								.catch((e) => ({ e, ok: false as const })),
-						),
+						sleep(k * spread)
+							.then(() =>
+								// batchLimit 5 ⇒ many short sweep transactions ⇒ a long window in
+								// which the sibling pass's truncate/drop can land mid-sweep.
+								gc
+									.gc(repo, { batchLimit: 5, graceSeconds: 0, maintain: false })
+									.then((v) => ({ ok: true as const, v }))
+									.catch((e) => ({ e, ok: false as const })),
+							)
+							.finally(() => {
+								passSettleMs[k] = Date.now() - raceStart
+							}),
 						sleep(HANG_MS).then(() => HUNG),
 					]),
 				),
 			)
+			const firstSettle = passSettleMs[0]
+			if (firstSettle !== undefined && spread < firstSettle) secondPassOverlapped++
 			const hung = settled.filter((s) => s === HUNG).length
 			const results = settled.filter((s) => s !== HUNG) as PassOutcome[]
 			const deleted = results
@@ -154,6 +216,9 @@ describe("race — two concurrent gc() passes on one repo", () => {
 			}
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): second gc pass started inside the first pass's window in ${secondPassOverlapped}/${ITERS} iterations`,
+		)
 		expect(breaks, rounds.join("\n")).toEqual([])
 		// The sharper form of the same property: across every iteration, a GC over a
 		// fully reachable repo must destroy nothing at all.

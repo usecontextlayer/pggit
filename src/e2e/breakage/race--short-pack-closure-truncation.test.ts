@@ -171,6 +171,11 @@ describe("race — a truncated want-closure serving a short pack", () => {
 	it("never serves a short pack: a fetch racing gc + a re-inserting writer stays sound", async () => {
 		const breaks: string[] = []
 		const verdicts: string[] = []
+		// Overlap telemetry — recorded, not asserted: whether each iteration's gc
+		// ran inside the fetch serve it races ("in"), spilled past it ("straddle"),
+		// or started after the serve finished ("late", a wasted arm). The
+		// resurrector overlaps by construction and is not tracked.
+		const overlaps = { in: 0, late: 0, straddle: 0 }
 
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const repo = `race/short/${i}`
@@ -199,16 +204,27 @@ describe("race — a truncated want-closure serving a short pack", () => {
 			})()
 
 			let fetchErr: unknown
+			const raceStart = Date.now()
+			let serveSettleMs = 0
+			let racerSettleMs = 0
 			const fetchP = spawnGit(["-c", "protocol.version=2", "fetch", "-q", url, tip], {
 				cwd: dest,
-			}).catch((e) => {
-				fetchErr = e
 			})
-			const gcP = sleep(delay).then(() =>
-				gc
-					.gc(repo, { batchLimit: 15, graceSeconds: 0, maintain: false })
-					.catch(() => undefined),
-			)
+				.catch((e) => {
+					fetchErr = e
+				})
+				.finally(() => {
+					serveSettleMs = Date.now() - raceStart
+				})
+			const gcP = sleep(delay)
+				.then(() =>
+					gc
+						.gc(repo, { batchLimit: 15, graceSeconds: 0, maintain: false })
+						.catch(() => undefined),
+				)
+				.finally(() => {
+					racerSettleMs = Date.now() - raceStart
+				})
 			// The resurrector races the FETCH's presence checks; it must stop when
 			// the fetch settles, NOT when gc does — a zero-grace sweep can never
 			// drain while the resurrector keeps re-inserting what it just deleted,
@@ -218,6 +234,13 @@ describe("race — a truncated want-closure serving a short pack", () => {
 			stop = true
 			await resurrect
 			await gcP
+			overlaps[
+				delay >= serveSettleMs
+					? "late"
+					: racerSettleMs <= serveSettleMs
+						? "in"
+						: "straddle"
+			]++
 
 			let verdict: Verdict
 			let detail = ""
@@ -242,6 +265,9 @@ describe("race — a truncated want-closure serving a short pack", () => {
 			}
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): gc vs fetch serve — in=${overlaps.in} straddle=${overlaps.straddle} late=${overlaps.late}`,
+		)
 		expect(breaks, verdicts.join("\n")).toEqual([])
 	}, 1_800_000)
 })

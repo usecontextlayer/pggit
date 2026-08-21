@@ -19,8 +19,18 @@
  * longer exist (a permanently unclonable repo).
  *
  * Converted from `breakage/race--deleterepo.ts` (`--iters=20 --runs=120`).
- * Probabilistic: the iteration count, the three modes and the swept delete-start
- * delays are frozen exactly as the script ran them.
+ * Probabilistic. The swept delete-start delays are NOT the source's: it froze
+ * one absolute-millisecond table ([0..120]ms) across three actors whose walls
+ * differ by multiples, so on any box the delete crowded into each actor's head
+ * and never raced its later phases. Each run instead times one un-raced
+ * instance of EACH actor (a clone, a repack, a push) and sweeps the delete
+ * across FRACTIONS of that actor's own measured wall (0–97%), so the arms land
+ * across the whole operation per mode. That calibration is also why 12
+ * iterations carry the coverage the source spread over 20 (ruling 5,
+ * docs/2026-08-20-test-efficiency.md). The per-round pre-race state is COPIED
+ * from one of two templates — encoded tier for the clone/push modes, raw for
+ * the repack mode, whose raced actor builds the tier itself; both templates'
+ * first copies are proven canonical AND byte-faithful.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -28,17 +38,36 @@ import { join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps, type GitDeps } from "@/index"
-import type { PackInputObject } from "@/pack/write-pack"
+import { parseOid } from "@/oid"
 import { type GitServer, serveOnPort } from "@/server"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
+	loadReachableObjects,
+	repackEligibleObjects,
+} from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
-const ITERS = 20
+const ITERS = 12
 const RUNS = 120
 const MODES = ["clone", "repack", "push"] as const
+type Mode = (typeof MODES)[number]
+/** Encoded tier for the clone/push modes; raw for repack mode, whose raced
+ * actor builds the tier itself. */
+const TEMPLATE: Record<Mode, string> = {
+	clone: "race/delrepo/template/encoded",
+	push: "race/delrepo/template/encoded",
+	repack: "race/delrepo/template/raw",
+}
+/** Where in the mode's own measured un-raced wall each iteration's delete
+ * lands: the cascade can strike any phase, so the sweep spans the whole op. */
+const DELAY_FRACTIONS = [
+	0, 0.03, 0.08, 0.15, 0.22, 0.3, 0.4, 0.5, 0.6, 0.72, 0.85, 0.97,
+] as const
 
 const msg = (e: unknown) =>
 	(e instanceof Error ? e.message : String(e)).split("\n")[0] ?? ""
@@ -50,8 +79,9 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 	let repack: Repack
 	let src = ""
 	let client = ""
-	let objects: PackInputObject[] = []
+	let objects: GitObjectWithOid[] = []
 	let tip = ""
+	const calMs: Record<Mode, number> = { clone: 0, push: 0, repack: 0 }
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -67,6 +97,74 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 		deps = createGitDeps(db.sql)
 		repack = createRepack(db.sql)
 		server = await serveOnPort(createGitApp(deps), 0)
+
+		// Two templates: the per-round pre-race states, built once, copied per
+		// round. Encoded for clone/push modes; raw for repack mode.
+		await deps.objects.putPack(TEMPLATE.repack, objects)
+		await deps.refs.setRef(TEMPLATE.repack, "refs/heads/main", tip)
+		await deps.refs.setSymref(TEMPLATE.repack, "HEAD", "refs/heads/main")
+		await deps.objects.putPack(TEMPLATE.clone, objects)
+		await deps.refs.setRef(TEMPLATE.clone, "refs/heads/main", tip)
+		await deps.refs.setSymref(TEMPLATE.clone, "HEAD", "refs/heads/main")
+		await repack.repack(TEMPLATE.clone)
+		const refsAtTip = [
+			{ kind: "direct" as const, name: "refs/heads/main", oid: parseOid(tip) },
+			{ kind: "symbolic" as const, name: "HEAD", target: "refs/heads/main" },
+		]
+		for (const [template, encodings] of [
+			[TEMPLATE.repack, { kind: "exact", objects: [] }],
+			[TEMPLATE.clone, { kind: "exact", objects: repackEligibleObjects(objects) }],
+		] as const) {
+			const proof = `${template}/copy-proof`
+			await copyTemplateRepo(db.sql, template, proof)
+			await assertCanonicalStoreFixture(db.sql, proof, {
+				encodings,
+				objects,
+				refs: refsAtTip,
+			})
+			await assertTemplateCopyFaithful(db.sql, template, proof)
+		}
+
+		// Calibrate each raced actor once, un-raced, timed wall-to-wall: the
+		// delete's swept delays are fractions of the actor's OWN wall.
+		const calClone = "race/delrepo/cal/clone"
+		await copyTemplateRepo(db.sql, TEMPLATE.clone, calClone)
+		const calCloneDest = join(mkdtempSync(join(tmpdir(), "delrepo-cal-")), "c")
+		scratch.push(calCloneDest)
+		let calStart = Date.now()
+		await spawnGit([
+			"-c",
+			"protocol.version=2",
+			"clone",
+			"-q",
+			`http://127.0.0.1:${server.port}/${calClone}`,
+			calCloneDest,
+		])
+		calMs.clone = Date.now() - calStart
+
+		const calRepack = "race/delrepo/cal/repack"
+		await copyTemplateRepo(db.sql, TEMPLATE.repack, calRepack)
+		calStart = Date.now()
+		await repack.repack(calRepack)
+		calMs.repack = Date.now() - calStart
+
+		const calPush = "race/delrepo/cal/push"
+		await copyTemplateRepo(db.sql, TEMPLATE.clone, calPush)
+		await spawnGit(["reset", "-q", "--hard", tip], { cwd: client })
+		writeFileSync(join(client, "del.txt"), "cal\n")
+		await spawnGit(["add", "del.txt"], { cwd: client })
+		await spawnGit(["commit", "-q", "-m", "cal"], { cwd: client })
+		calStart = Date.now()
+		await spawnGit(
+			[
+				"push",
+				"-q",
+				`http://127.0.0.1:${server.port}/${calPush}`,
+				"HEAD:refs/heads/main",
+			],
+			{ cwd: client },
+		)
+		calMs.push = Date.now() - calStart
 	}, 600_000)
 
 	afterAll(async () => {
@@ -81,31 +179,45 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 		const bump = (k: string) => {
 			tally[k] = (tally[k] ?? 0) + 1
 		}
+		// Overlap telemetry — recorded, not asserted: whether each round's delete
+		// landed inside the raced actor's window ("in"), spilled past it
+		// ("straddle"), or fired after the actor finished ("late", a wasted arm).
+		const overlaps = { in: 0, late: 0, straddle: 0 }
 
 		outer: for (let i = 0; i < ITERS; i++) {
 			for (const mode of MODES) {
 				const repo = `race/delrepo/${mode}/${i}`
 				const url = `http://127.0.0.1:${server.port}/${repo}`
-				await deps.objects.putPack(repo, objects)
-				await deps.refs.setRef(repo, "refs/heads/main", tip)
-				await deps.refs.setSymref(repo, "HEAD", "refs/heads/main")
-				if (mode !== "repack") await repack.repack(repo)
+				// Pre-race state in one copy of the mode's template.
+				await copyTemplateRepo(db.sql, TEMPLATE[mode], repo)
 
-				const delay = [0, 2, 5, 10, 20, 40, 70, 120][i % 8] as number
+				const fraction = DELAY_FRACTIONS[i % DELAY_FRACTIONS.length] as number
+				const delay = Math.round(fraction * calMs[mode])
 				const dest = join(mkdtempSync(join(tmpdir(), `delrepo-${mode}-`)), "c")
 				scratch.push(dest)
 				const problems: string[] = []
 				let actorErr: unknown
 				let repackErr: unknown
+				const raceStart = Date.now()
+				let actorSettleMs = 0
+				let deleteSettleMs = 0
+				const timedDelete = () =>
+					sleep(delay)
+						.then(() => deps.admin.deleteRepo(repo))
+						.finally(() => {
+							deleteSettleMs = Date.now() - raceStart
+						})
 
 				if (mode === "clone") {
 					await Promise.allSettled([
-						spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest]).catch(
-							(e) => {
+						spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
+							.catch((e) => {
 								actorErr = e
-							},
-						),
-						sleep(delay).then(() => deps.admin.deleteRepo(repo)),
+							})
+							.finally(() => {
+								actorSettleMs = Date.now() - raceStart
+							}),
+						timedDelete(),
 					])
 					if (actorErr === undefined) {
 						// An EMPTY clone is not a race defect: pggit treats an unknown repo
@@ -134,10 +246,15 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 					}
 				} else if (mode === "repack") {
 					await Promise.allSettled([
-						repack.repack(repo).catch((e) => {
-							repackErr = e
-						}),
-						sleep(delay).then(() => deps.admin.deleteRepo(repo)),
+						repack
+							.repack(repo)
+							.catch((e) => {
+								repackErr = e
+							})
+							.finally(() => {
+								actorSettleMs = Date.now() - raceStart
+							}),
+						timedDelete(),
 					])
 					bump(
 						`repack ${repackErr === undefined ? "ok" : `err(${msg(repackErr).slice(0, 60)})`}`,
@@ -177,12 +294,14 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 						await spawnGit(["rev-parse", "HEAD"], { cwd: client })
 					).stdout.trim()
 					await Promise.allSettled([
-						spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd: client }).catch(
-							(e) => {
+						spawnGit(["push", "-q", url, "HEAD:refs/heads/main"], { cwd: client })
+							.catch((e) => {
 								actorErr = e
-							},
-						),
-						sleep(delay).then(() => deps.admin.deleteRepo(repo)),
+							})
+							.finally(() => {
+								actorSettleMs = Date.now() - raceStart
+							}),
+						timedDelete(),
 					])
 					if (actorErr === undefined) {
 						// git said the push succeeded. Either the repo is gone entirely
@@ -205,6 +324,13 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 					bump(`push ${actorErr === undefined ? "ok" : "err"}`)
 				}
 
+				overlaps[
+					delay >= actorSettleMs
+						? "late"
+						: deleteSettleMs <= actorSettleMs
+							? "in"
+							: "straddle"
+				]++
 				rmSync(dest, { force: true, recursive: true })
 				if (problems.length > 0) {
 					breaks.push(
@@ -215,6 +341,9 @@ describe("race — admin.deleteRepo() against a clone / repack / push in flight"
 			}
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): delete vs raced actor — in=${overlaps.in} straddle=${overlaps.straddle} late=${overlaps.late}`,
+		)
 		expect(breaks, JSON.stringify(tally, null, 2)).toEqual([])
 		// A run in which the delete always won is not a pass: the soundness checks
 		// above only bite on a clone that actually served something.

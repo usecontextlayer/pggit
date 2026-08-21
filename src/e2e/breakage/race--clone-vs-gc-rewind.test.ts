@@ -24,22 +24,37 @@
  * corrupt result for this race).
  *
  * Converted from `breakage/race--clone-vs-gc-rewind.ts` (`--iters=40 --runs=150
- * --rewind=60`). Probabilistic: the iteration count and the swept gc-start delays
- * are frozen exactly as the script ran them.
+ * --rewind=60`). Probabilistic. The swept gc-start delays are NOT the source's:
+ * it froze absolute milliseconds ([0..45]ms), which tie the race to one
+ * machine's serve speed. Each run instead times one un-raced fetch of the same
+ * shape and sweeps the gc start across FRACTIONS of that measured wall — dense
+ * in the serve's opening phase where the batch-by-batch deletion has to get
+ * ahead of the walk, plus two TAIL arms (0.5, 1.1) that land the gc late or
+ * after the serve, so the "some fetches must complete" floor below stays
+ * reachable on any box under any load. That calibration is also why 12
+ * iterations carry the coverage the source spread over 40 (ruling 5,
+ * docs/2026-08-20-test-efficiency.md). The per-iteration pre-race state (full
+ * history, tier built, ref rewound) is assembled by COPYING a template repo's
+ * rows; the template's first copy is proven canonical AND byte-faithful.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import type { PackInputObject } from "@/pack/write-pack"
+import { parseOid } from "@/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { loadReachableObjects } from "@/testing/git-fixtures"
+import {
+	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
+	loadReachableObjects,
+	repackEligibleObjects,
+} from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -47,13 +62,21 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { assertTemplateCopyFaithful, copyTemplateRepo } from "@/testing/template-repo"
 
-const ITERS = 40
+const ITERS = 12
 const RUNS = 150
 /** How far back the ref is rewound — the size of the orphaned span GC eats. */
 const REWIND = 60
 /** Oracle rounds against the plain `file://` bare remote. */
 const ORACLE_ROUNDS = 6
+const TEMPLATE = "race/gc-rewind/template"
+/** Where in the measured un-raced fetch wall each iteration's gc starts: dense
+ * across the opening phase (the hunt), with two tail arms that keep complete
+ * fetches — the anti-vacuousness floor — reachable on any box. */
+const DELAY_FRACTIONS = [
+	0, 0.002, 0.005, 0.01, 0.02, 0.035, 0.05, 0.08, 0.12, 0.2, 0.5, 1.1,
+] as const
 
 type Verdict = "OK" | "PROTO" | "HTTP500" | "CORRUPT" | "OTHER"
 
@@ -94,9 +117,10 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 	let repack: Repack
 	let gc: Gc
 	let src = ""
-	let objects: PackInputObject[] = []
+	let objects: GitObjectWithOid[] = []
 	let tip = ""
 	let rewindTo = ""
+	let fetchMs = 0
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -114,6 +138,39 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 		refs = fixture.deps.refs
 		repack = createRepack(db.sql)
 		gc = createGc(db.sql)
+
+		// Template: full history seeded, delta tier live, ref rewound through the
+		// public surface — the per-iteration pre-race state, built once.
+		await store.putPack(TEMPLATE, objects)
+		await refs.setRef(TEMPLATE, "refs/heads/main", tip)
+		await refs.setSymref(TEMPLATE, "HEAD", "refs/heads/main")
+		await repack.repack(TEMPLATE)
+		await refs.setRef(TEMPLATE, "refs/heads/main", rewindTo)
+		const proof = `${TEMPLATE}/copy-proof`
+		await copyTemplateRepo(db.sql, TEMPLATE, proof)
+		await assertCanonicalStoreFixture(db.sql, proof, {
+			encodings: { kind: "exact", objects: repackEligibleObjects(objects) },
+			objects,
+			refs: [
+				{ kind: "direct", name: "refs/heads/main", oid: parseOid(rewindTo) },
+				{ kind: "symbolic", name: "HEAD", target: "refs/heads/main" },
+			],
+		})
+		await assertTemplateCopyFaithful(db.sql, TEMPLATE, proof)
+
+		// Calibrate: one un-raced fetch of the exact per-iteration shape, timed
+		// wall-to-wall. The raced gc delays are fractions of this.
+		const calRepo = "race/gc-rewind/cal"
+		await copyTemplateRepo(db.sql, TEMPLATE, calRepo)
+		const calDest = join(mkdtempSync(join(tmpdir(), "gcrew-cal-")), "c")
+		scratch.push(calDest)
+		await spawnGit(["init", "-q", "-b", "main", calDest])
+		const calStart = Date.now()
+		await spawnGit(
+			["-c", "protocol.version=2", "fetch", "-q", repoUrl(server, calRepo), tip],
+			{ cwd: calDest },
+		)
+		fetchMs = Date.now() - calStart
 	}, 600_000)
 
 	afterAll(async () => {
@@ -170,36 +227,53 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 	it("pggit: a fetch git reported as successful is never CORRUPT", async () => {
 		const breaks: string[] = []
 		const verdicts: string[] = []
+		// Overlap telemetry — recorded, not asserted: whether each iteration's gc
+		// ran inside the fetch serve it races ("in"), spilled past it ("straddle"),
+		// or started after the serve finished ("late" — the two tail arms are
+		// EXPECTED to land here; they exist for the completed-fetch floor).
+		const overlaps = { in: 0, late: 0, straddle: 0 }
 
 		for (let i = 0; i < ITERS && breaks.length === 0; i++) {
 			const repo = `race/gc-rewind/${i}`
-			await store.putPack(repo, objects)
-			await refs.setRef(repo, "refs/heads/main", tip)
-			await refs.setSymref(repo, "HEAD", "refs/heads/main")
-			await repack.repack(repo) // the delta tier is live for this race
-
-			// Rewind through the PUBLIC ref surface, exactly how the platform does it.
-			await refs.setRef(repo, "refs/heads/main", rewindTo)
+			// Pre-race state in one copy: full history, live tier, rewound ref.
+			await copyTemplateRepo(db.sql, TEMPLATE, repo)
 
 			const dest = join(mkdtempSync(join(tmpdir(), "gcrew-dest-")), "c")
 			scratch.push(dest)
 			await spawnGit(["init", "-q", "-b", "main", dest])
 			const url = repoUrl(server, repo)
-			const delay = [0, 1, 2, 4, 7, 11, 16, 22, 30, 45][i % 10] as number
+			const fraction = DELAY_FRACTIONS[i % DELAY_FRACTIONS.length] as number
+			const delay = Math.round(fraction * fetchMs)
 
 			let fetchErr: unknown
+			const raceStart = Date.now()
+			let serveSettleMs = 0
+			let racerSettleMs = 0
 			await Promise.allSettled([
 				spawnGit(["-c", "protocol.version=2", "fetch", "-q", url, tip], {
 					cwd: dest,
-				}).catch((e) => {
-					fetchErr = e
-				}),
+				})
+					.catch((e) => {
+						fetchErr = e
+					})
+					.finally(() => {
+						serveSettleMs = Date.now() - raceStart
+					}),
 				// Small batchLimit ⇒ many short sweep transactions ⇒ the deletion is
 				// spread across the whole serve, not one atomic instant.
-				sleep(delay).then(() =>
-					gc.gc(repo, { batchLimit: 25, graceSeconds: 0, maintain: false }),
-				),
+				sleep(delay)
+					.then(() => gc.gc(repo, { batchLimit: 25, graceSeconds: 0, maintain: false }))
+					.finally(() => {
+						racerSettleMs = Date.now() - raceStart
+					}),
 			])
+			overlaps[
+				delay >= serveSettleMs
+					? "late"
+					: racerSettleMs <= serveSettleMs
+						? "in"
+						: "straddle"
+			]++
 
 			const { verdict, detail } = await classify(dest, tip, fetchErr)
 			verdicts.push(`iter ${i} gcAt=+${delay}ms ${verdict}`)
@@ -209,6 +283,9 @@ describe("race — fetch of a rewound tip vs gc(graceSeconds: 0)", () => {
 			}
 		}
 
+		console.log(
+			`overlap telemetry (recorded, not asserted): gc vs fetch serve — in=${overlaps.in} straddle=${overlaps.straddle} late=${overlaps.late}`,
+		)
 		expect(breaks, verdicts.join("\n")).toEqual([])
 		// Only CORRUPT is a break, so a server that 500'd or refused every raced
 		// fetch passes this test having served nothing. Require some to succeed.
