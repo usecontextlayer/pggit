@@ -27,7 +27,7 @@
  * The oracle is `applyDelta`, and it is NOT self-referential: `applyDelta` is already
  * pinned against GIT-PRODUCED deltas in `read-pack.test.ts`, so it is an independently
  * grounded reader. Real git accepting our output is a separate layer
- * (`encode-delta-oracle.test.ts`); real repositories are a third (`perf/delta-corpus.ts`).
+ * (`encode-delta-oracle.test.ts`); real repositories are a third (`perf/probes/delta-corpus.ts`).
  */
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"

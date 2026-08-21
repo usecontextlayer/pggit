@@ -24,7 +24,7 @@
  * design — coverage is only owed once a pass finishes.
  *
  * The cost of I6 failing — what a customer pays in permanent clone bytes for a
- * crash they never saw — is measured by `perf/breakage/txn--interrupted-repack-cost.ts`.
+ * crash they never saw — is measured by `perf/probes/txn/interrupted-repack-cost.ts`.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

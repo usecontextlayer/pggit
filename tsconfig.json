@@ -16,7 +16,8 @@
 		"noUnusedParameters": true,
 		"outDir": "dist-types",
 		"paths": {
-			"@/*": ["./src/*"]
+			"@/*": ["./src/*"],
+			"@perf/*": ["./perf/*"]
 		},
 		"resolveJsonModule": true,
 		"skipLibCheck": true,

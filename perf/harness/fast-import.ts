@@ -1,0 +1,88 @@
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { mulberry32, type Scenario } from "@perf/harness/scenarios"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
+import { spawnGit } from "@/testing/spawn-git"
+
+/** Deterministic path for file `i`: `pathDepth` dirs of `treeWidth` fanout. */
+function filePath(i: number, s: Scenario): string {
+	const parts: string[] = []
+	let n = i
+	for (let d = 0; d < s.pathDepth; d++) {
+		parts.push(`d${n % s.treeWidth}`)
+		n = Math.floor(n / s.treeWidth)
+	}
+	parts.push(`f${i}.md`)
+	return parts.join("/")
+}
+
+/** Printable-ASCII blob of a random in-range length (ASCII ⇒ byteLength === length). */
+function blobContent(salt: string, s: Scenario, rnd: () => number): string {
+	const len = s.blobMinBytes + Math.floor(rnd() * (s.blobMaxBytes - s.blobMinBytes + 1))
+	let str = `# ${salt}\n`
+	while (str.length < len) str += String.fromCharCode(32 + Math.floor(rnd() * 95))
+	return str.slice(0, len)
+}
+
+/** Build a git fast-import stream for the scenario (one initial commit + churn). */
+function buildStream(s: Scenario, rnd: () => number): string {
+	const out: string[] = []
+	let mark = 0
+	const nextMark = () => ++mark
+	const blobMark: number[] = []
+
+	const emitBlob = (content: string): number => {
+		const m = nextMark()
+		out.push(`blob\nmark :${m}\ndata ${content.length}\n${content}\n`)
+		return m
+	}
+	type CommitParent = { kind: "root" } | { kind: "child"; mark: number }
+	const emitCommit = (msg: string, parent: CommitParent, changed: number[]): number => {
+		const cm = nextMark()
+		const from = parent.kind === "root" ? "" : `from :${parent.mark}\n`
+		let body = `commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\n${from}`
+		for (const i of changed) body += `M 100644 :${blobMark[i]} ${filePath(i, s)}\n`
+		out.push(body)
+		return cm
+	}
+
+	// Commit 0: every file.
+	const all: number[] = []
+	for (let i = 0; i < s.blobCount; i++) {
+		blobMark[i] = emitBlob(blobContent(`f${i}-v0`, s, rnd))
+		all.push(i)
+	}
+	let prev = emitCommit("c0", { kind: "root" }, all)
+
+	// Commits 1..historyLen-1: churn a deterministic subset (new blob versions).
+	for (let c = 1; c < s.historyLen; c++) {
+		const changed = new Set<number>()
+		while (changed.size < s.churn) {
+			const i = Math.floor(rnd() * s.blobCount)
+			if (changed.has(i)) continue
+			blobMark[i] = emitBlob(blobContent(`f${i}-v${c}`, s, rnd))
+			changed.add(i)
+		}
+		prev = emitCommit(`c${c}`, { kind: "child", mark: prev }, [...changed])
+	}
+
+	// Extra branch aliases exercise advertisement/ref cardinality; identical tips are one negotiation want.
+	for (let r = 0; r < s.refCount; r++) {
+		out.push(`reset refs/heads/branch${r}\nfrom :${prev}\n`)
+	}
+
+	return out.join("")
+}
+
+/**
+ * Generate a real git repo for `scenario` via `git fast-import` and return its
+ * path. Pinned identity/clock + seeded RNG make the object set reproducible.
+ */
+export async function generateRepo(scenario: Scenario, seed: number): Promise<string> {
+	const stream = buildStream(scenario, mulberry32(seed))
+	const dir = mkdtempSync(join(tmpdir(), `pggit-perf-${scenario.name}-`))
+	await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
+	await spawnGit(["fast-import", "--quiet"], { cwd: dir, input: stream })
+	return dir
+}

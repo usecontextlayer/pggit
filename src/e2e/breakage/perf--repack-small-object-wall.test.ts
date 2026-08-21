@@ -17,7 +17,7 @@
  * Black-box: one commit with W tiny files, seeded through `putPack`, then
  * `repack()`. Comparator: `git repack -adf` on the same repo.
  *
- * Routed here rather than to `perf/breakage/` because the probe's only verdict is
+ * Routed here rather than to `perf/probes/` because the probe's only verdict is
  * a correctness one — whether repack throws on a repo `git repack -adf` handles
  * fine. There is no measured threshold to exceed; the wall timings it printed
  * survive as console output beside the assertion.

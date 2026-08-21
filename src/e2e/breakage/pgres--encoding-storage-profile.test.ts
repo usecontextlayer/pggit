@@ -24,7 +24,7 @@
  * on its way to TOAST. The byte numbers are read as evidence for those facts, not
  * as a threshold on cost. The rest of the `pgres--*` lens (churn bloat, GC pass
  * overhead, snapshot hold, pool contention, WAL per repack) prices resources and
- * lives in `perf/breakage/`.
+ * lives in `perf/probes/pgres/`.
  *
  * The source probe EXITED non-zero when: any leaf's `data` column is not
  * `attstorage='e'` (C4 falsified), or observed TOAST bytes for the wide-tree repo

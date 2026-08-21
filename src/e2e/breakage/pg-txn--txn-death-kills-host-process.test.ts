@@ -47,9 +47,9 @@
  * the child's exit status. That indirection is load-bearing and survives the
  * conversion: the crash fires from a `setImmediate`, so nothing in THIS process
  * (no try/catch, no vitest hook) could ever observe it as an assertion — only an
- * exit code can. The child program is emitted next to the harness under
- * `perf/breakage/` (outside `tsconfig.json`'s `include`, so a stray copy can never
- * break `tsc`) and removed in `afterAll`.
+ * exit code can. The child program is emitted at the repo root — outside
+ * `tsconfig.json`'s `include` (`src/**`, `perf/**`, `manage.ts`), so a stray copy
+ * can never break `tsc` — and removed in `afterAll`.
  *
  * The source script exited non-zero when a child died. The patched driver's live
  * contract is that a killed backend fails the request, never the host, so all four
@@ -221,12 +221,7 @@ describe("breakage/pg-txn — a killed backend must not kill the host process", 
 		const packPath = join(root, "push.pack")
 		writeFileSync(packPath, pack)
 
-		childPath = join(
-			REPO_ROOT,
-			"perf",
-			"breakage",
-			`_pg-txn-death-child-${randomUUID()}.ts`,
-		)
+		childPath = join(REPO_ROOT, `_pg-txn-death-child-${randomUUID()}.ts`)
 		writeFileSync(childPath, CHILD_SOURCE)
 
 		for (const mode of MODES) {

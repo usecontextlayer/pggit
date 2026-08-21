@@ -1,4 +1,3 @@
-import { describe, expect, it } from "vitest"
 import {
 	type MemoryBreakdown,
 	median,
@@ -6,7 +5,8 @@ import {
 	peakPerField,
 	percentile,
 	requireSamples,
-} from "./memory"
+} from "@perf/memory"
+import { describe, expect, it } from "vitest"
 
 describe("peakOf", () => {
 	it("returns the maximum value", () => {

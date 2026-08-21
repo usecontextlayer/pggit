@@ -1,11 +1,11 @@
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
+import { integerArg, nonemptyStringArg, parseArgs } from "@perf/args"
+import { runScenario } from "@perf/harness/harness"
+import type { RttMode } from "@perf/harness/pg-latency"
+import { printSummary, writeReport } from "@perf/harness/report"
+import { SCENARIOS } from "@perf/harness/scenarios"
 import { z } from "zod"
-import { integerArg, nonemptyStringArg, parseArgs } from "./args"
-import { runScenario } from "./harness"
-import type { RttMode } from "./pg-latency"
-import { printSummary, writeReport } from "./report"
-import { SCENARIOS } from "./scenarios"
 
 const argsSchema = z
 	.object({

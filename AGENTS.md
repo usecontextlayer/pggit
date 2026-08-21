@@ -9,8 +9,8 @@ workspace). It mirrors the `@usecontextlayer/` engineering conventions:
 - tsdown owns the shipped build (`dist/*.mjs` + `dist/*.d.mts`); `tsc -b` is the
   typecheck-only pass (emits to `dist-types/`).
 - Vitest for tests, with the `*.test.ts` / `*.node.integration.test.ts` taxonomy.
-- ESM only (`"type": "module"`), `@/*` → `./src/*` import alias, Zod-validated
-  `src/env.ts` singleton, errors must be loud (no silent fallbacks).
+- ESM only (`"type": "module"`), Zod-validated `src/env.ts` singleton, errors must be loud (no silent fallbacks).
+- Alias imports EVERYWHERE: `@/*` → `./src/*` and `@perf/*` → `./perf/*`. No relative imports (`./` or `../`) in authored code, in any tree. The one exception is `src/database/models/**` — Kanel-generated (`manage.ts codegen`), which emits relative imports; those files are generator-owned artifacts, never hand-edited.
 - General-engineering discipline from the monorepo AGENTS.md applies: data
   structures first, transform at boundaries / trust types in the core, validate
   at edges, libraries-first, net-negative line delta on bug fixes. The monorepo's
