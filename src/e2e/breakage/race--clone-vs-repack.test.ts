@@ -23,22 +23,29 @@
  * --mode=all`). Probabilistic: the iteration count, the mode sweep and the swept
  * repack-start delays are frozen exactly as the script ran them. The fixture size
  * is load-bearing — the bug needs a served set spanning many 1000-object batches.
+ * Each iteration's pre-race state is now assembled by COPYING a template repo's
+ * rows instead of re-seeding it through `putPack`, because that fixture assembly —
+ * not the raced operation — was 28% of the whole gate's wall time
+ * (docs/2026-08-20-test-efficiency.md, lever 1(a)); the states themselves are
+ * unchanged, and each template's first copy is proven against the canonical
+ * object/ref identity its seeding established.
  */
-import { mkdtempSync, rmSync } from "node:fs"
+import { cpSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import type { PackInputObject } from "@/pack/write-pack"
 import type { GitServer } from "@/server"
-import type { ObjectStore } from "@/store/object-store"
-import type { RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
 	allObjectOids,
+	assertCanonicalStoreFixture,
 	branchAndTagRefsOf,
+	type CanonicalStoreFixture,
+	type CanonicalStoreRef,
 	loadReachableObjects,
+	repackEligibleObjects,
 } from "@/testing/git-fixtures"
 import {
 	repoUrl,
@@ -47,25 +54,30 @@ import {
 } from "@/testing/git-server-fixture"
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
+import { copyTemplateRepo } from "@/testing/template-repo"
 
 const ITERS = 30
 const RUNS = 1200
 const MODES = ["clone", "half", "fetch"] as const
 
+/** The pre-race server state each mode races against — seeded ONCE, copied per
+ * iteration. `half` and `fetch` race the SAME server state (the tier covers the
+ * old history while the new history is still pending) and differ only in what the
+ * client already holds, so they share one template. */
+const TEMPLATE = {
+	clone: "race/clone-repack/template/full-raw",
+	fetch: "race/clone-repack/template/half",
+	half: "race/clone-repack/template/half",
+} as const
+
 describe("race — repack committing mid-clone / mid-fetch", () => {
 	let db: IsolatedDb
 	let server: GitServer
-	let store: ObjectStore
-	let refs: RefStore
 	let repack: Repack
-	let srcBase = ""
-	let src = ""
-	let baseObjects: PackInputObject[] = []
-	let fullObjects: PackInputObject[] = []
-	let baseRefs: { name: string; oid: string }[] = []
-	let fullRefs: { name: string; oid: string }[] = []
 	let srcOidsFull: string[] = []
-	let head = ""
+	/** A client cloned from the `half` template while it was still at the BASE
+	 * state — `fetch` mode's un-raced setup, deduplicated across iterations. */
+	let fetchClientBase = ""
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -73,14 +85,14 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 		// extends `base` (same pinned identity + clock ⇒ the shared prefix is
 		// byte-identical), which is what makes the incremental mode a real fetch with
 		// haves rather than a disjoint second repo.
-		srcBase = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
-		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS + 40 })
+		const srcBase = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
+		const src = await createAppendOnlyRepo({ docs: 4, runs: RUNS + 40 })
 		scratch.push(srcBase, src)
-		baseObjects = await loadReachableObjects(srcBase, ["--all"])
-		baseRefs = await branchAndTagRefsOf(srcBase)
-		head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
-		fullObjects = await loadReachableObjects(src, ["--all"])
-		fullRefs = await branchAndTagRefsOf(src)
+		const baseObjects = await loadReachableObjects(srcBase, ["--all"])
+		const baseRefs = await branchAndTagRefsOf(srcBase)
+		const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: src })).stdout.trim()
+		const fullObjects = await loadReachableObjects(src, ["--all"])
+		const fullRefs = await branchAndTagRefsOf(src)
 		srcOidsFull = await allObjectOids(src)
 		const baseTip = (
 			await spawnGit(["rev-parse", "HEAD"], { cwd: srcBase })
@@ -97,18 +109,10 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
-		store = fixture.deps.objects
-		refs = fixture.deps.refs
+		const store = fixture.deps.objects
+		const refs = fixture.deps.refs
 		repack = createRepack(db.sql)
-	}, 900_000)
 
-	afterAll(async () => {
-		await teardownGitServerFixture({ db, server })
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
-	})
-
-	it("a clone/fetch raced by a repack lands complete and fsck-clean", async () => {
-		const breaks: string[] = []
 		const setRefs = async (
 			repo: string,
 			entries: { name: string; oid: string }[],
@@ -118,6 +122,84 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 			}
 			await refs.setSymref(repo, "HEAD", head)
 		}
+
+		// Never repacked: every object serves raw until a racing pass lands.
+		await store.putPack(TEMPLATE.clone, fullObjects)
+		await setRefs(TEMPLATE.clone, fullRefs)
+
+		// Tier already covers the OLD history; the new history is pending, so a racing
+		// pass adds encodings for objects a read is mid-flight on.
+		await store.putPack(TEMPLATE.half, baseObjects)
+		await setRefs(TEMPLATE.half, baseRefs)
+		await repack.repack(TEMPLATE.half)
+		// `fetch` mode's client, cloned from the template WHILE it is still at base —
+		// that is what makes the per-iteration fetch incremental (the client sends
+		// haves). Only this un-raced setup clone is deduplicated; the raced fetch is a
+		// fresh, fully real one every iteration.
+		fetchClientBase = join(mkdtempSync(join(tmpdir(), "race-cr-fetch-base-")), "c")
+		scratch.push(fetchClientBase)
+		await spawnGit([
+			"-c",
+			"protocol.version=2",
+			"clone",
+			"-q",
+			repoUrl(server, TEMPLATE.half),
+			fetchClientBase,
+		])
+		// The DELTA only: a real second push carries the history that arrived, not
+		// every base object re-sent to be conflict-skipped.
+		const baseOids = new Set(baseObjects.map((object) => object.oid))
+		await store.putPack(
+			TEMPLATE.half,
+			fullObjects.filter((object) => !baseOids.has(object.oid)),
+		)
+		await setRefs(TEMPLATE.half, fullRefs)
+
+		// The anchored identity proof (docs/2026-08-20-test-efficiency.md): one copy of
+		// each template, checked against the same canonical object/ref identity its
+		// seeding established, so the copy path can never drift from the ingest path
+		// silently. Both templates hold the FULL object set at the FULL refs; they
+		// differ only in how much of the encoding tier is populated.
+		const refsAtFull: CanonicalStoreRef[] = [
+			...fullRefs.map(({ name, oid }) => ({ kind: "direct" as const, name, oid })),
+			{ kind: "symbolic", name: "HEAD", target: head },
+		]
+		const identities: readonly (readonly [string, CanonicalStoreFixture])[] = [
+			[
+				TEMPLATE.clone,
+				{
+					// EMPTY, not unchecked: "never repacked, so every object serves raw" is
+					// the whole premise of `clone` mode, and it is what the copy must carry.
+					encodings: { kind: "exact", objects: [] },
+					objects: fullObjects,
+					refs: refsAtFull,
+				},
+			],
+			[
+				TEMPLATE.half,
+				{
+					// The repack ran over the base state ALONE and repack only ever adds
+					// rows, so exactly the base objects carry an encoding here.
+					encodings: { kind: "exact", objects: repackEligibleObjects(baseObjects) },
+					objects: fullObjects,
+					refs: refsAtFull,
+				},
+			],
+		]
+		for (const [template, expected] of identities) {
+			const proof = `${template}/copy-proof`
+			await copyTemplateRepo(db.sql, template, proof)
+			await assertCanonicalStoreFixture(db.sql, proof, expected)
+		}
+	}, 900_000)
+
+	afterAll(async () => {
+		await teardownGitServerFixture({ db, server })
+		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+	})
+
+	it("a clone/fetch raced by a repack lands complete and fsck-clean", async () => {
+		const breaks: string[] = []
 
 		outer: for (let i = 0; i < ITERS; i++) {
 			// Sweep the repack's start across the whole clone, so it commits between
@@ -134,41 +216,15 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 				const problems: string[] = []
 
 				try {
-					if (mode === "clone") {
-						// Never repacked: every object serves raw until the racing pass lands.
-						await store.putPack(repo, fullObjects)
-						await setRefs(repo, fullRefs)
-						const settled = await Promise.allSettled([
-							spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest]),
-							sleep(delay).then(() => repack.repack(repo)),
-						])
-						for (const s of settled) {
-							if (s.status === "rejected") problems.push(`${s.reason}`)
-						}
-					} else if (mode === "half") {
-						// Tier already covers the OLD history; the new history is pending, so
-						// the racing pass adds encodings for objects the clone is mid-read on.
-						await store.putPack(repo, baseObjects)
-						await setRefs(repo, baseRefs)
-						await repack.repack(repo)
-						await store.putPack(repo, fullObjects)
-						await setRefs(repo, fullRefs)
-						const settled = await Promise.allSettled([
-							spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest]),
-							sleep(delay).then(() => repack.repack(repo)),
-						])
-						for (const s of settled) {
-							if (s.status === "rejected") problems.push(`${s.reason}`)
-						}
-					} else {
-						// A real incremental fetch: clone the OLD tip first (so the client
-						// sends haves), advance the server, then race fetch against repack.
-						await store.putPack(repo, baseObjects)
-						await setRefs(repo, baseRefs)
-						await repack.repack(repo)
-						await spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest])
-						await store.putPack(repo, fullObjects)
-						await setRefs(repo, fullRefs)
+					// Objects, derived rows, encodings and refs all land in one copy — the
+					// template already carries the refs this mode's pre-race state needs.
+					await copyTemplateRepo(db.sql, TEMPLATE[mode], repo)
+
+					if (mode === "fetch") {
+						// A real incremental fetch: the client holds the OLD tip (so it sends
+						// haves) while the server is already advanced; race it against a repack.
+						cpSync(fetchClientBase, dest, { recursive: true })
+						await spawnGit(["remote", "set-url", "origin", url], { cwd: dest })
 						const settled = await Promise.allSettled([
 							spawnGit(["-c", "protocol.version=2", "fetch", "-q", "origin"], {
 								cwd: dest,
@@ -180,6 +236,14 @@ describe("race — repack committing mid-clone / mid-fetch", () => {
 						}
 						if (problems.length === 0) {
 							await spawnGit(["merge", "-q", "--ff-only", "origin/main"], { cwd: dest })
+						}
+					} else {
+						const settled = await Promise.allSettled([
+							spawnGit(["-c", "protocol.version=2", "clone", "-q", url, dest]),
+							sleep(delay).then(() => repack.repack(repo)),
+						])
+						for (const s of settled) {
+							if (s.status === "rejected") problems.push(`${s.reason}`)
 						}
 					}
 
