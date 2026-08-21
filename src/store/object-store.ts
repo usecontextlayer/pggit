@@ -18,8 +18,8 @@ import { readPack } from "@/pack/read-pack"
 import { type PackInputObject, packHeader, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
 import { throwMissingDerivedRow } from "@/store/derived-row"
+import { stampRepoPush } from "@/store/push-watermark"
 import { ancestry, originClosure, routeServeSet } from "@/store/reachability"
-import { stampRepoPush } from "@/store/repo-activity"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 /** Objects fetched per round-trip when streaming content into a served pack. */

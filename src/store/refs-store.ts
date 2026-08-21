@@ -7,7 +7,7 @@ import type { ReposId } from "@/database/models/public/Repos"
 import { isOid, ZERO_OID } from "@/object/oid"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 import { throwMissingDerivedRow } from "@/store/derived-row"
-import { stampRepoPush } from "@/store/repo-activity"
+import { stampRepoPush } from "@/store/push-watermark"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 
 export type RefRow = { name: string; oid: string; peeled?: string }
