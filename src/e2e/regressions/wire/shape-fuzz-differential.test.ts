@@ -72,7 +72,7 @@ function rng(seed: number): () => number {
 
 /** Directory/file name bytes — every fragment VALID UTF-8, since D16 rejects a
  * non-UTF-8 path at ingest (that contract has its own tests:
- * `pg-corrupt--non-utf8-path-collision`, `non-utf8-paths`). The exotic coverage
+ * `pg-corrupt/non-utf8-path-collision`, `non-utf8-paths`). The exotic coverage
  * lives in look-alikes a normalizing layer could collapse: NFC "é" beside NFD
  * "é" (distinct bytes, identical rendering) and a case-folding pair. */
 const NAME_BYTES: Buffer[] = [

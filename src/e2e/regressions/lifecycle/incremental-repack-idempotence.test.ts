@@ -47,7 +47,7 @@ type RoundResult = TestResult<MirrorComparison> & {
 	second: RepackResult
 }
 
-describe("lifecycle breakage — incremental repack idempotence", () => {
+describe("regressions/lifecycle — incremental repack idempotence", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

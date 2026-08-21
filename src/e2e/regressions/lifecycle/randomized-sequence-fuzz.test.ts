@@ -412,7 +412,7 @@ const FLOORS = {
 	tag: 6,
 } as const
 
-describe("lifecycle breakage — randomized sequence fuzz", () => {
+describe("regressions/lifecycle — randomized sequence fuzz", () => {
 	it("keeps pggit byte-identical to a file:// oracle through any lifecycle sequence", async () => {
 		const baseUrl = inject("pgBaseUrl")
 		const tally = newTally()

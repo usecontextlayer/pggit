@@ -274,7 +274,7 @@ const CASES: FaultCase[] = [
 	},
 ]
 
-describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => {
+describe("regressions/pg-txn — GC/repack aborted at every batch boundary", () => {
 	let db: IsolatedDb
 	let admin: Sql
 	let appSql: Sql
@@ -327,7 +327,7 @@ describe("breakage/pg-txn — GC/repack aborted at every batch boundary", () => 
 			// ── the fault ────────────────────────────────────────────────────
 			// gc and repack each get a FRESH client so one case's injected timeout or
 			// connection termination cannot contaminate the next case. Connection cleanup
-			// itself is pinned by pg-txn--gc-poisons-pooled-connection.test.ts; this sweep
+			// itself is pinned by gc-poisons-pooled-connection.test.ts; this sweep
 			// isolates the row-level convergence question.
 			const mkFaulty = () =>
 				postgres(baseUrl, {

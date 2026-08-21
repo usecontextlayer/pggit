@@ -42,7 +42,7 @@ const REPO = "workspace/slate/shapes"
 
 type CloneCheck = TestResult<MirrorComparison> & { tag: string }
 
-describe("lifecycle breakage — merge, revert and criss-cross history shapes", () => {
+describe("regressions/lifecycle — merge, revert and criss-cross history shapes", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

@@ -100,7 +100,7 @@ type PointResult = {
 	convergenceGap: { clone: string[]; projection: string[] } | null
 }
 
-describe("breakage/pg-txn — a post-CAS failure must not tear the push", () => {
+describe("regressions/pg-txn — a post-CAS failure must not tear the push", () => {
 	let db: IsolatedDb
 	let admin: Sql
 	let src = ""

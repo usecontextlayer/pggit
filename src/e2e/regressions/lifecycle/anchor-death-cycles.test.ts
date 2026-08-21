@@ -47,7 +47,7 @@ async function revParse(dir: string, rev: string): Promise<string> {
 
 type CloneCheck = TestResult<MirrorComparison> & { tag: string }
 
-describe("lifecycle breakage — anchor death cycles", () => {
+describe("regressions/lifecycle — anchor death cycles", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

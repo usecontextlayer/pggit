@@ -21,11 +21,11 @@ const unitTestExclude = [...configDefaults.exclude, "**/*.integration.test.ts"]
 // timings fed its own verdicts — and that claim was false: its only `Date.now()`
 // feeds a `console.log`, while every verdict is an object-set equality, an
 // `fsck --strict`, or a served-delta floor. It runs in the parallel pool instead,
-// as the four `shapes--negative-sweep-*.test.ts` files.
+// as the four `shapes/negative-sweep-*.test.ts` files.
 const soloTests = [
 	"**/gc-scheduler*.test.ts",
-	"**/pg-txn--gc-repack-fault-sweep.test.ts",
-	"**/pg-txn--copy-cancel-hangs-push-forever.test.ts",
+	"**/pg-txn/gc-repack-fault-sweep.test.ts",
+	"**/pg-txn/copy-cancel-hangs-push-forever.test.ts",
 ]
 
 export default defineConfig({

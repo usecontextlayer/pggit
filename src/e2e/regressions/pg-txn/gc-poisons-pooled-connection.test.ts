@@ -88,7 +88,7 @@ const appName = `pggit-poison-${randomUUID().slice(0, 8)}`
 const short = (e: unknown) =>
 	`${(e as { code?: string }).code ?? ""} ${(e as Error).message}`.trim().slice(0, 110)
 
-describe("breakage/pg-txn — an aborted GC pass must not poison its pool", () => {
+describe("regressions/pg-txn — an aborted GC pass must not poison its pool", () => {
 	let db: IsolatedDb
 	let admin: Sql
 	let shared: Sql

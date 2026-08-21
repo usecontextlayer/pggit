@@ -90,7 +90,7 @@ type RaceOutcome = {
 	detail: string
 }
 
-describe("breakage/pg-txn — clone vs. ref rewind + gc(0)", () => {
+describe("regressions/pg-txn — clone vs. ref rewind + gc(0)", () => {
 	let db: IsolatedDb
 	let admin: Sql
 	let appSql: Sql

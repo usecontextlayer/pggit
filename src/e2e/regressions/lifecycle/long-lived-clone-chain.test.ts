@@ -48,7 +48,7 @@ type IncrementalComparison = {
 
 type RoundResult<T> = TestResult<T> & { label: string }
 
-describe("lifecycle breakage — long-lived clone chain", () => {
+describe("regressions/lifecycle — long-lived clone chain", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

@@ -22,7 +22,7 @@
  * every verdict here is a DISCRETE catalog fact over a hermetically-built fixture —
  * a storage class, a reloptions set, whether the out-of-line payload was compressed
  * on its way to TOAST. The byte numbers are read as evidence for those facts, not
- * as a threshold on cost. The rest of the `pgres--*` lens (churn bloat, GC pass
+ * as a threshold on cost. The rest of the `pgres` lens (churn bloat, GC pass
  * overhead, snapshot hold, pool contention, WAL per repack) prices resources and
  * lives in `perf/probes/pgres/`.
  *

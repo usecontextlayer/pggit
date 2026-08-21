@@ -1,5 +1,7 @@
 # The excellence pass — charter, method, and running record
 
+> **Path note (2026-08-21 reorg):** suites this record names as `src/e2e/breakage/<lens>--<name>.test.ts` now live at `src/e2e/regressions/<lens>/<name>.test.ts`, and perf harnesses named `perf/breakage/<lens>--<name>.ts` at `perf/probes/<lens>/<name>.ts`. Mentions below keep the names that were current at the time of each dated entry.
+
 The derived-state spine (S1–S7) landed on `delta-packs` as commits `ab4664a..db0dfa0`, survived three adversarial review rounds, and reached green on every gate. This document is the charter and running record of the pass that follows: making the repo **excellent**, not merely correct. It is the single source of truth for where the pass stands; the session driving it can die at any time, and a successor picks up from here.
 
 Driving-session transcripts (if a successor needs the blow-by-blow): Claude Code session `d9b35932-0fc5-488f-b703-7b3363de5edb` drove through the 2026-08-20 late-night limit death; its successor `ee5ab81c-33cb-4c4d-b15a-ddbcfcc1845d` (2026-08-21) closed cycle C, ran efficiency waves 2–3 and both worker-cap gates, and recovered/relayed the session audit. Both transcripts live under `~/.claude/projects/-Users-alizain-ContextLayer/` on the owner's machine — transcripts are deleted after ~30 days, so this doc must stand without them. Finding IDs like "R16" or "round-3 CRITICAL" refer to `docs/2026-08-19-adversarial-review-findings.md`; design decision IDs like "D1"/"D4"/"S2" refer to `docs/2026-08-17-derived-state-spine-design.md`.

@@ -1,5 +1,7 @@
 # Test-suite efficiency — mandate, measurements, and running record
 
+> **Path note (2026-08-21 reorg):** suites this record names as `src/e2e/breakage/<lens>--<name>.test.ts` now live at `src/e2e/regressions/<lens>/<name>.test.ts`, and perf harnesses named `perf/breakage/<lens>--<name>.ts` at `perf/probes/<lens>/<name>.ts`. Mentions below keep the names that were current at measurement time.
+
 An offshoot of the excellence pass (`docs/2026-08-20-excellence-pass.md`): the full vitest gate costs ~48–60 minutes of heavy load and the owner's laptop pays for it. The mandate, in the owner's rulings: **no full-suite runs without explicit permission**; scheduling tricks (process priority demotion, fewer workers, owner-scheduled gates) were considered and **rejected**. The refined goal (owner, 2026-08-20 evening): **make the full harness cheaper to run so the suite finishes in LESS wall time — by being more parallel, avoiding burning the laptop, and avoiding flakiness — while "ideally not affecting its efficacy _too much_, though a little bit is okay."** The direction remains content-level and evidence-driven: flamegraphs and empirical hotspot data, never guesses about what "looks slow."
 
 ### The wall-time model that orders the work

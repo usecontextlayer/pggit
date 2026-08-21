@@ -18,10 +18,10 @@
  * moment `pg_stat_activity` shows that pid inside the targeted statement. A
  * cancel (not a terminate) is used deliberately: terminating a backend inside a
  * `pg.begin` kills the host process outright — that is its own finding, see
- * pg-txn--txn-death-kills-host-process.test.ts — which would mask this question.
+ * txn-death-kills-host-process.test.ts — which would mask this question.
  *
  * The `copy … from stdin` statement is NOT a fault point here: cancelling it
- * hangs the push forever (pg-txn--copy-cancel-hangs-push-forever.test.ts), so it
+ * hangs the push forever (copy-cancel-hangs-push-forever.test.ts), so it
  * is covered there instead.
  *
  * CHECKED after every fault, then again after a clean retry push:
@@ -144,7 +144,7 @@ type PointResult = {
 	lostObjects: number
 }
 
-describe("breakage/pg-txn — a cancel on every ingest statement", () => {
+describe("regressions/pg-txn — a cancel on every ingest statement", () => {
 	let db: IsolatedDb
 	let admin: Sql
 	let cleanSql: Sql

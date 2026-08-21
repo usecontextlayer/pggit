@@ -59,7 +59,7 @@ type RoundObservation = MirrorComparison & { converged: RepackResult }
 
 type RoundResult = RoundResultBase & TestResult<RoundObservation>
 
-describe("lifecycle breakage — store-rewind storm", () => {
+describe("regressions/lifecycle — store-rewind storm", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

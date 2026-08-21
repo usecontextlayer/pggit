@@ -40,7 +40,7 @@ const REPO = "workspace/slate/degenerate"
 
 type CloneCheck = TestResult<MirrorComparison> & { tag: string }
 
-describe("lifecycle breakage — drain to empty and refill", () => {
+describe("regressions/lifecycle — drain to empty and refill", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

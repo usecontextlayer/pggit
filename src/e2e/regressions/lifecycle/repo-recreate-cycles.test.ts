@@ -1,7 +1,7 @@
 /**
  * Lifecycle breakage — repo deletion and recreation, five cycles, with components
  * built FRESH each cycle (so the stale-resolver defect covered by
- * `lifecycle--repo-recreate-silent-noop-repack` is out of the way and only
+ * `repo-recreate-silent-noop-repack` is out of the way and only
  * data-level resurrection is under test).
  *
  * Asks: does anything from a previous incarnation survive the cascade and attach
@@ -43,7 +43,7 @@ type CycleResult = TestResult<MirrorComparison> & {
 	converged: RepackResult
 }
 
-describe("lifecycle breakage — repo recreate cycles", () => {
+describe("regressions/lifecycle — repo recreate cycles", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

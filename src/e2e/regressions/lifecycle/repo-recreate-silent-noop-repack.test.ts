@@ -61,7 +61,7 @@ async function clonedPackBytes(url: string, dest: string): Promise<number> {
 	return bytes
 }
 
-describe("lifecycle breakage — silent no-op repack after repo recreate", () => {
+describe("regressions/lifecycle — silent no-op repack after repo recreate", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let root = ""

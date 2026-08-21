@@ -104,7 +104,7 @@ async function cancelIngestCopy(admin: Sql, pid: number): Promise<boolean> {
 	return false
 }
 
-describe("breakage/pg-txn — a cancelled ingest COPY must not hang the push", () => {
+describe("regressions/pg-txn — a cancelled ingest COPY must not hang the push", () => {
 	type BackendObservation =
 		| { kind: "gone" }
 		| { kind: "present"; state: string; query: string }

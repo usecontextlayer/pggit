@@ -97,7 +97,7 @@ type AttemptResult = {
 	expected: string[]
 }
 
-describe("breakage/pg-txn — repo_file must never describe a superseded tip", () => {
+describe("regressions/pg-txn — repo_file must never describe a superseded tip", () => {
 	let db: IsolatedDb
 	let admin: Sql
 	let appSql: Sql

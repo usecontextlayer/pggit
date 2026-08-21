@@ -11,7 +11,7 @@
  * lossy U+FFFD projection, decision 2026-06-22): the lossy decode was not
  * injective, so two byte-distinct paths could collapse onto one projection row
  * and the second was SILENTLY dropped from the published read surface (see
- * `src/e2e/breakage/pg-corrupt--non-utf8-path-collision.test.ts`). Rejection at
+ * `src/e2e/regressions/pg-corrupt/non-utf8-path-collision.test.ts`). Rejection at
  * the boundary removes that class instead of handling it.
  *
  * Asserted here: canonical git accepts the repo (the divergence is real and

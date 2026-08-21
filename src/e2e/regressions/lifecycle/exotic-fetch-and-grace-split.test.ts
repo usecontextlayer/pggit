@@ -134,7 +134,7 @@ function normalizeThrow(err: unknown): string {
 		.slice(0, 200)}`
 }
 
-describe("lifecycle breakage — exotic fetch shapes and grace splits", () => {
+describe("regressions/lifecycle — exotic fetch shapes and grace splits", () => {
 	let root = ""
 	const outcomes: ProbeOutcome[] = []
 	let graceConverge: RepackResult = { deltas: 0, wholes: 0 }

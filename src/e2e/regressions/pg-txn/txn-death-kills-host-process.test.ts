@@ -83,7 +83,7 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".."
  * that one pid the moment it enters the target statement, then exit cleanly. NO
  * `uncaughtException` handler — a non-zero exit IS the finding.
  */
-const CHILD_SOURCE = `/** Emitted at runtime by src/e2e/breakage/pg-txn--txn-death-kills-host-process.test.ts. */
+const CHILD_SOURCE = `/** Emitted at runtime by src/e2e/regressions/pg-txn/txn-death-kills-host-process.test.ts. */
 import { readFileSync } from "node:fs"
 import { setTimeout as sleep } from "node:timers/promises"
 import postgres from "postgres"
@@ -199,7 +199,7 @@ function runChild(childPath: string, env: Record<string, string>): Promise<Outco
 type Mode = (typeof MODES)[number]
 type ModeResult = { mode: Mode; crashes: number; firstTail: string }
 
-describe("breakage/pg-txn — a killed backend must not kill the host process", () => {
+describe("regressions/pg-txn — a killed backend must not kill the host process", () => {
 	let db: IsolatedDb
 	let src = ""
 	let root = ""
