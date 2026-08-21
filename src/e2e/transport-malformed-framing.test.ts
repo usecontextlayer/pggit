@@ -13,7 +13,7 @@
  */
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -102,8 +102,8 @@ describe("mal03 — overrun/unterminated pkt-line is a framing error, not swallo
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		const snapshots = createRepoFileProjection(db.sql)
-		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
+		const projection = createRepoFileProjection(db.sql)
+		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 	}, 180_000)
 
 	afterAll(async () => {

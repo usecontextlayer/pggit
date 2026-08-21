@@ -14,11 +14,8 @@ import {
 import { bindRepoBackend } from "@/protocol/repo-backend"
 import { handleUploadPack } from "@/protocol/upload-pack"
 import { encodeAdvertisement } from "@/protocol/v2"
-import { syncRefSnapshot } from "@/repo-view/rebuild"
-import {
-	createRepoFileProjection,
-	type RepoFileProjection,
-} from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection, type RepoFileProjection } from "@/repo-file/projection"
+import { syncRefProjection } from "@/repo-file/sync-ref"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepoAdmin, type RepoAdmin } from "@/store/repo-admin"
@@ -27,9 +24,9 @@ import { createRepoResolver } from "@/store/repo-resolver"
 export type GitAppDeps = {
 	objects: ObjectStore
 	refs: RefStore
-	/** Optional queryable-view layer. When provided, push maintains a `repo_file`
-	 * path→blob index per branch; when omitted, this is a plain git remote. */
-	snapshots?: RepoFileProjection
+	/** Optional `repo_file` projection. When provided, push maintains the per-branch
+	 * path→blob index; when omitted, this is a plain git remote. */
+	projection?: RepoFileProjection
 }
 
 /** What `createGitDeps` composes: the git app's stores plus the administrative
@@ -140,9 +137,10 @@ function receiveBackendFor(deps: GitAppDeps, repoId: string): ReceiveBackend {
 		listRefNames: () => deps.refs.listRefNames(repoId),
 		objectType: (oid) => deps.objects.objectType(repoId, oid),
 	}
-	if (deps.snapshots) {
-		const sdeps = { objects: deps.objects, snapshots: deps.snapshots }
-		backend.syncRefSnapshot = (ref, newOid) => syncRefSnapshot(sdeps, repoId, ref, newOid)
+	if (deps.projection) {
+		const pdeps = { objects: deps.objects, projection: deps.projection }
+		backend.syncRefProjection = (ref, newOid) =>
+			syncRefProjection(pdeps, repoId, ref, newOid)
 	}
 	return backend
 }
@@ -249,7 +247,7 @@ export function createGitApp(
  * `host.mount("/git", createGitApp(createGitDeps(pg)).fetch)` — `app.mount` strips
  * the mount prefix so the catch-all parse sees a mount-relative path (`app.route`
  * would not). `startServer` (server.ts) is the standalone equivalent of this same
- * composition. `snapshots` is always
+ * composition. `projection` is always
  * included so a mounted host gets the queryable `repo_file` projection maintained
  * on push (the read surface).
  */
@@ -261,8 +259,8 @@ export function createGitDeps(pg: Sql): GitDeps {
 	return {
 		admin: createRepoAdmin(pg, repos),
 		objects: createObjectStore(pg, repos),
+		projection: createRepoFileProjection(pg, repos),
 		refs: createRefStore(pg, repos),
-		snapshots: createRepoFileProjection(pg, repos),
 	}
 }
 

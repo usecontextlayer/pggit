@@ -26,7 +26,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
 import { decodePktStream } from "@/protocol/pkt-line"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -49,8 +49,8 @@ describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (g
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		const snapshots = createRepoFileProjection(db.sql)
-		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
+		const projection = createRepoFileProjection(db.sql)
+		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 		url = `http://127.0.0.1:${server.port}/neg01`
 
 		// main: c1 ← c2 ← c3.  feature (off c1): f1 — a SIBLING, NOT an ancestor of c3.

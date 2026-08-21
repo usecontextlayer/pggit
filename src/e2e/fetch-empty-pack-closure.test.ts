@@ -26,7 +26,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -49,9 +49,9 @@ describe("neg02 — buildPack must not re-add a want already in the have-closure
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		// Wire the snapshot layer exactly as the live server does (server.ts).
-		const snapshots = createRepoFileProjection(db.sql)
-		app = createGitApp({ objects, refs, snapshots })
+		// Wire the projection exactly as the live server does (server.ts).
+		const projection = createRepoFileProjection(db.sql)
+		app = createGitApp({ objects, projection, refs })
 		server = await serveOnPort(app, 0)
 		url = `http://127.0.0.1:${server.port}/neg02`
 

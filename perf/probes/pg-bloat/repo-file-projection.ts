@@ -48,8 +48,8 @@ import {
 	vacuumFull,
 } from "@perf/probes/pg-bloat/_util"
 import { z } from "zod"
-import { syncRefSnapshot } from "@/repo-view/rebuild"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
+import { syncRefProjection } from "@/repo-file/sync-ref"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { deterministicFiller, FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
@@ -132,8 +132,8 @@ async function main(): Promise<void> {
 
 		const store = createObjectStore(app)
 		const refs = createRefStore(app)
-		const snapshots = createRepoFileProjection(app)
-		const deps = { objects: store, snapshots }
+		const projection = createRepoFileProjection(app)
+		const deps = { objects: store, projection }
 
 		let tip = await revParse(src, "refs/heads/main")
 		const baseObjs = await objectsBetween(src, tip)
@@ -145,7 +145,7 @@ async function main(): Promise<void> {
 		)
 		await refs.setRef(REPO_ID, "refs/heads/main", tip)
 		await refs.setSymref(REPO_ID, "HEAD", "refs/heads/main")
-		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", tip)
+		await syncRefProjection(deps, REPO_ID, "refs/heads/main", tip)
 		const [baseCount] = await db.sql<{ n: string }[]>`
 			select count(*)::text as n from repo_file`
 		if (!baseCount || Number(baseCount.n) !== FILES) {
@@ -193,7 +193,7 @@ async function main(): Promise<void> {
 				objs.map((o) => ({ content: o.content, type: o.type })),
 			)
 			await refs.setRef(REPO_ID, "refs/heads/main", newTip)
-			await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", newTip)
+			await syncRefProjection(deps, REPO_ID, "refs/heads/main", newTip)
 			tip = newTip
 
 			if (p < 3 || (p + 1) % 10 === 0 || p === PUSHES - 1) {

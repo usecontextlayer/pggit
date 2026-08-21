@@ -52,8 +52,8 @@ import {
 	walBytes,
 } from "@perf/probes/pg-bloat/_util"
 import { z } from "zod"
-import { syncRefSnapshot } from "@/repo-view/rebuild"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
+import { syncRefProjection } from "@/repo-file/sync-ref"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
@@ -204,8 +204,8 @@ async function main(): Promise<void> {
 			try {
 				const store = createObjectStore(app)
 				const refs = createRefStore(app)
-				const snapshots = createRepoFileProjection(app)
-				const deps = { objects: store, snapshots }
+				const projection = createRepoFileProjection(app)
+				const deps = { objects: store, projection }
 				const repoId = `bench/${s.name}/${F}`
 
 				const baseObjs = await objectsBetween(src, baseTip)
@@ -217,7 +217,7 @@ async function main(): Promise<void> {
 				)
 				await refs.setRef(repoId, "refs/heads/main", baseTip)
 				await refs.setSymref(repoId, "HEAD", "refs/heads/main")
-				await syncRefSnapshot(deps, repoId, "refs/heads/main", baseTip)
+				await syncRefProjection(deps, repoId, "refs/heads/main", baseTip)
 				const baseRepack = await createRepack(app).repack(repoId)
 				if (baseRepack.wholes + baseRepack.deltas !== eligibleBaseObjs.length) {
 					throw new Error(`${s.name} F=${F}: incomplete base repack`)
@@ -258,7 +258,7 @@ async function main(): Promise<void> {
 					pushObjs.map((o) => ({ content: o.content, type: o.type })),
 				)
 				await refs.setRef(repoId, "refs/heads/main", newTip)
-				await syncRefSnapshot(deps, repoId, "refs/heads/main", newTip)
+				await syncRefProjection(deps, repoId, "refs/heads/main", newTip)
 				const encRes = await createRepack(app).repack(repoId)
 
 				await flushStats(app)

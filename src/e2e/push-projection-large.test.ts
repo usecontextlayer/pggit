@@ -20,7 +20,7 @@
  * HTTP 500 and killed the client's push ("the remote end hung up unexpectedly")
  * even though objects and ref had committed. Fixed by chunking the rebuild.
  *
- * The live server wires `snapshots: createRepoFileProjection(db)`, and so does this
+ * The live server wires `projection: createRepoFileProjection(db)`, and so does this
  * fixture — the path under test is production's.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
@@ -28,14 +28,14 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-describe("a06 — repo_file snapshot insert stays under the bind-parameter ceiling", () => {
+describe("a06 — repo_file projection insert stays under the bind-parameter ceiling", () => {
 	let isolated: IsolatedDb
 	let server: GitServer
 	let url: string
@@ -46,9 +46,9 @@ describe("a06 — repo_file snapshot insert stays under the bind-parameter ceili
 		isolated = await createIsolatedSchema(baseUrl)
 		const objects = createObjectStore(isolated.sql)
 		const refs = createRefStore(isolated.sql)
-		// Wire the queryable-view layer EXACTLY as the live server does (server.ts).
-		const snapshots = createRepoFileProjection(isolated.sql)
-		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
+		// Wire the projection EXACTLY as the live server does (server.ts).
+		const projection = createRepoFileProjection(isolated.sql)
+		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 		url = `http://127.0.0.1:${server.port}/repo`
 	}, 120_000)
 

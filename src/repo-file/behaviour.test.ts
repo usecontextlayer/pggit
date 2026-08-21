@@ -10,11 +10,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { rebuildAllSnapshots, syncRefSnapshot } from "@/repo-view/rebuild"
-import {
-	createRepoFileProjection,
-	type RepoFileProjection,
-} from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection, type RepoFileProjection } from "@/repo-file/projection"
+import { rebuildAllProjections, syncRefProjection } from "@/repo-file/sync-ref"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
@@ -39,19 +36,19 @@ function requireOnly<T>(rows: T[], context: string): T {
 
 type FileRow = { path: string; mode: string; content: Buffer }
 
-describe("repo-view — queryable file view (behaviour, real git)", () => {
+describe("repo-file — queryable file view (behaviour, real git)", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let objects: ObjectStore
 	let refs: RefStore
-	let snapshots: RepoFileProjection
+	let projection: RepoFileProjection
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		objects = createObjectStore(db.sql)
 		refs = createRefStore(db.sql)
-		snapshots = createRepoFileProjection(db.sql)
-		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
+		projection = createRepoFileProjection(db.sql)
+		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 	}, 180_000)
 
 	afterAll(async () => {
@@ -253,8 +250,8 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 				false,
 			)
 			expect(deleted).toEqual([true])
-			await syncRefSnapshot(
-				{ objects, snapshots },
+			await syncRefProjection(
+				{ objects, projection },
 				"delbranch",
 				"refs/heads/main",
 				"0".repeat(40),
@@ -339,7 +336,7 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 		}
 	})
 
-	it("rebuildAllSnapshots reconstructs the view after the projection is wiped", async () => {
+	it("rebuildAllProjections reconstructs the view after the projection is wiped", async () => {
 		const dir = newRepo("backfill")
 		try {
 			await spawnGit(["init", "-q"], { cwd: dir })
@@ -354,10 +351,10 @@ describe("repo-view — queryable file view (behaviour, real git)", () => {
 			// Simulate drift: wipe the projection via the public clearRepo (clean slate),
 			// not raw table DELETEs — so the test is coupled to the documented store API,
 			// not to the projection's internal table set.
-			await snapshots.clearRepo("backfill")
+			await projection.clearRepo("backfill")
 			expect(await queryFiles("backfill", "refs/heads/main")).toEqual([])
 
-			await rebuildAllSnapshots({ objects, refs, snapshots }, "backfill")
+			await rebuildAllProjections({ objects, projection, refs }, "backfill")
 
 			expect(await queryFiles("backfill", "refs/heads/main")).toEqual(
 				await lsTreeFiles(dir, mainHead),

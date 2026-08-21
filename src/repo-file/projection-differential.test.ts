@@ -3,9 +3,8 @@ import { dirname, join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { assertNever } from "@/lang"
-import { buildFileList } from "@/repo-view/build-file-list"
-import { syncRefSnapshot } from "@/repo-view/rebuild"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
+import { buildFileList, syncRefProjection } from "@/repo-file/sync-ref"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { loadAllObjects, parseLsTree } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
@@ -152,8 +151,8 @@ describe("repo_file incremental ≡ full rebuild", () => {
 	/** Ingest the repo's objects and advance the projection to `tip`. */
 	async function pushAndProject(repo: string, dir: string, tip: string): Promise<void> {
 		await objects.putPack(repo, await loadAllObjects(dir))
-		await syncRefSnapshot(
-			{ objects, snapshots: createRepoFileProjection(db.sql) },
+		await syncRefProjection(
+			{ objects, projection: createRepoFileProjection(db.sql) },
 			repo,
 			REF,
 			tip,

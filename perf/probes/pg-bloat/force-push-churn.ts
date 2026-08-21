@@ -60,8 +60,8 @@ import {
 	walBytes,
 } from "@perf/probes/pg-bloat/_util"
 import { z } from "zod"
-import { syncRefSnapshot } from "@/repo-view/rebuild"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
+import { syncRefProjection } from "@/repo-file/sync-ref"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -199,10 +199,10 @@ async function main(): Promise<void> {
 
 		const store = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		const snapshots = createRepoFileProjection(db.sql)
+		const projection = createRepoFileProjection(db.sql)
 		const gc = createGc(db.sql)
 		const repack = createRepack(db.sql)
-		const deps = { objects: store, snapshots }
+		const deps = { objects: store, projection }
 
 		// Seed the base history exactly as a first push would, then repack it —
 		// the steady state the candidate maintenance sequence is meant to preserve.
@@ -215,7 +215,7 @@ async function main(): Promise<void> {
 		)
 		await refs.setRef(REPO_ID, "refs/heads/main", baseTip)
 		await refs.setSymref(REPO_ID, "HEAD", "refs/heads/main")
-		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", baseTip)
+		await syncRefProjection(deps, REPO_ID, "refs/heads/main", baseTip)
 		const seedRepack = await repack.repack(REPO_ID)
 		if (seedRepack.wholes + seedRepack.deltas !== eligibleBaseObjects.length) {
 			throw new Error(
@@ -291,9 +291,9 @@ async function main(): Promise<void> {
 			// advance (push), then rewind (force push) — the ref-move pair the
 			// projection and GC both react to.
 			await refs.setRef(REPO_ID, "refs/heads/main", tip)
-			await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", tip)
+			await syncRefProjection(deps, REPO_ID, "refs/heads/main", tip)
 			await refs.setRef(REPO_ID, "refs/heads/main", baseTip)
-			await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", baseTip)
+			await syncRefProjection(deps, REPO_ID, "refs/heads/main", baseTip)
 
 			const gcRes = await gc.gc(REPO_ID, { graceSeconds: 0, maintain: false })
 			if (gcRes.deletedObjects !== objs.length) {

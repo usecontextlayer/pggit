@@ -9,7 +9,7 @@
  * no longer the tip.
  *
  * `handleReceivePack` applies the ref CAS, then (post-commit, best-effort) calls
- * `syncRefSnapshot(ref, c.newOid)` with the oid from ITS OWN command. That call
+ * `syncRefProjection(ref, c.newOid)` with the oid from ITS OWN command. That call
  * walks the tip's trees (one point-read per tree — slow for a wide tree) and then
  * replaces the branch's `repo_file` rows in a transaction. Nothing serializes two
  * such rebuilds, and nothing checks that `newOid` is still what the ref holds.

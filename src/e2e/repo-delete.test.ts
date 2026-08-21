@@ -74,7 +74,7 @@ describe("e2e — repo deletion (real git)", () => {
 		)
 		if (contentRow === undefined) throw new Error(`repo row missing for ${CONTENT}`)
 		const contentId = contentRow.id
-		// The push populated all four row classes (snapshots included via createGitDeps).
+		// The push populated all four row classes (the projection included via createGitDeps).
 		const before = await childRowCounts(contentId)
 		for (const table of Object.keys(before)) {
 			expect(before[table], `${table} should have rows before delete`).toBeGreaterThan(0)

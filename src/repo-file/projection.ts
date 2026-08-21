@@ -44,7 +44,7 @@ export type ApplyOutcome = "noop" | "rebuilt" | "diffed" | "skipped"
  * commit each branch's rows reflect, and a push moves the projection FORWARD from
  * that basis — never rebuilds backwards, never infers the basis from the push
  * command (R12: an inferred basis makes a torn projection representable). A
- * one-file push writes a handful of rows instead of two full snapshots.
+ * one-file push writes a handful of rows instead of two full file lists.
  */
 export function createRepoFileProjection(pg: Sql, repoResolver?: RepoResolver) {
 	const db = initKysely<Database>(pg)
@@ -52,7 +52,7 @@ export function createRepoFileProjection(pg: Sql, repoResolver?: RepoResolver) {
 
 	return {
 		/**
-		 * Bring `refName`'s snapshot to `newOid` (R13). The plan is decided and the
+		 * Bring `refName`'s projection to `newOid` (R13). The plan is decided and the
 		 * trees are walked OUTSIDE any transaction — the walks read through the
 		 * shared pool, and holding a pool connection open while borrowing more from
 		 * the same pool is a self-deadlock at `max: 1` and a starvation wedge under
@@ -141,7 +141,7 @@ export function createRepoFileProjection(pg: Sql, repoResolver?: RepoResolver) {
 				if (outcome !== "stale") return outcome
 			}
 			throw new Error(
-				`repo-view: projection basis for ${repoId} ${refName} moved on every attempt — concurrent pushes are outrunning the walk`,
+				`repo-file: projection basis for ${repoId} ${refName} moved on every attempt — concurrent pushes are outrunning the walk`,
 			)
 		},
 
@@ -156,8 +156,8 @@ export function createRepoFileProjection(pg: Sql, repoResolver?: RepoResolver) {
 			})
 		},
 
-		/** Drop `refName`'s snapshot and its recorded basis (branch deleted). */
-		async dropRefSnapshot(repoId: string, refName: string): Promise<void> {
+		/** Drop `refName`'s projection and its recorded basis (branch deleted). */
+		async dropRefProjection(repoId: string, refName: string): Promise<void> {
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return
 			await pg.begin(async (tx) => {

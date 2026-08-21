@@ -27,7 +27,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -65,9 +65,9 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		// Mirror the LIVE server boot (the queryable snapshot view is wired in prod).
-		const snapshots = createRepoFileProjection(db.sql)
-		app = createGitApp({ objects, refs, snapshots })
+		// Mirror the LIVE server boot (the repo_file projection is wired in prod).
+		const projection = createRepoFileProjection(db.sql)
+		app = createGitApp({ objects, projection, refs })
 
 		src = mkdtempSync(join(tmpdir(), "nam01-src-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
@@ -204,9 +204,9 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		// Boot exactly like the live server (server.ts) — objects + refs + the
-		// queryable snapshot view — so the receive-pack path under test is identical.
-		const snapshots = createRepoFileProjection(db.sql)
-		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
+		// repo_file projection — so the receive-pack path under test is identical.
+		const projection = createRepoFileProjection(db.sql)
+		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 		url = `http://127.0.0.1:${server.port}/nam02`
 
 		src = mkdtempSync(join(tmpdir(), "pggit-nam02-src-"))

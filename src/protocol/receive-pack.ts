@@ -192,7 +192,7 @@ export type ReceiveBackend = {
 	objectType: (oid: Oid) => Promise<GitObjectType | null>
 	/** Refresh the queryable file projection for a just-applied ref. Present only
 	 * when the (optional) queryable-view layer is wired; a plain remote omits it. */
-	syncRefSnapshot?: (ref: string, newOid: Oid) => Promise<void>
+	syncRefProjection?: (ref: string, newOid: Oid) => Promise<void>
 }
 
 /**
@@ -413,7 +413,7 @@ export async function handleReceivePack(
 		// back or 500 an already-applied push (rebuild.ts's standing contract). Absorb
 		// it loudly to the log; the projection is rebuilt on the next push to the ref.
 		try {
-			await backend.syncRefSnapshot?.(command.ref, command.newOid)
+			await backend.syncRefProjection?.(command.ref, command.newOid)
 		} catch (err) {
 			console.error(
 				`pggit: snapshot refresh failed for ${command.ref} (the push is already applied):`,

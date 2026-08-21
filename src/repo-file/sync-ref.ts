@@ -1,19 +1,44 @@
 import { commitTreeOid } from "@/object/object"
 import { ZERO_OID } from "@/object/oid"
-import { diffFileLists, type TreeReader } from "@/object/tree-diff"
-import { buildFileList, type ObjectReader } from "@/repo-view/build-file-list"
-import type { RepoFileProjection } from "@/repo-view/repo-file-projection"
+import {
+	diffFileLists,
+	type FileEntry,
+	listFiles,
+	type TreeReader,
+} from "@/object/tree-diff"
+import type { RepoFileProjection } from "@/repo-file/projection"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
 
-export type SnapshotDeps = {
+export type ProjectionDeps = {
 	objects: ObjectStore
-	snapshots: RepoFileProjection
+	projection: RepoFileProjection
+}
+
+export type ObjectReader = (oid: string) => Promise<{ content: Buffer }>
+export type FileList = { files: FileEntry[] }
+
+/**
+ * The flat path→blob index of a commit's tree (the `git ls-tree -r` of a commit,
+ * read straight from the object store): one FileEntry per blob — full path from
+ * the root, raw mode, blob oid. Subtrees are recursed; gitlinks (submodules) are
+ * skipped (no blob in this repo). Blob CONTENT is NOT read — it lives in
+ * git_object and is joined at query time (§4.5 collapse). The walk itself is
+ * `listFiles` (object/tree-diff.ts), shared with the diff path so the full and
+ * incremental projections can never disagree about what a tree contains.
+ */
+export async function buildFileList(
+	readObject: ObjectReader,
+	commitOid: string,
+): Promise<FileList> {
+	const commit = await readObject(commitOid)
+	const readTree: TreeReader = async (oid) => (await readObject(oid)).content
+	return { files: await listFiles(readTree, commitTreeOid(commit.content)) }
 }
 
 /**
- * Refresh `refName`'s file snapshot after a push applied it. Non-branch refs are
- * ignored; a delete (zero oid) drops the snapshot; otherwise
+ * Refresh `refName`'s file projection after a push applied it. Non-branch refs are
+ * ignored; a delete (zero oid) drops the projection; otherwise
  * the projection advances to the new tip — incrementally from its recorded basis
  * when the tip descends from it, by full rebuild when no basis exists, and NOT AT
  * ALL when a newer push already projected past this oid (the monotonic guard).
@@ -24,8 +49,8 @@ export type SnapshotDeps = {
  * absorbed failure self-heals on the next push (head didn't advance, so that
  * push recomputes from the same basis).
  */
-export async function syncRefSnapshot(
-	deps: SnapshotDeps,
+export async function syncRefProjection(
+	deps: ProjectionDeps,
 	repoId: string,
 	refName: string,
 	newOid: string,
@@ -34,19 +59,19 @@ export async function syncRefSnapshot(
 	// describe a workspace file tree.
 	if (!refName.startsWith("refs/heads/")) return
 	if (newOid === ZERO_OID) {
-		await deps.snapshots.dropRefSnapshot(repoId, refName)
+		await deps.projection.dropRefProjection(repoId, refName)
 		return
 	}
 	const readObject: ObjectReader = async (oid: string) => {
 		const obj = await deps.objects.getObject(repoId, oid)
 		if (!obj)
-			throw new Error(`repo-view: object ${oid} missing while building ${refName}`)
+			throw new Error(`repo-file: object ${oid} missing while building ${refName}`)
 		return obj
 	}
 	const readTree: TreeReader = async (oid) => (await readObject(oid)).content
 	const treeOf = async (commitOid: string): Promise<string> =>
 		commitTreeOid((await readObject(commitOid)).content)
-	await deps.snapshots.applyRefAdvance(repoId, refName, newOid, {
+	await deps.projection.applyRefAdvance(repoId, refName, newOid, {
 		diffFrom: async (basisCommit) =>
 			diffFileLists(readTree, await treeOf(basisCommit), await treeOf(newOid)),
 		fullList: () => buildFileList(readObject, newOid),
@@ -59,12 +84,12 @@ export async function syncRefSnapshot(
  * drifts. Everything is re-derived from the canonical objects; `clearRepo` also
  * clears the recorded bases, so every branch takes the full-rebuild path.
  */
-export async function rebuildAllSnapshots(
-	deps: SnapshotDeps & { refs: RefStore },
+export async function rebuildAllProjections(
+	deps: ProjectionDeps & { refs: RefStore },
 	repoId: string,
 ): Promise<void> {
-	await deps.snapshots.clearRepo(repoId)
+	await deps.projection.clearRepo(repoId)
 	for (const ref of await deps.refs.listRefs(repoId)) {
-		await syncRefSnapshot(deps, repoId, ref.name, ref.oid)
+		await syncRefProjection(deps, repoId, ref.name, ref.oid)
 	}
 }

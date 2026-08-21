@@ -9,8 +9,8 @@
  * `refs/heads/*`; the same objects are legal under `refs/tags/*`
  * (typed-graph-policy pins that half through a real `git push`).
  *
- * ORIGINATED as the breakage probe for the post-commit snapshot refresh
- * (`syncRefSnapshot` → `buildFileList` → `commitTreeOid`), which assumed every
+ * ORIGINATED as the breakage probe for the post-commit projection refresh
+ * (`syncRefProjection` → `buildFileList` → `commitTreeOid`), which assumed every
  * `refs/heads/*` tip was a commit and threw `commit has no tree header` for a
  * tree/blob/tag tip — escaping the handler as HTTP 500 AFTER the ref CAS had
  * already committed, leaving an illegal branch ref the client never learned about.
@@ -22,7 +22,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
@@ -44,10 +44,10 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		// The LIVE server wires the queryable snapshot view — reproduce that boot so
-		// the snapshot rebuild (where the bug lives) is actually exercised.
-		const snapshots = createRepoFileProjection(db.sql)
-		app = createGitApp({ objects, refs, snapshots })
+		// The LIVE server wires the repo_file projection — reproduce that boot so
+		// the projection rebuild (where the bug lives) is actually exercised.
+		const projection = createRepoFileProjection(db.sql)
+		app = createGitApp({ objects, projection, refs })
 
 		src = mkdtempSync(join(tmpdir(), "a13-src-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })

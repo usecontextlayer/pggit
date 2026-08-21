@@ -93,7 +93,7 @@ describe("treeEntries", () => {
 })
 
 describe("commitTreeOid fail loud", () => {
-	// Reachable on the repo-view projection path (build-file-list walks a pushed
+	// Reachable on the repo-file projection path (`buildFileList` walks a pushed
 	// commit's tree via commitTreeOid), so the guard is real, not dead defense.
 	it("throws on a commit with no tree header", () => {
 		expect(

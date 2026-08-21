@@ -52,8 +52,8 @@ import {
 } from "@perf/probes/pg-bloat/_util"
 import postgres from "postgres"
 import { z } from "zod"
-import { syncRefSnapshot } from "@/repo-view/rebuild"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
+import { syncRefProjection } from "@/repo-file/sync-ref"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
@@ -229,8 +229,8 @@ async function main(): Promise<void> {
 
 		const store = createObjectStore(app)
 		const refs = createRefStore(app)
-		const snapshots = createRepoFileProjection(app)
-		const deps = { objects: store, snapshots }
+		const projection = createRepoFileProjection(app)
+		const deps = { objects: store, projection }
 
 		console.log(`## 2. flush volume of a realistic push/repack workload\n`)
 		const catBefore = await catalogSizes(db.sql)
@@ -249,7 +249,7 @@ async function main(): Promise<void> {
 		)
 		await refs.setRef(REPO_ID, "refs/heads/main", prev)
 		await refs.setSymref(REPO_ID, "HEAD", "refs/heads/main")
-		await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", prev)
+		await syncRefProjection(deps, REPO_ID, "refs/heads/main", prev)
 
 		for (let i = 1; i < commits.length; i += PUSH_BATCH) {
 			const tip = requiredAt(
@@ -265,7 +265,7 @@ async function main(): Promise<void> {
 				})),
 			)
 			await refs.setRef(REPO_ID, "refs/heads/main", tip)
-			await syncRefSnapshot(deps, REPO_ID, "refs/heads/main", tip)
+			await syncRefProjection(deps, REPO_ID, "refs/heads/main", tip)
 			prev = tip
 		}
 		const repackRes = await createRepack(app).repack(REPO_ID)

@@ -26,7 +26,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -51,8 +51,8 @@ describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact
 		isolated = await createIsolatedSchema(baseUrl)
 		const objects = createObjectStore(isolated.sql)
 		const refs = createRefStore(isolated.sql)
-		const snapshots = createRepoFileProjection(isolated.sql)
-		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
+		const projection = createRepoFileProjection(isolated.sql)
+		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 		url = `http://127.0.0.1:${server.port}/repo`
 	}, 120_000)
 

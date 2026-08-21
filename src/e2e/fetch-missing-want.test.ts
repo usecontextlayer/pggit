@@ -24,7 +24,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
-import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
+import { createRepoFileProjection } from "@/repo-file/projection"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
@@ -92,8 +92,8 @@ describe("mal01 — fetch of a want absent from a non-empty repo errors cleanly 
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		const snapshots = createRepoFileProjection(db.sql)
-		server = await serveOnPort(createGitApp({ objects, refs, snapshots }), 0)
+		const projection = createRepoFileProjection(db.sql)
+		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 		url = `http://127.0.0.1:${server.port}/mal01`
 
 		// The repo must EXIST and hold objects for the bug to bite (an empty repo
