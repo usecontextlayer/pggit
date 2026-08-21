@@ -1,6 +1,16 @@
 # perf — pggit diagnostic performance harness
 
-Drives a **real `git clone`** over loopback against the **in-process** server, checks its advertised refs and reachable object set against canonical Git, profiles the server process, and emits a machine-readable `report.json` plus a flamegraph. This driver is one-shot and diagnostic; the named probes under `perf/breakage/` enforce their own exit-1 regression bounds.
+Drives a **real `git clone`** over loopback against the **in-process** server, checks its advertised refs and reachable object set against canonical Git, profiles the server process, and emits a machine-readable `report.json` plus a flamegraph. This driver is one-shot and diagnostic; the named probes under `perf/probes/` enforce their own exit-1 regression bounds.
+
+## What lives where
+
+- `run.ts` — the scenario driver's entry (`pnpm run perf`), the subject of the rest of this README.
+- `harness/` — the scenario driver's private modules (`harness`, `scenarios`, `fast-import`, `report`, `process-metrics`, `profile`, `pg-latency`); nothing outside `run.ts` and this folder imports them.
+- `probes/<lens>/` — the standalone diagnostic probes, one folder per lens (`perf` = threshold diagnostics, `pg-bloat` = storage economics, `pgres` = Postgres resource economics, `realrepo` = real-repository differentials, `txn` = crash integrity, `wire` = wire-shape economics). Each probe runs directly (`npx tsx perf/probes/<lens>/<name>.ts`, usage line in its header) and owns its exit-1 bound; a `_util.ts` inside a lens folder is that lens's private library.
+- `probes/` root — the two unlensed probes (`delta-probe.ts`, `delta-corpus.ts`) and the cross-lens libraries (`_table.ts`, `_vacuum-evidence.ts`).
+- `args.ts`, `collector-evidence.ts`, `memory.ts` (+ its co-located test) — shared by the harness and the probes, so they live at the `perf/` root.
+- A leading `_` always means "library, never a runnable probe". All perf-internal imports use the `@perf/*` alias (see `tsconfig.json` `paths`).
+- The frozen 2026-08-15 breakage-conversion records that once sat beside the probes live at `docs/2026-08-15-breakage-conversion/`.
 
 ## Run
 
