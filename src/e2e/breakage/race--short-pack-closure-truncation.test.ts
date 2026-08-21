@@ -31,8 +31,19 @@
  *   CORRUPT   clone exit 0, fsck fails                                      <-- the defect
  *
  * Converted from `breakage/race--short-pack-closure-truncation.ts` (`--iters=60
- * --runs=250 --rewind=120 --resurrect=trees`). Probabilistic: the iteration
- * count and the swept gc-start delays are frozen exactly as the script ran them.
+ * --runs=250 --rewind=120 --resurrect=trees`). Probabilistic. The swept
+ * gc-start delays are NOT the source's: it froze absolute milliseconds
+ * ([0..60]ms), which tie the hunt to one machine's serve speed — the hunted gap
+ * (between the closure CTE and the tree-content re-read) sits in the serve's
+ * opening phase, and on a slower or loaded box 60 ms is still before the CTE
+ * finishes while on a faster one it overshoots the whole closure. Each run
+ * instead times one un-raced fetch of the same shape and sweeps the gc start
+ * across FRACTIONS of that measured wall (0–7%, the serve's opening phase), so
+ * the arms straddle the CTE→re-read seam on any box. That calibration is also
+ * why 20 iterations carry the coverage the source spread over 60: one full
+ * 20-arm sweep concentrated on a window the arms actually hit beats three
+ * sweeps of absolute delays that drift off it
+ * (docs/2026-08-20-test-efficiency.md, ruling 5).
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -55,9 +66,17 @@ import {
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-const ITERS = 60
+const ITERS = 20
 const RUNS = 250
 const REWIND = 120
+/** Where in the measured un-raced fetch wall each iteration's gc starts. The
+ * hunted seam lives in the serve's opening closure phase, so the sweep is
+ * dense there and stops at 7% — a gc landing later races nothing this file
+ * hunts. */
+const DELAY_FRACTIONS = [
+	0, 0.001, 0.002, 0.003, 0.004, 0.006, 0.008, 0.01, 0.013, 0.016, 0.02, 0.024, 0.028,
+	0.033, 0.038, 0.044, 0.05, 0.056, 0.063, 0.07,
+] as const
 /** What the concurrent writer re-inserts. `trees` cycles far faster than `all`,
  * and trees are the only objects whose loss is SILENT (a lost blob still trips
  * the closure's presence check and a lost tree trips the serve path's guard —
@@ -98,6 +117,7 @@ describe("race — a truncated want-closure serving a short pack", () => {
 	let resurrectSet: PackInputObject[] = []
 	let tip = ""
 	let rewindTo = ""
+	let fetchMs = 0
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -121,6 +141,24 @@ describe("race — a truncated want-closure serving a short pack", () => {
 		refs = fixture.deps.refs
 		gc = createGc(db.sql)
 		repack = createRepack(db.sql)
+
+		// Calibrate: one repo in the exact per-iteration shape, one un-raced fetch
+		// of it, timed wall-to-wall. The raced gc delays are fractions of this.
+		const calRepo = "race/short/cal"
+		await store.putPack(calRepo, objects)
+		await refs.setRef(calRepo, "refs/heads/main", tip)
+		await refs.setSymref(calRepo, "HEAD", "refs/heads/main")
+		await repack.repack(calRepo)
+		await refs.setRef(calRepo, "refs/heads/main", rewindTo)
+		const calDest = join(mkdtempSync(join(tmpdir(), "short-cal-")), "c")
+		scratch.push(calDest)
+		await spawnGit(["init", "-q", "-b", "main", calDest])
+		const calStart = Date.now()
+		await spawnGit(
+			["-c", "protocol.version=2", "fetch", "-q", repoUrl(server, calRepo), tip],
+			{ cwd: calDest },
+		)
+		fetchMs = Date.now() - calStart
 	}, 600_000)
 
 	afterAll(async () => {
@@ -147,7 +185,8 @@ describe("race — a truncated want-closure serving a short pack", () => {
 			scratch.push(dest)
 			await spawnGit(["init", "-q", "-b", "main", dest])
 
-			const delay = [0, 1, 2, 3, 5, 7, 10, 14, 20, 28, 40, 60][i % 12] as number
+			const fraction = DELAY_FRACTIONS[i % DELAY_FRACTIONS.length] as number
+			const delay = Math.round(fraction * fetchMs)
 			let stop = false
 			// The resurrector: keep re-inserting the FULL object set for as long as
 			// the race runs, so anything GC removes can come back before the serve

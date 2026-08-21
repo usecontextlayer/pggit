@@ -22,8 +22,18 @@
  * assertion's message, never on the assertion.
  *
  * Converted from `breakage/race--concurrent-repack.ts` (`--iters=40 --runs=400
- * --passes=6 --push=0`). Probabilistic: the iteration count, the pass count and
- * the swept start offsets (including their randomized jitter) are frozen exactly.
+ * --passes=6 --push=0`). Probabilistic: the pass count and the jitter formula
+ * are the source's. The swept start offsets are NOT: the source froze absolute
+ * milliseconds ([0..250]ms), which tie the stagger to one machine's repack
+ * speed — on a box where a pass runs longer, every offset crowds into the first
+ * COPY flush and the later phases are never raced. Each run instead times one
+ * un-raced calibration pass and staggers the cohort across FRACTIONS of that
+ * measured wall (the last of the 6 passes starts at up to ~5× the largest
+ * fraction, i.e. near the end of a solo pass), so the interleavings cover the
+ * pass's phases on any box. That calibration is also why 12 iterations carry
+ * the coverage the source spread over 40: one full 12-arm sweep whose arms land
+ * in-phase beats 3.3 sweeps of absolute offsets that mostly pile onto the same
+ * phase (docs/2026-08-20-test-efficiency.md, ruling 5).
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -49,12 +59,19 @@ import {
 import type { IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-const ITERS = 40
+const ITERS = 12
 const RUNS = 400
 /** Concurrent repack passes per iteration. >2 matters: the divergence window is
  * the gap between a pass's `pending` read and its `existing` read, and pool
  * contention (the isolated schema's porsager pool is max:4) is what widens it. */
 const PASSES = 6
+/** Per-iteration stagger spread, as a fraction of the measured un-raced pass
+ * wall. Pass k starts at ~k×spread(+jitter), so the smallest fractions land all
+ * six passes inside the first COPY flush and the largest spreads them across
+ * the whole pass. */
+const SPREAD_FRACTIONS = [
+	0, 0.0005, 0.001, 0.002, 0.004, 0.008, 0.015, 0.03, 0.05, 0.09, 0.14, 0.2,
+] as const
 describe("race — concurrent repack passes on one repo", () => {
 	let db: IsolatedDb
 	let server: GitServer
@@ -66,6 +83,7 @@ describe("race — concurrent repack passes on one repo", () => {
 	let srcOids: string[] = []
 	let sourceRefs: { name: string; oid: string }[] = []
 	let head = ""
+	let repackMs = 0
 	const scratch: string[] = []
 
 	beforeAll(async () => {
@@ -82,6 +100,18 @@ describe("race — concurrent repack passes on one repo", () => {
 		store = fixture.deps.objects
 		refs = fixture.deps.refs
 		repack = createRepack(db.sql)
+
+		// Calibrate: seed one throwaway repo and time a solo, un-raced repack pass
+		// wall-to-wall. The staggered starts are fractions of this measurement.
+		const calRepo = "race/repack/cal"
+		await store.putPack(calRepo, objects)
+		for (const { name, oid } of sourceRefs) {
+			await refs.setRef(calRepo, name, oid)
+		}
+		await refs.setSymref(calRepo, "HEAD", head)
+		const calStart = Date.now()
+		await repack.repack(calRepo)
+		repackMs = Date.now() - calStart
 	}, 600_000)
 
 	afterAll(async () => {
@@ -104,7 +134,8 @@ describe("race — concurrent repack passes on one repo", () => {
 
 			// Vary each pass's start so they land at different points of one another:
 			// before the first COPY flush, right after it, mid-phase-2, etc.
-			const spread = [0, 1, 3, 8, 15, 25, 40, 60, 90, 130, 180, 250][i % 12] as number
+			const fraction = SPREAD_FRACTIONS[i % SPREAD_FRACTIONS.length] as number
+			const spread = Math.round(fraction * repackMs)
 			const delays = Array.from({ length: PASSES }, (_, k) =>
 				k === 0 ? 0 : Math.round(k * spread + Math.random() * spread),
 			)
