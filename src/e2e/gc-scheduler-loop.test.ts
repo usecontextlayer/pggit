@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { createGcScheduler } from "@/gc-scheduler"
+import { createGcScheduler } from "@/store/gc-scheduler"
 import {
 	countObjects,
 	type GcFixture,

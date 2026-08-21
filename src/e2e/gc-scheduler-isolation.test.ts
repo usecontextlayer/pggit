@@ -20,7 +20,7 @@
  * judged eligible. Both landed per §6; this is their regression gate.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { createGcScheduler } from "@/gc-scheduler"
+import { createGcScheduler } from "@/store/gc-scheduler"
 import {
 	ageObjects,
 	cloneAndFsck,

@@ -272,18 +272,18 @@ export function createGitDeps(pg: Sql): GitDeps {
 // from the published package — a consumer e2e migrating a throwaway `ctx_pggit`, or a
 // production deploy provisioning the agent-state store.
 export { migrateToLatest } from "@/database/migrate"
+export type { Gc, GcOptions, GcResult } from "@/store/gc"
+export { createGc } from "@/store/gc"
 export type {
 	DrainEntry,
 	DrainSummary,
 	GcScheduler,
 	GcSchedulerOptions,
-} from "@/gc-scheduler"
+} from "@/store/gc-scheduler"
 // Public GC surface: the per-repo reachability GC primitive (a host may drive it
 // directly on its own schedule) and the self-scheduling background drain that
 // decides when to run it (docs/2026-06-24-gc-scheduler-design.md §4).
-export { createGcScheduler } from "@/gc-scheduler"
-export type { Gc, GcOptions, GcResult } from "@/store/gc"
-export { createGc } from "@/store/gc"
+export { createGcScheduler } from "@/store/gc-scheduler"
 // Administrative repo lifecycle: exact-name delete + prefix listing, exported for
 // hosts composing their own deps; `createGitDeps` already wires it as `.admin`.
 export type { RepoAdmin } from "@/store/repo-admin"

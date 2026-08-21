@@ -2,12 +2,12 @@ import { serve } from "@hono/node-server"
 import type { Hono } from "hono"
 import postgres from "postgres"
 import { env } from "@/env"
+import { createGitApp, createGitDeps } from "@/index"
 import {
 	createGcSchedulerFromResolvedOptions,
 	type GcSchedulerOptions,
 	resolveGcSchedulerOptions,
-} from "@/gc-scheduler"
-import { createGitApp, createGitDeps } from "@/index"
+} from "@/store/gc-scheduler"
 
 export type GitServer = {
 	port: number

@@ -45,7 +45,7 @@ import { join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { assertNever } from "@/assert-never"
-import { createGcScheduler } from "@/gc-scheduler"
+import { createGcScheduler } from "@/store/gc-scheduler"
 import { IS_CI } from "@/testing/ci"
 import {
 	ageObjects,
