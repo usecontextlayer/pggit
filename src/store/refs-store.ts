@@ -6,7 +6,7 @@ import type { GitRefName } from "@/database/models/public/GitRef"
 import type { ReposId } from "@/database/models/public/Repos"
 import { isOid, ZERO_OID } from "@/object/oid"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
-import { throwMissingDerivedRow } from "@/store/derived-row"
+import { throwMissingDerivedRow } from "@/store/derived-row-invariant"
 import { stampRepoPush } from "@/store/push-watermark"
 import { createRepoResolver, type RepoResolver } from "@/store/repo-resolver"
 

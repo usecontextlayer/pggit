@@ -6,7 +6,7 @@ import type { ReposId } from "@/database/models/public/Repos"
 import { GITLINK_MODE, isTreeEntryMode, treeEntries } from "@/object/object"
 import { type IndexedTree, indexTreeEntries } from "@/object/tree-diff"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
-import { throwMissingDerivedRow } from "@/store/derived-row"
+import { throwMissingDerivedRow } from "@/store/derived-row-invariant"
 import {
 	loadEpoch,
 	oidAtPosition,
