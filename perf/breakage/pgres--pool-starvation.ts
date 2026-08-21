@@ -38,6 +38,7 @@
  *   npx tsx perf/breakage/pgres--pool-starvation.ts --clones=4 --cycles=4
  */
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres from "postgres"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
@@ -46,28 +47,28 @@ import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import {
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	branchAndTagRefsOf,
-	parseRevListObjectOids,
+	gitReachableOids,
 	repackEligibleObjects,
 	requiredAt,
 	requireGitOid,
+	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { median, percentile, requireSamples } from "../memory"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	fastImport,
 	initRepo,
-	median,
 	mkTmp,
 	objectsBetween,
-	revParse,
 	runCommits,
 	seedObjects,
 	setMain,
-	sleep,
-	table,
 } from "./_pgres-util"
 
 /** porsager's default `max` — exactly what `startServer` gets today. */
@@ -109,16 +110,11 @@ type WorkloadEvidence =
 	| { kind: "baseline" }
 	| { kind: "background"; receipt: RepackReceipt }
 
-function pct(xs: number[], p: number): number {
+function latencyPercentile(xs: number[], p: number): number {
 	if (xs.length === 0 || xs.some((x) => !Number.isFinite(x) || x <= 0)) {
 		throw new Error("latency percentile requires finite positive samples")
 	}
-	const s = [...xs].sort((a, b) => a - b)
-	return requiredAt(
-		s,
-		Math.min(s.length - 1, Math.floor((p / 100) * s.length)),
-		"latency percentile",
-	)
+	return percentile(requireSamples(xs), p)
 }
 
 async function main(): Promise<void> {
@@ -163,9 +159,7 @@ async function main(): Promise<void> {
 		await seedObjects(appPg, REPO, objects)
 		await setMain(appPg, REPO, tip)
 
-		const wantObjects = parseRevListObjectOids(
-			(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
-		).sort()
+		const wantObjects = await gitReachableOids(dir)
 		const wantRefs = await branchAndTagRefsOf(dir)
 
 		server = await serveOnPort(createGitApp(createGitDeps(appPg)), 0)
@@ -174,21 +168,11 @@ async function main(): Promise<void> {
 		let seq = 0
 
 		const verifyClone = async (dest: string): Promise<void> => {
-			const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			if (`${fsck.stdout}${fsck.stderr}`.trim() !== "") {
-				throw new Error(`${dest}: clone is not fsck-clean`)
-			}
-			const gotObjects = parseRevListObjectOids(
-				(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dest })).stdout,
-			).sort()
+			await assertGitReachableObjects(dest, wantObjects, `clone ${dest}`)
 			const gotRefs = await branchAndTagRefsOf(dest)
-			if (
-				gotObjects.length !== wantObjects.length ||
-				gotObjects.some((oid, i) => oid !== wantObjects[i]) ||
-				JSON.stringify(gotRefs) !== JSON.stringify(wantRefs)
-			) {
+			if (JSON.stringify(gotRefs) !== JSON.stringify(wantRefs)) {
 				throw new Error(
-					`${dest}: clone differs from canonical git (objects ${gotObjects.length}/${wantObjects.length}, refs ${gotRefs.length}/${wantRefs.length})`,
+					`${dest}: clone refs differ from canonical git (${gotRefs.length}/${wantRefs.length})`,
 				)
 			}
 		}
@@ -408,7 +392,7 @@ async function main(): Promise<void> {
 				)
 			}
 		}
-		const baseP95 = pct(base.latencies, 95)
+		const baseP95 = latencyPercentile(base.latencies, 95)
 		if (!Number.isFinite(baseP95) || baseP95 <= 0) {
 			throw new Error(`baseline p95 must be positive, got ${baseP95}`)
 		}
@@ -428,10 +412,10 @@ async function main(): Promise<void> {
 				arms.map((a) => [
 					a.name,
 					a.latencies.length,
-					median(a.latencies).toFixed(0),
-					pct(a.latencies, 95).toFixed(0),
+					median(requireSamples(a.latencies)).toFixed(0),
+					latencyPercentile(a.latencies, 95).toFixed(0),
 					Math.max(...a.latencies),
-					`×${(pct(a.latencies, 95) / baseP95).toFixed(2)}`,
+					`×${(latencyPercentile(a.latencies, 95) / baseP95).toFixed(2)}`,
 					a.peakConns,
 					`${a.overlapRuns}/${a.kind === "baseline" ? 0 : CYCLES}`,
 					a.wallMs,
@@ -452,8 +436,8 @@ async function main(): Promise<void> {
 		console.log(
 			`\nbaseline spread across cycles: ${bmin}–${bmax} ms (×${(bmax / bmin).toFixed(2)}) — this shared box's own drift. An arm difference smaller than that is noise.`,
 		)
-		const sharedRatio = pct(shared.latencies, 95) / baseP95
-		const sepRatio = pct(separate.latencies, 95) / baseP95
+		const sharedRatio = latencyPercentile(shared.latencies, 95) / baseP95
+		const sepRatio = latencyPercentile(separate.latencies, 95) / baseP95
 		console.log(
 			`\nshared-pool p95 ×${sharedRatio.toFixed(2)} · separate-pool p95 ×${sepRatio.toFixed(2)} · every measured clone passed canonical ref/OID/fsck verification`,
 		)

@@ -1,5 +1,7 @@
 # Conversion mapping — lens `shapes`
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts, fixture counts, and mechanism names below describe the code as converted, not the landed derived-state spine or later review fixes. This file is deliberately not updated; read it as frozen provenance for the conversion.
+
 Source scripts assigned: **2**. Converted: **2**. Utilities/helpers: 0 (neither source script imports a `_*` helper — both depend only on `node:*` and `@/*` modules).
 
 | source | destination | kind | exact property asserted / measured | expected current state |

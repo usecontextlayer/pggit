@@ -1,5 +1,7 @@
 # Breakage conversion mapping — lens `wire`
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts and mechanism names below (including the pre-D8-prime serve rule) describe the code as converted, not the landed derived-state spine or later review fixes. This file is deliberately not updated; read it as frozen provenance for the conversion.
+
 11 source scripts assigned, 11 converted: **10 e2e tests** under `src/e2e/breakage/`, **1 perf harness** under `perf/breakage/`. No wire script imports a shared `_`-helper (`grep 'from "./_"' breakage/wire--*.ts` returns nothing) — every one already used `@/` aliases only, so no helper needed porting and no `perf/breakage/_wire-util.ts` was created. Script-local helpers (`ordering`, `digest`, `inventory`, `bytesDigest`, `depthOf`, `packShape`, `mktree`, `generate`, `rng`, …) are inlined into the destination file, per house style.
 
 | source | destination | kind | exact property asserted / measured | expected current state |

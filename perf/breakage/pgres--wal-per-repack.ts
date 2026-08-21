@@ -11,10 +11,8 @@
  *   repack  — `createRepack().repack()` (git_pack_encoding only)
  *   gc      — `gc(graceSeconds: 0)` after a rewind (delete WAL for both tiers)
  *   delete  — `admin.deleteRepo()`, a bare `DELETE FROM repos` whose ENTIRE teardown
- *             is the FK cascade. Migration 0008 hangs a FOURTH hash-partitioned
- *             child off that cascade, so one statement, one transaction, now also
- *             deletes every encoding row. Trials run with the tier BOTH present and
- *             absent, so the cascade's added cost is a difference, not a guess.
+ *             is the FK cascade. Trials run with the tier BOTH present and absent,
+ *             isolating the encoding rows' contribution to that cascade.
  *
  * NOISE, stated plainly: `pg_current_wal_lsn()` is INSTANCE-WIDE and this Postgres
  * is shared with sibling agents, so every delta here includes their writes. Three
@@ -34,6 +32,7 @@
  *   npx tsx perf/breakage/pgres--wal-per-repack.ts --trials=5 --commits=250
  */
 
+import { setTimeout as sleep } from "node:timers/promises"
 import { z } from "zod"
 import { createGitDeps } from "@/index"
 import type { Oid } from "@/oid"
@@ -41,28 +40,27 @@ import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import {
 	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
 	repackEligibleObjects,
 	requiredAt,
 	requireGitOid,
+	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { median, requireSamples } from "../memory"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	encodingCensus,
 	fastImport,
 	initRepo,
 	mb,
-	median,
-	type Obj,
 	objectsBetween,
-	revParse,
 	runCommits,
 	seedObjects,
 	setMain,
-	sleep,
-	table,
 	walLsn,
 } from "./_pgres-util"
 
@@ -125,8 +123,8 @@ async function trial(
 			)
 		}
 		const assertRows = async (
-			expectedObjects: readonly Obj[],
-			expectedEncodings: readonly Obj[],
+			expectedObjects: readonly GitObjectWithOid[],
+			expectedEncodings: readonly GitObjectWithOid[],
 			expectedTip: Oid,
 		): Promise<void> => {
 			await assertCanonicalStoreFixture(pg, REPO, {
@@ -351,26 +349,26 @@ async function main(): Promise<void> {
 		),
 	)
 
-	console.log("\n## repo deletion — the FK cascade now carries a fourth child table\n")
+	console.log("\n## repo deletion — encoding-row contribution to the FK cascade\n")
 	console.log(
 		table(
 			["arm", "delete WAL MB (median)", "delete ms (median)"],
 			[
 				[
 					"tier PRESENT",
-					mb(median(trials.map((t) => t.deleteWal))),
-					median(trials.map((t) => t.deleteMs)).toFixed(0),
+					mb(median(requireSamples(trials.map((t) => t.deleteWal)))),
+					median(requireSamples(trials.map((t) => t.deleteMs))).toFixed(0),
 				],
 				[
 					"tier ABSENT (control)",
-					mb(median(noTier.map((t) => t.deleteWal))),
-					median(noTier.map((t) => t.deleteMs)).toFixed(0),
+					mb(median(requireSamples(noTier.map((t) => t.deleteWal)))),
+					median(requireSamples(noTier.map((t) => t.deleteMs))).toFixed(0),
 				],
 			],
 		),
 	)
-	const delWith = median(trials.map((t) => t.deleteMs))
-	const delWithout = median(noTier.map((t) => t.deleteMs))
+	const delWith = median(requireSamples(trials.map((t) => t.deleteMs)))
+	const delWithout = median(requireSamples(noTier.map((t) => t.deleteMs)))
 	if (delWith <= 0 || delWithout <= 0) {
 		throw new Error(`repo deletion timers must be positive: ${delWith}/${delWithout}`)
 	}
@@ -378,10 +376,10 @@ async function main(): Promise<void> {
 		`\nthe tier adds ${(delWith - delWithout).toFixed(0)} ms (×${(delWith / delWithout).toFixed(2)}) to a repo deletion — ONE statement, ONE transaction, holding its locks for that whole time.`,
 	)
 
-	const push = median(trials.map((t) => t.pushWal))
-	const repack = median(trials.map((t) => t.repackWal))
-	const idle = median(trials.map((t) => t.idleWal))
-	const gc = median(trials.map((t) => t.gcWal))
+	const push = median(requireSamples(trials.map((t) => t.pushWal)))
+	const repack = median(requireSamples(trials.map((t) => t.repackWal)))
+	const idle = median(requireSamples(trials.map((t) => t.idleWal)))
+	const gc = median(requireSamples(trials.map((t) => t.gcWal)))
 	const ratio = repack / push
 
 	console.log(

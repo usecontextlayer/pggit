@@ -17,6 +17,7 @@
 import { execSync } from "node:child_process"
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
@@ -24,6 +25,7 @@ import { createRepack } from "@/store/repack"
 import {
 	allObjectOids,
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
 	loadGitObjects,
 	repackEligibleObjects,
@@ -37,6 +39,7 @@ import {
 	pgUrlArg,
 	positiveIntegerArg,
 } from "../args"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	mb,
@@ -44,7 +47,6 @@ import {
 	rewrittenArtifactStream,
 	secs,
 	seedRepo,
-	table,
 	withPeakRss,
 } from "./_perf-util"
 
@@ -135,15 +137,10 @@ async function main(): Promise<void> {
 		)
 	}
 	const verify = async (dest: string): Promise<void> => {
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-		const oids = await allObjectOids(dest)
+		await assertGitReachableObjects(dest, expectedOids, `clone ${dest}`)
 		const tip = await revParse(dest, "refs/heads/main")
-		if (
-			tip !== expectedTip ||
-			oids.length !== expectedOids.length ||
-			oids.some((oid, i) => oid !== expectedOids[i])
-		) {
-			throw new Error(`clone ${dest} diverged from canonical refs/object set`)
+		if (tip !== expectedTip) {
+			throw new Error(`clone ${dest} diverged from canonical ref tip`)
 		}
 	}
 
@@ -178,7 +175,7 @@ async function main(): Promise<void> {
 				}
 				globalThis.gc()
 				globalThis.gc()
-				await new Promise((r) => setTimeout(r, 50))
+				await sleep(50)
 				const pggitDests = Array.from({ length: conc }, (_, i) =>
 					join(mkTmp(`conc-pggit-${conc}-${i}`), "c"),
 				)

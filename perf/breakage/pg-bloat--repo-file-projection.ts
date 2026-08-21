@@ -32,6 +32,7 @@ import { syncRefSnapshot } from "@/repo-view/rebuild"
 import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { deterministicFiller, FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
@@ -40,11 +41,10 @@ import {
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { vacuumVerbose } from "../vacuum-evidence"
 import {
 	aggregate,
 	backendWal,
-	COMMITTER,
-	filler,
 	flushStats,
 	horizon,
 	kb,
@@ -58,7 +58,6 @@ import {
 	taggedPool,
 	vacuumAnalyze,
 	vacuumFull,
-	vacuumVerbose,
 } from "./_pg-bloat-util"
 
 /** tag so WAL and dead-tuple cost are attributable on a shared instance */
@@ -86,24 +85,24 @@ function baseStream(): string {
 	let mark = 0
 	const lines: string[] = []
 	for (let i = 0; i < FILES; i++) {
-		const content = `# f${i}\n${filler(`f${i}-v0`, 300)}\n`
+		const content = `# f${i}\n${deterministicFiller(`f${i}-v0`, 300)}\n`
 		const m = ++mark
 		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
 		lines.push(`M 100644 :${m} src/d${i % 40}/f${i}.md`)
 	}
 	const cm = ++mark
 	out.push(
-		`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata 4\nbase\n${lines.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nbase\n${lines.join("\n")}\n`,
 	)
 	return out.join("")
 }
 
 function touchStream(gen: number): string {
 	const i = gen % FILES
-	const content = `# f${i}\n${filler(`f${i}-v${gen}`, 300)}\n`
+	const content = `# f${i}\n${deterministicFiller(`f${i}-v${gen}`, 300)}\n`
 	return (
 		`blob\nmark :1\ndata ${Buffer.byteLength(content)}\n${content}\n` +
-		`commit refs/heads/main\nmark :2\ncommitter ${COMMITTER}\ndata 5\ntouch\nfrom refs/heads/main^0\n` +
+		`commit refs/heads/main\nmark :2\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 5\ntouch\nfrom refs/heads/main^0\n` +
 		`M 100644 :1 src/d${i % 40}/f${i}.md\n`
 	)
 }

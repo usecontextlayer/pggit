@@ -18,21 +18,14 @@ import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
+	loadAllReachableObjects,
 	repackEligibleObjects,
 	requiredAt,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
-import {
-	cleanupTmp,
-	gitRepack,
-	mb,
-	reachableObjects,
-	secs,
-	seedRepo,
-	table,
-	withPeakRss,
-} from "./_perf-util"
+import { table } from "../table"
+import { cleanupTmp, gitRepack, mb, secs, seedRepo, withPeakRss } from "./_perf-util"
 
 const { pg: PG_URL, sizes: SIZES } = parseArgs(
 	z
@@ -64,7 +57,7 @@ type Row = {
 async function measure(n: number): Promise<Row> {
 	const dir = await createAppendOnlyRepo({ docs: 8, runs: n })
 	try {
-		const objects = await reachableObjects(dir)
+		const objects = await loadAllReachableObjects(dir)
 		const treeBytes = objects
 			.filter((o) => o.type === "tree")
 			.reduce((a, o) => a + o.content.length, 0)

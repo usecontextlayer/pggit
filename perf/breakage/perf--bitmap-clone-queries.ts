@@ -19,7 +19,6 @@
  */
 import { rmSync } from "node:fs"
 import { join } from "node:path"
-import postgres from "postgres"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import type { Oid } from "@/oid"
@@ -37,7 +36,8 @@ import {
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
-import { mkTmp, seedRepo, table } from "./_perf-util"
+import { table } from "../table"
+import { mkTmp, queryCountingClient, seedRepo } from "./_perf-util"
 
 const { pg: PG_URL, sizes: SIZES } = parseArgs(
 	z
@@ -50,21 +50,6 @@ const { pg: PG_URL, sizes: SIZES } = parseArgs(
 const REPO = "probe/bitmap-clone"
 /** The largest size must cut clone-serve queries by at least this factor. */
 const MIN_QUERY_FACTOR = 5
-
-type Counter = { n: number }
-
-function countingClient(schema: string): { sql: postgres.Sql; c: Counter } {
-	const c: Counter = { n: 0 }
-	const sql = postgres(PG_URL, {
-		connection: { search_path: schema },
-		debug: () => {
-			c.n++
-		},
-		max: 4,
-		onnotice: () => {},
-	})
-	return { c, sql }
-}
 
 type Row = {
 	n: number
@@ -80,7 +65,7 @@ async function cloneCounting(
 	schema: string,
 	label: string,
 ): Promise<{ queries: number; ms: number; oids: Oid[]; tip: Oid }> {
-	const { sql, c } = countingClient(schema)
+	const { sql, counter } = queryCountingClient(PG_URL, schema)
 	try {
 		const server = await serveOnPort(createGitApp(createGitDeps(sql)), 0)
 		try {
@@ -100,7 +85,7 @@ async function cloneCounting(
 				return {
 					ms,
 					oids: await allObjectOids(dest),
-					queries: c.n,
+					queries: counter.queries,
 					tip: await revParse(dest, "refs/heads/main"),
 				}
 			} finally {

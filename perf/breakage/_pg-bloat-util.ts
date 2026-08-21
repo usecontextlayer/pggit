@@ -10,20 +10,11 @@
  * `vacuumAnalyze`, which the caller runs only on tables inside the isolated schema
  * it created.
  */
-import { createHash } from "node:crypto"
-import { mkdtempSync, rmSync, statSync } from "node:fs"
-import { readdir } from "node:fs/promises"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import postgresFactory, { type Sql } from "postgres"
-import {
-	type GitObjectWithOid,
-	gitReachableOids,
-	loadGitObjects,
-	loadReachableObjects,
-} from "@/testing/git-fixtures"
-export const WHEN = "1700000000 +0000"
-export const COMMITTER = `pggit oracle <oracle@pggit.test> ${WHEN}`
+import { type GitObjectWithOid, loadReachableObjects } from "@/testing/git-fixtures"
+import { createScratchArena } from "@/testing/scratch-arena"
 
 /** The tables whose economics this hunt is about. */
 export const TABLES = [
@@ -35,10 +26,9 @@ export const TABLES = [
 	"repo_file",
 	"repos",
 ] as const
-export type TableName = (typeof TABLES)[number]
 
 /** Which of those are HASH-partitioned ×16 (sizes must sum over leaves). */
-export const PARTITIONED = new Set<string>([
+const PARTITIONED = new Set<string>([
 	"git_object",
 	"git_commit",
 	"git_tag",
@@ -95,6 +85,16 @@ export async function sizesAll(sql: Sql): Promise<Record<string, Sizes>> {
 	const out: Record<string, Sizes> = {}
 	for (const t of TABLES) out[t] = await sizeOf(sql, t)
 	return out
+}
+
+export function requiredCount(
+	counts: ReadonlyMap<string, number>,
+	table: string,
+	phase: string,
+): number {
+	const value = counts.get(table)
+	if (value === undefined) throw new Error(`${phase}: row census omitted ${table}`)
+	return value
 }
 
 export type Stat = {
@@ -189,7 +189,7 @@ export function aggregate(rows: Stat[]): Record<string, Stat> {
  * does not report this cannot tell "the tuning never fired" from "nothing could be
  * reclaimed", so every harness here prints it.
  */
-export type Horizon = {
+type Horizon = {
 	/** how many XIDs behind the current snapshot's xmin lags */
 	ageXids: number
 	/** the longest-running client transaction, in seconds */
@@ -240,44 +240,6 @@ export async function horizon(sql: Sql): Promise<Horizon> {
 }
 
 /**
- * `VACUUM (VERBOSE)` a relation on a private connection with notices captured,
- * returning what the server actually said. The line that settles every bloat
- * argument is "N are dead but not yet removable".
- */
-export async function vacuumVerbose(
-	baseUrl: string,
-	schema: string,
-	relation: string,
-): Promise<{ removed: number; notRemovable: number; remain: number; lines: string[] }> {
-	const lines: string[] = []
-	const conn = postgresFactory(baseUrl, {
-		connection: { search_path: schema },
-		max: 1,
-		onnotice: (n) => lines.push(`${n.message ?? ""}`),
-	})
-	try {
-		await conn.unsafe(`vacuum (verbose) ${relation}`)
-	} finally {
-		await conn.end()
-	}
-	const text = lines.join("\n")
-	const m = text.match(
-		/tuples: (\d+) removed, (\d+) remain, (\d+) are dead but not yet removable/,
-	)
-	if (m === null) {
-		throw new Error(
-			`VACUUM VERBOSE did not report tuple counts for ${relation}:\n${text}`,
-		)
-	}
-	return {
-		lines,
-		notRemovable: Number(m[3]),
-		remain: Number(m[2]),
-		removed: Number(m[1]),
-	}
-}
-
-/**
  * A porsager pool tagged with `application_name`, pointed at `schema`. Tagging is
  * what makes WAL and transaction-duration measurements ATTRIBUTABLE on a shared
  * instance: `pg_current_wal_lsn()` is cluster-wide and counts every other tenant's
@@ -302,9 +264,9 @@ export function taggedPool(baseUrl: string, schema: string, app: string, max = 4
  * trivial command through every pooled connection is what actually publishes them.
  */
 export async function flushStats(sql: Sql, connections = 8): Promise<void> {
-	await new Promise((r) => setTimeout(r, 1100))
+	await sleep(1100)
 	await Promise.all(Array.from({ length: connections }, () => sql`select 1`))
-	await new Promise((r) => setTimeout(r, 250))
+	await sleep(250)
 }
 
 /** WAL bytes written by the backends of one `application_name` (PG 18+). */
@@ -393,46 +355,13 @@ export function scratchRoot(tag: string): {
 	root: string
 	cleanup: () => void
 } {
-	const root = mkdtempSync(join(tmpdir(), `pggit-bloat-${tag}-`))
+	const arena = createScratchArena()
+	const root = arena.make(`bloat-${tag}`)
 	return {
-		cleanup: () => rmSync(root, { force: true, recursive: true }),
+		cleanup: arena.cleanup,
 		dir: (name: string) => join(root, name),
 		root,
 	}
-}
-
-export function filler(salt: string, len: number): string {
-	let out = ""
-	while (out.length < len) {
-		out += createHash("sha1").update(`${salt}-${out.length}`).digest("hex")
-	}
-	return out.slice(0, len)
-}
-
-export function runDirName(salt: string, i: number): string {
-	const h = createHash("sha1").update(`${salt}-run-${i}`).digest("hex")
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-}
-
-/** Total bytes under a directory (git's own on-disk cost). */
-export async function duBytes(dir: string): Promise<number> {
-	let total = 0
-	const walk = async (d: string): Promise<void> => {
-		for (const e of await readdir(d, { withFileTypes: true })) {
-			const p = join(d, e.name)
-			if (e.isDirectory()) await walk(p)
-			else if (e.isFile()) total += statSync(p).size
-		}
-	}
-	await walk(dir)
-	return total
-}
-
-/** Every reachable object in a repo, in one `cat-file --batch`. */
-export type Obj = GitObjectWithOid
-
-export async function reachableObjects(dir: string): Promise<Obj[]> {
-	return loadGitObjects(dir, await gitReachableOids(dir))
 }
 
 /**
@@ -444,6 +373,6 @@ export async function objectsBetween(
 	dir: string,
 	rev: string,
 	exclude?: string,
-): Promise<Obj[]> {
+): Promise<GitObjectWithOid[]> {
 	return loadReachableObjects(dir, [rev, ...(exclude ? [`^${exclude}`] : [])])
 }

@@ -23,18 +23,21 @@ import { createGitApp, createGitDeps } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import {
 	allObjectOids,
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
 	loadGitObjects,
 	repackEligibleObjects,
 	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	gitRepack,
@@ -43,11 +46,8 @@ import {
 	mkTmp,
 	secs,
 	seedRepo,
-	table,
 } from "./_perf-util"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 const {
 	commits: COMMITS,
 	pg: PG_URL,
@@ -88,7 +88,7 @@ function stream(kind: ArmKind): string {
 	}
 	let prev = ++mark
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${changes.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${changes.join("\n")}\n`,
 	)
 	// Each commit rewrites ONE file, far past the 64th entry, with fresh content.
 	for (let c = 0; c < COMMITS; c++) {
@@ -99,7 +99,7 @@ function stream(kind: ArmKind): string {
 		const msg = `c${c}`
 		const target = 64 + ((c * 977) % (WIDTH - 64))
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
 				`M 100644 :${m} w/${name(target)}\n`,
 		)
 		prev = cm
@@ -170,15 +170,10 @@ async function arm(kind: ArmKind): Promise<Arm> {
 			} finally {
 				await server.close()
 			}
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-			const cloneOids = await allObjectOids(dest)
+			await assertGitReachableObjects(dest, expectedOids, `${label} clone`)
 			const cloneTip = await revParse(dest, "refs/heads/main")
-			if (
-				cloneTip !== expectedTip ||
-				cloneOids.length !== expectedOids.length ||
-				cloneOids.some((oid, i) => oid !== expectedOids[i])
-			) {
-				throw new Error(`${label} clone diverged from canonical refs/object set`)
+			if (cloneTip !== expectedTip) {
+				throw new Error(`${label} clone diverged from canonical ref tip`)
 			}
 			const run = requiredCollector(collectedRuns(), "fetch", label)
 			const packBytes = requiredPositiveCounter(run, "packBytes", label)

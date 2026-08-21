@@ -46,6 +46,11 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	uuidFromSeed,
+} from "@/testing/append-only-repo"
+import {
 	assertCanonicalStoreFixture,
 	repackEligibleObjects,
 	revParse,
@@ -53,17 +58,16 @@ import {
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg, positiveNumberArg } from "../args"
+import { vacuumVerbose } from "../vacuum-evidence"
 import {
 	aggregate,
-	COMMITTER,
-	filler,
 	horizon,
 	mb,
 	objectsBetween,
 	pad,
 	padr,
 	rawIndexSizes,
-	runDirName,
+	requiredCount,
 	type Sizes,
 	type Stat,
 	scratchRoot,
@@ -72,7 +76,6 @@ import {
 	TABLES,
 	vacuumAnalyze,
 	vacuumFull,
-	vacuumVerbose,
 	walBytes,
 } from "./_pg-bloat-util"
 
@@ -117,16 +120,6 @@ function requiredStat(
 	return value
 }
 
-function requiredCount(
-	counts: ReadonlyMap<string, number>,
-	table: string,
-	phase: string,
-): number {
-	const value = counts.get(table)
-	if (value === undefined) throw new Error(`${phase}: row census omitted ${table}`)
-	return value
-}
-
 /**
  * One base history plus ROUNDS throwaway branches off its tip. Every branch's
  * objects are distinct, so each round ingests genuinely new rows that the rewind
@@ -143,23 +136,23 @@ function buildStream(): string {
 	}
 	const seeded: string[] = []
 	for (let i = 0; i < 24; i++) {
-		const m = blob(`# doc ${i}\n\n${filler(`doc-${i}-v0`, 1400)}\n`)
+		const m = blob(`# doc ${i}\n\n${deterministicFiller(`doc-${i}-v0`, 1400)}\n`)
 		seeded.push(`M 100644 :${m} docs/doc-${i}.md`)
 	}
 	let prev = next()
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
 	)
 	const commitOn = (ref: string, parent: number, salt: string, i: number): number => {
-		const dir = runDirName(salt, i)
+		const dir = uuidFromSeed(`${salt}-run-${i}`)
 		const record = blob(
-			`{"run":"${dir}","payload":"${filler(`${salt}-rec-${i}`, 900)}"}\n`,
+			`{"run":"${dir}","payload":"${deterministicFiller(`${salt}-rec-${i}`, 900)}"}\n`,
 		)
-		const stderr = blob(`${filler(`${salt}-err-${i}`, 300)}\n`)
+		const stderr = blob(`${deterministicFiller(`${salt}-err-${i}`, 300)}\n`)
 		const cm = next()
 		const msg = `${salt} ${i}`
 		out.push(
-			`commit ${ref}\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${parent}\n` +
+			`commit ${ref}\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${parent}\n` +
 				`M 100644 :${record} .engine/runs/planner-updates/${dir}/record.json\n` +
 				`M 100644 :${stderr} .engine/runs/planner-updates/${dir}/stderr\n`,
 		)

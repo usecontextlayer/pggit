@@ -23,12 +23,12 @@ import { z } from "zod"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createGitApp, createGitDeps } from "@/index"
 import { collectedRuns, resetCollected } from "@/instrument"
-import { readPack } from "@/pack/read-pack"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import {
 	allObjectOids,
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
 	loadGitObjects,
 	repackEligibleObjects,
@@ -39,6 +39,7 @@ import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	mb,
@@ -46,7 +47,6 @@ import {
 	rewrittenArtifactStream,
 	secs,
 	seedRepo,
-	table,
 	timedSpawn,
 	withPeakRss,
 } from "./_perf-util"
@@ -113,8 +113,8 @@ async function main(): Promise<void> {
 			`canonical clone measurement invalid: ms=${gitClone.ms}, peak=${gitClone.peakRss}`,
 		)
 	}
-	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: gitClonedTo })
 	const expectedOids = await allObjectOids(src)
+	await assertGitReachableObjects(gitClonedTo, expectedOids, "canonical clone")
 	const expectedTip = await revParse(src, "refs/heads/main")
 	const expectedObjects = await loadGitObjects(src, expectedOids)
 	const blobObjects = expectedObjects.filter((object) => object.type === "blob")
@@ -123,13 +123,6 @@ async function main(): Promise<void> {
 		throw new Error(
 			`fixture produced ${blobObjects.length} blobs and ${commitObjects.length} commits for ${VERSIONS} versions`,
 		)
-	}
-	const gitCloneOids = await allObjectOids(gitClonedTo)
-	if (
-		gitCloneOids.length !== expectedOids.length ||
-		gitCloneOids.some((oid, i) => oid !== expectedOids[i])
-	) {
-		throw new Error("canonical clone did not reproduce the source object set")
 	}
 	const gitCloneBytes = allocatedDiskBytes(join(gitClonedTo, ".git", "objects"))
 
@@ -178,20 +171,15 @@ async function main(): Promise<void> {
 		} finally {
 			await server.close()
 		}
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+		await assertGitReachableObjects(dest, expectedOids, "pggit clone")
 		if (clone.ms <= 0 || clone.peakRss <= clone.baseRss) {
 			throw new Error(
 				`pggit clone measurement invalid: ms=${clone.ms}, base=${clone.baseRss}, peak=${clone.peakRss}`,
 			)
 		}
-		const cloneOids = await allObjectOids(dest)
 		const cloneTip = await revParse(dest, "refs/heads/main")
-		if (
-			cloneTip !== expectedTip ||
-			cloneOids.length !== expectedOids.length ||
-			cloneOids.some((oid, i) => oid !== expectedOids[i])
-		) {
-			throw new Error("pggit clone refs/object set diverged from canonical git")
+		if (cloneTip !== expectedTip) {
+			throw new Error("pggit clone ref tip diverged from canonical git")
 		}
 		if (run === undefined) throw new Error("missing raw-fetch instrumentation run")
 		const packBytes = requiredPositiveCounter(run, "packBytes", "blob-delta raw fetch")
@@ -211,20 +199,6 @@ async function main(): Promise<void> {
 				`objectsServed ${String(objectsServed)} != expected ${expectedOids.length}`,
 			)
 		}
-		const [pggitRawObjects, gitRawObjects] = await Promise.all([
-			readPack(pggitPack),
-			readPack(gitPack),
-		])
-		const pggitRawOids = pggitRawObjects.map((object) => object.oid).sort()
-		const gitRawOids = gitRawObjects.map((object) => object.oid).sort()
-		if (
-			JSON.stringify(pggitRawOids) !== JSON.stringify(expectedOids) ||
-			JSON.stringify(gitRawOids) !== JSON.stringify(expectedOids)
-		) {
-			throw new Error(
-				`raw response object sets differ from source (${pggitRawOids.length}/${gitRawOids.length}/${expectedOids.length})`,
-			)
-		}
 		const pggitIndexDir = join(mkTmp("blobs-pggit-pack"), "r.git")
 		const gitIndexDir = join(mkTmp("blobs-git-pack"), "r.git")
 		await spawnGit(["init", "-q", "--bare", pggitIndexDir])
@@ -233,6 +207,16 @@ async function main(): Promise<void> {
 			indexRawPack(pggitIndexDir, pggitPack, "complete"),
 			indexRawPack(gitIndexDir, gitPack, "complete"),
 		])
+		const pggitRawOids = pggitIndex.entries.map((object) => object.oid).sort()
+		const gitRawOids = gitIndex.entries.map((object) => object.oid).sort()
+		if (
+			JSON.stringify(pggitRawOids) !== JSON.stringify(expectedOids) ||
+			JSON.stringify(gitRawOids) !== JSON.stringify(expectedOids)
+		) {
+			throw new Error(
+				`raw response object sets differ from source (${pggitRawOids.length}/${gitRawOids.length}/${expectedOids.length})`,
+			)
+		}
 		const pggitBlobDeltas = pggitIndex.entries.filter(
 			(object) => object.type === "blob" && object.kind === "delta",
 		).length

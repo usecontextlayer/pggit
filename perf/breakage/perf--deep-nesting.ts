@@ -23,17 +23,20 @@ import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import {
 	allObjectOids,
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
 	loadGitObjects,
 	repackEligibleObjects,
 	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
 import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	gitRepack,
@@ -42,12 +45,9 @@ import {
 	mkTmp,
 	secs,
 	seedRepo,
-	table,
 	withPeakRss,
 } from "./_perf-util"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 const { depths: DEPTHS, pg: PG_URL } = parseArgs(
 	z
 		.object({
@@ -72,7 +72,7 @@ function stream(depth: number): string {
 		const cm = ++mark
 		const msg = `c${c}`
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n` +
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\n` +
 				(parent.kind === "root" ? "" : `from :${parent.mark}\n`) +
 				`M 100644 :${bm} ${path}\n`,
 		)
@@ -164,15 +164,10 @@ async function main(): Promise<void> {
 							`http://127.0.0.1:${server.port}/probe/deep`,
 							dest,
 						])
-						await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-						const gotOids = await allObjectOids(dest)
+						await assertGitReachableObjects(dest, expectedOids, "deep clone")
 						const gotTip = await revParse(dest, "refs/heads/main")
-						if (
-							gotTip !== expectedTip ||
-							gotOids.length !== expectedOids.length ||
-							gotOids.some((oid, i) => oid !== expectedOids[i])
-						) {
-							throw new Error("deep clone diverged from canonical refs/object set")
+						if (gotTip !== expectedTip) {
+							throw new Error("deep clone diverged from canonical ref tip")
 						}
 						fsckNote = "clone + fsck --strict clean"
 					} catch (e) {

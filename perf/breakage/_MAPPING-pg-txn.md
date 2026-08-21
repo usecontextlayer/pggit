@@ -1,5 +1,7 @@
 # Breakage conversion mapping — lens `pg-txn`
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts and mechanism names below (`git_edge`, `deriveEdges`, separate GC sweeps, and their fault points) describe the code as converted, not the landed derived-state spine. This file is deliberately not updated; read it as frozen provenance for the conversion.
+
 8 source scripts assigned, 8 converted. Every one is a fault-injection **correctness** repro (its verdict is a clone/push/invariant/convergence property, and it builds its own repo hermetically via `createAppendOnlyRepo` or an inline `git fast-import`), so all 8 route to **e2e** under `src/e2e/breakage/`. None routes to `perf/breakage/` — no script's primary verdict is a measured threshold, and none mirror-clones an external repo.
 
 Every test sources Postgres from `createIsolatedSchema(inject("pgBaseUrl"))` and builds its own extra pools with `postgres(baseUrl, { connection: { search_path: db.schema, … } })`; `:6489` appears nowhere. Fault-injection mechanics are preserved verbatim (`statement_timeout` connection params, `pg_cancel_backend`, `pg_terminate_backend`, `lock table … in access exclusive mode`, `select … for update`), and every `pg_terminate_backend` / `pg_cancel_backend` targets only a pid the test itself read from a connection it opened.

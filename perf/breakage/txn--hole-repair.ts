@@ -25,13 +25,13 @@ import {
 	loadGitObjects,
 	parseRevListObjectOids,
 	repackEligibleObjects,
-	requireGitOid,
+	revParse,
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg } from "../args"
-import { table } from "./_txn-util"
+import { table } from "../table"
 
 const REPO = "r"
 const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
@@ -78,10 +78,7 @@ async function lineageShape(db: IsolatedDb, oids: Buffer[]): Promise<LineageShap
 
 /** The tree OID at a fixture path that must exist. */
 async function treeAt(dir: string, spec: string): Promise<Oid> {
-	return requireGitOid(
-		(await spawnGit(["rev-parse", spec], { cwd: dir })).stdout.trim(),
-		`rev-parse ${spec}`,
-	)
+	return revParse(dir, spec)
 }
 
 function assertTierCoverage(stage: string, tier: TierSize): void {

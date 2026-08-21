@@ -8,7 +8,7 @@ import type { ProcessMetrics } from "./process-metrics"
 import type { Hotspot } from "./profile"
 import type { Scenario } from "./scenarios"
 
-export type PhaseReport = {
+type PhaseReport = {
 	name: string
 	wallMs: number
 	queryCount: number
@@ -16,7 +16,7 @@ export type PhaseReport = {
 }
 
 /** Memory summary carried in report.json — the full RSS timeseries goes to memory.json. */
-export type MemorySummary = Omit<MemoryReport, "rssSeries">
+type MemorySummary = Omit<MemoryReport, "rssSeries">
 
 /**
  * The report is split into two layers so the top-line comparison stays valid
@@ -74,7 +74,7 @@ const PHASE_ORDER = ["ref-advertise", "closure", "pack-encode"]
 // everything else `count()` records is Layer-2 diagnostics.
 const CONTRACT_COUNTERS = new Set(["wireBytes", "objectsServed"])
 
-export type AssembleInput = {
+type AssembleInput = {
 	scenario: Scenario
 	objectsInRepo: number
 	gitVersion: string

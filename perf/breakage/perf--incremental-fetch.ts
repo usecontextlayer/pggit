@@ -30,6 +30,7 @@ import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
 	listDifferences,
+	loadAllReachableObjects,
 	repackEligibleObjects,
 	requiredAt,
 	revParse,
@@ -42,15 +43,9 @@ import {
 	requiredPhase,
 	requiredPositiveCounter,
 } from "../collector-evidence"
-import {
-	cleanupTmp,
-	mb,
-	mkTmp,
-	reachableObjects,
-	secs,
-	seedRepo,
-	table,
-} from "./_perf-util"
+import { median, requireSamples } from "../memory"
+import { table } from "../table"
+import { cleanupTmp, mb, mkTmp, secs, seedRepo } from "./_perf-util"
 
 const { pg: PG_URL, sizes: SIZES } = parseArgs(
 	z
@@ -65,12 +60,6 @@ const STEPS = 8
 /** pggit/git per-fetch latency ratio at which this is called broken. */
 const RATIO_LIMIT = 5
 
-const median = (xs: number[]): number =>
-	requiredAt(
-		[...xs].sort((a, b) => a - b),
-		Math.floor(xs.length / 2),
-		"median sample",
-	)
 /** The least contention-polluted statistic on a loaded machine: the best case. */
 const best = (xs: number[]): number => Math.min(...xs)
 
@@ -124,7 +113,7 @@ async function measure(n: number): Promise<Row> {
 		const db = await createIsolatedSchema(PG_URL)
 		let server: Awaited<ReturnType<typeof serveOnPort>> | undefined
 		try {
-			const expectedObjects = await reachableObjects(src)
+			const expectedObjects = await loadAllReachableObjects(src)
 			const seeded = await seedRepo(db.sql, "probe/inc", src, expectedObjects)
 			const repacked = await createRepack(db.sql).repack("probe/inc")
 			if (
@@ -211,14 +200,14 @@ async function measure(n: number): Promise<Row> {
 				throw new Error("fetch timer recorded a nonpositive latency")
 			}
 			return {
-				closureShare: median(closures),
+				closureShare: median(requireSamples(closures)),
 				gitBest: best(gitFetches),
-				gitMs: median(gitFetches),
+				gitMs: median(requireSamples(gitFetches)),
 				n,
 				objects: seeded.objects,
-				packBytes: median(packs),
+				packBytes: median(requireSamples(packs)),
 				pggitBest: best(pggitFetches),
-				pggitMs: median(pggitFetches),
+				pggitMs: median(requireSamples(pggitFetches)),
 			}
 		} finally {
 			try {

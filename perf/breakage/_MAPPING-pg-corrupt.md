@@ -1,5 +1,7 @@
 # Breakage conversion mapping — lens `pg-corrupt`
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts and mechanism names below describe the code as converted, not the landed derived-state spine or later review fixes. This file is deliberately not updated; read it as frozen provenance for the conversion.
+
 7 source scripts assigned, 7 converted. Every one routed to **e2e**: each verdict is a
 correctness property (byte-identity, an invariant over the derived tier, a specific
 HTTP failure mode, a match against a real-git oracle) and each builds its own repo

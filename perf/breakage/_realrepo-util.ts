@@ -10,8 +10,6 @@
  *
  * Everything here is shared boundary work: strict arguments, scratch ownership, raw-pack indexing, exact stored-tier coverage, canonical object/ref readers, and a findings ledger. Measurements and thresholds remain in the harness that owns them.
  */
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Sql } from "postgres"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
@@ -21,6 +19,7 @@ import {
 	allObjectOids,
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
+	cloneIndependentMirror,
 	type GitObjectWithOid,
 	loadAllObjects,
 	parseVerifyPackObjects,
@@ -28,30 +27,25 @@ import {
 	type VerifyPackObject,
 } from "@/testing/git-fixtures"
 import { sidebandDemux } from "@/testing/pkt-oracle"
-import { GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { createScratchArena } from "@/testing/scratch-arena"
+import { spawnGit } from "@/testing/spawn-git"
 import { spawnUploadPack } from "@/testing/upload-pack-oracle"
 
 export const kb = (n: number): string => `${(n / 1000).toFixed(0)} KB`
 export const mb = (n: number): string => `${(n / 1_000_000).toFixed(2)} MB`
 export const secs = (ms: number): string => `${(ms / 1000).toFixed(1)}s`
 
-export type Scratch = {
+type Scratch = {
 	/** A fresh temp directory, remembered so `cleanup()` can remove it. */
 	mk: (tag: string) => string
 	cleanup: () => void
 }
 
 export function createScratch(prefix: string): Scratch {
-	const dirs: string[] = []
+	const arena = createScratchArena()
 	return {
-		cleanup: () => {
-			for (const d of dirs) rmSync(d, { force: true, recursive: true })
-		},
-		mk: (tag: string) => {
-			const d = mkdtempSync(join(tmpdir(), `${prefix}-${tag}-`))
-			dirs.push(d)
-			return d
-		},
+		cleanup: arena.cleanup,
+		mk: (tag: string) => arena.make(`${prefix}-${tag}`),
 	}
 }
 
@@ -67,7 +61,7 @@ export function createScratch(prefix: string): Scratch {
  * `--no-hardlinks` keeps the clone's object files physically its own, so nothing
  * here can reach back into the source's store.
  */
-export type MirrorSource = { path: string }
+type MirrorSource = { path: string }
 
 export function mirrorSourceFromArgs(args: {
 	repo?: string
@@ -87,11 +81,11 @@ export async function prepareMirror(
 	source: MirrorSource,
 ): Promise<string> {
 	const work = join(scratch.mk("mirror"), "source.git")
-	await spawnGit(["clone", "--mirror", "--no-hardlinks", "-q", source.path, work])
+	await cloneIndependentMirror(source.path, work)
 	return work
 }
 
-export type CanonicalStoreEncoding = { kind: "unencoded" } | { kind: "repacked" }
+type CanonicalStoreEncoding = { kind: "unencoded" } | { kind: "repacked" }
 
 /** Prove a real-repository store before any harness measurement is scored. */
 export async function assertCanonicalRealRepoStore(
@@ -110,34 +104,6 @@ export async function assertCanonicalRealRepoStore(
 		refs: await canonicalStoreRefsOf(dir),
 	})
 	return objects
-}
-
-export type GitOutcome =
-	| { status: "success"; stdout: string; stderr: string }
-	| { status: "failure"; code: number; stdout: string; stderr: string }
-
-/** `spawnGit`, but a non-zero exit is an OUTCOME to compare against the oracle's,
- * not a throw — "pggit rejected what git accepted" is the finding these harnesses
- * exist to catch, and it is only visible if both sides report their exit code. */
-export async function tryGit(
-	args: string[],
-	cwd?: string,
-	input?: string,
-): Promise<GitOutcome> {
-	try {
-		const r = await spawnGit(args, { cwd, input })
-		return { status: "success", stderr: r.stderr, stdout: r.stdout }
-	} catch (err) {
-		if (err instanceof GitCommandError) {
-			return {
-				code: err.code,
-				status: "failure",
-				stderr: err.stderr,
-				stdout: err.stdout,
-			}
-		}
-		throw err
-	}
 }
 
 function requireV2Pack(response: Buffer, source: string): Buffer {
@@ -314,9 +280,9 @@ export async function repackExactly(
 	return { ...receipt, coverage }
 }
 
-export type Ledger = {
+type Ledger = {
 	findings: string[]
-	report: string[]
+	report: (string | number)[][]
 	fail: (what: string, detail: string) => void
 }
 
@@ -324,7 +290,7 @@ export type Ledger = {
  * harness exits non-zero when the ledger is non-empty. */
 export function createLedger(slug: string): Ledger {
 	const findings: string[] = []
-	const report: string[] = []
+	const report: (string | number)[][] = []
 	return {
 		fail: (what: string, detail: string): void => {
 			findings.push(`${what}: ${detail}`)

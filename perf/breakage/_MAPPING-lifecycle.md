@@ -1,5 +1,7 @@
 # Breakage conversion mapping — lens `lifecycle`
 
+> **Point-in-time conversion record (2026-08-15).** Verdicts and mechanism names below describe the code as converted, not the landed derived-state spine or later review fixes. This file is deliberately not updated; read it as frozen provenance for the conversion.
+
 11 source scripts assigned, 11 converted. Every one routed to **e2e**: each verdict is a correctness property (clone/fetch success, `git fsck --strict`, object/ref-set and byte-for-byte identity against a `file://` oracle, repack convergence, or a specific throw), and each builds its own repo hermetically via `git fast-import`. No script in this lens measures a threshold or needs an external repo, so `perf/breakage/` holds only this mapping.
 
 Shared helper `breakage/_lib.ts` is **utility/helper, not a test** — its `scratchRoot` / `buildSource` / `lineage` / `revList` / `revParse` / `mirrorClone` / `objectBytesDigest` / `diffLists` are inlined per destination file (house style: existing e2e tests inline their own helpers), with the hardcoded `pggit oracle <oracle@pggit.test>` identity replaced by `PINNED_IDENTITY` from `@/testing/spawn-git` (same bytes) and the hardcoded `postgres://…:6489` replaced by `createIsolatedSchema(inject("pgBaseUrl"))`.

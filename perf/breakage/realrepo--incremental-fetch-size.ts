@@ -21,6 +21,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import type { Oid } from "@/oid"
 import { serveOnPort } from "@/server"
 import {
+	assertGitReachableObjects,
 	branchAndTagRefsOf,
 	gitReachableOids,
 	parseRevListObjectOids,
@@ -36,6 +37,7 @@ import {
 	positiveIntegerArg,
 	positiveNumberArg,
 } from "../args"
+import { table } from "../table"
 import {
 	assertCanonicalRealRepoStore,
 	canonicalV2Pack,
@@ -80,15 +82,11 @@ function requireEqual<T>(label: string, left: readonly T[], right: readonly T[])
 }
 
 async function requireTrackingClientsEqual(pgDir: string, gitDir: string): Promise<void> {
+	const expectedOids = await gitReachableOids(gitDir)
 	await Promise.all([
-		spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: pgDir }),
-		spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: gitDir }),
+		assertGitReachableObjects(pgDir, expectedOids, "pggit tracking client"),
+		assertGitReachableObjects(gitDir, expectedOids, "canonical tracking client"),
 	])
-	requireEqual(
-		"tracking reachable OIDs",
-		await gitReachableOids(pgDir),
-		await gitReachableOids(gitDir),
-	)
 	requireEqual(
 		"tracking refs",
 		await branchAndTagRefsOf(pgDir),
@@ -246,13 +244,18 @@ async function main(): Promise<void> {
 		throw new Error("warm raw pack totals must both be positive")
 	}
 	console.log("\n### per-round raw PACK bytes (round 0 is cold)\n")
-	console.log("| round | commit | pggit | git | ratio |")
-	console.log("|---|---|---|---|---|")
-	for (const row of rows) {
-		console.log(
-			`| ${row.round} | ${row.rev.slice(0, 8)} | ${kb(row.pggit)} | ${kb(row.git)} | ${(row.pggit / row.git).toFixed(2)}x |`,
-		)
-	}
+	console.log(
+		table(
+			["round", "commit", "pggit", "git", "ratio"],
+			rows.map((row) => [
+				row.round,
+				row.rev.slice(0, 8),
+				kb(row.pggit),
+				kb(row.git),
+				`${(row.pggit / row.git).toFixed(2)}x`,
+			]),
+		),
+	)
 	const ratio = pggitWarmBytes / gitWarmBytes
 	const cold = rows[0]
 	if (cold === undefined) throw new Error("cold round was not measured")

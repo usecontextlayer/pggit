@@ -1,13 +1,9 @@
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
+import { spawnGit } from "@/testing/spawn-git"
 import { mulberry32, type Scenario } from "./scenarios"
-
-// Raw fast-import "when": <unix-ts> <tz>, matching spawn-git's PINNED_DATE clock
-// (@1700000000 +0000) so generated commit OIDs are reproducible.
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 
 /** Deterministic path for file `i`: `pathDepth` dirs of `treeWidth` fanout. */
 function filePath(i: number, s: Scenario): string {
@@ -45,7 +41,7 @@ function buildStream(s: Scenario, rnd: () => number): string {
 	const emitCommit = (msg: string, parent: CommitParent, changed: number[]): number => {
 		const cm = nextMark()
 		const from = parent.kind === "root" ? "" : `from :${parent.mark}\n`
-		let body = `commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\n${from}`
+		let body = `commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\n${from}`
 		for (const i of changed) body += `M 100644 :${blobMark[i]} ${filePath(i, s)}\n`
 		out.push(body)
 		return cm

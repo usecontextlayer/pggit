@@ -27,9 +27,9 @@ export type MemoryBreakdown = {
 	rss: number
 }
 
-export type NonEmptySamples<T> = readonly [T, ...T[]]
-export type RssSample = [number, number]
-export type RssSeries = [RssSample, RssSample, ...RssSample[]]
+type NonEmptySamples<T> = readonly [T, ...T[]]
+type RssSample = [number, number]
+type RssSeries = [RssSample, RssSample, ...RssSample[]]
 
 /** Establish a measurement boundary before reducers score a series. */
 export function requireSamples<T>(samples: readonly T[]): NonEmptySamples<T> {
@@ -66,6 +66,18 @@ export function peakOf(values: NonEmptySamples<number>): number {
 	let max = first
 	for (const value of rest) if (value > max) max = value
 	return max
+}
+
+/** Median of a measured series, averaging the middle pair for an even sample count. */
+export function median(values: NonEmptySamples<number>): number {
+	const sorted = [...values].sort((a, b) => a - b)
+	const midpoint = Math.floor(sorted.length / 2)
+	const upper = sorted.at(midpoint)
+	if (upper === undefined) throw new Error("median requires a non-empty sample")
+	if (sorted.length % 2 === 1) return upper
+	const lower = sorted.at(midpoint - 1)
+	if (lower === undefined) throw new Error("median requires a lower middle sample")
+	return (lower + upper) / 2
 }
 
 /** Nearest-rank percentile of a measured series (p in [0,100]). */

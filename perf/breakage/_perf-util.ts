@@ -3,31 +3,47 @@
  */
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { cpSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
-import type { Sql } from "postgres"
+import postgresFactory, { type Sql } from "postgres"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
 	type GitObjectWithOid,
-	gitReachableOids,
-	loadGitObjects,
+	loadAllReachableObjects,
+	packFileBytes,
 	repackEligibleObjects,
+	requiredAt,
 	seedGitRefs,
 } from "@/testing/git-fixtures"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { createScratchArena } from "@/testing/scratch-arena"
+import { spawnGit } from "@/testing/spawn-git"
 import { peakOf, rssBytes, startRssSampler } from "../memory"
-
-export { table } from "../table"
 
 export const mb = (bytes: number): string => `${(bytes / 1_000_000).toFixed(1)}`
 export const secs = (ms: number): string => `${(ms / 1000).toFixed(2)}`
 
-const REWRITTEN_ARTIFACT_WHEN = "1700000000 +0000"
-const REWRITTEN_ARTIFACT_COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${REWRITTEN_ARTIFACT_WHEN}`
+/** A schema-scoped client that counts queries and their normalized SQL shapes. */
+export function queryCountingClient(
+	pgUrl: string,
+	schema: string,
+): { sql: Sql; counter: { byShape: Map<string, number>; queries: number } } {
+	const counter = { byShape: new Map<string, number>(), queries: 0 }
+	const sql = postgresFactory(pgUrl, {
+		connection: { search_path: schema },
+		debug: (_id, query) => {
+			counter.queries++
+			const shape = query.trim().replace(/\s+/g, " ").slice(0, 46)
+			counter.byShape.set(shape, (counter.byShape.get(shape) ?? 0) + 1)
+		},
+		max: 4,
+		onnotice: () => {},
+	})
+	return { counter, sql }
+}
 
 function deterministicNoise(salt: string, length: number): Buffer {
 	const parts: Buffer[] = []
@@ -64,7 +80,7 @@ export function rewrittenArtifactStream(options: {
 		const message = `v${version}`
 		parts.push(
 			Buffer.from(
-				`commit refs/heads/main\nmark :${commitMark}\ncommitter ${REWRITTEN_ARTIFACT_COMMITTER}\ndata ${message.length}\n${message}\n` +
+				`commit refs/heads/main\nmark :${commitMark}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${message.length}\n${message}\n` +
 					(parent.kind === "root" ? "" : `from :${parent.mark}\n`) +
 					`M 100644 :${blobMark} data/artifact.bin\n`,
 			),
@@ -74,15 +90,9 @@ export function rewrittenArtifactStream(options: {
 	return Buffer.concat(parts)
 }
 
-const scratch: string[] = []
-export function mkTmp(tag: string): string {
-	const d = mkdtempSync(join(tmpdir(), `pggit-breakage-${tag}-`))
-	scratch.push(d)
-	return d
-}
-export function cleanupTmp(): void {
-	for (const d of scratch.splice(0)) rmSync(d, { force: true, recursive: true })
-}
+const scratch = createScratchArena()
+export const mkTmp = scratch.make
+export const cleanupTmp = scratch.cleanup
 
 /** Peak-RSS sampler around an async call — process-wide RSS sampled off-thread so synchronous encoding work cannot hide its own peak. */
 export async function withPeakRss<T>(
@@ -91,15 +101,14 @@ export async function withPeakRss<T>(
 	const baseRss = process.memoryUsage().rss
 	const sampler = startRssSampler()
 	const t0 = Date.now()
-	let outcome: { ok: true; value: T } | { ok: false; error: unknown }
-	try {
-		outcome = { ok: true, value: await fn() }
-	} catch (error) {
-		outcome = { error, ok: false }
-	}
+	const outcome = requiredAt(
+		await Promise.allSettled([Promise.resolve().then(fn)]),
+		0,
+		"peak-RSS measured operation",
+	)
 	const ms = Date.now() - t0
 	const series = await sampler.stop()
-	if (!outcome.ok) throw outcome.error
+	if (outcome.status === "rejected") throw outcome.reason
 	return {
 		baseRss,
 		ms,
@@ -154,20 +163,7 @@ export async function gitRepack(
 	const dir = join(mkTmp(tag), "repo")
 	cpSync(srcDir, dir, { recursive: true })
 	const r = await timedSpawn("git", ["repack", "-adf", "-q", ...extraArgs], dir)
-	const out = await spawnGit(["count-objects", "-v"], { cwd: dir })
-	const size = out.stdout.match(/^size-pack: (\d+)$/m)?.[1]
-	if (size === undefined) {
-		throw new Error(`git count-objects did not report size-pack:\n${out.stdout}`)
-	}
-	const kb = Number(size)
-	return { ms: r.ms, packBytes: kb * 1024, peakRss: r.peakRss }
-}
-
-export type Obj = GitObjectWithOid
-
-/** Every reachable object of a repo, via ONE `git cat-file --batch`. */
-export async function reachableObjects(dir: string): Promise<Obj[]> {
-	return loadGitObjects(dir, await gitReachableOids(dir))
+	return { ms: r.ms, packBytes: await packFileBytes(dir), peakRss: r.peakRss }
 }
 
 /** Seed a real repo's objects + refs into a pggit schema through the public store. */
@@ -175,29 +171,15 @@ export async function seedRepo(
 	sql: Sql,
 	repoId: string,
 	dir: string,
-	objects?: Obj[],
+	objects?: GitObjectWithOid[],
 ): Promise<{ objects: number; eligibleObjects: number; rawBytes: number; ms: number }> {
-	const objs = objects ?? (await reachableObjects(dir))
+	const objs = objects ?? (await loadAllReachableObjects(dir))
 	if (objs.length === 0) throw new Error(`cannot seed empty repository ${dir}`)
 	const store = createObjectStore(sql)
 	const refs = createRefStore(sql)
 	const t0 = Date.now()
-	let batch: Obj[] = []
-	let bytes = 0
-	const flush = async (): Promise<void> => {
-		if (batch.length === 0) return
-		await store.putPack(repoId, batch)
-		batch = []
-		bytes = 0
-	}
-	let rawBytes = 0
-	for (const o of objs) {
-		rawBytes += o.content.length
-		batch.push(o)
-		bytes += o.content.length
-		if (bytes >= 16_000_000 || batch.length >= 20_000) await flush()
-	}
-	await flush()
+	await store.putPack(repoId, objs)
+	const rawBytes = objs.reduce((total, object) => total + object.content.length, 0)
 	await seedGitRefs(repoId, dir, refs)
 	await assertCanonicalStoreFixture(sql, repoId, {
 		encodings: { kind: "exact", objects: [] },

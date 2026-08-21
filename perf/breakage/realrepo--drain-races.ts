@@ -20,9 +20,10 @@ import { serveOnPort } from "@/server"
 import { createRepack } from "@/store/repack"
 import { parseRevListObjectOids, requiredAt, typedRefsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 import { nonemptyStringArg, parseArgs, pgUrlArg } from "../args"
+import { table } from "../table"
 import {
 	assertCanonicalRealRepoStore,
 	createLedger,
@@ -33,7 +34,6 @@ import {
 	oidSet,
 	postPggitV2Pack,
 	prepareMirror,
-	tryGit,
 } from "./_realrepo-util"
 
 const args = parseArgs(
@@ -64,8 +64,8 @@ async function verifyClone(
 	dir: string,
 	expect: { oids: Set<string>; refs: string },
 ): Promise<boolean> {
-	const fsck = await tryGit(["fsck", "--strict"], dir)
-	if (fsck.status === "failure") {
+	const fsck = await attemptGit(["fsck", "--strict"], dir)
+	if (!fsck.ok) {
 		fail(`${label}: git fsck --strict FAILED`, fsck.stderr.trim().slice(0, 800))
 		return false
 	}
@@ -197,9 +197,11 @@ async function main(): Promise<void> {
 				`sha256 ${d1.slice(0, 16)} vs ${d2.slice(0, 16)} — buildPack documents deterministic packs`,
 			)
 		}
-		report.push(
-			`| R1 | determinism (2 raw v2 fetches, same state) | ${d1 === d2 ? "byte-identical" : "DIVERGED"} |`,
-		)
+		report.push([
+			"R1",
+			"determinism (2 raw v2 fetches, same state)",
+			d1 === d2 ? "byte-identical" : "DIVERGED",
+		])
 
 		// Independent client correctness: both clones must accept that state.
 		const c1 = join(scratch.mk("det1"), "c.git")
@@ -235,7 +237,7 @@ async function main(): Promise<void> {
 			},
 		)
 		await waitForPartialCoverage(db, `races/${SLUG}`, beforeR2, () => repackSettled)
-		const cloneP = tryGit([
+		const cloneP = attemptGit([
 			"-c",
 			"protocol.version=2",
 			"clone",
@@ -260,17 +262,19 @@ async function main(): Promise<void> {
 			kind: "repacked",
 		})
 		console.log(
-			`  R2 concurrent repack: ${rp.wholes} wholes + ${rp.deltas} deltas; clone ${cl.status === "success" ? "ok" : `FAILED exit ${cl.code}`}`,
+			`  R2 concurrent repack: ${rp.wholes} wholes + ${rp.deltas} deltas; clone ${cl.ok ? "ok" : `FAILED exit ${cl.code}`}`,
 		)
-		if (cl.status === "failure")
+		if (!cl.ok)
 			fail(
 				"R2 a clone running concurrently with repack FAILED",
 				cl.stderr.trim().slice(0, 800),
 			)
 		else await verifyClone("R2 clone racing repack", raceDir, headExpect)
-		report.push(
-			`| R2 | clone ‖ repack | ${cl.status === "success" ? "pack valid, matches git" : "CLONE FAILED"} |`,
-		)
+		report.push([
+			"R2",
+			"clone ‖ repack",
+			cl.ok ? "pack valid, matches git" : "CLONE FAILED",
+		])
 
 		// ── R3: a push racing a repack, then a clone of the result ──────────────
 		// Fresh repo id so the repack has the whole history pending while a push of a
@@ -296,7 +300,7 @@ async function main(): Promise<void> {
 			},
 		)
 		await waitForPartialCoverage(db, rid2, beforeR3, () => repack3Settled)
-		const pushP3 = tryGit(["push", url2, `${head}:refs/heads/later`], MIRROR)
+		const pushP3 = attemptGit(["push", url2, `${head}:refs/heads/later`], MIRROR)
 		const [rp3, pu3] = await Promise.all([repackP3, pushP3])
 		if (rp3.wholes + rp3.deltas !== beforeR3.eligible - beforeR3.encoded) {
 			throw new Error(
@@ -307,9 +311,9 @@ async function main(): Promise<void> {
 			cwd: MIRROR,
 		})
 		console.log(
-			`  R3 repack ‖ push: repack ${rp3.wholes}w+${rp3.deltas}d, push ${pu3.status === "success" ? "ok" : `FAILED exit ${pu3.code}`}`,
+			`  R3 repack ‖ push: repack ${rp3.wholes}w+${rp3.deltas}d, push ${pu3.ok ? "ok" : `FAILED exit ${pu3.code}`}`,
 		)
-		if (pu3.status === "failure")
+		if (!pu3.ok)
 			fail(
 				"R3 a push running concurrently with repack FAILED",
 				pu3.stderr.trim().slice(0, 800),
@@ -328,14 +332,14 @@ async function main(): Promise<void> {
 				`R3 convergence left encoding coverage ${afterConverge.encoded}/${afterConverge.eligible}`,
 			)
 		}
-		if (pu3.status === "success") {
+		if (pu3.ok) {
 			await assertCanonicalRealRepoStore(db.sql, rid2, oracle2, { kind: "repacked" })
 		}
 		const oracle2Clone = join(scratch.mk("oracle2c"), "o.git")
 		await spawnGit(["clone", "--mirror", "-q", `file://${oracle2}`, oracle2Clone])
 		const expect2 = await oracleState(oracle2Clone)
 		const after3 = join(scratch.mk("after3"), "c.git")
-		const cl3 = await tryGit([
+		const cl3 = await attemptGit([
 			"-c",
 			"protocol.version=2",
 			"clone",
@@ -344,12 +348,14 @@ async function main(): Promise<void> {
 			url2,
 			after3,
 		])
-		if (cl3.status === "failure")
+		if (!cl3.ok)
 			fail("R3 clone after a push/repack race FAILED", cl3.stderr.trim().slice(0, 800))
 		else await verifyClone("R3 clone after push‖repack", after3, expect2)
-		report.push(
-			`| R3 | push ‖ repack (+converging repack ${rp3b.wholes}w+${rp3b.deltas}d) | ${cl3.status === "success" ? "pack valid, matches git" : "CLONE FAILED"} |`,
-		)
+		report.push([
+			"R3",
+			`push ‖ repack (+converging repack ${rp3b.wholes}w+${rp3b.deltas}d)`,
+			cl3.ok ? "pack valid, matches git" : "CLONE FAILED",
+		])
 	} finally {
 		await server.close()
 		await db.drop()
@@ -357,9 +363,7 @@ async function main(): Promise<void> {
 	}
 
 	console.log(`\n## ${SLUG} — drain races\n`)
-	console.log("| race | what | verdict |")
-	console.log("|---|---|---|")
-	for (const r of report) console.log(r)
+	console.log(table(["race", "what", "verdict"], report))
 	console.log(
 		`\n${findings.length === 0 ? "VERDICT: clean — every established race matched git's refs and objects." : `VERDICT: ${findings.length} FINDING(S)`}`,
 	)

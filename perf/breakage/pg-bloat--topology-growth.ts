@@ -18,25 +18,22 @@ import { z } from "zod"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	uuidFromSeed,
+} from "@/testing/append-only-repo"
+import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
+	loadAllReachableObjects,
+	packFileBytes,
 	requiredAt,
 	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
-import {
-	COMMITTER,
-	filler,
-	mb,
-	pad,
-	padr,
-	reachableObjects,
-	runDirName,
-	scratchRoot,
-	sizeOf,
-} from "./_pg-bloat-util"
+import { mb, pad, padr, scratchRoot, sizeOf } from "./_pg-bloat-util"
 
 /** growth exponent (log-log slope) above which the surface is super-linear */
 const EXPONENT_LIMIT = 1.35
@@ -61,20 +58,22 @@ function buildStream(commits: number): string {
 	}
 	const seeded: string[] = []
 	for (let i = 0; i < 20; i++) {
-		const m = blob(`# doc ${i}\n${filler(`doc-${i}`, 800)}\n`)
+		const m = blob(`# doc ${i}\n${deterministicFiller(`doc-${i}`, 800)}\n`)
 		seeded.push(`M 100644 :${m} docs/doc-${i}.md`)
 	}
 	let prev = next()
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
 	)
 	for (let i = 0; i < commits; i++) {
-		const dir = runDirName("topology", i)
-		const record = blob(`{"run":"${dir}","p":"${filler(`rec-${i}`, 700)}"}\n`)
-		const stderr = blob(`${filler(`err-${i}`, 200)}\n`)
+		const dir = uuidFromSeed(`topology-run-${i}`)
+		const record = blob(
+			`{"run":"${dir}","p":"${deterministicFiller(`rec-${i}`, 700)}"}\n`,
+		)
+		const stderr = blob(`${deterministicFiller(`err-${i}`, 200)}\n`)
 		const cm = next()
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata 3\nrun\nfrom :${prev}\n` +
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nrun\nfrom :${prev}\n` +
 				`M 100644 :${record} .engine/runs/planner-updates/${dir}/record.json\n` +
 				`M 100644 :${stderr} .engine/runs/planner-updates/${dir}/stderr\n`,
 		)
@@ -104,35 +103,15 @@ async function measure(
 	const gcDir = scratch.dir(`gc-${commits}`)
 	await spawnGit(["clone", "-q", "--mirror", src, gcDir])
 	await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: gcDir })
-	const packMatch = (
-		await spawnGit(["count-objects", "-v"], { cwd: gcDir })
-	).stdout.match(/size-pack: (\d+)/)
-	if (!packMatch) throw new Error("git count-objects omitted size-pack")
-	const packBytes = Number(packMatch[1]) * 1024
+	const packBytes = await packFileBytes(gcDir)
 	if (packBytes <= 0) throw new Error(`canonical git pack size is ${packBytes}`)
 
-	const objects = await reachableObjects(src)
+	const objects = await loadAllReachableObjects(src)
 	const db = await createIsolatedSchema(PG_URL)
 	try {
 		const store = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		let batch: typeof objects = []
-		let bytes = 0
-		const flush = async () => {
-			if (batch.length === 0) return
-			await store.putPack(
-				"r/topology",
-				batch.map((o) => ({ content: o.content, type: o.type })),
-			)
-			batch = []
-			bytes = 0
-		}
-		for (const o of objects) {
-			batch.push(o)
-			bytes += o.content.length
-			if (bytes >= 16_000_000) await flush()
-		}
-		await flush()
+		await store.putPack("r/topology", objects)
 		const tip = await revParse(src, "refs/heads/main")
 		await refs.setRef("r/topology", "refs/heads/main", tip)
 		await refs.setSymref("r/topology", "HEAD", "refs/heads/main")

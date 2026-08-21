@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
 	type MemoryBreakdown,
+	median,
 	peakOf,
 	peakPerField,
 	percentile,
@@ -21,6 +22,12 @@ describe("peakOf", () => {
 		// would throw on these, so peakOf must fold, not spread.
 		const big = Array.from({ length: 200_000 }, (_, i) => i)
 		expect(peakOf(requireSamples(big))).toBe(199_999)
+	})
+})
+
+describe("median", () => {
+	it("averages the middle pair of an even sample", () => {
+		expect(median([4, 1, 3, 2])).toBe(2.5)
 	})
 })
 

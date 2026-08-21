@@ -8,7 +8,7 @@ const TOXIPROXY_IMAGE = "ghcr.io/shopify/toxiproxy:2.12.0"
 
 export type RttMode = { kind: "loopback" } | { kind: "sweep"; requestedMs: number }
 
-export type RttSample = { rttMs: number; wallMs: number }
+type RttSample = { rttMs: number; wallMs: number }
 
 export type RttEvidence =
 	| { kind: "loopback" }
@@ -20,10 +20,10 @@ type PgHandleBase = {
 }
 
 /** A direct loopback endpoint has no latency-injection operation. */
-export type PlainPgHandle = PgHandleBase & { kind: "plain" }
+type PlainPgHandle = PgHandleBase & { kind: "plain" }
 
 /** A proxied endpoint can inject a per-response round-trip delay. */
-export type LatencyPgHandle = PgHandleBase & {
+type LatencyPgHandle = PgHandleBase & {
 	kind: "latency"
 	setLatencyMs: (ms: number, jitter?: number) => Promise<void>
 }

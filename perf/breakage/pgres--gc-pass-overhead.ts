@@ -36,31 +36,31 @@
  *
  *   npx tsx perf/breakage/pgres--gc-pass-overhead.ts --passes=120 --repos=12
  */
+import { setTimeout as sleep } from "node:timers/promises"
 import type { Sql } from "postgres"
 import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import {
 	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
 	repackEligibleObjects,
 	requiredAt,
 	requireGitOid,
+	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { median, requireSamples } from "../memory"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	fastImport,
 	initRepo,
-	median,
-	type Obj,
 	objectsBetween,
-	revParse,
 	runCommits,
 	seedObjects,
 	setMain,
-	sleep,
-	table,
 } from "./_pgres-util"
 
 const args = parseArgs(
@@ -83,9 +83,9 @@ type Catalog = { size: number; ins: number; del: number; upd: number }
 async function requireFixture(
 	pg: Sql,
 	repo: string,
-	objects: readonly Obj[],
+	objects: readonly GitObjectWithOid[],
 	tip: string,
-	encodings: readonly Obj[],
+	encodings: readonly GitObjectWithOid[],
 ): Promise<void> {
 	await assertCanonicalStoreFixture(pg, repo, {
 		encodings: { kind: "exact", objects: encodings },
@@ -213,8 +213,8 @@ async function main(): Promise<void> {
 		const withTier = await noop(PASSES)
 		const withMs = Date.now() - t1
 		const c4 = await catalogState(pg)
-		const bareMedian = median(bare)
-		const withTierMedian = median(withTier)
+		const bareMedian = median(requireSamples(bare))
+		const withTierMedian = median(requireSamples(withTier))
 		if (
 			!Number.isFinite(bareMs) ||
 			bareMs <= 0 ||
@@ -350,7 +350,7 @@ async function main(): Promise<void> {
 					}
 					xs.push(elapsed)
 				}
-				const measured = median(xs)
+				const measured = median(requireSamples(xs))
 				if (!Number.isFinite(measured) || measured <= 0) {
 					throw new Error(`${repo}: median timing must be positive, got ${measured}`)
 				}

@@ -24,8 +24,7 @@ import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
 	assertCanonicalStoreFixture,
 	type GitObjectWithOid,
-	gitReachableOids,
-	loadGitObjects,
+	loadAllReachableObjects,
 	parseRevListObjectOids,
 	repackEligibleObjects,
 	requiredAt,
@@ -33,7 +32,8 @@ import {
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
-import { cleanupTmp, gitRepack, secs, table } from "./_perf-util"
+import { table } from "../table"
+import { cleanupTmp, gitRepack, secs } from "./_perf-util"
 
 const { pg: PG_URL, sizes: SIZES } = parseArgs(
 	z
@@ -60,33 +60,13 @@ async function seedSubset(
 	repoId: string,
 	objs: GitObjectWithOid[],
 ): Promise<void> {
-	const store = createObjectStore(sql)
-	let batch: GitObjectWithOid[] = []
-	let bytes = 0
-	const flush = async (): Promise<void> => {
-		if (batch.length === 0) return
-		await store.putPack(
-			repoId,
-			batch.map((o) => ({
-				content: o.content,
-				type: o.type,
-			})),
-		)
-		batch = []
-		bytes = 0
-	}
-	for (const o of objs) {
-		batch.push(o)
-		bytes += o.content.length
-		if (bytes >= 16_000_000 || batch.length >= 20_000) await flush()
-	}
-	await flush()
+	await createObjectStore(sql).putPack(repoId, objs)
 }
 
 async function measure(n: number): Promise<Row> {
 	const dir = await createAppendOnlyRepo({ docs: 8, runs: n })
 	try {
-		const all = await loadGitObjects(dir, await gitReachableOids(dir))
+		const all = await loadAllReachableObjects(dir)
 		const prior = new Set(
 			parseRevListObjectOids(
 				(await spawnGit(["rev-list", "--objects", "HEAD~1"], { cwd: dir })).stdout,

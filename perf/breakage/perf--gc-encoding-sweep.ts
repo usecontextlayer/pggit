@@ -22,12 +22,14 @@ import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
+	loadAllReachableObjects,
 	repackEligibleObjects,
 	requiredAt,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
-import { cleanupTmp, reachableObjects, secs, seedRepo, table } from "./_perf-util"
+import { table } from "../table"
+import { cleanupTmp, secs, seedRepo } from "./_perf-util"
 
 const { pg: PG_URL, sizes: SIZES } = parseArgs(
 	z
@@ -52,7 +54,7 @@ async function measure(n: number): Promise<Row> {
 	try {
 		const db = await createIsolatedSchema(PG_URL)
 		try {
-			const objects = await reachableObjects(src)
+			const objects = await loadAllReachableObjects(src)
 			const seeded = await seedRepo(db.sql, "probe/gc", src, objects)
 			const gc = createGc(db.sql)
 			const pass = async (expectedEpoch: "rebuilt" | "unchanged"): Promise<number> => {

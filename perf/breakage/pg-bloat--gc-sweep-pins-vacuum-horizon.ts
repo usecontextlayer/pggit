@@ -37,21 +37,16 @@ import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
+import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	uuidFromSeed,
+} from "@/testing/append-only-repo"
 import { assertCanonicalStoreFixture, revParse } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
-import {
-	COMMITTER,
-	filler,
-	horizon,
-	objectsBetween,
-	pad,
-	padr,
-	runDirName,
-	scratchRoot,
-	sizeOf,
-} from "./_pg-bloat-util"
+import { horizon, objectsBetween, pad, padr, scratchRoot, sizeOf } from "./_pg-bloat-util"
 
 const REPO_ID = "workspace/slate/horizon"
 /** application_name tag so the sampler can attribute open transactions to THIS pass */
@@ -85,14 +80,14 @@ function buildStream(): string {
 	let prev = next()
 	const m0 = blob("# seed\n")
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\nM 100644 :${m0} docs/a.md\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\nM 100644 :${m0} docs/a.md\n`,
 	)
 	const commit = (ref: string, parent: number, salt: string, i: number): number => {
-		const d = runDirName(salt, i)
-		const r = blob(`{"r":"${d}","p":"${filler(`${salt}-${i}`, 500)}"}\n`)
+		const d = uuidFromSeed(`${salt}-run-${i}`)
+		const r = blob(`{"r":"${d}","p":"${deterministicFiller(`${salt}-${i}`, 500)}"}\n`)
 		const cm = next()
 		out.push(
-			`commit ${ref}\nmark :${cm}\ncommitter ${COMMITTER}\ndata 2\nxx\nfrom :${parent}\n` +
+			`commit ${ref}\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nxx\nfrom :${parent}\n` +
 				`M 100644 :${r} .engine/runs/planner-updates/${d}/record.json\n`,
 		)
 		return cm

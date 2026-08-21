@@ -1,6 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs"
 import { writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createGitApp } from "@/index"
 import { type Collector, collectedRuns, resetCollected } from "@/instrument"
@@ -10,15 +8,17 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import {
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
-	type GitObjectWithOid,
 	gitReachableOids,
-	loadGitObjects,
-	requireGitOid,
+	loadAllObjects,
+	parseLsRemoteRefs,
 	seedGitRefs,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
 import { generateRepo } from "./fast-import"
 import { type MemoryReport, startMemorySampler } from "./memory"
 import {
@@ -35,30 +35,12 @@ import type { Scenario } from "./scenarios"
 
 const REPO_ID = "perf"
 
-type Outcome<T> = { status: "success"; value: T } | { status: "failure"; error: unknown }
-
-async function outcomeOf<T>(work: () => Promise<T>): Promise<Outcome<T>> {
-	try {
-		return { status: "success", value: await work() }
-	} catch (error) {
-		return { error, status: "failure" }
-	}
+function settledValue<T>(result: PromiseSettledResult<T>): T {
+	if (result.status === "rejected") throw result.reason
+	return result.value
 }
 
-function outcomeOfSync<T>(work: () => T): Outcome<T> {
-	try {
-		return { status: "success", value: work() }
-	} catch (error) {
-		return { error, status: "failure" }
-	}
-}
-
-function outcomeValue<T>(outcome: Outcome<T>): T {
-	if (outcome.status === "failure") throw outcome.error
-	return outcome.value
-}
-
-export type RunOptions = {
+type RunOptions = {
 	scenario: Scenario
 	seed: number
 	repeat: number
@@ -73,11 +55,6 @@ type PgRuntime =
 			pg: Awaited<ReturnType<typeof startLatencyPg>>
 			requestedMs: number
 	  }
-
-/** Load every object from a real repo (the m0 seeding path: real git, real store). */
-async function loadAllObjects(dir: string): Promise<GitObjectWithOid[]> {
-	return loadGitObjects(dir, await gitReachableOids(dir))
-}
 
 async function seedStore(
 	srcRepo: string,
@@ -98,43 +75,9 @@ async function seedStore(
 	return { objectCount: allObjects.length, objects, refs }
 }
 
-async function verifyClone(dir: string, expectedOids: readonly Oid[]): Promise<void> {
-	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dir })
-	const actual = await gitReachableOids(dir)
-	const expected = [...expectedOids].sort()
-	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-		throw new Error(
-			`clone object set differs from canonical source: expected ${expected.length}, got ${actual.length}`,
-		)
-	}
-}
-
-function normalizedLsRemote(stdout: string, source: string): string[] {
-	const rows = stdout.trim().split("\n").filter(Boolean)
-	if (rows.length === 0) throw new Error(`${source} advertised no refs`)
-	return rows
-		.map((line) => {
-			const fields = line.split("\t")
-			const [oid, name] = fields
-			if (
-				fields.length !== 2 ||
-				oid === undefined ||
-				name === undefined ||
-				name.length === 0
-			) {
-				throw new Error(
-					`${source} emitted malformed ls-remote row ${JSON.stringify(line)}`,
-				)
-			}
-			return `${requireGitOid(oid, `${source} ls-remote row`)}\t${name}`
-		})
-		.sort()
-}
-
 /** One `git clone` over loopback; returns its wall time in ms. */
 async function cloneOnce(port: number, expectedOids: readonly Oid[]): Promise<number> {
-	const dest = mkdtempSync(join(tmpdir(), "pggit-perf-clone-"))
-	try {
+	return withTempDir("pggit-perf-clone-", async (dest) => {
 		const t0 = process.hrtime.bigint()
 		await spawnGit([
 			"clone",
@@ -145,14 +88,13 @@ async function cloneOnce(port: number, expectedOids: readonly Oid[]): Promise<nu
 			dest,
 		])
 		const wallMs = Number(process.hrtime.bigint() - t0) / 1e6
-		await verifyClone(dest, expectedOids)
+		await assertGitReachableObjects(dest, expectedOids, "clone")
 		return wallMs
-	} finally {
-		rmSync(dest, { force: true, recursive: true })
-	}
+	})
 }
 
 export async function runScenario(opts: RunOptions): Promise<Report> {
+	const scratch = createScratchArena()
 	const runtime: PgRuntime =
 		opts.rtt.kind === "loopback"
 			? { kind: "loopback", pg: await startPlainPg() }
@@ -164,9 +106,9 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 	const pg: PgHandle = runtime.pg
 	const db = await createIsolatedSchema(pg.baseUrl)
 	let server: GitServer | undefined
-	let srcRepo: string | undefined
 	try {
-		srcRepo = await generateRepo(opts.scenario, opts.seed)
+		const srcRepo = await generateRepo(opts.scenario, opts.seed)
+		scratch.own(srcRepo)
 		const { objects, refs, objectCount } = await seedStore(srcRepo, db)
 		const expectedOids = await gitReachableOids(srcRepo)
 		if (expectedOids.length === 0)
@@ -178,8 +120,8 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 			spawnGit(["ls-remote", srcRepo]),
 			spawnGit(["ls-remote", `http://127.0.0.1:${port}/${REPO_ID}`]),
 		])
-		const expectedRefs = normalizedLsRemote(canonicalRefs.stdout, "canonical source")
-		const actualRefs = normalizedLsRemote(servedRefs.stdout, "pggit")
+		const expectedRefs = parseLsRemoteRefs(canonicalRefs.stdout, "canonical source")
+		const actualRefs = parseLsRemoteRefs(servedRefs.stdout, "pggit")
 		if (JSON.stringify(actualRefs) !== JSON.stringify(expectedRefs)) {
 			throw new Error(
 				`served refs differ from canonical source: expected ${expectedRefs.length}, got ${actualRefs.length}`,
@@ -199,11 +141,11 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 		// clone. The MEMORY clone runs the RSS/breakdown samplers without the profiler's
 		// sampling overhead. Both clones are deterministic (same repo), so the
 		// collectors, profile, and memory all describe the same workload.
-		const profDest = mkdtempSync(join(tmpdir(), "pggit-perf-prof-"))
+		const profDest = scratch.make("perf-prof")
 		resetCollected()
 		const cpu0 = process.cpuUsage()
 		startProfile()
-		const profileClone = await outcomeOf(() =>
+		const [profileClone] = await Promise.allSettled([
 			spawnGit([
 				"clone",
 				"-c",
@@ -212,19 +154,18 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 				`http://127.0.0.1:${port}/${REPO_ID}`,
 				profDest,
 			]),
-		)
-		const profileStop = await outcomeOf(() => stopProfile(opts.outDir))
-		outcomeValue(profileClone)
-		const profile: ProfileResult = outcomeValue(profileStop)
+		])
+		const [profileStop] = await Promise.allSettled([stopProfile(opts.outDir)])
+		settledValue(profileClone)
+		const profile: ProfileResult = settledValue(profileStop)
 		const cpu = process.cpuUsage(cpu0)
 		const collectors: readonly Collector[] = [...collectedRuns()]
-		await verifyClone(profDest, expectedOids)
-		rmSync(profDest, { force: true, recursive: true })
+		await assertGitReachableObjects(profDest, expectedOids, "profile clone")
 
-		const memDest = mkdtempSync(join(tmpdir(), "pggit-perf-mem-"))
+		const memDest = scratch.make("perf-mem")
 		const proc = collectProcessMetrics()
 		const memory = startMemorySampler()
-		const memoryClone = await outcomeOf(() =>
+		const [memoryClone] = await Promise.allSettled([
 			spawnGit([
 				"clone",
 				"-c",
@@ -233,15 +174,17 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 				`http://127.0.0.1:${port}/${REPO_ID}`,
 				memDest,
 			]),
-		)
+		])
 		// Stop the GC observer BEFORE the memory sampler forces a GC for its retained-set
 		// read, so the forced collection never pollutes the GC counts. Capture both
 		// outcomes so one failed stop never prevents the other sampler from stopping.
-		const processStop = outcomeOfSync(() => proc.stop())
-		const memoryStop = await outcomeOf(() => memory.stop())
-		outcomeValue(memoryClone)
-		const processMetrics: ProcessMetrics = outcomeValue(processStop)
-		const memoryReport: MemoryReport = outcomeValue(memoryStop)
+		const [processStop] = await Promise.allSettled([
+			Promise.resolve().then(() => proc.stop()),
+		])
+		const [memoryStop] = await Promise.allSettled([memory.stop()])
+		settledValue(memoryClone)
+		const processMetrics: ProcessMetrics = settledValue(processStop)
+		const memoryReport: MemoryReport = settledValue(memoryStop)
 		await writeFile(
 			join(opts.outDir, "memory.json"),
 			JSON.stringify({
@@ -249,8 +192,7 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 				sampler: memoryReport.sampler,
 			}),
 		)
-		await verifyClone(memDest, expectedOids)
-		rmSync(memDest, { force: true, recursive: true })
+		await assertGitReachableObjects(memDest, expectedOids, "memory clone")
 
 		// RTT sweep: clone wall at 0ms vs the requested latency (same repo, via proxy).
 		let rtt: RttEvidence = { kind: "loopback" }
@@ -289,6 +231,6 @@ export async function runScenario(opts: RunOptions): Promise<Report> {
 		await server?.close()
 		await db.drop()
 		await pg.stop()
-		if (srcRepo) rmSync(srcRepo, { force: true, recursive: true })
+		scratch.cleanup()
 	}
 }

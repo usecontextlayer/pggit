@@ -43,42 +43,45 @@
  *
  *   npx tsx perf/breakage/pgres--churn-cycle-bloat.ts --rounds=14 --commits=60
  */
-import { readdirSync, rmSync, statSync } from "node:fs"
+import { rmSync } from "node:fs"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import type { Sql } from "postgres"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
+import { directoryBytes } from "@/testing/directory-size"
 import {
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	branchAndTagRefsOf,
-	parseRevListObjectOids,
+	gitReachableOids,
+	mirrorClone,
+	mirrorStateOf,
 	repackEligibleObjects,
 	requiredAt,
 	requireGitOid,
+	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { table } from "../table"
 import {
 	cleanupTmp,
-	cloneAndVerify,
 	encodingCensus,
 	fastImport,
 	initRepo,
 	mb,
 	mkTmp,
 	objectsBetween,
-	revParse,
 	runCommits,
 	schemaStats,
 	seedObjects,
 	setMain,
-	sleep,
 	stat,
-	table,
 	total,
 } from "./_pgres-util"
 
@@ -180,17 +183,6 @@ function tailGrowthPerLiveByte(rows: Row[]): number {
 }
 
 const phys = (r: Row): number => r.encHeap + r.encToast + r.encIdx
-
-function fileContentBytes(dir: string): number {
-	const walk = (p: string): number => {
-		const st = statSync(p)
-		if (!st.isDirectory()) return st.size
-		let n = 0
-		for (const e of readdirSync(p)) n += walk(join(p, e))
-		return n
-	}
-	return walk(dir)
-}
 
 /** Seconds the OLDEST client backend has been holding a transaction snapshot — the
  * instance-wide xmin horizon lag. Shared: this is the sibling agents' load. */
@@ -337,7 +329,7 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 				encToast: e.toast,
 				encVac: e.vac,
 				gcObjects: g.deletedObjects,
-				gitDirBytes: fileContentBytes(join(dir, ".git")),
+				gitDirBytes: await directoryBytes(join(dir, ".git")),
 				ms: Date.now() - t0,
 				objAutovac: o.autovac,
 				objDead: o.dead,
@@ -357,18 +349,16 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			try {
 				const url = `http://127.0.0.1:${server.port}/${REPO}`
 				const clone = join(mkTmp(`clone-${mode.key}`), "c.git")
-				const got = await cloneAndVerify(url, clone)
-				const want = parseRevListObjectOids(
-					(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
-				).sort()
-				const wantRefs = (await branchAndTagRefsOf(dir)).map(
-					({ name, oid }) => `${oid} ${name}`,
-				)
+				const [got, want] = await Promise.all([
+					mirrorClone(url, clone),
+					mirrorStateOf(dir),
+				])
 				const same =
-					got.objects.length === want.length &&
-					got.objects.every((x, i) => x === want[i]) &&
-					JSON.stringify(got.refs) === JSON.stringify(wantRefs) &&
-					got.fsck === ""
+					JSON.stringify(got.objects) === JSON.stringify(want.objects) &&
+					JSON.stringify(got.refs) === JSON.stringify(want.refs) &&
+					got.digest === want.digest &&
+					got.fsck === "" &&
+					want.fsck === ""
 				let result: CorrectnessResult = same
 					? {
 							status: "passed",
@@ -376,7 +366,7 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 						}
 					: {
 							status: "failed",
-							verdict: `MISMATCH: clone ${got.objects.length} objs / local ${want.length} objs / fsck=${got.fsck || "clean"}`,
+							verdict: `MISMATCH: clone ${got.objects.length} objs / local ${want.objects.length} objs / fsck=${got.fsck || "clean"}`,
 						}
 
 				const extra = runCommits({
@@ -399,41 +389,27 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 					}
 				}
 				await spawnGit(["fetch", "-q", "origin", "+refs/*:refs/*"], { cwd: clone })
-				const after = (
-					await spawnGit(["rev-parse", "refs/heads/main"], { cwd: clone })
-				).stdout.trim()
+				const after = await revParse(clone, "refs/heads/main")
 				if (after !== tip2) {
 					result = {
 						status: "failed",
 						verdict: `${result.verdict} | INCREMENTAL FETCH MISMATCH ${after} != ${tip2}`,
 					}
 				} else {
-					const f = await spawnGit(["fsck", "--strict", "--no-dangling"], {
-						cwd: clone,
-					})
-					const gotAfter = parseRevListObjectOids(
-						(await spawnGit(["rev-list", "--objects", "--all"], { cwd: clone })).stdout,
-					).sort()
-					const wantAfter = parseRevListObjectOids(
-						(await spawnGit(["rev-list", "--objects", "--all"], { cwd: dir })).stdout,
-					).sort()
+					const wantAfter = await gitReachableOids(dir)
+					await assertGitReachableObjects(
+						clone,
+						wantAfter,
+						`${mode.key} incremental clone`,
+					)
 					const [gotRefsAfter, wantRefsAfter] = await Promise.all([
 						branchAndTagRefsOf(clone),
 						branchAndTagRefsOf(dir),
 					])
-					if (
-						gotAfter.length !== wantAfter.length ||
-						gotAfter.some((oid, i) => oid !== wantAfter[i]) ||
-						JSON.stringify(gotRefsAfter) !== JSON.stringify(wantRefsAfter)
-					) {
-						throw new Error(
-							`${mode.key}: incremental clone refs/objects diverged from git`,
-						)
+					if (JSON.stringify(gotRefsAfter) !== JSON.stringify(wantRefsAfter)) {
+						throw new Error(`${mode.key}: incremental clone refs diverged from git`)
 					}
-					result = appendEvidence(
-						result,
-						`incremental fetch ok (fsck ${`${f.stdout}${f.stderr}`.trim() || "clean"})`,
-					)
+					result = appendEvidence(result, "incremental fetch ok (fsck clean)")
 				}
 				rmSync(clone, { force: true, recursive: true })
 				return result

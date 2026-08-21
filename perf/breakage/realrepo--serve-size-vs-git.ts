@@ -34,6 +34,7 @@ import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 import { nonemptyStringArg, parseArgs, pgUrlArg, positiveNumberArg } from "../args"
+import { table } from "../table"
 import {
 	assertCanonicalRealRepoStore,
 	canonicalV2Pack,
@@ -97,17 +98,26 @@ async function wantedRefOids(dir: string): Promise<Oid[]> {
 	return wants
 }
 
-function table(label: string, a: { by: Attribution; total: number }): void {
+function printAttribution(label: string, a: { by: Attribution; total: number }): void {
 	console.log(`\n### ${label} — ${mb(a.total)} of pack entries`)
-	console.log("| type | objects | bytes in pack | entries stored as deltas |")
-	console.log("|---|---|---|---|")
-	for (const t of ["commit", "tree", "blob", "tag"]) {
-		const s = a.by.get(t)
-		if (!s) continue
-		console.log(
-			`| ${t} | ${s.n} | ${mb(s.packed)} | ${s.deltified} (${((s.deltified / s.n) * 100).toFixed(0)}%) |`,
-		)
-	}
+	console.log(
+		table(
+			["type", "objects", "bytes in pack", "entries stored as deltas"],
+			["commit", "tree", "blob", "tag"].flatMap((type) => {
+				const stats = a.by.get(type)
+				return stats === undefined
+					? []
+					: [
+							[
+								type,
+								stats.n,
+								mb(stats.packed),
+								`${stats.deltified} (${((stats.deltified / stats.n) * 100).toFixed(0)}%)`,
+							],
+						]
+			}),
+		),
+	)
 }
 
 async function main(): Promise<void> {
@@ -191,24 +201,30 @@ async function main(): Promise<void> {
 				`verify-pack entry bytes exceed raw pack length (pggit ${p.total}/${pggitPack.length}, git ${g.total}/${gitPack.length})`,
 			)
 		}
-		table("pggit raw response pack", p)
-		table("git raw response pack (gc --aggressive)", g)
+		printAttribution("pggit raw response pack", p)
+		printAttribution("git raw response pack (gc --aggressive)", g)
 
 		const ratio = pggitPack.length / gitPack.length
 		console.log(`\n### where the gap is`)
-		console.log("| type | pggit | git | pggit / git |")
-		console.log("|---|---|---|---|")
+		const gapRows: (string | number)[][] = []
 		for (const t of ["commit", "tree", "blob", "tag"]) {
 			const ps = p.by.get(t)
 			const gs = g.by.get(t)
 			if (!ps || !gs) continue
-			console.log(
-				`| ${t} | ${mb(ps.packed)} | ${mb(gs.packed)} | ${(ps.packed / gs.packed).toFixed(2)}x |`,
-			)
+			gapRows.push([
+				t,
+				mb(ps.packed),
+				mb(gs.packed),
+				`${(ps.packed / gs.packed).toFixed(2)}x`,
+			])
 		}
-		console.log(
-			`| **raw pack** | **${mb(pggitPack.length)}** | **${mb(gitPack.length)}** | **${ratio.toFixed(2)}x** |`,
-		)
+		gapRows.push([
+			"**raw pack**",
+			`**${mb(pggitPack.length)}**`,
+			`**${mb(gitPack.length)}**`,
+			`**${ratio.toFixed(2)}x**`,
+		])
+		console.log(table(["type", "pggit", "git", "pggit / git"], gapRows))
 
 		const pggitBlobs = p.by.get("blob")
 		const gitBlobs = g.by.get("blob")

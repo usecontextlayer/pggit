@@ -30,7 +30,7 @@ import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg } from "../args"
 import { requiredPositiveMeasurement } from "../collector-evidence"
-import { table } from "./_txn-util"
+import { table } from "../table"
 
 const REPO = "r"
 const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
@@ -50,11 +50,7 @@ function timed(pg: Sql, into: Map<string, number>): Sql {
 				if (prop !== "unsafe") return Reflect.get(t, prop, receiver)
 				const real = Reflect.get(t, prop, t) as Sql["unsafe"]
 				return async (sql: string, ...rest: unknown[]) => {
-					const bucket = sql.includes("git_pack_encoding")
-						? "encodings"
-						: sql.includes("git_object")
-							? "objects"
-							: "other"
+					const bucket = sql.includes("git_object") ? "objects" : "other"
 					const t0 = performance.now()
 					try {
 						return await (real as (s: string, ...r: unknown[]) => Promise<unknown>).call(

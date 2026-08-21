@@ -21,15 +21,16 @@
  * Exit 0 = both orders serve canonical refs and objects, at depth <= 1.
  * Exit 1 = reproduced, with the diverging ref/object or the offending depth named.
  */
-import { mkdirSync, readdirSync } from "node:fs"
+import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
-import { allRefsOf, parseVerifyPackObjects, requiredAt } from "@/testing/git-fixtures"
+import { allRefsOf, requiredAt, verifyPackObjectsInRepo } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { spawnGit } from "@/testing/spawn-git"
+import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { nonemptyStringArg, parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { table } from "../table"
 import {
 	assertCanonicalRealRepoStore,
 	createLedger,
@@ -38,7 +39,6 @@ import {
 	oidSet,
 	prepareMirror,
 	repackExactly,
-	tryGit,
 } from "./_realrepo-util"
 
 const args = parseArgs(
@@ -72,13 +72,9 @@ async function refList(dir: string): Promise<string> {
 /** Delta chain depths as the CLIENT measures them, from `git verify-pack -v`.
  * Column 6 is the chain depth for a deltified entry; absent for a base entry. */
 async function depthHistogram(bareDir: string): Promise<Map<number, number>> {
-	const packDir = join(bareDir, "objects", "pack")
 	const hist = new Map<number, number>()
-	const indexes = readdirSync(packDir).filter((x) => x.endsWith(".idx"))
-	if (indexes.length === 0) throw new Error(`${bareDir}: clone contains no pack index`)
-	for (const f of indexes) {
-		const out = await spawnGit(["verify-pack", "-v", join(packDir, f)], { cwd: bareDir })
-		for (const object of parseVerifyPackObjects(out.stdout)) {
+	for (const pack of await verifyPackObjectsInRepo(bareDir)) {
+		for (const object of pack.objects) {
 			if (object.kind !== "delta") continue
 			hist.set(object.depth, (hist.get(object.depth) ?? 0) + 1)
 		}
@@ -107,14 +103,14 @@ async function runOrder(
 	let accepted = 0
 	let postFirstObjects = 0
 	for (const ref of refs) {
-		const o = await tryGit(["push", `file://${oracle}`, `+${ref}:${ref}`], MIRROR)
-		if (o.status === "failure") {
+		const o = await attemptGit(["push", `file://${oracle}`, `+${ref}:${ref}`], MIRROR)
+		if (!o.ok) {
 			throw new Error(
 				`${label}: canonical git rejected fixture ref ${ref}: ${o.stderr.trim().slice(0, 500)}`,
 			)
 		}
-		const p = await tryGit(["push", url, `+${ref}:${ref}`], MIRROR)
-		if (p.status === "failure") {
+		const p = await attemptGit(["push", url, `+${ref}:${ref}`], MIRROR)
+		if (!p.ok) {
 			fail(
 				`${label}: pggit rejected canonical ref push ${ref} (exit ${p.code})`,
 				p.stderr.trim().slice(0, 500),
@@ -140,7 +136,7 @@ async function runOrder(
 	)
 
 	const clone = join(scratch.mk(`clone-${label}`), "c.git")
-	const c = await tryGit([
+	const c = await attemptGit([
 		"-c",
 		"protocol.version=2",
 		"clone",
@@ -149,7 +145,7 @@ async function runOrder(
 		url,
 		clone,
 	])
-	if (c.status === "failure") {
+	if (!c.ok) {
 		fail(
 			`${label}: mirror clone after per-ref pushes FAILED`,
 			c.stderr.trim().slice(0, 800),
@@ -159,8 +155,8 @@ async function runOrder(
 	const oracleClone = join(scratch.mk(`oclone-${label}`), "o.git")
 	await spawnGit(["clone", "--mirror", "-q", `file://${oracle}`, oracleClone])
 
-	const fsck = await tryGit(["fsck", "--strict"], clone)
-	if (fsck.status === "failure")
+	const fsck = await attemptGit(["fsck", "--strict"], clone)
+	if (!fsck.ok)
 		fail(`${label}: git fsck --strict FAILED`, fsck.stderr.trim().slice(0, 800))
 
 	const [got, want] = [await oidSet(clone), await oidSet(oracleClone)]
@@ -198,12 +194,18 @@ async function runOrder(
 			`max depth ${maxDepth} (bound ${MAX_DEPTH}); histogram ${depths.map(([d, n]) => `depth ${d}: ${n} entries`).join(", ")}`,
 		)
 	}
-	report.push(
-		`| ${label} | ${refs.length} refs, one push each + repack | ${missing.length === 0 && extra.length === 0 && gr === wr ? "IDENTICAL to git" : "DIVERGED"} |`,
-	)
-	report.push(
-		`| ${label} | served delta depth | max ${maxDepth} (${depths.map(([d, n]) => `${d}:${n}`).join(" ") || "no deltas"}) |`,
-	)
+	report.push([
+		label,
+		`${refs.length} refs, one push each + repack`,
+		missing.length === 0 && extra.length === 0 && gr === wr
+			? "IDENTICAL to git"
+			: "DIVERGED",
+	])
+	report.push([
+		label,
+		"served delta depth",
+		`max ${maxDepth} (${depths.map(([d, n]) => `${d}:${n}`).join(" ") || "no deltas"})`,
+	])
 	return { oids: got, state: "complete" }
 }
 
@@ -240,9 +242,11 @@ async function main(): Promise<void> {
 					`forward-only ${only1.length}, reverse-only ${only2.length}`,
 				)
 			}
-			report.push(
-				`| both | forward vs reverse object sets | ${only1.length === 0 && only2.length === 0 ? "identical" : "DIVERGED"} |`,
-			)
+			report.push([
+				"both",
+				"forward vs reverse object sets",
+				only1.length === 0 && only2.length === 0 ? "identical" : "DIVERGED",
+			])
 		}
 	} finally {
 		await server.close()
@@ -251,9 +255,7 @@ async function main(): Promise<void> {
 	}
 
 	console.log(`\n## ${SLUG} — branch-order stress\n`)
-	console.log("| order | what | verdict |")
-	console.log("|---|---|---|")
-	for (const r of report) console.log(r)
+	console.log(table(["order", "what", "verdict"], report))
 	console.log(
 		`\n${findings.length === 0 ? "VERDICT: clean — both orders matched git, depth bound held." : `VERDICT: ${findings.length} FINDING(S)`}`,
 	)

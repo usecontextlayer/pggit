@@ -29,19 +29,6 @@ export function requiredCollector(
 	return collector
 }
 
-/** Read one finite nonnegative counter. */
-export function requiredCounter(
-	collector: Collector,
-	metric: string,
-	context: string,
-): number {
-	const value = collector.counters.get(metric)
-	if (value === undefined || !Number.isFinite(value) || value < 0) {
-		throw new Error(`${context}: required ${metric} counter is missing or invalid`)
-	}
-	return value
-}
-
 /** Read one positive counter whose value proves that the measured path ran. */
 export function requiredPositiveCounter(
 	collector: Collector,

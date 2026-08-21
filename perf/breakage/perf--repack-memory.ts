@@ -23,14 +23,17 @@ import postgres from "postgres"
 import { z } from "zod"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { createRepack } from "@/store/repack"
+import { FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
 import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
+	gitObjectInventory,
+	loadAllReachableObjects,
 	repackEligibleObjects,
 	requiredAt,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
 import {
 	increasingIntegerListArg,
 	nonemptyStringArg,
@@ -38,20 +41,17 @@ import {
 	pgUrlArg,
 	positiveIntegerArg,
 } from "../args"
+import { table } from "../table"
 import {
 	cleanupTmp,
 	gitRepack,
 	importRepo,
 	mb,
-	reachableObjects,
 	secs,
 	seedRepo,
-	table,
 	timedSpawn,
 } from "./_perf-util"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 const REPO_ID = "probe/mem"
 /** Peak RSS above git's at which this is called broken. */
 const RSS_RATIO_LIMIT = 2
@@ -144,7 +144,7 @@ function stream(commits: number, width: number): string {
 	}
 	let prev = ++mark
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${changes.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${changes.join("\n")}\n`,
 	)
 	for (let c = 0; c < commits; c++) {
 		const m = ++mark
@@ -153,7 +153,7 @@ function stream(commits: number, width: number): string {
 		const cm = ++mark
 		const msg = `c${c}`
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n` +
 				`M 100644 :${m} wide/f${String(c % width).padStart(6, "0")}.txt\n`,
 		)
 		prev = cm
@@ -163,25 +163,9 @@ function stream(commits: number, width: number): string {
 
 /** Total bytes by object type, WITHOUT holding any content in the harness. */
 async function bytesByType(dir: string): Promise<Map<string, number>> {
-	const out = await spawnGit(
-		["cat-file", "--batch-all-objects", "--batch-check=%(objecttype) %(objectsize)"],
-		{ cwd: dir },
-	)
 	const totals = new Map<string, number>()
-	for (const line of out.stdout.split("\n")) {
-		if (line === "") continue
-		const [type, size] = line.split(" ")
-		const bytes = Number(size)
-		if (
-			!type ||
-			!size ||
-			line.split(" ").length !== 2 ||
-			!/^(blob|commit|tag|tree)$/.test(type) ||
-			!Number.isSafeInteger(bytes) ||
-			bytes < 0
-		)
-			throw new Error(`malformed cat-file size row: ${JSON.stringify(line)}`)
-		totals.set(type, (totals.get(type) ?? 0) + bytes)
+	for (const { size, type } of (await gitObjectInventory(dir)).values()) {
+		totals.set(type, (totals.get(type) ?? 0) + size)
 	}
 	return totals
 }
@@ -267,7 +251,7 @@ async function main({ commits: commitCounts, pg, width }: ParentArgs): Promise<v
 						`repack child peak ${child.peakRss} did not exceed interpreter floor ${floor.peakRss}`,
 					)
 				}
-				const canonicalObjects = await reachableObjects(dir)
+				const canonicalObjects = await loadAllReachableObjects(dir)
 				await assertCanonicalStoreFixture(db.sql, REPO_ID, {
 					encodings: {
 						kind: "exact",

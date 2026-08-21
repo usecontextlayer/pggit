@@ -40,6 +40,8 @@ import { createRepoFileProjection } from "@/repo-view/repo-file-projection"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
+import { deterministicFiller, FAST_IMPORT_COMMITTER } from "@/testing/append-only-repo"
+import { directoryBytes } from "@/testing/directory-size"
 import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
@@ -51,14 +53,12 @@ import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg } from "../args"
 import {
 	backendWal,
-	COMMITTER,
-	duBytes,
-	filler,
 	flushStats,
 	kb,
 	objectsBetween,
 	pad,
 	padr,
+	requiredCount,
 	type Sizes,
 	scratchRoot,
 	sizesAll,
@@ -88,16 +88,6 @@ function requiredSize(sizes: Record<string, Sizes>, table: string, phase: string
 	return value
 }
 
-function requiredCount(
-	counts: ReadonlyMap<string, number>,
-	table: string,
-	phase: string,
-): number {
-	const value = counts.get(table)
-	if (value === undefined) throw new Error(`${phase}: row census omitted ${table}`)
-	return value
-}
-
 const SHAPES: Shape[] = [
 	{ depth: 0, files: 4096, name: "wide-flat", width: 4096 },
 	{ depth: 1, files: 4096, name: "d1-w64", width: 64 },
@@ -123,14 +113,14 @@ function baseStream(s: Shape): string {
 	let mark = 0
 	const lines: string[] = []
 	for (let i = 0; i < s.files; i++) {
-		const content = `# f${i}\n${filler(`${s.name}-f${i}-v0`, 400)}\n`
+		const content = `# f${i}\n${deterministicFiller(`${s.name}-f${i}-v0`, 400)}\n`
 		const m = ++mark
 		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
 		lines.push(`M 100644 :${m} ${filePath(i, s)}`)
 	}
 	const cm = ++mark
 	out.push(
-		`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata 4\nbase\n${lines.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nbase\n${lines.join("\n")}\n`,
 	)
 	return out.join("")
 }
@@ -148,7 +138,7 @@ function touchStream(
 	const stride = Math.max(1, Math.floor(s.files / n))
 	for (let k = 0; k < n; k++) {
 		const i = (k * stride) % s.files
-		const content = `# f${i}\n${filler(`${s.name}-f${i}-v${gen}`, 400)}\n`
+		const content = `# f${i}\n${deterministicFiller(`${s.name}-f${i}-v${gen}`, 400)}\n`
 		bytes += Buffer.byteLength(content)
 		const m = ++mark
 		out.push(`blob\nmark :${m}\ndata ${Buffer.byteLength(content)}\n${content}\n`)
@@ -156,7 +146,7 @@ function touchStream(
 	}
 	const cm = ++mark
 	out.push(
-		`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata 5\ntouch\nfrom refs/heads/main^0\n${lines.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 5\ntouch\nfrom refs/heads/main^0\n${lines.join("\n")}\n`,
 	)
 	return { bytes, stream: out.join("") }
 }
@@ -195,7 +185,7 @@ async function main(): Promise<void> {
 				cwd: src,
 			})
 			await spawnGit(["gc", "-q", "--prune=now"], { cwd: bare })
-			const gitBefore = await duBytes(bare)
+			const gitBefore = await directoryBytes(bare)
 			const baseTip = await revParse(src, "refs/heads/main")
 
 			const touch = touchStream(s, F, idx + 1)
@@ -205,7 +195,7 @@ async function main(): Promise<void> {
 				cwd: src,
 			})
 			await spawnGit(["gc", "-q", "--prune=now"], { cwd: bare })
-			const gitBytes = (await duBytes(bare)) - gitBefore
+			const gitBytes = (await directoryBytes(bare)) - gitBefore
 
 			// ── pggit's cost for the same push ────────────────────────────────
 			const db = await createIsolatedSchema(PG_URL)

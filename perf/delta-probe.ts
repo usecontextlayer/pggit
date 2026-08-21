@@ -23,9 +23,7 @@
  *   npx tsx perf/delta-probe.ts --runs=1476
  */
 
-import { createHash } from "node:crypto"
-import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { cpSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
 import { deflateSync } from "node:zlib"
 import { z } from "zod"
@@ -39,29 +37,34 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	runDirName,
+} from "@/testing/append-only-repo"
+import {
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
+	cloneIndependentMirror,
 	gitLogRawBasePairs,
-	gitReachableOids,
-	loadGitObjects,
+	loadAllReachableObjects,
+	packFileBytes,
+	parseLsRemoteRefs,
 	repackEligibleObjects,
 	seedGitRefs,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
-import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
+import { createScratchArena } from "@/testing/scratch-arena"
+import { spawnGit } from "@/testing/spawn-git"
 import { nonemptyStringArg, parseArgs, pgUrlArg, positiveIntegerArg } from "./args"
 import {
 	requiredCollector,
 	requiredPhase,
 	requiredPositiveCounter,
 } from "./collector-evidence"
+import { table } from "./table"
 
-const WHEN = "1700000000 +0000"
-const COMMITTER = `${PINNED_IDENTITY.name} <${PINNED_IDENTITY.email}> ${WHEN}`
 const REPO_ID = "workspace/slate/probe"
-/** Cap the bytes in one COPY round-trip; late-history trees are ~90 KB each. */
-const INGEST_BYTES = 16_000_000
-
 type ProbeSource = { kind: "generated" } | { kind: "repository"; path: string }
 
 const args = parseArgs(
@@ -101,19 +104,6 @@ const secs = (ms: number): string => `${(ms / 1000).toFixed(2)}s`
 // The generated shape (used only when --repo is absent)
 // ---------------------------------------------------------------------------
 
-function runDirName(i: number): string {
-	const h = createHash("sha1").update(`run-${i}`).digest("hex")
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-}
-
-function filler(salt: string, len: number): string {
-	let out = ""
-	while (out.length < len) {
-		out += createHash("sha1").update(`${salt}-${out.length}`).digest("hex")
-	}
-	return out.slice(0, len)
-}
-
 function buildStream(): string {
 	const out: string[] = []
 	let mark = 0
@@ -126,79 +116,40 @@ function buildStream(): string {
 
 	const seeded: string[] = []
 	for (let i = 0; i < DOC_COUNT; i++) {
-		const m = blob(`# doc ${i}\n\n${filler(`doc-${i}-v0`, 2000)}\n`)
+		const m = blob(`# doc ${i}\n\n${deterministicFiller(`doc-${i}-v0`, 2000)}\n`)
 		seeded.push(`M 100644 :${m} docs/planner-updates/doc-${i}.md`)
 	}
-	const agents = blob(`# agents\n${filler("agents", 500)}\n`)
+	const agents = blob(`# agents\n${deterministicFiller("agents", 500)}\n`)
 	seeded.push(`M 100644 :${agents} .agents/AGENTS.md`)
 
 	let prev = next()
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 7\nseed c0\n${seeded.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 7\nseed c0\n${seeded.join("\n")}\n`,
 	)
 
 	for (let i = 0; i < RUNS; i++) {
 		const dir = runDirName(i)
 		const record = blob(
-			`{"run":"${dir}","status":"ok","payload":"${filler(`rec-${i}`, 1200)}"}\n`,
+			`{"run":"${dir}","status":"ok","payload":"${deterministicFiller(`rec-${i}`, 1200)}"}\n`,
 		)
-		const stderr = blob(`${filler(`err-${i}`, 400)}\n`)
+		const stderr = blob(`${deterministicFiller(`err-${i}`, 400)}\n`)
 		const changes = [
 			`M 100644 :${record} .engine/runs/planner-updates/${dir}/record.json`,
 			`M 100644 :${stderr} .engine/runs/planner-updates/${dir}/stderr`,
 		]
 		if (i % 13 === 0) {
 			const d = i % DOC_COUNT
-			const m = blob(`# doc ${d}\n\n${filler(`doc-${d}-v${i}`, 2000)}\n`)
+			const m = blob(`# doc ${d}\n\n${deterministicFiller(`doc-${d}-v${i}`, 2000)}\n`)
 			changes.push(`M 100644 :${m} docs/planner-updates/doc-${d}.md`)
 		}
 		const cm = next()
 		const msg = `run ${i}`
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n${changes.join("\n")}\n`,
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata ${msg.length}\n${msg}\nfrom :${prev}\n${changes.join("\n")}\n`,
 		)
 		prev = cm
 	}
 	return out.join("")
-}
-
-// ---------------------------------------------------------------------------
-// Reading a repo's REACHABLE objects in one `git cat-file` (never a spawn each)
-// ---------------------------------------------------------------------------
-
-type Obj = Awaited<ReturnType<typeof loadGitObjects>>[number]
-
-async function reachableObjects(dir: string): Promise<Obj[]> {
-	return loadGitObjects(dir, await gitReachableOids(dir))
-}
-
-async function verifyClone(dir: string, expectedOids: readonly Oid[]): Promise<void> {
-	await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dir })
-	const actual = await gitReachableOids(dir)
-	const expected = [...expectedOids].sort()
-	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-		throw new Error(
-			`clone object set differs from source: expected ${expected.length}, got ${actual.length}`,
-		)
-	}
-}
-
-function normalizeLsRemote(stdout: string): string[] {
-	const rows = stdout.trim().split("\n").filter(Boolean)
-	if (rows.length === 0) throw new Error("ls-remote advertised no refs")
-	return rows
-		.map((line) => {
-			const fields = line.split("\t")
-			if (fields.length !== 2 || fields[1]?.length === 0) {
-				throw new Error(`unexpected ls-remote line: ${JSON.stringify(line)}`)
-			}
-			const oid = fields[0]
-			if (oid === undefined || !/^[0-9a-f]{40}$/.test(oid)) {
-				throw new Error(`unexpected ls-remote oid: ${JSON.stringify(line)}`)
-			}
-			return `${oid}\t${fields[1]}`
-		})
-		.sort()
 }
 
 // ---------------------------------------------------------------------------
@@ -219,19 +170,14 @@ function normalizeLsRemote(stdout: string): string[] {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-	const scratch: string[] = []
-	const mkdir = (tag: string): string => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-delta-probe-${tag}-`))
-		scratch.push(d)
-		return d
-	}
+	const scratch = createScratchArena()
+	const mkdir = (tag: string): string => scratch.make(`delta-probe-${tag}`)
 
 	// --- the repo under test ------------------------------------------------
 	const src = join(mkdir("src"), "repo")
 	if (SOURCE.kind === "repository") {
 		console.log(`# delta-probe — real repo: ${SOURCE.path}\n`)
-		// Copy before touching anything: the customer mirror stays pristine.
-		cpSync(SOURCE.path, src, { recursive: true })
+		await cloneIndependentMirror(SOURCE.path, src)
 	} else {
 		console.log(`# delta-probe — generated shape: ${RUNS} runs, ${DOC_COUNT} docs\n`)
 		mkdirSync(src)
@@ -247,7 +193,7 @@ async function main(): Promise<void> {
 	}
 
 	// --- A. git's own numbers ----------------------------------------------
-	const objects = await reachableObjects(src)
+	const objects = await loadAllReachableObjects(src)
 	if (objects.length === 0) throw new Error("delta-probe found no reachable objects")
 	const eligibleObjects = objects.filter(
 		(object) => object.content.length < MAX_INLINE_BYTEA_BYTES,
@@ -268,15 +214,20 @@ async function main(): Promise<void> {
 	console.log(
 		`## A. object weight — ${objects.length} reachable objects, ${commits} commits\n`,
 	)
-	console.log("| type | count | raw | individually deflated (no-tier baseline) |")
-	console.log("|---|---|---|---|")
+	const objectRows: (string | number)[][] = []
 	let rawTotal = 0
 	let deflatedTotal = 0
 	for (const [type, s] of [...byType.entries()].sort((a, b) => b[1].raw - a[1].raw)) {
 		rawTotal += s.raw
 		deflatedTotal += s.deflated
-		console.log(`| ${type} | ${s.count} | ${mb(s.raw)} | ${mb(s.deflated)} |`)
+		objectRows.push([type, s.count, mb(s.raw), mb(s.deflated)])
 	}
+	console.log(
+		table(
+			["type", "count", "raw", "individually deflated (no-tier baseline)"],
+			objectRows,
+		),
+	)
 	console.log(
 		`| **total** | **${objects.length}** | **${mb(rawTotal)}** | **${mb(deflatedTotal)}** |`,
 	)
@@ -286,12 +237,7 @@ async function main(): Promise<void> {
 	const gcStart = Date.now()
 	await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: gcDir })
 	const gcMs = Date.now() - gcStart
-	const countObjects = await spawnGit(["count-objects", "-v"], { cwd: gcDir })
-	const sizePackRaw = countObjects.stdout.match(/^size-pack: (\d+)$/m)?.[1]
-	if (sizePackRaw === undefined) {
-		throw new Error(`git count-objects did not report size-pack:\n${countObjects.stdout}`)
-	}
-	const sizePack = Number(sizePackRaw) * 1024
+	const sizePack = await packFileBytes(gcDir)
 	if (sizePack === 0) throw new Error("git gc produced a zero-byte pack")
 	console.log(
 		`\n\`git gc --aggressive\`: **${mb(sizePack)}** in ${secs(gcMs)} → ` +
@@ -307,20 +253,7 @@ async function main(): Promise<void> {
 		const store = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		const ingestStart = Date.now()
-		let batch: Obj[] = []
-		let batchBytes = 0
-		const flush = async (): Promise<void> => {
-			if (batch.length === 0) return
-			await store.putPack(REPO_ID, batch)
-			batch = []
-			batchBytes = 0
-		}
-		for (const o of objects) {
-			batch.push(o)
-			batchBytes += o.content.length
-			if (batchBytes >= INGEST_BYTES) await flush()
-		}
-		await flush()
+		await store.putPack(REPO_ID, objects)
 		const ingestMs = Date.now() - ingestStart
 
 		await seedGitRefs(REPO_ID, src, refs)
@@ -387,10 +320,14 @@ async function main(): Promise<void> {
 		console.log(`\n## C. the clone side\n`)
 		const app = createGitApp(createGitDeps(db.sql), { instrument: true })
 		server = await serveOnPort(app, 0)
-		const canonicalRefs = normalizeLsRemote((await spawnGit(["ls-remote", src])).stdout)
-		const servedRefs = normalizeLsRemote(
+		const canonicalRefs = parseLsRemoteRefs(
+			(await spawnGit(["ls-remote", src])).stdout,
+			"canonical source",
+		)
+		const servedRefs = parseLsRemoteRefs(
 			(await spawnGit(["ls-remote", `http://127.0.0.1:${server.port}/${REPO_ID}`]))
 				.stdout,
+			"pggit",
 		)
 		if (JSON.stringify(servedRefs) !== JSON.stringify(canonicalRefs)) {
 			throw new Error(
@@ -413,7 +350,7 @@ async function main(): Promise<void> {
 		const cpu = process.cpuUsage(cpuBefore)
 		await server.close()
 		server = undefined
-		await verifyClone(dest, expectedOids)
+		await assertGitReachableObjects(dest, expectedOids, "unrepacked clone")
 
 		const fetchRun = requiredCollector([...collectedRuns()], "fetch", "unrepacked clone")
 		const closureMs = requiredPhase(fetchRun, "closure", "unrepacked clone")
@@ -518,7 +455,7 @@ async function main(): Promise<void> {
 				`repacked clone served ${objectsServed2} objects for a ${objects.length}-object source`,
 			)
 		}
-		await verifyClone(dest2, expectedOids)
+		await assertGitReachableObjects(dest2, expectedOids, "repacked clone")
 		console.log(
 			`clone wall **${secs(clone2Ms)}** (was ${secs(cloneMs)}), ` +
 				`pack **${mb(packBytes2)}** (was ${mb(packBytes)}) — ` +
@@ -559,7 +496,7 @@ async function main(): Promise<void> {
 		// less for shallow depth). Sweep it rather than assume.
 		const encodeStart = Date.now()
 		let verified = 0
-		const rows: string[] = []
+		const rows: (string | number)[][] = []
 		for (const cap of [1, 2, 3, 4, 8, 16, Number.POSITIVE_INFINITY]) {
 			let deltaBytes = 0
 			let wholeBytes = 0
@@ -608,19 +545,21 @@ async function main(): Promise<void> {
 				throw new Error(`depth-cap ${cap} produced no deltas`)
 			}
 			const total = deltaBytes + wholeBytes
-			rows.push(
-				`| ${cap === Number.POSITIVE_INFINITY ? "uncapped" : cap} | ${mb(total)} | ` +
-					`${(deflatedTotal / total).toFixed(1)}× | ${deltified} |`,
-			)
+			rows.push([
+				cap === Number.POSITIVE_INFINITY ? "uncapped" : cap,
+				mb(total),
+				`${(deflatedTotal / total).toFixed(1)}×`,
+				deltified,
+			])
 		}
 		if (verified === 0) throw new Error("delta feasibility sweep verified no programs")
 		console.log(
 			`${verified} deltas encoded and round-tripped through this repo's own \`applyDelta\` — all exact`,
 		)
 		console.log(`encode+verify sweep: ${secs(Date.now() - encodeStart)}\n`)
-		console.log("| depth cap | served size | vs no tier | trees deltified |")
-		console.log("|---|---|---|---|")
-		for (const r of rows) console.log(r)
+		console.log(
+			table(["depth cap", "served size", "vs no tier", "trees deltified"], rows),
+		)
 		console.log(
 			`\nfor reference — no tier **${mb(deflatedTotal)}**, ` +
 				`\`git gc --aggressive\` (window search, not same-path) **${mb(sizePack)}**`,
@@ -646,7 +585,7 @@ async function main(): Promise<void> {
 		if (lineageHeads.length === 0) {
 			throw new Error("every tree lineage is cyclic; star-topology sweep has no anchor")
 		}
-		const anchorRows: string[] = []
+		const anchorRows: (string | number)[][] = []
 		for (const K of [4, 8, 16, 32, 64, 128]) {
 			let bytes = 0
 			const deltaOf = new Set<Oid>()
@@ -688,20 +627,25 @@ async function main(): Promise<void> {
 			}
 			if (deltaOf.size === 0) throw new Error(`anchor interval ${K} produced no deltas`)
 			for (const o of objects) if (!deltaOf.has(o.oid)) bytes += deflatedBytes(o.oid)
-			anchorRows.push(
-				`| ${K} | 1 | ${mb(bytes)} | ${(deflatedTotal / bytes).toFixed(1)}× | ${deltaOf.size} |`,
-			)
+			anchorRows.push([
+				K,
+				1,
+				mb(bytes),
+				`${(deflatedTotal / bytes).toFixed(1)}×`,
+				deltaOf.size,
+			])
 		}
 		console.log(
-			"| anchor every K | max depth | served size | vs no tier | trees deltified |",
+			table(
+				["anchor every K", "max depth", "served size", "vs no tier", "trees deltified"],
+				anchorRows,
+			),
 		)
-		console.log("|---|---|---|---|---|")
-		for (const r of anchorRows) console.log(r)
 	} finally {
 		await server?.close()
 		await server2?.close()
 		await db.drop()
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		scratch.cleanup()
 	}
 }
 

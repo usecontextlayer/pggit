@@ -12,7 +12,6 @@
  */
 import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import postgres from "postgres"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import { serveOnPort } from "@/server"
@@ -22,6 +21,7 @@ import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
 	allObjectOids,
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
 	loadGitObjects,
 	repackEligibleObjects,
@@ -31,7 +31,8 @@ import {
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { increasingIntegerListArg, parseArgs, pgUrlArg } from "../args"
-import { cleanupTmp, mkTmp, secs, seedRepo, table } from "./_perf-util"
+import { table } from "../table"
+import { cleanupTmp, mkTmp, queryCountingClient, secs, seedRepo } from "./_perf-util"
 
 const { pg: PG_URL, sizes: SIZES } = parseArgs(
 	z
@@ -46,23 +47,6 @@ const RTTS = [1, 15, 30]
 /** Modeled minutes for ONE repo at 30 ms RTT above which this is called broken.
  * Two minutes is the per-repository budget for one explicitly invoked repack. */
 const MODELED_MINUTES_LIMIT = 2
-
-type Counter = { n: number; byShape: Map<string, number> }
-
-function countingClient(schema: string): { sql: postgres.Sql; c: Counter } {
-	const c: Counter = { byShape: new Map(), n: 0 }
-	const sql = postgres(PG_URL, {
-		connection: { search_path: schema },
-		debug: (_id, query) => {
-			c.n++
-			const shape = query.trim().replace(/\s+/g, " ").slice(0, 46)
-			c.byShape.set(shape, (c.byShape.get(shape) ?? 0) + 1)
-		},
-		max: 4,
-		onnotice: () => {},
-	})
-	return { c, sql }
-}
 
 type Row = {
 	n: number
@@ -89,7 +73,7 @@ async function measure(n: number): Promise<Row> {
 				)
 			}
 
-			const repackC = countingClient(db.schema)
+			const repackC = queryCountingClient(PG_URL, db.schema)
 			const { repacked, repackMs } = await (async () => {
 				const t0 = Date.now()
 				try {
@@ -104,11 +88,11 @@ async function measure(n: number): Promise<Row> {
 			if (
 				repacked.wholes + repacked.deltas !== seeded.eligibleObjects ||
 				repacked.deltas <= 0 ||
-				repackC.c.n <= 0 ||
+				repackC.counter.queries <= 0 ||
 				repackMs <= 0
 			) {
 				throw new Error(
-					`repack prerequisite invalid: ${repacked.wholes} wholes + ${repacked.deltas} deltas/${seeded.eligibleObjects} eligible objects, q=${repackC.c.n}, ms=${repackMs}`,
+					`repack prerequisite invalid: ${repacked.wholes} wholes + ${repacked.deltas} deltas/${seeded.eligibleObjects} eligible objects, q=${repackC.counter.queries}, ms=${repackMs}`,
 				)
 			}
 			await assertCanonicalStoreFixture(db.sql, "probe/rt", {
@@ -120,7 +104,7 @@ async function measure(n: number): Promise<Row> {
 				refs: await canonicalStoreRefsOf(src),
 			})
 
-			const cloneC = countingClient(db.schema)
+			const cloneC = queryCountingClient(PG_URL, db.schema)
 			let server: Awaited<ReturnType<typeof serveOnPort>> | undefined
 			try {
 				server = await serveOnPort(createGitApp(createGitDeps(cloneC.sql)), 0)
@@ -135,15 +119,10 @@ async function measure(n: number): Promise<Row> {
 					`http://127.0.0.1:${server.port}/probe/rt`,
 					dest,
 				])
-				await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-				const gotOids = await allObjectOids(dest)
+				await assertGitReachableObjects(dest, expectedOids, "round-trip clone")
 				const gotTip = await revParse(dest, "refs/heads/main")
-				if (
-					gotTip !== expectedTip ||
-					gotOids.length !== expectedOids.length ||
-					gotOids.some((oid, i) => oid !== expectedOids[i])
-				) {
-					throw new Error("clone diverged from canonical git ref tip/object set")
+				if (gotTip !== expectedTip) {
+					throw new Error("clone diverged from canonical git ref tip")
 				}
 			} finally {
 				try {
@@ -152,9 +131,10 @@ async function measure(n: number): Promise<Row> {
 					await cloneC.sql.end()
 				}
 			}
-			if (cloneC.c.n <= 0) throw new Error("clone query counter observed no queries")
+			if (cloneC.counter.queries <= 0)
+				throw new Error("clone query counter observed no queries")
 
-			const gcC = countingClient(db.schema)
+			const gcC = queryCountingClient(PG_URL, db.schema)
 			const swept = await (async () => {
 				try {
 					return await createGc(gcC.sql).gc("probe/rt", {
@@ -165,9 +145,13 @@ async function measure(n: number): Promise<Row> {
 					await gcC.sql.end()
 				}
 			})()
-			if (swept.deletedObjects !== 0 || swept.epoch !== "rebuilt" || gcC.c.n <= 0) {
+			if (
+				swept.deletedObjects !== 0 ||
+				swept.epoch !== "rebuilt" ||
+				gcC.counter.queries <= 0
+			) {
 				throw new Error(
-					`completed GC receipt invalid: deleted=${swept.deletedObjects}, epoch=${swept.epoch}, q=${gcC.c.n}`,
+					`completed GC receipt invalid: deleted=${swept.deletedObjects}, epoch=${swept.epoch}, q=${gcC.counter.queries}`,
 				)
 			}
 			await assertCanonicalStoreFixture(db.sql, "probe/rt", {
@@ -179,17 +163,17 @@ async function measure(n: number): Promise<Row> {
 				refs: await canonicalStoreRefsOf(src),
 			})
 
-			const top = [...repackC.c.byShape.entries()]
+			const top = [...repackC.counter.byShape.entries()]
 				.sort((a, b) => b[1] - a[1])
 				.slice(0, 3)
 				.map(([s, k]) => `${k}× ${s}`)
 				.join(" · ")
 			return {
-				clone: cloneC.c.n,
-				gc: gcC.c.n,
+				clone: cloneC.counter.queries,
+				gc: gcC.counter.queries,
 				n,
 				objects: seeded.objects,
-				repack: repackC.c.n,
+				repack: repackC.counter.queries,
 				repackMs,
 				top,
 			}

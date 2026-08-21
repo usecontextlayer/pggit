@@ -37,32 +37,33 @@
  *
  *   npx tsx perf/breakage/pgres--gc-snapshot-blocks-reclaim.ts
  */
+import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { z } from "zod"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import {
 	assertCanonicalStoreFixture,
+	type GitObjectWithOid,
 	repackEligibleObjects,
 	requiredAt,
 	requireGitOid,
+	revParse,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
 import { parseArgs, pgUrlArg } from "../args"
+import { table } from "../table"
+import { vacuumVerbose } from "../vacuum-evidence"
 import {
 	cleanupTmp,
 	fastImport,
 	initRepo,
-	type Obj,
 	objectsBetween,
-	revParse,
 	runCommits,
 	schemaStats,
 	seedObjects,
 	setMain,
-	sleep,
 	stat,
-	table,
 } from "./_pgres-util"
 
 const APP = "pgres-snapshot-probe"
@@ -95,7 +96,7 @@ function requireNonnegativeInteger(value: string, context: string): number {
 async function requireRepoCensus(
 	pg: Sql,
 	repo: string,
-	objects: readonly Obj[],
+	objects: readonly GitObjectWithOid[],
 	tip: string,
 ): Promise<void> {
 	await assertCanonicalStoreFixture(pg, repo, {
@@ -305,7 +306,6 @@ async function main(): Promise<void> {
 		const holder = await gcPg.reserve()
 		let holderInTransaction = false
 		let holderReleased = false
-		let verbose: ReturnType<typeof postgres> | undefined
 		try {
 			await holder`begin isolation level repeatable read`
 			holderInTransaction = true
@@ -327,56 +327,18 @@ async function main(): Promise<void> {
 			// `onnotice`. Only three numbers matter, and they are Postgres's own words:
 			// how many tuples it removed, how many it saw as "dead but not yet
 			// removable", and how many XIDs behind the removable cutoff was.
-			type Verdict = {
-				removed: number
-				notRemovable: number
-				xidsOld: number
-				rels: number
-			}
-			let acc: Verdict = { notRemovable: 0, rels: 0, removed: 0, xidsOld: 0 }
-			const vacuum = postgres(PG_URL, {
-				connection: { application_name: `${APP}-vac`, search_path: iso.schema },
-				max: 1,
-				onnotice: (n) => {
-					const m = `${n.message ?? ""}`.replace(/\s+/g, " ")
-					if (!/finished vacuuming/.test(m)) return
-					if (!/git_pack_encoding|git_object/.test(m)) return
-					const t = m.match(
-						/tuples: (\d+) removed, \d+ remain, (\d+) are dead but not yet removable/,
-					)
-					const x = m.match(/which was (\d+) XIDs old/)
-					if (t) {
-						acc.removed += requireNonnegativeInteger(
-							requiredAt(t, 1, "VACUUM removed-tuples notice"),
-							"VACUUM removed tuples",
-						)
-						acc.notRemovable += requireNonnegativeInteger(
-							requiredAt(t, 2, "VACUUM not-removable-tuples notice"),
-							"VACUUM not-removable tuples",
-						)
-						acc.rels++
-					}
-					if (x) {
-						acc.xidsOld = Math.max(
-							acc.xidsOld,
-							requireNonnegativeInteger(
-								requiredAt(x, 1, "VACUUM XID-age notice"),
-								"VACUUM XID age",
-							),
-						)
-					}
-				},
-			})
-			verbose = vacuum
-			const vacuumVerbose = async (): Promise<Verdict> => {
-				acc = { notRemovable: 0, rels: 0, removed: 0, xidsOld: 0 }
-				await vacuum.unsafe("vacuum (verbose, analyze) git_pack_encoding")
-				await vacuum.unsafe("vacuum (verbose, analyze) git_object")
-				return acc
-			}
-			const underVerdict = await vacuumVerbose()
+			const collectVacuumEvidence = () =>
+				vacuumVerbose(PG_URL, iso.schema, ["git_pack_encoding", "git_object"], {
+					analyze: true,
+					applicationName: `${APP}-vac`,
+				})
+			const underVerdict = await collectVacuumEvidence()
 			const under = await deadNow()
-			if (underVerdict.rels === 0 || underVerdict.notRemovable === 0 || under.enc === 0) {
+			if (
+				underVerdict.relations === 0 ||
+				underVerdict.notRemovable === 0 ||
+				under.enc === 0
+			) {
 				throw new Error(
 					`snapshot demo did not prove blocked reclaim: ${JSON.stringify({ under, underVerdict })}`,
 				)
@@ -402,7 +364,7 @@ async function main(): Promise<void> {
 					`release-side prerequisite failed: database snapshot horizon did not clear within ${waited} ms`,
 				)
 			}
-			const afterVerdict = await vacuumVerbose()
+			const afterVerdict = await collectVacuumEvidence()
 			const after = await deadNow()
 			if (afterVerdict.notRemovable !== 0 || after.enc >= under.enc) {
 				throw new Error(
@@ -437,14 +399,14 @@ async function main(): Promise<void> {
 					[
 						[
 							"UNDER a held snapshot",
-							underVerdict.rels,
+							underVerdict.relations,
 							underVerdict.removed,
 							underVerdict.notRemovable,
 							underVerdict.xidsOld,
 						],
 						[
 							"AFTER releasing it",
-							afterVerdict.rels,
+							afterVerdict.relations,
 							afterVerdict.removed,
 							afterVerdict.notRemovable,
 							afterVerdict.xidsOld,
@@ -484,11 +446,7 @@ async function main(): Promise<void> {
 			try {
 				if (holderInTransaction) await holder`rollback`
 			} finally {
-				try {
-					if (!holderReleased) holder.release()
-				} finally {
-					await verbose?.end()
-				}
+				if (!holderReleased) holder.release()
 			}
 		}
 	} finally {

@@ -42,9 +42,18 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	uuidFromSeed,
+} from "@/testing/append-only-repo"
+import { directoryBytes } from "@/testing/directory-size"
+import {
 	allRefsOf,
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	canonicalStoreRefsOf,
+	loadAllReachableObjects,
+	packFileBytes,
 	repackEligibleObjects,
 	seedGitRefs,
 } from "@/testing/git-fixtures"
@@ -52,18 +61,7 @@ import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 import { nonemptyStringArg, parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
-import {
-	COMMITTER,
-	duBytes,
-	filler,
-	mb,
-	pad,
-	padr,
-	reachableObjects,
-	runDirName,
-	scratchRoot,
-	sizeOf,
-} from "./_pg-bloat-util"
+import { mb, pad, padr, scratchRoot, sizeOf } from "./_pg-bloat-util"
 
 const REPO_ID = "workspace/slate/tier"
 /** the tier may weigh this much more than the pack it emits before it is a defect */
@@ -116,31 +114,31 @@ function buildStream(): string {
 	}
 	const seeded: string[] = []
 	for (let i = 0; i < DOCS; i++) {
-		const m = blob(`# doc ${i}\n\n${filler(`doc-${i}-v0`, 2000)}\n`)
+		const m = blob(`# doc ${i}\n\n${deterministicFiller(`doc-${i}-v0`, 2000)}\n`)
 		seeded.push(`M 100644 :${m} docs/planner-updates/doc-${i}.md`)
 	}
 	let prev = next()
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
 	)
 	for (let i = 0; i < RUNS; i++) {
-		const dir = runDirName("tier", i)
+		const dir = uuidFromSeed(`tier-run-${i}`)
 		const record = blob(
-			`{"run":"${dir}","status":"ok","p":"${filler(`rec-${i}`, 1200)}"}\n`,
+			`{"run":"${dir}","status":"ok","p":"${deterministicFiller(`rec-${i}`, 1200)}"}\n`,
 		)
-		const stderr = blob(`${filler(`err-${i}`, 400)}\n`)
+		const stderr = blob(`${deterministicFiller(`err-${i}`, 400)}\n`)
 		const changes = [
 			`M 100644 :${record} .engine/runs/planner-updates/${dir}/record.json`,
 			`M 100644 :${stderr} .engine/runs/planner-updates/${dir}/stderr`,
 		]
 		if (i % 13 === 0) {
 			const d = i % DOCS
-			const m = blob(`# doc ${d}\n\n${filler(`doc-${d}-v${i}`, 2000)}\n`)
+			const m = blob(`# doc ${d}\n\n${deterministicFiller(`doc-${d}-v${i}`, 2000)}\n`)
 			changes.push(`M 100644 :${m} docs/planner-updates/doc-${d}.md`)
 		}
 		const cm = next()
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata 3\nrun\nfrom :${prev}\n${changes.join("\n")}\n`,
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 3\nrun\nfrom :${prev}\n${changes.join("\n")}\n`,
 		)
 		prev = cm
 	}
@@ -167,7 +165,7 @@ async function main(): Promise<void> {
 			)
 		}
 
-		const objects = await reachableObjects(src)
+		const objects = await loadAllReachableObjects(src)
 		const eligibleObjects = repackEligibleObjects(objects)
 		if (eligibleObjects.length !== objects.length) {
 			throw new Error(
@@ -193,14 +191,10 @@ async function main(): Promise<void> {
 		// ── git's own packing of exactly these objects ──────────────────────
 		const gcDir = scratch.dir("gc")
 		await spawnGit(["clone", "-q", "--mirror", src, gcDir])
-		const looseBytes = await duBytes(gcDir)
+		const looseBytes = await directoryBytes(gcDir)
 		await spawnGit(["gc", "--aggressive", "--prune=now", "-q"], { cwd: gcDir })
-		const gcBytes = await duBytes(gcDir)
-		const sizePackMatch = (
-			await spawnGit(["count-objects", "-v"], { cwd: gcDir })
-		).stdout.match(/size-pack: (\d+)/)
-		if (!sizePackMatch) throw new Error("git count-objects omitted size-pack")
-		const sizePack = Number(sizePackMatch[1]) * 1024
+		const gcBytes = await directoryBytes(gcDir)
+		const sizePack = await packFileBytes(gcDir)
 		if (sizePack <= 0) throw new Error(`canonical git pack size is ${sizePack}`)
 		console.log(
 			`git: ${mb(looseBytes)} MB as received → ${mb(gcBytes)} MB after \`gc --aggressive\` ` +
@@ -210,23 +204,7 @@ async function main(): Promise<void> {
 		// ── the same objects in pggit ───────────────────────────────────────
 		const store = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
-		let batch: typeof objects = []
-		let bytes = 0
-		const flush = async () => {
-			if (batch.length === 0) return
-			await store.putPack(
-				REPO_ID,
-				batch.map((o) => ({ content: o.content, type: o.type })),
-			)
-			batch = []
-			bytes = 0
-		}
-		for (const o of objects) {
-			batch.push(o)
-			bytes += o.content.length
-			if (bytes >= 16_000_000) await flush()
-		}
-		await flush()
+		await store.putPack(REPO_ID, objects)
 		await seedGitRefs(REPO_ID, src, refs)
 		const canonicalRefs = await allRefsOf(src)
 
@@ -271,11 +249,7 @@ async function main(): Promise<void> {
 		} finally {
 			await server.close()
 		}
-		const storedPackMatch = (
-			await spawnGit(["count-objects", "-v"], { cwd: dest })
-		).stdout.match(/size-pack: (\d+)/)
-		if (!storedPackMatch) throw new Error("client count-objects omitted size-pack")
-		const storedPack = Number(storedPackMatch[1]) * 1024
+		const storedPack = await packFileBytes(dest)
 		const run = requiredCollector(collectedRuns(), "fetch", "encoding-tier clone")
 		const servedPack = requiredPositiveCounter(run, "packBytes", "encoding-tier clone")
 		const objectsServed = requiredPositiveCounter(
@@ -289,17 +263,11 @@ async function main(): Promise<void> {
 				`serve prerequisite failed: objects=${objectsServed}/${objects.length}`,
 			)
 		}
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 		const clonedRefs = await allRefsOf(dest)
-		const clonedObjects = await reachableObjects(dest)
 		const expectedOids = objects.map((object) => object.oid).sort()
-		const clonedOids = clonedObjects.map((object) => object.oid).sort()
-		if (
-			JSON.stringify(clonedRefs) !== JSON.stringify(canonicalRefs) ||
-			clonedOids.length !== expectedOids.length ||
-			clonedOids.some((oid, i) => oid !== expectedOids[i])
-		) {
-			throw new Error("pggit mirror clone diverged from canonical refs/object set")
+		await assertGitReachableObjects(dest, expectedOids, "encoding-tier clone")
+		if (JSON.stringify(clonedRefs) !== JSON.stringify(canonicalRefs)) {
+			throw new Error("pggit mirror clone diverged from canonical refs")
 		}
 		console.log(
 			`served: raw wire pack ${mb(servedPack)} MB; client stored ${mb(storedPack)} MB after index-pack, fsck clean`,

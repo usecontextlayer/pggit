@@ -8,8 +8,7 @@
  *   npx tsx perf/breakage/txn--interrupted-repack-cost.ts
  *   npx tsx perf/breakage/txn--interrupted-repack-cost.ts --pg=postgres://…
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 import type { Sql } from "postgres"
 import { z } from "zod"
@@ -24,18 +23,21 @@ import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import {
 	allObjectOids,
 	assertCanonicalStoreFixture,
+	assertGitReachableObjects,
 	branchAndTagRefsOf,
 	canonicalStoreRefsOf,
 	gitReachableOids,
 	loadGitObjects,
 	repackEligibleObjects,
+	revParse,
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg } from "../args"
 import { requiredCollector, requiredPositiveCounter } from "../collector-evidence"
-import { table } from "./_txn-util"
+import { table } from "../table"
 
 const REPO = "r"
 const { pg: PG_URL } = parseArgs(z.object({ pg: pgUrlArg }).strict())
@@ -173,29 +175,21 @@ async function run(
 		])
 		// The correctness sub-check the probe carried: a resumed tier must still serve
 		// a repository canonical git accepts. `spawnGit` throws on a non-zero exit.
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-		const [expected, actual, expectedRefs, actualRefs] = await Promise.all([
+		const [expected, expectedRefs, actualRefs] = await Promise.all([
 			gitReachableOids(src),
-			gitReachableOids(dest),
 			branchAndTagRefsOf(src),
 			branchAndTagRefsOf(dest),
 		])
-		if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-			throw new Error(
-				`${label}: clone object set differs from source (${actual.length}/${expected.length})`,
-			)
-		}
+		await assertGitReachableObjects(dest, expected, `${label} clone`)
 		if (JSON.stringify(actualRefs) !== JSON.stringify(expectedRefs)) {
 			throw new Error(`${label}: clone refs differ from source`)
 		}
 		const [expectedTip, actualTip] = await Promise.all([
-			spawnGit(["rev-parse", "HEAD"], { cwd: src }),
-			spawnGit(["rev-parse", "HEAD"], { cwd: dest }),
+			revParse(src, "HEAD"),
+			revParse(dest, "HEAD"),
 		])
-		if (expectedTip.stdout.trim() !== actualTip.stdout.trim()) {
-			throw new Error(
-				`${label}: clone HEAD ${actualTip.stdout.trim()} != source ${expectedTip.stdout.trim()}`,
-			)
+		if (expectedTip !== actualTip) {
+			throw new Error(`${label}: clone HEAD ${actualTip} != source ${expectedTip}`)
 		}
 		return {
 			label,
@@ -209,8 +203,10 @@ async function run(
 }
 
 async function main(): Promise<void> {
-	const root = mkdtempSync(join(tmpdir(), "pggit-breakage-repack-cost-"))
+	const scratch = createScratchArena()
+	const root = scratch.make("repack-cost")
 	const src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
+	scratch.own(src)
 	try {
 		console.log(`# txn--interrupted-repack-cost — ${RUNS} runs\n`)
 		const base = await run("uninterrupted", [], src, join(root, "a"))
@@ -253,8 +249,7 @@ async function main(): Promise<void> {
 		console.log(`\n${regressed.length === 0 ? "OK" : `${regressed.length} REGRESSIONS`}`)
 		if (regressed.length > 0) process.exitCode = 1
 	} finally {
-		rmSync(src, { force: true, recursive: true })
-		rmSync(root, { force: true, recursive: true })
+		scratch.cleanup()
 	}
 }
 

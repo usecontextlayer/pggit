@@ -43,6 +43,11 @@ import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { createRepack } from "@/store/repack"
 import {
+	deterministicFiller,
+	FAST_IMPORT_COMMITTER,
+	uuidFromSeed,
+} from "@/testing/append-only-repo"
+import {
 	assertCanonicalStoreFixture,
 	canonicalStoreRefsOf,
 	parseRevListObjectOids,
@@ -54,16 +59,13 @@ import { spawnGit } from "@/testing/spawn-git"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
 import {
 	backendWal,
-	COMMITTER,
 	catalogSizes,
-	filler,
 	flushStats,
 	kb,
 	mb,
 	objectsBetween,
 	pad,
 	padr,
-	runDirName,
 	scratchRoot,
 	taggedPool,
 	tempStats,
@@ -102,19 +104,21 @@ function buildStream(): string {
 	}
 	const seeded: string[] = []
 	for (let i = 0; i < 40; i++) {
-		const m = blob(`# doc ${i}\n${filler(`d${i}`, 500)}\n`)
+		const m = blob(`# doc ${i}\n${deterministicFiller(`d${i}`, 500)}\n`)
 		seeded.push(`M 100644 :${m} docs/doc-${i}.md`)
 	}
 	let prev = next()
 	out.push(
-		`commit refs/heads/main\nmark :${prev}\ncommitter ${COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
+		`commit refs/heads/main\nmark :${prev}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 4\nseed\n${seeded.join("\n")}\n`,
 	)
 	for (let i = 0; i < COMMITS; i++) {
-		const dir = runDirName("stg", i)
-		const record = blob(`{"run":"${dir}","p":"${filler(`rec-${i}`, 600)}"}\n`)
+		const dir = uuidFromSeed(`stg-run-${i}`)
+		const record = blob(
+			`{"run":"${dir}","p":"${deterministicFiller(`rec-${i}`, 600)}"}\n`,
+		)
 		const cm = next()
 		out.push(
-			`commit refs/heads/main\nmark :${cm}\ncommitter ${COMMITTER}\ndata 2\nxx\nfrom :${prev}\n` +
+			`commit refs/heads/main\nmark :${cm}\ncommitter ${FAST_IMPORT_COMMITTER}\ndata 2\nxx\nfrom :${prev}\n` +
 				`M 100644 :${record} .engine/runs/planner-updates/${dir}/record.json\n`,
 		)
 		prev = cm

@@ -1,6 +1,6 @@
 import { z } from "zod"
 
-export const DEFAULT_PG_URL = "postgres://postgres:postgres@localhost:6489/postgres"
+const DEFAULT_PG_URL = "postgres://postgres:postgres@localhost:6489/postgres"
 
 const argPairSchema = z
 	.string()

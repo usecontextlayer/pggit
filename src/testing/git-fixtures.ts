@@ -110,6 +110,26 @@ export async function gitReachableOids(dir: string): Promise<Oid[]> {
 	return [...oids].sort()
 }
 
+/** Prove that a canonical Git repository is healthy and has exactly the expected reachable objects. */
+export async function assertGitReachableObjects(
+	dir: string,
+	expectedOids: readonly Oid[],
+	context: string,
+): Promise<void> {
+	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dir })
+	const fsckOutput = `${fsck.stdout}${fsck.stderr}`.trim()
+	if (fsckOutput !== "") {
+		throw new Error(`${context}: fsck emitted output: ${fsckOutput}`)
+	}
+	const actual = await gitReachableOids(dir)
+	const expected = [...expectedOids].sort()
+	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+		throw new Error(
+			`${context}: reachable object set differs: ${oidDifference(actual, expected)}`,
+		)
+	}
+}
+
 /** Same-path target-to-base pairs from one parent-before-child `git log --raw` stream. */
 export async function gitLogRawBasePairs(dir: string): Promise<Map<Oid, Oid>> {
 	const log = await spawnGit(
@@ -274,6 +294,11 @@ export async function loadAllObjects(dir: string): Promise<GitObjectWithOid[]> {
 	return loadGitObjects(dir, await allObjectOids(dir))
 }
 
+/** Every object reachable from any ref, including annotated-tag objects. */
+export async function loadAllReachableObjects(dir: string): Promise<GitObjectWithOid[]> {
+	return loadGitObjects(dir, await gitReachableOids(dir))
+}
+
 /** Every object reachable from the supplied revisions, as pack inputs. */
 export async function loadReachableObjects(
 	dir: string,
@@ -342,6 +367,45 @@ export async function allObjectOids(dir: string): Promise<Oid[]> {
 		.filter(Boolean)
 		.map((line) => requireGitOid(line, `object-list line ${JSON.stringify(line)}`))
 		.sort()
+}
+
+export type GitObjectInventory = Map<Oid, { size: number; type: GitObjectType }>
+
+/** Every stored object as validated oid/type/size metadata in oid order. */
+export async function gitObjectInventory(dir: string): Promise<GitObjectInventory> {
+	const out = await spawnGit(
+		[
+			"cat-file",
+			"--batch-all-objects",
+			"--batch-check=%(objectname) %(objecttype) %(objectsize)",
+		],
+		{ cwd: dir },
+	)
+	const inventory: GitObjectInventory = new Map()
+	for (const line of out.stdout.trim().split("\n").filter(Boolean)) {
+		const match = line.match(/^([0-9a-f]{40}) (blob|commit|tag|tree) ([0-9]+)$/)
+		if (match === null) {
+			throw new Error(`${dir}: malformed object inventory row ${JSON.stringify(line)}`)
+		}
+		const [, rawOid, rawType, rawSize] = match
+		if (rawOid === undefined || rawType === undefined || rawSize === undefined) {
+			throw new Error(`${dir}: incomplete object inventory row ${JSON.stringify(line)}`)
+		}
+		const oid = requireGitOid(rawOid, `object inventory row ${JSON.stringify(line)}`)
+		const size = Number(rawSize)
+		if (!Number.isSafeInteger(size)) {
+			throw new Error(
+				`${dir}: invalid object size in inventory row ${JSON.stringify(line)}`,
+			)
+		}
+		if (inventory.has(oid)) throw new Error(`${dir}: duplicate inventory oid ${oid}`)
+		inventory.set(oid, {
+			size,
+			type: requireGitObjectType(rawType, `object inventory row ${JSON.stringify(line)}`),
+		})
+	}
+	if (inventory.size === 0) throw new Error(`${dir}: object inventory was empty`)
+	return inventory
 }
 
 /** A byte-exact digest of the requested objects, read in stable oid order. */
@@ -446,26 +510,66 @@ function parseRefRows(
 		})
 }
 
-/** Mirror-clone a remote and return its validated refs, objects, bytes, and fsck. */
-export async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
-	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
-	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
-	const refs = (await allRefsOf(dest)).map(({ name, oid }) => `${oid} ${name}`)
+/** Parse and validate the two-column ref advertisement emitted by `git ls-remote`. */
+export function parseLsRemoteRefs(
+	stdout: string,
+	context: string,
+): { name: string; oid: Oid }[] {
+	const rows = stdout.trim().split("\n").filter(Boolean)
+	if (rows.length === 0) throw new Error(`${context}: ls-remote advertised no refs`)
+	return rows
+		.map((line) => {
+			const fields = line.split("\t")
+			const [rawOid, name] = fields
+			if (
+				fields.length !== 2 ||
+				rawOid === undefined ||
+				name === undefined ||
+				name.length === 0
+			) {
+				throw new Error(`${context}: malformed ls-remote row ${JSON.stringify(line)}`)
+			}
+			return {
+				name,
+				oid: requireGitOid(rawOid, `${context} ls-remote row ${JSON.stringify(line)}`),
+			}
+		})
+		.sort((a, b) => a.name.localeCompare(b.name) || a.oid.localeCompare(b.oid))
+}
+
+/** Observe the validated refs, objects, bytes, and fsck state of a mirror-shaped repository. */
+export async function mirrorStateOf(dir: string): Promise<MirrorState> {
+	const fsck = await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dir })
+	const refs = (await allRefsOf(dir)).map(({ name, oid }) => `${oid} ${name}`)
 	// HEAD is listed by target only: a symref's OID is its target ref's line, and
 	// an emptied repository's HEAD is unborn — it has a target but no OID.
-	refs.push(`HEAD -> ${await repositoryHeadTargetOf(dest)}`)
+	refs.push(`HEAD -> ${await repositoryHeadTargetOf(dir)}`)
 	refs.sort()
 	const complaints = `${fsck.stdout}${fsck.stderr}`
 		.split("\n")
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0 && !line.startsWith("notice:"))
-	const objects = await allObjectOids(dest)
+	const objects = await allObjectOids(dir)
 	return {
-		digest: await objectBytesDigest(dest, objects),
+		digest: await objectBytesDigest(dir, objects),
 		fsck: complaints.join("\n"),
 		objects,
 		refs,
 	}
+}
+
+/** Mirror-clone a remote and return its validated refs, objects, bytes, and fsck. */
+export async function mirrorClone(url: string, dest: string): Promise<MirrorState> {
+	await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
+	return mirrorStateOf(dest)
+}
+
+/** Make a mirror whose object files are physically independent from the source. */
+export async function cloneIndependentMirror(
+	source: string,
+	dest: string,
+): Promise<void> {
+	await spawnGit(["clone", "--mirror", "--no-hardlinks", "-q", source, dest])
 }
 
 /** Clone both remotes and return comparison data without asserting on it. */
@@ -645,14 +749,18 @@ export function packFiles(dir: string): string[] {
 	return readdirSync(join(dir, PACK_DIR)).filter((f) => f.endsWith(".pack"))
 }
 
-/** Total bytes occupied by a real repo's pack files, bare or non-bare. */
-export async function packFileBytes(dir: string): Promise<number> {
-	const packDir = (
+async function gitPackDir(dir: string): Promise<string> {
+	return (
 		await spawnGit(
 			["rev-parse", "--path-format=absolute", "--git-path", "objects/pack"],
 			{ cwd: dir },
 		)
 	).stdout.trim()
+}
+
+/** Total bytes occupied by a real repo's pack files, bare or non-bare. */
+export async function packFileBytes(dir: string): Promise<number> {
+	const packDir = await gitPackDir(dir)
 	return readdirSync(packDir)
 		.filter((file) => file.endsWith(".pack"))
 		.map((file) => statSync(join(packDir, file)).size)
@@ -753,6 +861,21 @@ export function parseVerifyPackObjects(stdout: string): VerifyPackObject[] {
 		throw new Error("parsed zero objects from git verify-pack -v")
 	}
 	return objects
+}
+
+/** Validated object rows grouped by pack index in a bare or non-bare repository. */
+export async function verifyPackObjectsInRepo(
+	dir: string,
+): Promise<{ index: string; objects: VerifyPackObject[] }[]> {
+	const packDir = await gitPackDir(dir)
+	const indexes = readdirSync(packDir).filter((file) => file.endsWith(".idx"))
+	if (indexes.length === 0) throw new Error(`${dir}: repository contains no pack index`)
+	const packs: { index: string; objects: VerifyPackObject[] }[] = []
+	for (const index of indexes) {
+		const out = await spawnGit(["verify-pack", "-v", join(packDir, index)], { cwd: dir })
+		packs.push({ index, objects: parseVerifyPackObjects(out.stdout) })
+	}
+	return packs
 }
 
 /** The sorted OIDs inside one pack, per `git verify-pack -v`. */

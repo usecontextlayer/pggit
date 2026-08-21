@@ -21,23 +21,19 @@
  *   npx tsx perf/breakage/wire--pack-shape-vs-git.ts
  *   npx tsx perf/breakage/wire--pack-shape-vs-git.ts --runs=600 --new=120
  */
-import { mkdtempSync, readdirSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
 import type { Oid } from "@/oid"
 import { serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
-import {
-	allRefsOf,
-	parseVerifyPackObjects,
-	repositoryHeadTargetOf,
-} from "@/testing/git-fixtures"
+import { mirrorStateOf, revParse, verifyPackObjectsInRepo } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import { createScratchArena } from "@/testing/scratch-arena"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 import { parseArgs, pgUrlArg, positiveIntegerArg } from "../args"
+import { table } from "../table"
 import {
 	assertCanonicalRealRepoStore,
 	canonicalV2Pack,
@@ -63,19 +59,13 @@ const RUNS_1 = args.runs
 const RUNS_2 = args.new
 const PG_URL = args.pg
 
-const scratch: string[] = []
-const mk = (tag: string): string => {
-	const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-	scratch.push(d)
-	return d
-}
+const scratch = createScratchArena()
+const mk = scratch.make
 const failures: string[] = []
 const fail = (msg: string): void => {
 	failures.push(msg)
 	console.error(`FAIL: ${msg}`)
 }
-const packDir = (dir: string): string => join(dir, ".git", "objects", "pack")
-
 /**
  * Parse `verify-pack -v`: entry count, delta count, max chain depth, and how many
  * deltas sit at a LOWER pack offset than their base (which only resolves because
@@ -87,18 +77,14 @@ async function packShape(dir: string): Promise<{
 	maxDepth: number
 	deltaBeforeBase: number
 }> {
-	const p = packDir(dir)
 	let entries = 0
 	let deltas = 0
 	let maxDepth = 0
 	let deltaBeforeBase = 0
-	const indexes = readdirSync(p).filter((x) => x.endsWith(".idx"))
-	if (indexes.length === 0) throw new Error(`${dir}: client has no indexed packs`)
-	for (const f of indexes) {
-		const out = await spawnGit(["verify-pack", "-v", join(p, f)], { cwd: dir })
+	for (const pack of await verifyPackObjectsInRepo(dir)) {
 		const offsetOf = new Map<string, number>()
 		const rows: { oid: Oid; offset: number; base?: Oid }[] = []
-		for (const object of parseVerifyPackObjects(out.stdout)) {
+		for (const object of pack.objects) {
 			entries++
 			offsetOf.set(object.oid, object.offset)
 			if (object.kind === "delta") {
@@ -113,26 +99,6 @@ async function packShape(dir: string): Promise<{
 		}
 	}
 	return { deltaBeforeBase, deltas, entries, maxDepth }
-}
-
-async function inventory(dir: string): Promise<string> {
-	const out = await spawnGit(["cat-file", "--batch-check", "--batch-all-objects"], {
-		cwd: dir,
-	})
-	const rows = out.stdout.trim().split("\n").filter(Boolean)
-	if (rows.length === 0) throw new Error(`${dir}: object inventory was empty`)
-	for (const row of rows) {
-		if (!/^[0-9a-f]{40} (blob|commit|tag|tree) [0-9]+$/.test(row)) {
-			throw new Error(`${dir}: malformed object inventory row ${JSON.stringify(row)}`)
-		}
-	}
-	return rows.sort().join("\n")
-}
-
-async function refs(dir: string): Promise<string> {
-	const direct = (await allRefsOf(dir)).map(({ name, oid }) => `${oid} ${name}`)
-	if (direct.length === 0) throw new Error(`${dir}: ref inventory was empty`)
-	return [...direct, `HEAD -> ${await repositoryHeadTargetOf(dir)}`].sort().join("\n")
 }
 
 function requireSameOids(label: string, observations: readonly Oid[][]): void {
@@ -158,24 +124,37 @@ async function requireCloneParity(
 	clones: ReadonlyMap<string, string>,
 ): Promise<void> {
 	const labels = ["pggit-repacked", "pggit-raw", "git"] as const
-	const inventories = await Promise.all(
-		labels.map((label) => inventory(requireCloneDir(clones, label))),
+	const states = await Promise.all(
+		labels.map((label) => mirrorStateOf(requireCloneDir(clones, label))),
 	)
-	const refsByRemote = await Promise.all(
-		labels.map((label) => refs(requireCloneDir(clones, label))),
-	)
-	if (inventories[0] !== inventories[2] || inventories[1] !== inventories[2]) {
-		throw new Error(`${stage}: client object inventories differ from canonical git`)
+	const expected = states[2]
+	if (
+		expected === undefined ||
+		expected.objects.length === 0 ||
+		expected.refs.length < 2
+	) {
+		throw new Error(`${stage}: canonical clone state was empty`)
 	}
-	if (refsByRemote[0] !== refsByRemote[2] || refsByRemote[1] !== refsByRemote[2]) {
-		throw new Error(`${stage}: client refs differ from canonical git`)
+	for (const [index, state] of states.entries()) {
+		if (state.fsck !== "") {
+			throw new Error(
+				`${stage}: ${labels[index] ?? "unknown clone"} failed fsck: ${state.fsck}`,
+			)
+		}
+		if (
+			state.digest !== expected.digest ||
+			JSON.stringify(state.objects) !== JSON.stringify(expected.objects) ||
+			JSON.stringify(state.refs) !== JSON.stringify(expected.refs)
+		) {
+			throw new Error(`${stage}: client repository state differs from canonical git`)
+		}
 	}
 }
 
 async function main(): Promise<void> {
 	console.log(`# wire--pack-shape-vs-git — ${RUNS_1} runs, +${RUNS_2} on the fetch\n`)
 	const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS_1 })
-	scratch.push(src)
+	scratch.own(src)
 	const bare = join(mk("bare"), "oracle.git")
 	await spawnGit(["clone", "--bare", "-q", src, bare])
 	await spawnGit(["repack", "-a", "-d", "-q"], { cwd: bare })
@@ -220,9 +199,8 @@ async function main(): Promise<void> {
 
 		// ---- A. cold fetch -------------------------------------------------------
 		console.log("## A. cold fetch: raw size and client-indexed shape\n")
-		console.log("| remote | entries | deltas | max chain depth | deltas ahead of base |")
-		console.log("|---|---|---|---|---|")
 		const clones = new Map<string, string>()
+		const coldRows: (string | number)[][] = []
 		for (const [label, url] of remotes) {
 			const dest = join(mk(`c-${label}`), "c")
 			await spawnGit([
@@ -236,21 +214,23 @@ async function main(): Promise<void> {
 				url,
 				dest,
 			])
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 			clones.set(label, dest)
 			const s = await packShape(dest)
-			console.log(
-				`| ${label} | ${s.entries} | ${s.deltas} | ${s.maxDepth} | ${s.deltaBeforeBase} |`,
-			)
+			coldRows.push([label, s.entries, s.deltas, s.maxDepth, s.deltaBeforeBase])
 			if (label === "pggit-repacked" && s.maxDepth > 1) {
 				fail(
 					`pggit served a delta chain of depth ${s.maxDepth} — star topology claims ≤ 1`,
 				)
 			}
 		}
+		console.log(
+			table(
+				["remote", "entries", "deltas", "max chain depth", "deltas ahead of base"],
+				coldRows,
+			),
+		)
 		await requireCloneParity("cold clone prerequisite", clones)
-		const initialTip = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
-		if (!/^[0-9a-f]{40}$/.test(initialTip)) throw new Error("initial tip was not an OID")
+		const initialTip = await revParse(src, "HEAD")
 		const coldRequest = fetchRequest({ done: true, wants: [initialTip] })
 		const [coldPggit, coldUnencoded, coldGit] = await Promise.all([
 			postPggitV2Pack(remotes[0][1], coldRequest),
@@ -275,7 +255,7 @@ async function main(): Promise<void> {
 
 		// ---- B. the incremental fetch -------------------------------------------
 		const grown = await createAppendOnlyRepo({ docs: 6, runs: RUNS_1 + RUNS_2 })
-		scratch.push(grown)
+		scratch.own(grown)
 		for (const repo of [REPO, RAW_REPO]) {
 			await spawnGit(
 				[
@@ -310,21 +290,20 @@ async function main(): Promise<void> {
 		console.log(`\nrepack #2: ${r2.wholes} wholes + ${r2.deltas} deltas\n`)
 
 		console.log(`## B. +${RUNS_2}-commit warm fetch: client-indexed shape\n`)
-		console.log("| remote | max chain depth after |")
-		console.log("|---|---|")
+		const warmRows: (string | number)[][] = []
 		for (const [label] of remotes) {
 			const dest = requireCloneDir(clones, label)
 			await spawnGit(["-c", "protocol.version=2", "fetch", "-q", "origin"], { cwd: dest })
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
 			const s = await packShape(dest)
-			console.log(`| ${label} | ${s.maxDepth} |`)
+			warmRows.push([label, s.maxDepth])
 			if (label === "pggit-repacked" && s.maxDepth > 1) {
 				fail(`pggit served a delta chain of depth ${s.maxDepth} on the incremental fetch`)
 			}
 		}
+		console.log(table(["remote", "max chain depth after"], warmRows))
 		await requireCloneParity("warm-fetch prerequisite", clones)
-		const grownTip = (await spawnGit(["rev-parse", "HEAD"], { cwd: grown })).stdout.trim()
-		if (!/^[0-9a-f]{40}$/.test(grownTip) || grownTip === initialTip) {
+		const grownTip = await revParse(grown, "HEAD")
+		if (grownTip === initialTip) {
 			throw new Error("grown fixture did not produce a distinct tip OID")
 		}
 		const warmRequest = fetchRequest({
@@ -362,7 +341,7 @@ async function main(): Promise<void> {
 	} finally {
 		await server.close()
 		await db.drop()
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		scratch.cleanup()
 	}
 
 	if (failures.length > 0) {
