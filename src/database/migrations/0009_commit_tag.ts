@@ -1,7 +1,7 @@
 import { type Kysely, sql } from "kysely"
 import { OBJECT_TYPE_CODE } from "@/database/object-type-codes"
 import { computeGenerations, requireGeneration } from "@/object/commit-graph"
-import { deriveCommitRow, deriveTagRow } from "@/object/derive"
+import { deriveCommitRow, deriveTagRow } from "@/object/ingest-validation"
 import { PACK_OBJ_TYPE } from "@/pack/object-header"
 
 // The derived-state spine, chunk 1 (docs/2026-08-17-derived-state-spine-design.md):
