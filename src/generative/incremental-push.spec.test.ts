@@ -21,17 +21,17 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
-import {
-	buildRepoFromCommands,
-	extendRepoFromCommands,
-	repoCommands,
-} from "@/generative/commands"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import { allObjectOids, branchAndTagRefsOf } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import {
+	buildRepoFromCommands,
+	extendRepoFromCommands,
+	repoCommands,
+} from "@/testing/repo-commands"
 import { spawnGit } from "@/testing/spawn-git"
 
 const REFSPEC = ["refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"]

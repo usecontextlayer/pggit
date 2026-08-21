@@ -41,7 +41,6 @@
 import { rmSync } from "node:fs"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
 import { IS_CI } from "@/testing/ci"
 import {
 	ageObjects,
@@ -58,6 +57,7 @@ import {
 	loadAllObjects,
 	parseRevListObjectOids,
 } from "@/testing/git-fixtures"
+import { buildRepoFromCommands, repoCommands } from "@/testing/repo-commands"
 import { spawnGit } from "@/testing/spawn-git"
 
 /**

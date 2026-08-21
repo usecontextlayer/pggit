@@ -12,7 +12,6 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import fc from "fast-check"
 import { describe, expect, inject, it } from "vitest"
-import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createObjectStore } from "@/store/object-store"
@@ -24,6 +23,7 @@ import {
 	seedRepoIntoStore,
 } from "@/testing/git-fixtures"
 import { createIsolatedSchema } from "@/testing/pg"
+import { buildRepoFromCommands, repoCommands } from "@/testing/repo-commands"
 import { spawnGit } from "@/testing/spawn-git"
 
 /** The distinct blob OIDs a branch's tree needs on disk — the git-derived oracle for

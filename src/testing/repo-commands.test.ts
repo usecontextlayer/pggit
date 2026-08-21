@@ -1,7 +1,7 @@
 import { rmSync } from "node:fs"
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
-import { buildRepoFromCommands, repoCommands } from "@/generative/commands"
+import { buildRepoFromCommands, repoCommands } from "@/testing/repo-commands"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 // The generator is the reusable CORE of the §8.4 differentials (spec §6). It must
