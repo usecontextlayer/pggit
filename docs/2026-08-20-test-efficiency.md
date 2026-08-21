@@ -1,6 +1,10 @@
 # Test-suite efficiency — mandate, measurements, and running record
 
-An offshoot of the excellence pass (`docs/2026-08-20-excellence-pass.md`): the full vitest gate costs ~48–60 minutes of heavy load and the owner's laptop pays for it. The mandate, in the owner's rulings: **no full-suite runs without explicit permission**; scheduling tricks (process priority demotion, fewer workers, owner-scheduled gates) were considered and **rejected** — the sanctioned direction is making the test CONTENT less wasteful and a little smaller in budget, driven by flamegraphs and empirical hotspot evidence, never by guesses about what "looks slow."
+An offshoot of the excellence pass (`docs/2026-08-20-excellence-pass.md`): the full vitest gate costs ~48–60 minutes of heavy load and the owner's laptop pays for it. The mandate, in the owner's rulings: **no full-suite runs without explicit permission**; scheduling tricks (process priority demotion, fewer workers, owner-scheduled gates) were considered and **rejected**. The refined goal (owner, 2026-08-20 evening): **make the full harness cheaper to run so the suite finishes in LESS wall time — by being more parallel, avoiding burning the laptop, and avoiding flakiness — while "ideally not affecting its efficacy _too much_, though a little bit is okay."** The direction remains content-level and evidence-driven: flamegraphs and empirical hotspot data, never guesses about what "looks slow."
+
+### The wall-time model that orders the work
+
+Full-gate wall ≈ `max(parallel-phase work ÷ workers, longest single file) + the solo phase run serially`. Consequences (numbers as first modeled; later measured as 1,632 s for the monster and ~425 s for the solo chain, and the monster has since been cut to 987 s): (1) raising the worker cap is useless while `race--clone-vs-repack` and the serial solo chain dominate the critical path — shrink those FIRST, then raise workers; (2) the `maxWorkers: 3` cap is a measured contention envelope, not a preference — lighter tests (fewer subprocesses, less CPU per file) and load-robust tests (calibrated waits instead of frozen milliseconds, as already done for `pg-txn--clone-vs-rewind-gc`) are what raise that envelope safely, so content fixes and parallelism are multiplicative, not alternatives; (3) flakiness and parallelism are the same problem — every timing-fragile test is both a flake source and the reason the cap is low. Candidate structural moves beyond fixes (a)–(c): split the monster file's three modes into three files so they parallelize across workers; make solo-phase members load-robust enough to rejoin the parallel pool.
 
 ## The measurement baseline, and what corrupted it
 
@@ -18,24 +22,120 @@ Source: vitest's own results cache (`node_modules/.vite/vitest/*/results.json` �
 - Top of the list, in order: race--clone-vs-repack (2593s), race--two-pushes-repack (552s), shapes--negative-sweep (481s, solo), race--concurrent-repack (408s), race--err-pkt-overflow (379s), race--short-pack-closure-truncation (374s), pg-txn--clone-vs-rewind-gc (305s), shapes--repack-param-limit-many-small-objects (294s).
 - The 30-minute fuzz timeout seen earlier that day was load+bug artifact, not a real cost: `lifecycle--randomized-sequence-fuzz` is not in the top 25 on a green run.
 
-## The structural hypothesis (to be confirmed by profiling before any fix lands)
+## The structural hypothesis (confirmed by both decompositions below, with one revision)
 
 Read from the sources of the whole race family: each heavy file is `N iterations × (re-seed the SAME immutable multi-thousand-object fixture into a fresh repo via store.putPack, plus repacks/clones/fscks)` wrapped around a race window of a few seconds. Counts, from the files themselves: clone-vs-repack 30 iters × 3 modes with up to two seeds per round of a ~10k-object set (and its `half`/`fetch` modes' second seed re-sends every base object just to be conflict-skipped); err-pkt-overflow 20 × ~10k; concurrent-repack 40 × ~3.5k; short-pack 60 × ~2k; two-pushes 25 × ~3.5k. The raced operations themselves are cheap; the fixture assembly around them is the budget.
 
-## Candidate content fixes (each needs the owner's explicit sign-off before landing)
+## The plan (ruled by the owner, 2026-08-20 late evening: "yes to 1–3, reserve on 4")
 
-- **(a) Template-repo seeding** — seed the object set ONCE per suite into a template repo, then per-iteration copy it DB-side (set-based `INSERT..SELECT` into a fresh `repo_id` within the same schema). Identical rows, identical never-repacked state, ~100 ms instead of seconds; preserves every iteration of race coverage. This is a NEW fixture pattern (DB-side assembly instead of public-surface seeding) — that is exactly why it is gated on sign-off.
-- **(b) Delta-only second seeds** — in modes that seed base-then-full, push only `full − base` the second time, which is what a real push carries. Semantically identical end state; free-standing; no coverage trade.
-- **(c) Iteration trims that preserve the sweep** — e.g. clone-vs-repack's 30 iterations cover its 12-delay sweep 2.5×; 12 iterations cover it exactly once. Trades away timing-jitter re-rolls; the owner decides whether that coverage is worth its minutes.
+Recorded largely verbatim from the driving conversation; the numbered decisions at the end carry the rulings (1–4 from the original ruling, 5–7 added later the same night — where this section's prose disagrees with a later-numbered ruling, the ruling wins).
 
-## Profiling method (in flight)
+**Lever 1 — cut the fixture-assembly budget (the dominant cost).**
+- **(b) Delta-only second seeds** — in `half`/`fetch`-style modes, push only `full − base` instead of re-sending every base object to be conflict-skipped. This is what a real push carries, so it is arguably a *fidelity improvement*, zero coverage loss, tiny diff. **Survey result (2026-08-20, full sweep of `src/e2e/` seeding call sites): (b) applies ONLY inside `race--clone-vs-repack.test.ts`** — every other race suite seeds once per iteration into a fresh repo and gets its increment via a real wire push (already a delta), so (b) folds into the monster conversion rather than being a separate wave. Three non-breakage files (`pack-encoding-incremental`, `pack-encoding-serve`, `fetch-negotiation`) do re-seed grown histories via `seedRepoIntoStore` but hold no in-memory array pair and sit outside the top 25 — flagged, deliberately untouched.
+- **(a) Template-repo DB-copy** — the big one. Shape: a `src/testing/` helper that seeds via `putPack` **once** per suite into a template repo, then per-iteration copies the rows (`INSERT..SELECT` across the git tables with a fresh `repo_id`). Two design commitments keep it honest: the helper gets an **anchored identity proof** (the first copy per suite is verified against `assertCanonicalStoreFixture`, so the copy path can never drift from the putPack path silently), and it stays a *fixture-assembly* tool — the raced operations still run through the real public surface. Convert the monster first, measure, then roll across the race family.
+- **(c) ITERS trims** — held in reserve at ruling time; superseded by ruling 5 below (exercised, paired with calibration).
+
+**Lever 2 — flakiness and parallelism are the same fix.** The race files sweep **frozen millisecond delays** (`[0, 5, 20, … 1100]`) across a serve whose duration varies by machine and load — that is why they inflated 3.9× under load while the suite averaged 1.6×, and why the worker cap sits at 3. The `pg-txn--clone-vs-rewind-gc` fix already established the repo's pattern: time one un-raced calibration operation, sweep delays as *fractions* of that measured wall. Applying it to the race family makes the sweeps land mid-serve on any box under any load — simultaneously the flake fix, the thing that lets these files run in a busier parallel pool, and an *efficacy improvement* (delays that actually hit the window they are hunting).
+
+**Lever 3 — restructure the critical path.** Even at zero cost for everything else, wall time ≥ longest file + solo chain. Two moves: **split the monster by mode** into three files (`clone`/`half`/`fetch`) — all 30 iterations of each mode survive exactly; it is file organization, not coverage change — and examine **the solo chain** (75% one file, `shapes--negative-sweep`, ~320 s quiet; the config claimed it was solo because "its per-shape timings feed its own verdicts" — the examination below later proved that claim FALSE, so no calibration is even needed to move it).
+
+**Sequencing:** (b) → build (a) + convert monster + measure → split monster → calibrate sweeps → roll (a) across the family → negative-sweep examination → then the maxWorkers A/B, which needs an owner-scheduled full gate. Each step is small, individually gated on blast-radius files only, and measured before the next.
+
+**Explicitly NOT done:** no trimming of any fsck/oid-comparison verdict (that is the oracle itself), and no touching the production serve path's PG chattiness (the round-trip counts point at real serve-side batching questions, but that is perf-work territory the adversarial ledger already governs — parked as an observation, not smuggled into a test mission).
+
+**The four decisions — ruled (owner, 2026-08-20):**
+1. Fixture pattern (a), DB-side template copy with the anchored identity proof: **YES, sanctioned.**
+2. Splitting the monster file by mode (iterations preserved, file boundaries changed): **YES.**
+3. Calibrated delay sweeps across the race family (extending the clone-vs-rewind pattern): **YES.**
+4. (c) iteration trims: originally RESERVE; **EXERCISED later the same night** (see ruling 5).
+
+**Later rulings (owner, 2026-08-20, after wave 1 measured 1,632 s → 987 s):**
+5. **Iteration trims PAIRED WITH calibration: YES, strongly agreed.** The exchange: calibration raises per-iteration hit probability (frozen delays mostly miss the mid-serve window off their home machine; calibrated delays mostly land in it), so trimming each race file to one full delay-sweep leaves expected detection power equal or better than today while cutting ~900–1,200 s of work. Execute per file WITH the calibration in the same change, sweep-preservation argument written into each header. Counts: monster 30→12 per mode (12-delay sweep once), concurrent-repack 40→12, short-pack 60→~20, and the same sweep-once logic across the family.
+6. **Monster fixture scale cut: YES, strongly agreed.** `RUNS` 1200→600 (~10k→~5k objects, ~10→~5 PACK_BATCH reads per serve). This is the one genuine efficacy spend in the plan: inter-batch seams drop 9→4; the property is seam-existence, not seam-count. Halves the surviving raced-serve cost (~400–500 s).
+7. **Then the worker-count A/B**: after 5–6 lands, measure how many workers the lightened, calibration-robust suite tolerates (full-gate A/B, owner-scheduled). Projected: ~2,900–3,100 s total work, longest file ~300 s, solo tail ~105 s → ~18–20 min at 3 workers, plausibly ~10–11 min at 5–6.
+
+## The efficacy ledger (what may be cut, and at what exchange rate)
+
+"Efficacy" is not one substance; the suite holds three kinds, and the acceptable cuts differ by kind:
+- **Deterministic coverage** (the ~139 files outside the top 25, ~20% of time; unit, e2e behaviors, wire goldens): high value per second, cheap. UNTOUCHABLE, as are all oracle verdicts (fsck, oid-set equality, delta floors) — those are the suite's definition, not its cost.
+- **Probabilistic race-hunting** (the race family): value per iteration DIMINISHES — the delay sweep covers the systematic dimension; repetitions only re-roll jitter. This is where trims are near-free, and only in combination with calibration (ruling 5).
+- **Adversarial scale** (fixture sizes): value is THRESHOLD-shaped — a shape is adversarial at a scale, and beyond the threshold extra scale is linear cost for little marginal value. The monster's RUNS cut (ruling 6) spends this deliberately. NOT spent: `WIDE = 20_000` in the shape sweep **crosses 2^14 = 16,384, which looks like a deliberate index-boundary crossing — do not shrink it without first establishing why it was chosen** (open question); `LINEAR = 10_000` would save only ~60–90 s, not worth its risk; generative fast-check budgets (~600 s total) sample fresh property space against the oracle every run — the highest value-per-second in the suite, defended.
+
+## Measured decompositions
+
+**Clean-box baselines (this box, quiet, solo runs):** `race--clone-vs-repack` **1,632 s** (vs 2,593 s recorded under load — 1.6×); `race--short-pack-closure-truncation` **95 s** (vs 374 s under load — **3.9×**, evidence that contention-sensitive race files were over-ranked by the loaded run and are the flakiness reservoir).
+
+**`race--short-pack-closure-truncation` (90 s test time, 60 iterations), components (they overlap — the server is in-process — so they do not sum to wall):**
+- **PG: 117,000 round-trips** (~2,000 per iteration; ≥23 s of pure round-trip floor at the measured 0.2 ms loopback RTT before any query executes).
+- **Node JS CPU: ~41 s busy** (90.9 s sampled − 49.8 s idle); top hotspots: zlib deflate ~14 s (serve-path pack encoding + repack deflates), Buffer churn ~6 s, `encodeDelta` 1.4 s, GC 2 s.
+- **git subprocesses: 28.2 s wall**, essentially all of it 56 protocol-v2 clones/fetches.
+- The node process is **idle 55% of its own wall** — waiting on PG round-trips and subprocess phases; this is why one race file cannot exploit more cores and anchors wall time.
+
+**`race--clone-vs-repack` (1,650 s test time, 90 rounds = 30 iterations × 3 modes):**
+- **git subprocess wall: 883 s (54%)** — 850 s of it the 119 raced clones/fetches themselves (~7 s each; the serve is in-process, so node works concurrently), 28 s fsck ×89, the rest noise.
+- **Node JS CPU: ~600 s busy** (1,651 sampled − 1,052 idle) — zlib deflate 192 s (serve-side pack compression), `encodeDelta` 36 s (repack), `rmSync` 28 s (per-round clone-dir deletion), porsager queue overhead 53 s, Buffer churn ~80 s, GC 24 s.
+- **PG: 686,000 round-trips.** CORRECTED ATTRIBUTION (the first reading blamed seeding via a correlation with objects-seeded; source inspection of `putPack` disproved it — objects go through COPY staging and `PACK_BATCH`-chunked derived-row inserts, so a 10k-object push is a few dozen round-trips): the storm is the **119 epoch-less clones paying the reachability WALK path (~2.5k queries each at this repo size — these race repos never run gc, so no epoch exists)** plus the **90 repack passes** (repack is the known round-trip-heavy pass; `perf--repack-roundtrips` exists, RTT-models, and budgets it for exactly this reason). Template-copy still removes a large share because it removes whole rounds of this work, not because seeding itself was chatty.
+
+**What the decomposition changes:** the seeding hypothesis holds for the PG/idle share, but the single biggest component is the raced clones' serve cost (~850 s), which is efficacy-bearing and stays. So fix (a) is confirmed (estimated ~600–700 s off the monster) AND the mode-split (ruled yes) becomes the necessary companion: post-(a)+split, three files of roughly ~330 s that parallelize, replacing a 1,632 s wall anchor. Two additions: clone-dir deletion (28 s of `rmSync`) can defer to `afterAll`; and an earlier note here claiming "putPack costs ~1 query per object" was WRONG and is retracted — source inspection shows the push path is COPY-batched (a few dozen round-trips per push regardless of size); the chatty paths are the epoch-less clone walk (~1 query per 4 objects, only on never-drained repos) and repack (already probe-budgeted with RTT modeling). No production follow-up is owed on the push path.
+
+**MEASURED AFTER (2026-08-20 late): the template-copy + delta-seed conversion took the monster from 1,632 s to 987 s solo — a 40% cut, green, with both anchored copy-proofs passing.** The prediction above (~600–700 s) landed within 10% of the actual 645 s saved. The remaining ~975 s is dominated by the efficacy-bearing raced serves; the mode-split turns it into three ~330 s parallel files, and rulings 5–6 (trims + `RUNS` halving) would take each to roughly ~70–130 s.
+
+## The negative-sweep examination (2026-08-20, late)
+
+`shapes--negative-sweep.test.ts` (~320 s quiet, 75% of the serial solo chain): 22 independent adversarial shapes, each driven through the full pipeline (push → repack → ~8–12 clones across pggit and a `file://` control → partial-filter clones → optional extend/mutate → gc → final clone). **Verified: not one verdict is timing-based** — the only `Date.now()` feeds a `console.log`; every assertion is object-set equality, `fsck --strict`, or a `minDeltasServed` count floor. The vitest config's stated reason for its solo placement ("its per-shape timings feed its own verdicts") is therefore FALSE for the current file — a stale claim to correct in the same change that moves it.
+
+**Restructure (RULED YES by the owner immediately after this examination; a subagent is executing it under an explicit be-methodical directive):** split the 22 shapes into 3–4 parallel-pool files (e.g. static shapes / growing shapes / mutating shapes / monster+linear-10k), with the shared `runShape` pipeline moving to `src/testing/` (the established home for shared test drivers — same rationale as `append-only-repo.ts`). Effect: the serial solo tail drops from ~425 s to ~105 s (the fault-sweep + copy-cancel + gc-scheduler files, whose solo placements ARE evidence-backed), and the sweep's ~320 s becomes parallel work. Identical shapes, identical verdicts, zero efficacy spent. **MEASURED AFTER (2026-08-20, landed): 22/22 shapes green across the four files, wall 119 s for 251 s of summed test time at maxWorkers 3 — versus ~320 s serial before; first concurrent exercise showed none of the feared RSS/subprocess contention.** Fixture scales (`DEPTH=2000`, `WIDE=20000`, `LINEAR=10000`) stay untouched — the file pins them as the sizes at which the shapes are adversarial, and shrinking them IS an efficacy trade, held for a separate ruling if ever needed.
+
+## Profiling method
 
 Temporary instrumentation, all of it scratch that must NEVER be committed: env-gated git-subprocess wall aggregation per subcommand in `src/testing/spawn-git.ts` (`PGGIT_GIT_STATS=<dir>`), env-gated query counting in `src/testing/pg.ts` (`PGGIT_PG_STATS=<dir>`), and an untracked `vitest.profile.config.ts` adding `--cpu-prof` to the fork pool so each worker writes a V8 `.cpuprofile`. Per profiled file this yields: wall (vitest), git wall per subcommand, PG round-trip counts, JS CPU with flamegraph-able profile; residual ≈ scheduling/sleeps. First target: the 28% file, running solo on the now-quiet box; then the same treatment across the rest of the top seven.
 
-## State and next steps
+## State and next steps (current as of late 2026-08-20)
 
-1. In flight: instrumented solo run of `race--clone-vs-repack` (also doubles as its clean-box baseline).
-2. Then: decomposition report → owner picks from fixes (a)/(b)/(c) per file → land sanctioned reductions with the usual review/statics/blast-radius discipline.
-3. Untouched second-order ideas, deliberately parked: content-keyed cache for `createAppendOnlyRepo` fixtures (each `(docs, runs)` tuple is rebuilt via fast-import many times per gate); a ~30-line vitest reporter appending per-file durations to a committed JSONL so cost regressions become visible; investigating the gate's ~65 s module-import phase; Spotlight (`mds_stores`) indexing churn on test tmpdirs.
+1. DONE and measured: both decompositions; wave 1 (template-copy + delta seeds) landed on the monster, 1,632 s → 987 s green.
+2. EXECUTING: the negative-sweep four-way split (subagent, be-methodical directive; driver reviews the full diff on landing, then runs the four new files + the converted monster individually).
+3. NEXT WAVE (all ruled): mode-split of the monster into three files; calibration + sweep-once iteration trims across the race family (ruling 5), `RUNS` 1200→600 in the monster (ruling 6) — one coherent change per file, measured solo before/after.
+4. THEN: the worker-count A/B on an owner-scheduled full gate (ruling 7).
+5. Untouched second-order ideas, deliberately parked: content-keyed cache for `createAppendOnlyRepo` fixtures (each `(docs, runs)` tuple is rebuilt via fast-import many times per gate); a ~30-line vitest reporter appending per-file durations to a committed JSONL so cost regressions become visible; investigating the gate's ~65 s module-import phase; Spotlight (`mds_stores`) indexing churn on test tmpdirs.
 
-**Driver's leans, plainly:** (b) should land regardless — it is a correction toward what production pushes actually carry. (a) is the big win and preserves coverage; I would take it over (c) everywhere the two compete. (c) is the fallback where (a) is unwanted. The verdict-side work (fscks, oid-set comparisons) is the oracle itself — do not trim it to save time.
+
+## Implementation notes
+
+### Decided — implementation
+
+- **(b) computes the delta client-side** from the object arrays the suite already holds in memory (`fullObjects` minus `baseObjects` by an oid Set), not via another `git rev-list` walk — the arrays exist, and a subprocess would spend time to re-learn what is in RAM.
+- **(a) lives in a NEW file under `src/testing/`** (suggested: `template-repo.ts`), never inside `git-fixtures.ts` — that file is part of the staged-but-uncommitted cycle-C ownership pass, and touching it would entangle two commit tracks. The helper copies `repos` plus the child tables with a fresh repo id via set-based `INSERT..SELECT`; the copy carries `git_commit.generation` **as stored** — re-deriving it through `putPack` per copy is the plausible-but-wrong implementation that rebuilds exactly the cost this removes.
+- **The anchored identity proof is the SUITE's job, not the helper's**: after the first copy in a given suite, assert it with `assertCanonicalStoreFixture` against the same expectations the template was seeded with. The helper stays generic; the proof stays where the canonical expectations live. Rejected alternative: a self-verifying helper — it would need canonical expectations threaded into every call.
+- **Templates are built with a SINGLE `putPack` ingest** (the post-ownership-pass `putGitObjects` behavior). Chunked seeding of a template would reintroduce the absorbing-NULL generation hazard the ownership pass just removed (sorted-OID batch boundaries can put a child before its parent; `computeGenerations` treats an absent out-of-batch parent as NULL, and NULL is absorbing).
+- **The monster's `fetch` mode may clone its base ONCE and `cp -R` the client directory per iteration**, retargeting with `git remote set-url origin <per-iteration url>` — the raced incremental fetch stays fully real; only the un-raced setup clone is deduplicated. A git clone directory is plain files; copying it is standard practice.
+- **This wave's scope is exactly: (b) where it applies + build (a) + convert the monster.** The mode-split of the monster (ruled yes) and the sweep calibration are the NEXT wave — deliberately not folded in, so each diff stays reviewable and individually measurable.
+
+### Nuances
+
+- **"Second seed" is not always fixture assembly.** (b) applies ONLY where a re-send's semantic is "the rest of the history arrived" (the monster's `half`/`fetch` modes). Where partial or overlapping pushes are the property under test it must NOT be applied — `race--short-pack-closure-truncation` re-pushes a resurrect set as the test itself, and `race--err-pkt-overflow` seeds `objects.slice(0, 50)` before the full set, which reads like deliberate partial-state setup. The rule for the implementer: if deleting the overlap would change what the header says the test probes, skip it and report, never "optimize" it.
+- **The copy helper must not be "improved" into using the public store surface.** Its entire point is bypassing `putPack` for state whose identity is already proven; the raced operations stay on the public surface. These look like contradictory standards side by side — they are the same standard (fixture assembly proves identity; the subject under test exercises the contract).
+- **Per-iteration repos need distinct names** (`repos.name` is the wire identity; the monster derives `race/clone-repack/<mode>/<i>`) — the copy takes the target name as an argument rather than generating one, so repo naming stays in the suite where the URL is built.
+- **FK insert order matters and should be derived from the migrations, not guessed** — `git_pack_encoding` and the derived-row tables hang off `git_object`/`repos` by composite FKs; the safe order starts at `repos`, then `git_object`, then the rest. (Copy `repo_file` too if present; for race suites it is empty and the copy is free.)
+
+### Traps (already paid for once)
+
+- **vitest 4 removed `test.poolOptions`** — worker `execArgv` (for `--cpu-prof`) is top-level now; the deprecated form silently no-ops with only a log-line warning.
+- **tinypool workers die by signal, not `process.exit()`** — `process.on("exit")` dumps never fire; any in-worker instrumentation must flush periodically.
+- **Background shell commands inherit a stale cwd** after any command that `cd`s elsewhere — one profiling launch failed with exit 127 because it ran from the workspace root; use absolute paths or a leading `cd` in the same command.
+- **Never trust `top`'s first sample or thermals as an idle check** — read the load average; twelve orphaned busy-loops corrupted a whole afternoon of measurements while every casual check said the box was idle.
+
+### Consequences to fold into the change
+
+- The monster suite's header says its iteration counts and delays are "frozen exactly" from the source script — after (a)/(b) land that paragraph must be amended in the same commit (the counts stay frozen; the seeding mechanism is now documented as template-copy).
+- The measured baselines above (1,632 s / 95 s) are the before-numbers; each landed wave re-measures the touched file solo and records the after-number here, or the claim of improvement is a guess.
+- Commit sequencing is entangled with the staged cycle-C ownership pass: efficiency edits stay unstaged/untracked until the owner rules on ordering (an open question in `docs/2026-08-20-excellence-pass.md`). No `git add`, no commits from implementing agents.
+
+### Open — implementation
+
+- ~~The monster's own decomposition~~ RESOLVED: measured (see Measured decompositions); it triggered rulings 5–6.
+- ~~Exact FK/table set for the copy~~ RESOLVED: derived from migrations 0001–0012 during wave 1; the landed `src/testing/template-repo.ts` carries the list with its rationale.
+
+### Concerns
+
+- The half-mode template bakes in "base repacked, full pending" state; if a future repack policy change alters what "repacked" leaves behind, templates rebuilt per suite track it automatically — but a reader who caches templates ACROSS suites (tempting, one step further) would break schema isolation. The helper should stay per-schema by construction (it takes the suite's `sql`).
+- Profiling instrumentation (unstaged scratch in `spawn-git.ts`/`pg.ts` plus untracked `vitest.profile.config.ts`) must be reverted before any efficiency commit — an implementing agent diffing the tree will see it; it is NOT part of any wave.
