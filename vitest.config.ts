@@ -9,18 +9,21 @@ const projectRoot = fileURLToPath(new URL(".", import.meta.url))
 // Unit runs exclude every integration variant (shared `.integration.test.` infix).
 const unitTestExclude = [...configDefaults.exclude, "**/*.integration.test.ts"]
 
-// Suites that must run with the machine to themselves, as the LAST phase:
+// Suites that must run with the machine to themselves, as the LAST phase. The bar is
+// a timing-sensitive VERDICT, never file length:
 //   - the gc-scheduler family drives interval/grace timing that CPU contention
 //     flakes;
 //   - the watcher-aimed fault suites target sub-second statement windows
 //     (`pg_cancel_backend` at a specific sweep batch, a ~200 ms COPY) that a
 //     loaded box makes unhittable — measured: green solo, red under three
-//     parallel workers;
-//   - the negative sweep is the longest single file and its per-shape timings
-//     feed its own verdicts.
+//     parallel workers.
+// The adversarial shape sweep is NOT here. It was, on the claim that its per-shape
+// timings fed its own verdicts — and that claim was false: its only `Date.now()`
+// feeds a `console.log`, while every verdict is an object-set equality, an
+// `fsck --strict`, or a served-delta floor. It runs in the parallel pool instead,
+// as the four `shapes--negative-sweep-*.test.ts` files.
 const soloTests = [
 	"**/gc-scheduler*.test.ts",
-	"**/shapes--negative-sweep.test.ts",
 	"**/pg-txn--gc-repack-fault-sweep.test.ts",
 	"**/pg-txn--copy-cancel-hangs-push-forever.test.ts",
 ]
