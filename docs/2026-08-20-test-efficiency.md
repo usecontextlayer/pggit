@@ -114,7 +114,7 @@ Temporary instrumentation, all of it scratch that must NEVER be committed: env-g
 - **The anchored identity proof is the SUITE's job, not the helper's**: after the first copy in a given suite, assert it with `assertCanonicalStoreFixture` against the same expectations the template was seeded with. The helper stays generic; the proof stays where the canonical expectations live. Rejected alternative: a self-verifying helper — it would need canonical expectations threaded into every call.
 - **Templates are built with a SINGLE `putPack` ingest** (the post-ownership-pass `putGitObjects` behavior). Chunked seeding of a template would reintroduce the absorbing-NULL generation hazard the ownership pass just removed (sorted-OID batch boundaries can put a child before its parent; `computeGenerations` treats an absent out-of-batch parent as NULL, and NULL is absorbing).
 - **The monster's `fetch` mode may clone its base ONCE and `cp -R` the client directory per iteration**, retargeting with `git remote set-url origin <per-iteration url>` — the raced incremental fetch stays fully real; only the un-raced setup clone is deduplicated. A git clone directory is plain files; copying it is standard practice.
-- **This wave's scope is exactly: (b) where it applies + build (a) + convert the monster.** The mode-split of the monster (ruled yes) and the sweep calibration are the NEXT wave — deliberately not folded in, so each diff stays reviewable and individually measurable.
+- **This wave's scope is exactly: (b) where it applies + build (a) + convert the monster.** The mode-split of the monster (ruled yes) and the sweep calibration are the NEXT wave — deliberately not folded in, so each diff stays reviewable and individually measurable. *(This is wave 1's scope note, kept for provenance; waves 2–3 executed the deferred pieces — see State items 2 and 5.)*
 
 ### Nuances
 
@@ -122,6 +122,10 @@ Temporary instrumentation, all of it scratch that must NEVER be committed: env-g
 - **The copy helper must not be "improved" into using the public store surface.** Its entire point is bypassing `putPack` for state whose identity is already proven; the raced operations stay on the public surface. These look like contradictory standards side by side — they are the same standard (fixture assembly proves identity; the subject under test exercises the contract).
 - **Per-iteration repos need distinct names** (`repos.name` is the wire identity; the monster derives `race/clone-repack/<mode>/<i>`) — the copy takes the target name as an argument rather than generating one, so repo naming stays in the suite where the URL is built.
 - **FK insert order matters and should be derived from the migrations, not guessed** — `git_pack_encoding` and the derived-row tables hang off `git_object`/`repos` by composite FKs; the safe order starts at `repos`, then `git_object`, then the rest. (Copy `repo_file` too if present; for race suites it is empty and the copy is free.)
+- **In the overlap telemetry, "straddle" is a HIT** — the racer started inside the hunted window and outlasted it; only "late" is a wasted arm, and some lates are designed (`race--clone-vs-gc-rewind`'s two tail arms exist for its completed-fetch floor). Reading "in" as the only success shape misreads the data.
+- **Calibration walls are measured once per suite in `beforeAll`** — cheap and usually right, but a load spike mid-suite skews later arms; the telemetry surfaces the drift, it does not prevent it.
+- **`race--deleterepo`'s two templates are not redundant** — repack mode's raced actor IS the tier builder, so its template must stay raw; collapsing to the encoded template would blunt that mode's race.
+- **`RUNS` is ceiling-load-bearing in `race--err-pkt-overflow` and budget-trimmable in the monster** — the raced refusal must exceed ~1,597 missing oids in the former (ruling 6 does not apply there); the two constants look symmetric and are not.
 
 ### Traps (already paid for once)
 
@@ -129,6 +133,7 @@ Temporary instrumentation, all of it scratch that must NEVER be committed: env-g
 - **tinypool workers die by signal, not `process.exit()`** — `process.on("exit")` dumps never fire; any in-worker instrumentation must flush periodically.
 - **Background shell commands inherit a stale cwd** after any command that `cd`s elsewhere — one profiling launch failed with exit 127 because it ran from the workspace root; use absolute paths or a leading `cd` in the same command.
 - **Never trust `top`'s first sample or thermals as an idle check** — read the load average; twelve orphaned busy-loops corrupted a whole afternoon of measurements while every casual check said the box was idle.
+- **vitest 4's default reporter swallows `console.log` from PASSING tests in non-TTY runs** — a green file shows no console output at all in a redirected log. The overlap telemetry (and the shape sweep's `deltasServed` lines, the storm's timing lines) are only visible with `--reporter=verbose`. A diagnostic that "didn't print" almost certainly printed into the void, not failed to run.
 
 ### Consequences to fold into the change
 
