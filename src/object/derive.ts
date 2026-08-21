@@ -8,7 +8,7 @@ import {
 	tagTargetType,
 	treeEntries,
 } from "@/object/object"
-import { isOid, type Oid } from "@/oid"
+import { isOid, type Oid } from "@/object/oid"
 
 /**
  * Ingest-boundary validation and row derivation — the single place a pushed

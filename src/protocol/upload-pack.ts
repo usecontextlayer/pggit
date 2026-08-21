@@ -1,6 +1,6 @@
 import { assertNever } from "@/assert-never"
 import { label, withPhase } from "@/instrument"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError, WantNotFoundError } from "@/protocol/errors"
 import {

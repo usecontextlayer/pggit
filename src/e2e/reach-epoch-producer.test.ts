@@ -15,7 +15,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { type Database, initKysely } from "@/database"
 import type { ReposId } from "@/database/models/public/Repos"
-import { ZERO_OID } from "@/oid"
+import { ZERO_OID } from "@/object/oid"
 import { type Epoch, loadEpoch, oidsOfUnion, splitOids } from "@/store/reach-epoch"
 import { fullClosure } from "@/store/reachability"
 import {

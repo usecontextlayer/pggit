@@ -15,7 +15,7 @@ import { createHash } from "node:crypto"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { parseRevListObjectOids, requireGitOid } from "@/testing/git-fixtures"
 import { PINNED_IDENTITY, spawnGit } from "@/testing/spawn-git"
 

@@ -23,7 +23,7 @@
 import { mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import type { GitServer } from "@/server"
 import { createGc, type GcResult } from "@/store/gc"
 import { createRepack } from "@/store/repack"

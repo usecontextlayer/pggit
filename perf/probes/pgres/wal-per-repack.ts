@@ -50,7 +50,7 @@ import {
 } from "@perf/probes/pgres/_util"
 import { z } from "zod"
 import { createGitDeps } from "@/index"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { createGc } from "@/store/gc"
 import { createRepack } from "@/store/repack"
 import {

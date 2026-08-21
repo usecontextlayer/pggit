@@ -14,7 +14,7 @@
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 import type { Sql } from "postgres"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { createObjectStore } from "@/store/object-store"
 import { createRefStore } from "@/store/refs-store"
 import {

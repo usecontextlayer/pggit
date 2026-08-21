@@ -1,5 +1,5 @@
 import type { GitObjectType } from "@/object/object"
-import { isOid, type Oid, ZERO_OID } from "@/oid"
+import { isOid, type Oid, ZERO_OID } from "@/object/oid"
 import { AGENT, assertSupportedObjectFormat } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"

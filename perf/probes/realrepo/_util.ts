@@ -13,7 +13,7 @@
 import { join } from "node:path"
 import type { Sql } from "postgres"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { createRepack } from "@/store/repack"
 import {
 	allObjectOids,

@@ -35,7 +35,7 @@ import {
 } from "@perf/probes/realrepo/_util"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { readPack } from "@/pack/read-pack"
 import { serveOnPort } from "@/server"
 import {

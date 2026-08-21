@@ -34,7 +34,7 @@ import {
 } from "@perf/probes/realrepo/_util"
 import { z } from "zod"
 import { createGitApp, createGitDeps } from "@/index"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { mirrorStateOf, revParse, verifyPackObjectsInRepo } from "@/testing/git-fixtures"

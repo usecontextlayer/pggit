@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { GitFormatError } from "@/object/format-error"
-import { type Oid, parseOid } from "@/oid"
+import { type Oid, parseOid } from "@/object/oid"
 
 /** The four addressable git object types (deltas resolve into one of these). */
 export type GitObjectType = "blob" | "commit" | "tree" | "tag"

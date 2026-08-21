@@ -32,7 +32,7 @@ import { join } from "node:path"
 import { deflateSync } from "node:zlib"
 import { parseRepeatedArgs } from "@perf/args"
 import { z } from "zod"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { applyDelta, DELTA_SIZE_MIN, encodeDelta } from "@/pack/delta"
 import {
 	cloneIndependentMirror,

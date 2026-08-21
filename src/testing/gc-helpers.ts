@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { ZERO_OID } from "@/oid"
+import { ZERO_OID } from "@/object/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"

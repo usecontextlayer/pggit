@@ -1,4 +1,4 @@
-import { isOid, type Oid } from "@/oid"
+import { isOid, type Oid } from "@/object/oid"
 import { AGENT } from "@/protocol/capabilities"
 import { GitProtocolError } from "@/protocol/errors"
 import { decodePktStream, encodePkt, encodePktLine } from "@/protocol/pkt-line"

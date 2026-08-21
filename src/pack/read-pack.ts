@@ -3,7 +3,7 @@ import { createInflate } from "node:zlib"
 import { count } from "@/instrument"
 import { GitFormatError } from "@/object/format-error"
 import { computeOid, type GitObjectType } from "@/object/object"
-import type { Oid } from "@/oid"
+import type { Oid } from "@/object/oid"
 import { applyDelta, DELTA_SIZE_MIN } from "@/pack/delta"
 import { decodeObjectHeader, PACK_OBJ_TYPE } from "@/pack/object-header"
 

@@ -1,6 +1,6 @@
 import { commitTreeOid } from "@/object/object"
+import { ZERO_OID } from "@/object/oid"
 import { diffFileLists, type TreeReader } from "@/object/tree-diff"
-import { ZERO_OID } from "@/oid"
 import { buildFileList, type ObjectReader } from "@/repo-view/build-file-list"
 import type { RepoFileProjection } from "@/repo-view/repo-file-projection"
 import type { ObjectStore } from "@/store/object-store"
