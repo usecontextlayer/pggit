@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { applyDelta } from "@/pack/delta"
-import { expectGitFormatError } from "@/testing/format-error"
+import { expectGitFormatError } from "@/testing/expect-format-error"
 
 /** The delta header's LEB128 size varint (LSB group first), per gitformat-pack —
  * re-derived here so the hand vectors own the format rather than importing it. */
