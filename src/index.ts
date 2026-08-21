@@ -282,6 +282,12 @@ export type {
 // directly on its own schedule) and the self-scheduling background drain that
 // decides when to run it (docs/2026-06-24-gc-scheduler-design.md §4).
 export { createGcScheduler } from "@/store/gc-scheduler"
+// Offline repack: builds the stored pack-encoding tier per repo. Exported for
+// hosts to drive on their own schedule — the GC drain does not invoke it, and
+// scheduling it remains the engine-side integration's job (the review ledger's
+// repack disposition).
+export type { Repack, RepackResult } from "@/store/repack"
+export { createRepack } from "@/store/repack"
 // Administrative repo lifecycle: exact-name delete + prefix listing, exported for
 // hosts composing their own deps; `createGitDeps` already wires it as `.admin`.
 export type { RepoAdmin } from "@/store/repo-admin"
