@@ -50,9 +50,13 @@ export default defineConfig({
 					// count (~one per core) the container-backed suites produce false
 					// 600 s timeouts and wedged workers — observed repeatedly on this
 					// suite (a 13 s file timing out purely from parallel load). Three
-					// concurrent files is the measured-safe envelope; raise it only
-					// with a full-suite A/B against solo timings.
-					maxWorkers: 3,
+					// concurrent files was the safe envelope while the race family swept
+					// frozen millisecond delays; the calibrated fraction sweeps are what
+					// made a denser pool safe. 6 is the measured ruling-7 A/B result
+					// (2026-08-21): 169 files / 654 tests green in 854 s wall on a box
+					// simultaneously carrying other sessions' load, zero flakes. Re-run
+					// that A/B before raising it further.
+					maxWorkers: 6,
 					name: "pggit",
 					sequence: { groupOrder: 0 },
 				},
