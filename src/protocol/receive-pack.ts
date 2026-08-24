@@ -190,8 +190,8 @@ export type ReceiveBackend = {
 	/** The stored type of `oid`, or null when absent — the branch-tip policy
 	 * (git: a new value under refs/heads/ must be a commit). */
 	objectType: (oid: Oid) => Promise<GitObjectType | null>
-	/** Refresh the queryable file projection for a just-applied ref. Present only
-	 * when the (optional) queryable-view layer is wired; a plain remote omits it. */
+	/** Synchronize the queryable file projection for a just-applied ref. Present only
+	 * when the optional `repo_file` projection is wired; a plain remote omits it. */
 	syncRefProjection?: (ref: string, newOid: Oid) => Promise<void>
 }
 
@@ -222,7 +222,7 @@ export async function handleReceivePack(
 	const useSideband = caps.includes("side-band-64k")
 	const atomic = caps.includes("atomic")
 
-	// rc3 boundary check: a ref name too long to store, or malformed under git's
+	// A ref name too long to store, or malformed under git's
 	// check-ref-format rules, is rejected BEFORE ingest — so an all-unstorable
 	// push never ingests a pack (no orphaned objects), and the raw btree error
 	// never escapes as a 500. (Directory/file conflicts are judged LATER, after
@@ -403,20 +403,18 @@ export async function handleReceivePack(
 	)
 	const results = outcomes.map(({ result }) => result)
 
-	// Post-commit: refresh the queryable file projection for each applied ref. The
-	// view layer decides branch-filtering and build-vs-drop. Sequential — same-repo
-	// rebuilds must not race the shared-blob reaper.
+	// Post-commit: sync the queryable file projection for each applied ref. The
+	// projection layer decides branch filtering and advance-vs-drop.
 	for (const { command, result } of outcomes) {
 		if (!result.ok) continue
-		// rc2: the queryable view is a DERIVED projection — a rebuild failure (e.g. a
-		// tip that is not a commit, which buildFileList cannot walk) must NEVER roll
-		// back or 500 an already-applied push (rebuild.ts's standing contract). Absorb
-		// it loudly to the log; the projection is rebuilt on the next push to the ref.
+		// The file index is DERIVED: a sync failure must never roll back or 500 an
+		// already-applied push. Log it loudly; because rows and their recorded basis
+		// advance together, the next push retries from the same basis.
 		try {
 			await backend.syncRefProjection?.(command.ref, command.newOid)
 		} catch (err) {
 			console.error(
-				`pggit: snapshot refresh failed for ${command.ref} (the push is already applied):`,
+				`pggit: file projection sync failed for ${command.ref} (the push is already applied):`,
 				err,
 			)
 		}

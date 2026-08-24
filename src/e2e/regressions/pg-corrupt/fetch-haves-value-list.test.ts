@@ -3,27 +3,25 @@
  * the wire boundary and batched before Postgres, so even a request larger than the
  * extended-query parameter ceiling returns the exact canonical pack.
  *
- * The original `commonHaves` query expanded the CLIENT'S entire have list into one
+ * Expanding the CLIENT'S entire have list into one
  * bind parameter per oid. PostgreSQL's Bind message caps a statement at 65,535
  * parameters (one was already spent on the repo id), so 65,534+ haves produced an
- * internal 500. `processHaves` now uses the same bounded lookup batches as the rest
- * of the store, and `parseFetch` validates haves like wants.
+ * internal 500. `processHaves` therefore uses the same bounded lookup batches as
+ * the rest of the store, and `parseFetch` validates haves like wants.
  *
- * Part A drives well-formed raw requests on both sides of the old wall and parses
+ * Part A drives well-formed raw requests on both sides of that wall and parses
  * the returned pack, requiring the exact closure canonical Git derives from the
  * source. Part B measures how many haves a REAL `git fetch` puts in each HTTP body,
  * observed at the HTTP boundary rather than through a store-method spy.
  *
- * MEASURED (2026-08-15, git 2.55.0, 4000 mutually-unreachable tips): the per-request
- * have counts were 16, 48, 112, 240, 496 — CUMULATIVE, confirming that
+ * With 4000 mutually-unreachable tips, per-request have counts are cumulative,
+ * confirming that
  * protocol-v2-over-HTTP being stateless makes git re-send the whole accumulated list
  * each round. But git then gave up (MAX_IN_VAIN) at 496, and a LINEAR history
  * collapses in one round because a single ACK marks the whole ancestor chain common.
- * So stock `git fetch` does not reach 65534 in these shapes: the old wall was a
+ * So stock `git fetch` does not reach 65534 in these shapes: the wall is a
  * hostile-input / exotic-client crash, not an everyday one.
  *
- * Originated as breakage probe `pg-corrupt--fetch-haves-value-list.ts`, whose
- * non-zero verdict reproduced the server fault; fixed by bounded lookups.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

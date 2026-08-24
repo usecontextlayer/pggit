@@ -24,8 +24,7 @@ import {
  * `graceSeconds` and `created_at` (`ageObjects`), never by sleeping on the wall
  * clock.
  *
- * ORIGINATED as the TDD suite written against a throwing `createGc` stub; GC has
- * honoured the §4 contract since, and these cases are its regression gate.
+ * These cases pin the §4 GC contract.
  */
 describe("GC reclamation & grace (§4: GC-1, GC-2, GC-3)", () => {
 	let fx: GcFixture

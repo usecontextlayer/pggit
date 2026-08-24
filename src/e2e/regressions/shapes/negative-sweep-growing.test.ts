@@ -85,9 +85,9 @@ shape("growing-gitlinks", {
 
 // C. growing dir whose subdirectory names are exotic-but-VALID UTF-8: NFC "é"
 // beside NFD "é" (distinct byte sequences that render identically), a CJK name,
-// and a 4-byte emoji. This replaced the raw-non-UTF-8 collision shape D16 now
-// rejects at ingest (see pg-corrupt--non-utf8-path-collision for the rejection
-// contract). Unlike that old pair these CANNOT collide — valid-UTF-8 decode is
+// and a 4-byte emoji. D16 rejects raw non-UTF-8 paths at ingest; see
+// `src/e2e/regressions/pg-corrupt/non-utf8-path-collision.test.ts`. These valid
+// UTF-8 names CANNOT collide because decode is
 // injective — which is exactly what this shape pins: they must key distinctly
 // through the repack's decoded names and survive the pipeline identical to git.
 shape("growing-utf8-exotic", {

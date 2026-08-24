@@ -1,5 +1,5 @@
 /**
- * mal04 ref-in-want — a v2 `fetch` whose only want is a `want-ref <ref>` line fails
+ * A v2 `fetch` whose only want is a `want-ref <ref>` line fails
  * LOUDLY; it is never served as a silent empty clone.
  *
  * pggit deliberately does not advertise `ref-in-want` (see the v2 advertisement:
@@ -13,11 +13,8 @@
  * advertised `ref-in-want`, so an adversarial or hand-built client is the only way
  * to reach the path.
  *
- * ORIGINATED as the breakage probe for `parseFetch` matching only `want <oid>`: a
- * `want-ref refs/…` line does not start with `want ` (the next char is `-`), so it
- * was SILENTLY DROPPED, `wants` came out empty, and the zero-want branch answered
- * HTTP 200 with an empty pack — a clone that succeeded and delivered nothing. Fixed
- * by rejecting the unadvertised argument at the parse boundary.
+ * `parseFetch` must reject the unadvertised argument at the parse boundary rather
+ * than silently dropping a line that does not start with `want `.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -33,7 +30,7 @@ import { packObjectCount } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { fetchRequest } from "@/testing/wire-fetch"
 
-describe("mal04 — ref-in-want (want-ref, unadvertised) must fail loudly, not clone empty", () => {
+describe("unadvertised ref-in-want fails loudly rather than cloning empty", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let app: ReturnType<typeof createGitApp>
@@ -48,12 +45,12 @@ describe("mal04 — ref-in-want (want-ref, unadvertised) must fail loudly, not c
 		const projection = createRepoFileProjection(db.sql)
 		app = createGitApp({ objects, projection, refs })
 		server = await serveOnPort(app, 0)
-		url = `http://127.0.0.1:${server.port}/mal04`
+		url = `http://127.0.0.1:${server.port}/want-ref`
 
 		// Seed a non-empty repo over the real wire so the bug bites: if the repo were
 		// empty, buildPack would short-circuit to an empty pack regardless and the
 		// test would not distinguish the dropped want-ref from a genuinely empty repo.
-		src = mkdtempSync(join(tmpdir(), "pggit-mal04-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-want-ref-source-"))
 		await spawnGit(["init", "--quiet", src])
 		writeFileSync(join(src, "a.txt"), "alpha\n")
 		await spawnGit(["add", "-A"], { cwd: src })
@@ -73,7 +70,7 @@ describe("mal04 — ref-in-want (want-ref, unadvertised) must fail loudly, not c
 		const tip = ls.stdout.match(/^([0-9a-f]{40})\s+refs\/heads\/(?:main|master)/m)?.[1]
 		expect(tip, "seeded repo must advertise a branch tip").toBeTruthy()
 
-		const res = await app.request("/mal04/git-upload-pack", {
+		const res = await app.request("/want-ref/git-upload-pack", {
 			body: fetchRequest({
 				done: true,
 				objectFormat: "sha1",

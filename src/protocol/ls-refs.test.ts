@@ -1,7 +1,7 @@
 /**
  * §8.1 ls-refs HANDLER behavior — ref-prefix filtering (testing #8) and the
  * `unborn` feature (functionality #3), driven through `handleUploadPack` against
- * an in-memory backend. The wire ENCODER goldens live in upload-pack-wire.spec;
+ * an in-memory backend. The wire ENCODER goldens live in upload-pack-wire.test.ts;
  * here we pin what the HANDLER selects/emits, mirroring git's t5701 ls-refs cases
  * and `ls-refs.c` `send_possibly_unborn_head` (unborn HEAD requires BOTH the
  * `unborn` and `symrefs` args, exactly as git does).

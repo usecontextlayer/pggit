@@ -1,5 +1,5 @@
 /**
- * a11 concurrency — two concurrent `--atomic` pushes that update the SAME two refs
+ * Two concurrent `--atomic` pushes that update the SAME two refs
  * in OPPOSITE order race for the per-ref row locks. Postgres detects the lock cycle
  * and aborts one transaction (SQLSTATE 40P01); either way — deadlock victim or
  * cleanly serialized loser — the losing batch must come back as an in-band
@@ -12,9 +12,8 @@
  * error"), the loop actually produced contention (else the suite proves nothing),
  * exactly one batch commits whole, and the final ref state is never a torn mix.
  *
- * ORIGINATED as the breakage probe for the atomic apply path catching only its own
- * `AtomicAbort`: a Postgres deadlock re-threw, escaped the handler, and became an
- * HTTP 500 the client could not read as a per-ref result. Fixed.
+ * A Postgres deadlock must be converted to a per-ref result rather than escaping
+ * the atomic apply path as HTTP 500.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -43,7 +42,7 @@ function atomicBody(
 	)
 }
 
-describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
+describe("concurrent atomic pushes that deadlock must not 500", () => {
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let src: string
@@ -59,7 +58,7 @@ describe("a11 — concurrent atomic pushes that deadlock must not 500", () => {
 		app = createGitApp({ objects, refs })
 
 		// Build four divergent tips off a common base; pack {a1,a2} and {b1,b2}.
-		src = mkdtempSync(join(tmpdir(), "a11-deadlock-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-atomic-deadlock-source-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		writeFileSync(join(src, "a.txt"), "base\n")
 		await spawnGit(["add", "."], { cwd: src })

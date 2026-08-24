@@ -19,10 +19,8 @@ type PgHandleBase = {
 	stop: () => Promise<void>
 }
 
-/** A direct loopback endpoint has no latency-injection operation. */
 type PlainPgHandle = PgHandleBase & { kind: "plain" }
 
-/** A proxied endpoint can inject a per-response round-trip delay. */
 type LatencyPgHandle = PgHandleBase & {
 	kind: "latency"
 	setLatencyMs: (ms: number, jitter?: number) => Promise<void>
@@ -30,7 +28,6 @@ type LatencyPgHandle = PgHandleBase & {
 
 export type PgHandle = PlainPgHandle | LatencyPgHandle
 
-/** Plain Postgres testcontainer — loopback, ~0ms latency, no proxy. */
 export async function startPlainPg(): Promise<PlainPgHandle> {
 	const container = await startPostgres()
 	return {
@@ -44,8 +41,8 @@ export async function startPlainPg(): Promise<PlainPgHandle> {
 
 /**
  * Postgres behind a Toxiproxy on a shared Docker network. porsager connects
- * through the proxy, so a `latency` toxic adds RTT to every query — exposing the
- * per-object round-trip cost the loopback hides.
+ * through the proxy, so a `latency` toxic delays every response — exposing the
+ * cost of serialized query executions that loopback hides.
  */
 export async function startLatencyPg(): Promise<LatencyPgHandle> {
 	const network = await new Network().start()

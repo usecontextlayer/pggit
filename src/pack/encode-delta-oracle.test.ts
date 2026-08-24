@@ -211,7 +211,7 @@ describe("encodeDelta — canonical git reads what we write", () => {
 		await gitFsck(repo)
 
 		// And the point of the exercise: the deltified pack must be dramatically smaller
-		// than the undeltified one `writePack` produces today for the same objects.
+		// than the undeltified one `writePack` produces for the same objects.
 		const undeltified = writePack(
 			trees.map((content) => ({ content, type: "tree" as const })),
 		)

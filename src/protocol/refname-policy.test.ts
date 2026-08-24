@@ -1,5 +1,5 @@
 /**
- * Refname policy at the receive boundary (adversarial-review fix, 2026-08-19):
+ * Refname policy at the receive boundary:
  * git clients VALIDATE refnames before sending, so only a hostile or non-git
  * client ever ships a funny name — which is exactly why the server must not
  * trust the wire. A funny name that reached storage would poison every later

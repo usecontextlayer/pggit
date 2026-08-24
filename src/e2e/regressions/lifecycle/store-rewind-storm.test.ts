@@ -1,17 +1,14 @@
 /**
- * Lifecycle breakage — store-rewind storm: N rounds of
+ * Lifecycle regression — store-rewind storm: N rounds of
  *   advance → repack → rewind main onto a divergent lineage (`setRef`)
  *   → delete staging ref → gc(0) → repack → clone/fsck/compare.
  * Half the rounds invert the gc/repack order.
  *
- * Converted from `breakage/lifecycle--force-push-storm.ts` (exploration 2),
- * mechanically and at full scale — 200 seed commits, six rounds, a 45-commit
+ * Full scale is 200 seed commits, six rounds, and a 45-commit
  * divergent lineage per round off six different branch points. The oracle is a
  * plain `file://` bare remote driven through the same sequence; every round's
  * mirror clone must be fsck-clean and BYTE-identical (every reachable object's
- * raw bytes, hashed in oid order), not merely oid-identical. The source exits 1
- * when the bug reproduces; the assertions here state the correct outcome, so a
- * reproduction is a RED test.
+ * raw bytes, hashed in oid order), not merely oid-identical.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -69,7 +66,7 @@ describe("regressions/lifecycle — store-rewind storm", () => {
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-storm-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-store-rewind-storm-"))
 		const dir = (name: string): string => join(root, name)
 
 		const src = dir("src")

@@ -748,3 +748,6 @@ Fix — Remove the error listener when listening succeeds, remove the listening 
 
    Scenario — Million-object cold clones or GC passes retain nearly one additional map entry per non-root object, adding tens of MiB plus hashing/collection work per concurrent walk. The allocation is deterministic; whether it causes material latency or OOM at production concurrency is not yet measured.
 
+## Addendum — observed concurrent-repack depth-2 instance (2026-08-24)
+
+One `src/e2e/regressions/race/concurrent-repack.test.ts` red under parallel machine load reported a maximum stored-delta chain depth of 2. That suite deliberately treats chain depth as diagnostic context rather than its client-visible verdict: the assertions remain clone success, strict fsck, object-set equality, incremental-fetch success, and non-throwing repack passes. The single observation was arbitrated as an instance of this ledger's RECORDED race-test family (overlap and participant success are not deterministically barrier-proven), was not independently reproduced, and was deliberately not chased. It changes no disposition and is not evidence that a client received a corrupt pack.

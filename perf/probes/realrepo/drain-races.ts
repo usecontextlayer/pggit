@@ -1,9 +1,9 @@
 /**
- * Race conditions created by directly driving the candidate serialized maintenance sequence on real repository history.
+ * Race conditions created by directly driving a host-serialized maintenance sequence on real repository history.
  *
  * R1 checks that two identical raw v2 fetches of the same unchanged repacked state produce byte-identical wire packs. R2 starts a clone only after observing committed partial encoding coverage while repack is still unsettled. R3 starts a push at that same proven partial-coverage seam, then converges and clones the result. Promise co-start is not evidence of overlap, so both race cases fail as unmet fixture preconditions unless the intermediate state is observed.
  *
- * Black-box behavior remains real `git push` / `git clone` over the wire plus direct `createRepack().repack()` calls. Every successful clone must be fsck-clean and match a plain `file://` oracle exactly in refs and objects. Concurrent repack-vs-repack is deliberately absent because this harness models serialized maintenance; the still-deferred production integration is not evidence supplied by this probe.
+ * Black-box behavior remains real `git push` / `git clone` over the wire plus direct `createRepack().repack()` calls. Every successful clone must be fsck-clean and match a plain `file://` oracle exactly in refs and objects. Concurrent repack-vs-repack is deliberately absent because this harness models one host serializing its maintenance calls; it makes no claim about cross-host serialization.
  *
  * A perf harness rather than a vitest e2e test because its corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for — the same reason `perf/probes/delta-corpus.ts` lives here.
  *
@@ -58,8 +58,7 @@ const { fail, findings, report } = createLedger(SLUG)
 /** The private mirror clone of the selected source; set by `prepareMirror` in `main`. */
 let MIRROR = ""
 
-/** A clone must be fsck-clean and hold exactly the oracle's object set. */
-async function verifyClone(
+async function verifyCanonicalClone(
 	label: string,
 	dir: string,
 	expect: { oids: Set<string>; refs: string },
@@ -209,8 +208,8 @@ async function main(): Promise<void> {
 		await spawnGit(["-c", "protocol.version=2", "clone", "--bare", "-q", url, c1])
 		await spawnGit(["-c", "protocol.version=2", "clone", "--bare", "-q", url, c2])
 		await Promise.all([
-			verifyClone("R1 clone 1", c1, midExpect),
-			verifyClone("R1 clone 2", c2, midExpect),
+			verifyCanonicalClone("R1 clone 1", c1, midExpect),
+			verifyCanonicalClone("R1 clone 2", c2, midExpect),
 		])
 
 		// ── R2: a clone racing a repack ─────────────────────────────────────────
@@ -269,7 +268,7 @@ async function main(): Promise<void> {
 				"R2 a clone running concurrently with repack FAILED",
 				cl.stderr.trim().slice(0, 800),
 			)
-		else await verifyClone("R2 clone racing repack", raceDir, headExpect)
+		else await verifyCanonicalClone("R2 clone racing repack", raceDir, headExpect)
 		report.push([
 			"R2",
 			"clone ‖ repack",
@@ -350,7 +349,7 @@ async function main(): Promise<void> {
 		])
 		if (!cl3.ok)
 			fail("R3 clone after a push/repack race FAILED", cl3.stderr.trim().slice(0, 800))
-		else await verifyClone("R3 clone after push‖repack", after3, expect2)
+		else await verifyCanonicalClone("R3 clone after push‖repack", after3, expect2)
 		report.push([
 			"R3",
 			`push ‖ repack (+converging repack ${rp3b.wholes}w+${rp3b.deltas}d)`,

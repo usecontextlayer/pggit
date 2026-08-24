@@ -16,7 +16,7 @@ export function createScratchArena(): {
 			}
 		},
 		make(tag) {
-			const directory = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
+			const directory = mkdtempSync(join(tmpdir(), `pggit-scratch-${tag}-`))
 			directories.push(directory)
 			return directory
 		},

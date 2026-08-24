@@ -6,8 +6,7 @@ import { diffFileLists, type FileDiff } from "@/object/tree-diff"
 import { spawnGit } from "@/testing/spawn-git"
 
 /**
- * tree-diff vs `git diff-tree` — the oracle test written BEFORE the
- * implementation (spine S3). `diffFileLists(read, beforeTree, afterTree)` must
+ * tree-diff vs `git diff-tree` (spine S3). `diffFileLists(read, beforeTree, afterTree)` must
  * report exactly what `git diff-tree -r --no-renames` reports for the same pair
  * of commits: removed paths, and added/changed files with their (mode, blob).
  * Mode-only changes count as changed (R14: the diff pairs by name and compares

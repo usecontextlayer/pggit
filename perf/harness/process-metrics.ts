@@ -18,8 +18,6 @@ export type ProcessMetrics = {
 	eventLoopDelayMeanMs: number
 	eventLoopDelayMaxMs: number
 	eventLoopDelayP99Ms: number
-	/** GC split by kind: minor = scavenge (young gen), major = mark-compact (the
-	 *  expensive one), plus incremental marking and weak-callback passes. */
 	gc: {
 		minor: GcBucket
 		major: GcBucket
@@ -30,8 +28,6 @@ export type ProcessMetrics = {
 	}
 }
 
-// V8 GC kinds as exposed on `gc` PerformanceEntry `detail.kind` (probed, not
-// guessed: MINOR=1, MAJOR=4, INCREMENTAL=8, WEAKCB=16 on this Node).
 type GcBucketName = "minor" | "major" | "incremental" | "weakCb"
 const GC_KIND = new Map<number, GcBucketName>([
 	[constants.NODE_PERFORMANCE_GC_MINOR, "minor"],

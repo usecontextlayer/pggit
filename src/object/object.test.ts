@@ -68,7 +68,7 @@ describe("treeEntries", () => {
 		])
 	})
 
-	// Fail loud (CLAUDE.md): a malformed/truncated tree must THROW, not silently
+	// A malformed/truncated tree must THROW, not silently
 	// return a short list — a short list would make `isConnected` report a corrupt
 	// object connected, silently accepting bad data. Asserted by the stable code,
 	// not the message text.

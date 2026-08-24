@@ -1,5 +1,5 @@
 /**
- * a13 ref lifecycle — a `refs/heads/*` push whose tip is NOT a commit (a tree,
+ * A `refs/heads/*` push whose tip is NOT a commit (a tree,
  * blob, or annotated-tag object) must NOT crash the response with HTTP 500.
  *
  * THE CONTRACT — canonical git's, observed against a `file://` bare-repo oracle:
@@ -9,13 +9,8 @@
  * `refs/heads/*`; the same objects are legal under `refs/tags/*`
  * (typed-graph-policy pins that half through a real `git push`).
  *
- * ORIGINATED as the breakage probe for the post-commit projection refresh
- * (`syncRefProjection` → `buildFileList` → `commitTreeOid`), which assumed every
- * `refs/heads/*` tip was a commit and threw `commit has no tree header` for a
- * tree/blob/tag tip — escaping the handler as HTTP 500 AFTER the ref CAS had
- * already committed, leaving an illegal branch ref the client never learned about.
- * Fixed by the branch-tip type policy that now runs before the CAS, so the ref is
- * never written and the client reads a clean rejection.
+ * The branch-tip type policy runs before the CAS, so an illegal branch ref is never
+ * written and the client reads a clean rejection.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -30,7 +25,7 @@ import { ZERO_OID } from "@/testing/pkt-oracle"
 import { spawnGit } from "@/testing/spawn-git"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
-describe("a13 — branch tip that is not a commit must not 500", () => {
+describe("branch tip that is not a commit must not 500", () => {
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let src: string
@@ -49,7 +44,7 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 		const projection = createRepoFileProjection(db.sql)
 		app = createGitApp({ objects, projection, refs })
 
-		src = mkdtempSync(join(tmpdir(), "a13-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-noncommit-tip-src-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		writeFileSync(join(src, "f.txt"), "hello\n")
 		await spawnGit(["add", "."], { cwd: src })
@@ -82,7 +77,7 @@ describe("a13 — branch tip that is not a commit must not 500", () => {
 			{ name: "tag", tip: () => tagOid },
 		]
 		for (const { name, tip } of cases) {
-			const repo = `a13-${name}`
+			const repo = `noncommit-${name}`
 			const refs = createRefStore(db.sql)
 			// First push a valid commit branch so the pack (carrying the closure) is
 			// ingested and connectivity is satisfied for the non-commit tip too.

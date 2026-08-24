@@ -36,9 +36,7 @@
  * `graceSeconds: 0`, never a wall-clock sleep; the `setInterval` `start()` is
  * never exercised (only `drainOnce()` is driven).
  *
- * Originated as the TDD spec for the scheduler (§6) and ran RED against a throwing
- * stub, before the store stamped `repos.last_pushed_at` at all; it now pins the
- * shipped contract.
+ * The property pins the scheduler's shipped eligibility and survivor contracts.
  */
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -85,7 +83,7 @@ type RepoOp =
 type Step = { repoIdx: number; op: RepoOp }
 
 /** A per-repo model the test keeps so it only ever issues valid, storage-mutating
- * git ops (the same "sensible but randomized" discipline as `generative/commands.ts`).
+ * git ops (the same "sensible but randomized" discipline as `testing/repo-commands.ts`).
  * `touched` is the oracle for assertion (b): a repo is eligible iff it received any
  * storage-mutating op (and `last_gc_at` is null on a never-GC'd repo, so eligible
  * === touched). `sideBranches` is a stack of live side-branch names a `delete`
@@ -145,7 +143,7 @@ async function deleteRef(
 ): Promise<void> {
 	// The wire now DENIES ref deletion (deny-non-FF policy), so the workload's
 	// delete-only-orphans case drives the STORE directly — the internal path a
-	// rewound/retired ref would take. An unconditional delete: zero new oid,
+	// deleted ref takes. An unconditional delete: zero new oid,
 	// zero old oid (no CAS assertion).
 	const done = await fx.refs.applyRefUpdates(
 		repo,
@@ -200,8 +198,8 @@ async function applyStep(
 		case "push":
 		case "rewind": {
 			// First push to a fresh repo creates main (a plain wire push); every later
-			// one is a store-level rewind advancing main to an independent root,
-			// orphaning the prior tip (the retired force-commit workload's internal twin).
+			// one is a store-level rewind advancing main to an independent root and
+			// orphaning the prior tip.
 			const rewind = state.mainExists
 			await pushFile(fx, repo, {
 				content: `main rev ${state.nextContent++}\n`,

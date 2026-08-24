@@ -1,12 +1,9 @@
 /**
  * TRANSACTIONAL-INTEGRITY PROBE 1 — a torn encoding tier is UNREPRESENTABLE.
  *
- * `createGc.gc()` once ran three independent sweeps (objects, edges, encodings),
- * and a pass dying between the object sweep and the encoding sweep left the
- * derived tier holding rows whose object — or whose delta BASE — no longer
- * existed. The 0008 FK cascades dissolved that state: a reclaimed object takes
- * its encoding row, and every delta row anchored on it, inside the very DELETE
- * that removes the object. There is no encoding sweep left to miss.
+ * The 0008 FK cascades make a torn encoding tier unrepresentable: reclaiming an
+ * object takes its encoding row and every delta row anchored on it inside the same
+ * DELETE. No independent encoding sweep can be missed.
  *
  * This pins that invariant with the REAL gc() code killed at the last remaining
  * crash point — after the object sweep, before the pass's cleanup — over the one
@@ -56,7 +53,7 @@ const REWIND_TO = 20 // main rewinds far below the kept delta's anchor
 
 /** A porsager client whose `unsafe()` throws the moment GC reaches its
  * post-sweep cleanup — the process dying right after the object sweep completed,
- * the last crash point a pass has now that every derived surface follows the
+ * the last crash point a pass has because every derived surface follows the
  * object DELETEs by cascade (0008/0009) and no later sweep exists. The trigger
  * is the SECOND `drop table if exists gc_live`: the first is the pass-start
  * heal, the second is the success-path cleanup — so the whole sweep has run and
@@ -106,7 +103,7 @@ describe("GC × crash — the tier stays whole through a mid-pass death", () => 
 	let q3: TestResult<RepackCounts>
 
 	beforeAll(async () => {
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-torn-gc-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-torn-gc-"))
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)

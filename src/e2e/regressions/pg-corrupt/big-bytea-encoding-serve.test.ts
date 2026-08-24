@@ -23,9 +23,6 @@
  * hex string is at its worst while an encoding row still gets written. The scale is
  * the test — do not shrink it.
  *
- * Converted from `breakage/pg-corrupt--big-bytea-encoding-serve.ts`, whose verdict
- * was: exit 0 = the blob round-trips byte-exact through push → repack → clone;
- * non-zero = reproduced (bytes differ, or an operation git does trivially crashed).
  */
 import { randomBytes } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"

@@ -15,13 +15,10 @@
  * `refs/heads/*` namespace), stated ONCE here instead of enumerated per case. Any
  * disagreement is a real divergence from canonical git.
  *
- * Provenance: `refNameProblem` drifted from git once already — it required a second
- * level below `refs/` only after a review round found receive-pack accepting one-level
- * names, a corner no hand-picked list contained. The hand-picked vectors live on in
- * `src/protocol/refname-policy.test.ts` as named regressions; this is the
- * generative coverage they cannot give.
+ * The hand-picked vectors live in `src/protocol/refname-policy.test.ts`; this
+ * property supplies the generative coverage they cannot.
  *
- * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
+ * Executable spec with a pinned seed.
  * HERMETIC: no Postgres, no server — one `git check-ref-format` spawn per candidate.
  */
 import fc from "fast-check"

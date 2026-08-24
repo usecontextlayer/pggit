@@ -45,9 +45,7 @@ import {
  * (passed as `{ sql }`) for the row helpers. No other test touches `public`, so this
  * stays isolated from the schema-per-file tests sharing the container.
  *
- * ORIGINATED as the TDD suite written while the store did not stamp
- * `repos.last_pushed_at` and `startServer` ignored its `gc` opts entirely — no
- * drain was ever started. Both landed per §6; this is their regression gate.
+ * These cases pin the server wiring and activity-stamp contracts under §6.
  */
 describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	const POLL_TIMEOUT_MS = 8000

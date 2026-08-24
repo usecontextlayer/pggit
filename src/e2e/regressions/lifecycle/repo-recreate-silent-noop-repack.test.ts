@@ -1,40 +1,16 @@
 /**
- * FINDING (fixed) — after `admin.deleteRepo(name)` and a re-push under the SAME
- * name, a long-lived `createRepack(sql)` (and `createGc(sql)`) silently no-op'd
- * on that repo forever, so the encoding tier was never built and the repo's
- * garbage never reclaimed. No error, no log line: `repack()` returned
- * `{wholes:0,deltas:0}` — indistinguishable from "already covered".
+ * After `admin.deleteRepo(name)` and a re-push under the SAME name, long-lived
+ * `createRepack(sql)` and `createGc(sql)` instances must target the new incarnation
+ * rather than silently returning no work.
  *
- * The mechanism, entirely from the public surface: each of those components
- * built its OWN memoizing `createRepoResolver`, whose name->id cache was safe
- * only while `RepoResolver.invalidate()` could reach it — and `admin.deleteRepo`
- * invalidates only the ONE resolver inside its `createGitDeps` composition.
- * `createRepack(pg)` / `createGc(pg)` take a bare `Sql` and sat outside it, so
- * they kept resolving the dead id: queries hit a repo_id with zero rows and
- * reported zero work. The fix: both resolve the name fresh per pass through the
- * unmemoized `lookupRepoId` primitive, so a recreate is picked up on the very
- * next pass.
- *
- * Why this lands with the delta work rather than being purely pre-existing: W1
- * puts `createRepack()` on the drain (`drainRepo`), built once per process and
- * held for its lifetime — exactly the shape that goes stale. The GC half has sat
- * built-but-unwired since 2026-07-09, so this is the first time the pattern gets
- * a second, size-critical consumer.
- *
- * Proven below with git-observable evidence only:
- *   1. long-lived repack after recreate -> {0,0}, long-lived gc -> all zeros
- *   2. a FRESH repack/gc over the same schema does real work — so (1) was a lie
- *   3. a mirror clone taken between (1) and (2) receives a pack N times larger
- *      than the one taken after (2): the tier really was absent on the wire
+ * A repo name does not identify a stable database row: deletion cascades the old
+ * `repos.id`, and recreation assigns a new one. Each pass must therefore resolve
+ * the name afresh through `lookupRepoId`; retaining an id across passes would make
+ * a process-lifetime component query the dead incarnation and report no work.
  *
  * Full scale: 200 append-only run commits. Every assertion states the contract —
  * the long-lived components do the work, the fresh ones find nothing left, and
  * the two clones are the same size.
- *
- * Originated as breakage probe
- * `lifecycle--repo-recreate-silent-noop-repack.ts` (exit 1 when the silent no-op
- * reproduced); fixed by resolving the repo name fresh per pass through the
- * unmemoized `lookupRepoId` primitive.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -69,12 +45,12 @@ describe("regressions/lifecycle — silent no-op repack after repo recreate", ()
 	let longLivedGc: GcResult = { deletedObjects: 0, epoch: "unchanged" }
 	let freshRepack: RepackResult = { deltas: 0, wholes: 0 }
 	let freshGc: GcResult = { deletedObjects: 0, epoch: "unchanged" }
-	let packWhileStale = 0
+	let packAfterLongLived = 0
 	let packAfterFresh = 0
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-recreate-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-repo-recreate-long-lived-"))
 
 		const src = join(root, "src")
 		await buildLifecycleSource(src, 200)
@@ -106,7 +82,7 @@ describe("regressions/lifecycle — silent no-op repack after repo recreate", ()
 		longLivedRepack = await repack.repack(REPO)
 		longLivedGc = await gc.gc(REPO, { graceSeconds: 0 })
 
-		packWhileStale = await clonedPackBytes(url, join(root, "c1"))
+		packAfterLongLived = await clonedPackBytes(url, join(root, "c1"))
 
 		// --- the truth, from freshly built components -------------------------
 		freshRepack = await createRepack(db.sql).repack(REPO)
@@ -126,8 +102,7 @@ describe("regressions/lifecycle — silent no-op repack after repo recreate", ()
 	})
 
 	it("leaves a freshly built repack nothing to do", () => {
-		// The inverse half of the lie: the source only calls it a reproduction when
-		// the long-lived pass reported zero AND a fresh one then found real work.
+		// If the long-lived pass resolved the recreated repo, no encoding work remains.
 		expect(freshRepack).toEqual({ deltas: 0, wholes: 0 })
 	})
 
@@ -140,9 +115,8 @@ describe("regressions/lifecycle — silent no-op repack after repo recreate", ()
 	})
 
 	it("serves the encoded tier on the wire while the long-lived repack held it", () => {
-		// The git-observable consequence: with the tier really built by the
-		// long-lived pass, the clone taken before the fresh repack cannot be the
-		// bigger one — under the bug it is several times larger.
-		expect(packWhileStale).toBeLessThanOrEqual(packAfterFresh)
+		// A fresh no-op repack cannot make the encoded response smaller than the pack
+		// already served after the long-lived pass.
+		expect(packAfterLongLived).toBeLessThanOrEqual(packAfterFresh)
 	})
 })

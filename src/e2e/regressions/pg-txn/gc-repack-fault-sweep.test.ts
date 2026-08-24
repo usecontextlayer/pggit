@@ -1,7 +1,5 @@
 /**
- * BREAKAGE (pg-txn) — abort GC and repack at every batch boundary.
- * Converted from `breakage/pg-txn--gc-repack-fault-sweep.ts`; its rationale
- * verbatim:
+ * Postgres transaction regression — abort GC and repack at every batch boundary.
  *
  * HUNT: abort GC and repack at every batch boundary and ask whether the store is
  * ever WRONG (rather than merely behind), and whether one more gc+repack+clone
@@ -25,8 +23,7 @@
  *     committed — or `pg_terminate_backend` it, which kills the connection under
  *     the pass instead.
  *
- * WHY AIMED, when the source script swept `statement_timeout` T = 50 … 6400ms and
- * called each T "a different batch": a statement_timeout fires when a SINGLE
+ * WHY AIMED: a statement_timeout fires when a SINGLE
  * statement outlives T, never when the PASS does. gc's longest statement here is
  * one sweep DELETE, so the whole ladder collapses onto that one statement, and
  * measured at RUNS=600 every rung from 400ms up never fired AT ALL — those five
@@ -56,9 +53,7 @@
  *   C. one clean gc + repack + clone returns everything to correct
  *   D. a further repack is a no-op ({wholes:0,deltas:0}) and a further gc reclaims 0
  *
- * The source script exits 0 when the store is never wrong and always converges —
- * a NEGATIVE result, so this suite is expected GREEN. It is brought over because
- * the negative is the finding: these are the fault points that do NOT tear.
+ * These are fault points that must not tear the store.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

@@ -1,5 +1,5 @@
 /**
- * neg02 incremental-negotiation — a `want` the client already owns through its
+ * A `want` the client already owns through its
  * `have`-closure is served as NOTHING. The pack pggit builds for that shape carries
  * exactly the objects canonical `git upload-pack --stateless-rpc` builds for the
  * same request bytes: zero.
@@ -15,11 +15,8 @@
  * to a real `git upload-pack` over the source repo — the oracle is a dependency of
  * the run, not a remembered value.
  *
- * ORIGINATED as the breakage probe for a serve set that subtracted the have-closure
- * and then re-added EVERY explicit want — a re-add justified only for partial-clone
- * promisor roots, which on a plain fetch shipped a 1-object pack carrying a commit
- * whose tree the same pack omitted (connectivity-incomplete in isolation). Fixed:
- * the served set is routed and that re-add is scoped to the promisor case.
+ * Re-adding every explicit want after subtracting the have closure would violate
+ * this contract; only partial-clone promisor roots receive that treatment.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -36,7 +33,7 @@ import { spawnGit } from "@/testing/spawn-git"
 import { spawnUploadPack } from "@/testing/upload-pack-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
 
-describe("neg02 — buildPack must not re-add a want already in the have-closure (minimal pack)", () => {
+describe("buildPack does not re-add a want already in the have closure", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let app: ReturnType<typeof createGitApp>
@@ -53,11 +50,11 @@ describe("neg02 — buildPack must not re-add a want already in the have-closure
 		const projection = createRepoFileProjection(db.sql)
 		app = createGitApp({ objects, projection, refs })
 		server = await serveOnPort(app, 0)
-		url = `http://127.0.0.1:${server.port}/neg02`
+		url = `http://127.0.0.1:${server.port}/have-closure`
 
 		// Linear history c1 ← c2 ← … ← c6, pushed over the real wire. c3 is an
 		// ancestor of c6, so the c3 closure is fully contained in the c6 closure.
-		src = mkdtempSync(join(tmpdir(), "pggit-neg02-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-have-closure-source-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		for (const v of ["1", "2", "3", "4", "5", "6"]) {
 			writeFileSync(join(src, "a.txt"), `${v}\n`)
@@ -82,7 +79,7 @@ describe("neg02 — buildPack must not re-add a want already in the have-closure
 			objectFormat: "sha1",
 			wants: [c3],
 		})
-		const res = await app.request("/neg02/git-upload-pack", {
+		const res = await app.request("/have-closure/git-upload-pack", {
 			body: request,
 			headers: { "Git-Protocol": "version=2" },
 			method: "POST",

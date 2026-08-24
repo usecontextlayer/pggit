@@ -13,10 +13,9 @@
  * the source repo's object set. Timings are reported, not asserted — they ride on
  * the assertion's message so a red round prints the spread that produced it.
  *
- * Converted from `breakage/race--clone-storm.ts` (`--iters=10 --runs=400
- * --clones=8 --repacks=3`). The race is probabilistic: the iteration count IS
+ * The race is probabilistic: the iteration count IS
  * the test, so the loop, its counts and its start staggers are frozen exactly
- * as the script ran them — there is no swept delay dimension here to calibrate
+ * by design — there is no swept delay dimension here to calibrate
  * or trim; the storm's near-simultaneous starts are the shape. Only the
  * per-round seeding changed: the pre-race state (full history, no tier — the
  * raced repacks build it) is COPIED from a template proven canonical AND

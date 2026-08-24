@@ -1,6 +1,6 @@
 /**
  * WIRE — the encoding tier across a denied-push / GC / repack cycle, judged from a
- * real client. (Converted from `breakage/wire--force-push-gc-repack.ts`.)
+ * real client.
  *
  * The tier's hygiene (design D7) is DDL since 0008: the FK cascades leave no
  * encoding row pointing at a reclaimed object OR a reclaimed BASE. A surviving

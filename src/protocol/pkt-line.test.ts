@@ -20,7 +20,7 @@ const arbPkt: fc.Arbitrary<Pkt> = fc.oneof(
 
 // The literal-byte goldens for encodePktLine/encodePkt (000ahello\n, 0000/0001/
 // 0002, near-cap widths) and the real-git advertisement round-trip live in the
-// §8.3 framing.spec corpus — the deliberate home for byte literals. This file owns
+// §8.3 framing.test.ts corpus — the deliberate home for byte literals. This file owns
 // the encode↔decode round-trip, bounds, and generative coverage instead.
 
 describe("decodePktStream", () => {

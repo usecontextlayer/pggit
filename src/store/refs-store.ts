@@ -249,7 +249,7 @@ export function createRefStore(pg: Sql, repoResolver?: RepoResolver) {
 					// writer of that ref's row — fails THAT command and never the batch.
 					// Letting it throw here would 500 a push whose earlier commands are
 					// already applied: refs moved, no report, no projection, no stamp —
-					// the three-way tear pg-txn--post-cas-failure-tears-push pins.
+					// a three-way tear between durable state and the client-visible result.
 					try {
 						const r = await casRefUpdate(db, id, cmd)
 						results.push(r.state !== "rejected")

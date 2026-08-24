@@ -29,14 +29,13 @@
  * grace, the same bar canonical upload-pack holds under a concurrent prune —
  * and a ref VANISHING is a hard break in both arms (gc never touches refs).
  *
- * Converted from `breakage/race--push-gc-repack.ts` (`--iters=40 --runs=120
- * --grace=-1 --rewind=40`; grace=-1 alternates 0 / 60). Probabilistic. Two
- * things are deliberately NOT the source's:
+ * This race is probabilistic; grace alternates between 0 and 60. Two fixture
+ * details preserve coverage across machines:
  *
  * - The actor-start offsets were frozen absolute milliseconds; they are now
  *   FRACTIONS of one measured un-raced clone wall (the longest actor), so the
  *   four starts keep the same relative stagger on any box under any load.
- * - The original indexing ALIASED: the 6-row offset matrix cycled `i % 6` while
+ * - A 6-row offset matrix would alias with grace cycling `i % 2` while
  *   grace cycled `i % 2`, and 6 and 2 share a factor — so offset rows 0/2/4
  *   only ever ran at grace 0 and rows 1/3/5 only at grace 60, and 40 iterations
  *   never covered the other six combinations. Grace now flips per full matrix

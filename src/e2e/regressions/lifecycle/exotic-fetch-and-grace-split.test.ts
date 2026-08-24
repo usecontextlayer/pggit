@@ -1,7 +1,8 @@
 /**
- * Lifecycle breakage — exotic fetch shapes and grace splits, each run against
+ * Lifecycle regression — exotic fetch shapes and grace splits, each run against
  * pggit TWICE: once with no encoding tier, once after repack. A difference
- * between the two is the tier's fault; identical failure in both is pre-existing.
+ * between the two is the tier's fault; identical behavior belongs to their shared
+ * serving path.
  *
  * The tier differential alone would be pggit-vs-pggit — a probe that fails the
  * same way in both arms compares equal — so every probe ALSO runs against a
@@ -10,13 +11,11 @@
  * outside pggit's scope: it does not implement the v2 `shallow` feature, so the
  * contract there is a loud client-side failure against a control that succeeds.
  *
- * Originated as exploration-8 probe `lifecycle--exotic-fetch-and-grace-split.ts`
- * (exit 1 on a DIFF), converted mechanically and at full scale: four probes ×
- * two tier states over 120-commit repos, then the grace-split sequence over a
- * 140-commit repo.
+ * Full scale is four probes × two tier states over 120-commit repos, then the
+ * grace-split sequence over a 140-commit repo.
  *
  * Each (probe, tier-state) run gets its own isolated schema, exactly as the
- * source did: the no-tier run must never see a repack the tier run performed.
+ * no-tier run must never see a repack the tier run performed.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -47,8 +46,8 @@ const REPO = "workspace/slate/exotic"
  *   "oracle"      — pggit must produce exactly what canonical git produces.
  *   "unsupported" — pggit deliberately does not implement the v2 `shallow`
  *                   (deepen) feature, so the contract is a LOUD client-side
- *                   failure where the control succeeds (the a10 transport suite
- *                   owns that decision).
+ *                   failure where the control succeeds
+ *                   (`transport/shallow-unsupported.test.ts` owns that decision).
  */
 type Probe = {
 	name: string
@@ -143,7 +142,7 @@ describe("regressions/lifecycle — exotic fetch shapes and grace splits", () =>
 	let graceFsck = ""
 
 	beforeAll(async () => {
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-exotic-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-exotic-fetch-"))
 		const dir = (name: string): string => join(root, name)
 		const baseUrl = inject("pgBaseUrl")
 
@@ -346,9 +345,10 @@ describe("regressions/lifecycle — exotic fetch shapes and grace splits", () =>
 	})
 
 	it("fails loudly on the shapes it does not implement, which the oracle serves", () => {
-		// pggit does not implement the v2 shallow (deepen) feature; the a10 transport
-		// suite pins that as a deliberate scope choice with a LOUD failure. Both halves
-		// matter here: a silent success would be the original bug, and a control that
+		// pggit does not implement the v2 shallow (deepen) feature;
+		// `transport/shallow-unsupported.test.ts` pins that deliberate scope choice
+		// with a LOUD failure. Both halves matter here: a silent success would violate
+		// the contract, and a control that
 		// also failed would mean the probe proves nothing about pggit.
 		const unsupported = outcomes.filter((o) => o.contract === "unsupported")
 		expect(unsupported.length).toBeGreaterThan(0)

@@ -2,8 +2,6 @@
  * WIRE — request shapes that stress buildPack's inputs against the deltified tier:
  * a want that is NOT a ref tip, a want plus haves that cut it, a mirror clone, and
  * a many-ref negotiation whose request body git gzip-compresses.
- * (Converted from `breakage/wire--exact-oid-and-gzip.ts`.)
- *
  *   1. `git fetch <url> <oid>` for an OLD commit — the served set is a SUB-closure
  *      of the repo, so a delta's anchor may sit outside it.
  *   2. The same want against a client that already holds an ancestor (haves cut the

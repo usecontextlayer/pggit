@@ -1,11 +1,10 @@
 /**
- * pg-bloat--toast-storage-propagation — settles design-doc Concern **C4**.
+ * TOAST storage propagation — settles design-doc Concern **C4**.
  *
  * `0008_pack_encoding.ts` declares `data bytea storage external` INLINE on the
  * HASH-partitioned PARENT `git_pack_encoding`, asserting (from the 0001 precedent
  * that inline COMPRESSION propagates) that the attribute reaches all 16 leaf
- * partitions. The design originally recorded that as an unverified expectation;
- * this file turns it into a live catalog and behavioral contract, plus
+ * partitions. This file makes that a live catalog and behavioral contract, plus
  * a behavioural proof that does not trust the catalog alone, plus the cost
  * accounting for whichever way it lands.
  *
@@ -24,15 +23,11 @@
  *      TOAST, and whether a second compression pass over already-deflated bytes
  *      would recover anything.
  *
- * The source repro EXITED NON-ZERO when any leaf partition's
- * `git_pack_encoding.data` was not `attstorage = 'e'` (external) — i.e. the
- * migration's asserted propagation did not happen and every encoding row is
- * paying a second compression pass over already-deflated bytes. Here that
- * criterion is inverted into the assertion of CORRECT behaviour: every leaf IS
- * external, and nothing compresses the tier's bytes a second time.
+ * Every leaf's `git_pack_encoding.data` must have `attstorage = 'e'` (external),
+ * proving the migration's asserted propagation and preventing a second compression
+ * pass over already-deflated bytes.
  *
- * Fixture: the append-only shape (one run directory per commit) at the repro's
- * scale — 300 run commits over 20 docs.
+ * Fixture: the append-only shape at 300 run commits over 20 docs.
  */
 import { rmSync } from "node:fs"
 import { deflateSync } from "node:zlib"

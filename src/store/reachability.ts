@@ -19,9 +19,14 @@ import {
  * oid; the wire caps a statement at 65,534 binds. */
 const LOOKUP_BATCH = 1000
 
-/** A loaded `git_commit` row. `gen`/`time` ride along for the frontier — tiny
- * columns, one query shape for every walk. */
-type CommitRow = { gen: number | null; time: number; parents: string[]; tree: string }
+/** A loaded `git_commit` row. `generation`/`commitTime` ride along for the
+ * frontier — tiny columns, one query shape for every walk. */
+type CommitRow = {
+	generation: number | null
+	commitTime: number
+	parents: string[]
+	treeOid: string
+}
 
 /** Batched PK reads over the derived commit rows — THE `git_commit` read every
  * walk shares (parents ordered via WITH ORDINALITY; aggregation order over a
@@ -31,33 +36,33 @@ async function loadCommitRows(
 	id: ReposId,
 	oids: Iterable<string>,
 ): Promise<Map<string, CommitRow>> {
-	const out = new Map<string, CommitRow>()
+	const commitsByOid = new Map<string, CommitRow>()
 	for (const batch of batches([...oids], LOOKUP_BATCH)) {
 		const rows = await sql<{
 			oid: string
-			tree: string
+			tree_oid: string
 			parents: string[]
-			gen: number | null
-			time: string
+			generation: number | null
+			commit_time: string
 		}>`
-			select encode(c.oid, 'hex') as oid, encode(c.tree_oid, 'hex') as tree,
+			select encode(c.oid, 'hex') as oid, encode(c.tree_oid, 'hex') as tree_oid,
 				(select coalesce(array_agg(encode(p.h, 'hex') order by p.ord), '{}')
 					from unnest(c.parents) with ordinality as p(h, ord)) as parents,
-				c.generation as gen, c.commit_time::text as time
+				c.generation, c.commit_time::text as commit_time
 			from git_commit c
 			where c.repo_id = ${id}::bigint
-				and c.oid in (${sql.join(batch.map((h) => sql`${Buffer.from(h, "hex")}`))})
+				and c.oid in (${sql.join(batch.map((oid) => sql`${Buffer.from(oid, "hex")}`))})
 		`.execute(db)
-		for (const r of rows.rows) {
-			out.set(r.oid, {
-				gen: r.gen,
-				parents: r.parents,
-				time: Number(r.time),
-				tree: r.tree,
+		for (const row of rows.rows) {
+			commitsByOid.set(row.oid, {
+				commitTime: Number(row.commit_time),
+				generation: row.generation,
+				parents: row.parents,
+				treeOid: row.tree_oid,
 			})
 		}
 	}
-	return out
+	return commitsByOid
 }
 
 /** Batched PK reads over the derived tag rows: oid → target oid. */
@@ -66,17 +71,17 @@ async function loadTagTargets(
 	id: ReposId,
 	oids: Iterable<string>,
 ): Promise<Map<string, string>> {
-	const out = new Map<string, string>()
+	const targetsByTagOid = new Map<string, string>()
 	for (const batch of batches([...oids], LOOKUP_BATCH)) {
 		const rows = await sql<{ oid: string; target: string }>`
 			select encode(t.oid, 'hex') as oid, encode(t.target_oid, 'hex') as target
 			from git_tag t
 			where t.repo_id = ${id}::bigint
-				and t.oid in (${sql.join(batch.map((h) => sql`${Buffer.from(h, "hex")}`))})
+				and t.oid in (${sql.join(batch.map((oid) => sql`${Buffer.from(oid, "hex")}`))})
 		`.execute(db)
-		for (const r of rows.rows) out.set(r.oid, r.target)
+		for (const row of rows.rows) targetsByTagOid.set(row.oid, row.target)
 	}
-	return out
+	return targetsByTagOid
 }
 
 /** The walks' `git_object` probe: type + content (trees ONLY — a `case` guard
@@ -90,18 +95,20 @@ async function loadObjectMeta(
 	id: ReposId,
 	oids: Iterable<string>,
 ): Promise<Map<string, { type: number; content: Buffer | null }>> {
-	const out = new Map<string, { type: number; content: Buffer | null }>()
+	const metadataByOid = new Map<string, { type: number; content: Buffer | null }>()
 	for (const batch of batches([...oids], LOOKUP_BATCH)) {
 		const rows = await sql<{ oid: string; type: number; content: Buffer | null }>`
 			select encode(o.oid, 'hex') as oid, o.type,
 				case when o.type = ${PACK_OBJ_TYPE.TREE} then o.content end as content
 			from git_object o
 			where o.repo_id = ${id}::bigint
-				and o.oid in (${sql.join(batch.map((h) => sql`${Buffer.from(h, "hex")}`))})
+				and o.oid in (${sql.join(batch.map((oid) => sql`${Buffer.from(oid, "hex")}`))})
 		`.execute(db)
-		for (const r of rows.rows) out.set(r.oid, { content: r.content, type: r.type })
+		for (const row of rows.rows) {
+			metadataByOid.set(row.oid, { content: row.content, type: row.type })
+		}
 	}
-	return out
+	return metadataByOid
 }
 
 /** What an edge DECLARED the object to be: a commit's parent is a commit, its
@@ -124,26 +131,31 @@ type EdgeExpectation = "commit" | "tree" | "blob"
  *   here).
  * - "ok" otherwise. */
 function judgeProbedType(
-	expects: ReadonlySet<EdgeExpectation> | undefined,
-	type: number,
+	expectations: ReadonlySet<EdgeExpectation> | undefined,
+	typeCode: number,
 ): "ok" | "violation" | "corruption" {
-	if (type === PACK_OBJ_TYPE.COMMIT || type === PACK_OBJ_TYPE.TAG) {
-		return expects !== undefined && expects.size > 0 && !expects.has("commit")
+	if (typeCode === PACK_OBJ_TYPE.COMMIT || typeCode === PACK_OBJ_TYPE.TAG) {
+		return expectations !== undefined &&
+			expectations.size > 0 &&
+			!expectations.has("commit")
 			? "violation"
 			: "corruption"
 	}
-	if (expects === undefined || expects.size === 0) return "ok"
-	const actual = type === PACK_OBJ_TYPE.TREE ? "tree" : "blob"
-	return expects.has(actual) ? "ok" : "violation"
+	if (expectations === undefined || expectations.size === 0) return "ok"
+	const actual = typeCode === PACK_OBJ_TYPE.TREE ? "tree" : "blob"
+	return expectations.has(actual) ? "ok" : "violation"
 }
 
 /** A boundary (stop-set) oid's deferred check: the walk never probes a stop
  * oid, so its edge expectations are verified in one batched type probe at the
  * end. At a boundary a "commit" expectation IS satisfiable by a commit. */
-function boundarySatisfies(expects: ReadonlySet<EdgeExpectation>, type: number): boolean {
-	if (type === PACK_OBJ_TYPE.COMMIT) return expects.has("commit")
-	if (type === PACK_OBJ_TYPE.TREE) return expects.has("tree")
-	if (type === PACK_OBJ_TYPE.BLOB) return expects.has("blob")
+function boundarySatisfies(
+	expectations: ReadonlySet<EdgeExpectation>,
+	typeCode: number,
+): boolean {
+	if (typeCode === PACK_OBJ_TYPE.COMMIT) return expectations.has("commit")
+	if (typeCode === PACK_OBJ_TYPE.TREE) return expectations.has("tree")
+	if (typeCode === PACK_OBJ_TYPE.BLOB) return expectations.has("blob")
 	return false // a TAG satisfies no edge expectation (edges never declare tags)
 }
 
@@ -154,16 +166,16 @@ async function loadObjectTypes(
 	id: ReposId,
 	oids: Iterable<string>,
 ): Promise<Map<string, number>> {
-	const out = new Map<string, number>()
+	const typesByOid = new Map<string, number>()
 	for (const batch of batches([...oids], LOOKUP_BATCH)) {
 		const rows = await sql<{ oid: string; type: number }>`
 			select encode(oid, 'hex') as oid, type from git_object
 			where repo_id = ${id}::bigint
-				and oid in (${sql.join(batch.map((h) => sql`${Buffer.from(h, "hex")}`))})
+				and oid in (${sql.join(batch.map((oid) => sql`${Buffer.from(oid, "hex")}`))})
 		`.execute(db)
-		for (const r of rows.rows) out.set(r.oid, r.type)
+		for (const row of rows.rows) typesByOid.set(row.oid, row.type)
 	}
-	return out
+	return typesByOid
 }
 
 type PeeledTagChain =
@@ -220,7 +232,7 @@ type ClosureResult = { present: Set<string>; missing: Set<string> }
  * commit's parents are commits, a commit's root tree and a tree's entries are
  * trees/blobs — only roots and tag targets can be anything. Sorting oids by
  * origin spares the dominant tree/blob volume the commit/tag row lookups. */
-type Frontier = { commits: string[]; objects: string[]; unknown: string[] }
+type ClosureLevel = { commits: string[]; objects: string[]; unknown: string[] }
 
 /**
  * Everything reachable from `roots` — level-synchronous BFS in JS. Per level:
@@ -244,7 +256,7 @@ export async function fullClosure(
 	const missing = new Set<string>()
 	const visited = new Set<string>(roots)
 	const expected = new Map<string, Set<EdgeExpectation>>()
-	let frontier: Frontier = { commits: [], objects: [], unknown: [...new Set(roots)] }
+	let level: ClosureLevel = { commits: [], objects: [], unknown: [...new Set(roots)] }
 
 	const expect = (oid: string, kind: EdgeExpectation): void => {
 		const set = expected.get(oid)
@@ -252,8 +264,8 @@ export async function fullClosure(
 		else expected.set(oid, new Set([kind]))
 	}
 	const enqueue = (
-		next: Frontier,
-		bucket: keyof Frontier,
+		next: ClosureLevel,
+		bucket: keyof ClosureLevel,
 		oid: string,
 		kind?: EdgeExpectation,
 	): void => {
@@ -267,23 +279,20 @@ export async function fullClosure(
 		next[bucket].push(oid)
 	}
 
-	while (
-		frontier.commits.length + frontier.objects.length + frontier.unknown.length >
-		0
-	) {
-		const next: Frontier = { commits: [], objects: [], unknown: [] }
+	while (level.commits.length + level.objects.length + level.unknown.length > 0) {
+		const next: ClosureLevel = { commits: [], objects: [], unknown: [] }
 
 		// 1. Commit rows: known commits (parents) plus whatever the unknowns hold.
-		const commitProbe = [...frontier.commits, ...frontier.unknown]
+		const commitProbe = [...level.commits, ...level.unknown]
 		const commitRows = await loadCommitRows(db, id, commitProbe)
-		for (const [oid, r] of commitRows) {
+		for (const [oid, row] of commitRows) {
 			present.add(oid)
-			enqueue(next, "objects", r.tree, "tree")
-			for (const par of r.parents) enqueue(next, "commits", par, "commit")
+			enqueue(next, "objects", row.treeOid, "tree")
+			for (const parent of row.parents) enqueue(next, "commits", parent, "commit")
 		}
 
 		// 2. Tag rows, for unknowns that were not commits.
-		const tagProbe = frontier.unknown.filter((o) => !commitRows.has(o))
+		const tagProbe = level.unknown.filter((oid) => !commitRows.has(oid))
 		const tagRows = await loadTagTargets(db, id, tagProbe)
 		for (const [oid, target] of tagRows) {
 			present.add(oid)
@@ -292,39 +301,40 @@ export async function fullClosure(
 
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = [
-			...frontier.objects,
-			...frontier.commits.filter((o) => !commitRows.has(o)),
-			...tagProbe.filter((o) => !tagRows.has(o)),
+			...level.objects,
+			...level.commits.filter((oid) => !commitRows.has(oid)),
+			...tagProbe.filter((oid) => !tagRows.has(oid)),
 		]
-		const metas = await loadObjectMeta(db, id, objectProbe)
-		for (const [oid, m] of metas) {
+		const objectMetadata = await loadObjectMeta(db, id, objectProbe)
+		for (const [oid, metadata] of objectMetadata) {
 			// A typed-edge violation (commit.tree → blob, 40000 entry → blob, a
 			// parent that is no commit) is a MALFORMED GRAPH, judged like an
 			// absent object on this SERVE path: the want is refused — never an
 			// under-walk that silently skips descendants. A commit/tag with no
 			// derived row stays a LOUD corruption crash.
-			const verdict = judgeProbedType(expected.get(oid), m.type)
-			if (verdict === "corruption") throwMissingDerivedRow(oid, m.type)
+			const verdict = judgeProbedType(expected.get(oid), metadata.type)
+			if (verdict === "corruption") throwMissingDerivedRow(oid, metadata.type)
 			if (verdict === "violation") {
 				missing.add(oid)
 				continue
 			}
 			present.add(oid)
-			if (m.type === PACK_OBJ_TYPE.TREE) {
-				if (m.content === null) {
+			if (metadata.type === PACK_OBJ_TYPE.TREE) {
+				if (metadata.content === null) {
 					throw new Error(`pggit reachability: tree ${oid} returned no content`)
 				}
-				for (const e of treeEntries(m.content)) {
-					if (isTreeEntryMode(e.mode)) enqueue(next, "objects", e.oid, "tree")
-					else if (e.mode !== GITLINK_MODE && !omitBlobs) {
-						enqueue(next, "objects", e.oid, "blob")
+				for (const entry of treeEntries(metadata.content)) {
+					if (isTreeEntryMode(entry.mode)) {
+						enqueue(next, "objects", entry.oid, "tree")
+					} else if (entry.mode !== GITLINK_MODE && !omitBlobs) {
+						enqueue(next, "objects", entry.oid, "blob")
 					}
 				}
 			}
 		}
-		for (const oid of objectProbe) if (!metas.has(oid)) missing.add(oid)
+		for (const oid of objectProbe) if (!objectMetadata.has(oid)) missing.add(oid)
 
-		frontier = next
+		level = next
 	}
 	return { missing, present }
 }
@@ -415,26 +425,28 @@ export async function originClosure(
 			return
 		}
 		if (kind !== undefined) expect(expected, oid, kind)
-		const have = masks.get(oid) ?? 0n
-		const news = bits & ~have
-		if (news === 0n) return
-		masks.set(oid, have | news)
+		const existingBits = masks.get(oid) ?? 0n
+		const newBits = bits & ~existingBits
+		if (newBits === 0n) return
+		masks.set(oid, existingBits | newBits)
 		const pending = next[bucket].get(oid) ?? 0n
-		next[bucket].set(oid, pending | news)
+		next[bucket].set(oid, pending | newBits)
 	}
 
-	origins.forEach((o, i) => {
-		enqueue(level, "unknown", o, 1n << BigInt(i))
+	origins.forEach((origin, index) => {
+		enqueue(level, "unknown", origin, 1n << BigInt(index))
 	})
 
 	/** Merge per-oid bits of several pending maps (an oid can enter one level
 	 * through two buckets — e.g. as a parent and as a tag target). */
 	const merge = (...maps: Map<string, bigint>[]): Map<string, bigint> => {
-		const out = new Map<string, bigint>()
-		for (const m of maps) {
-			for (const [oid, bits] of m) out.set(oid, (out.get(oid) ?? 0n) | bits)
+		const merged = new Map<string, bigint>()
+		for (const map of maps) {
+			for (const [oid, bits] of map) {
+				merged.set(oid, (merged.get(oid) ?? 0n) | bits)
+			}
 		}
-		return out
+		return merged
 	}
 
 	while (level.commits.size + level.objects.size + level.unknown.size > 0) {
@@ -443,10 +455,12 @@ export async function originClosure(
 		// 1. Commit rows: known commits (parents) plus whatever the unknowns hold.
 		const commitProbe = merge(level.commits, level.unknown)
 		const commitRows = await loadCommitRows(db, id, commitProbe.keys())
-		for (const [oid, r] of commitRows) {
+		for (const [oid, row] of commitRows) {
 			const bits = commitProbe.get(oid) as bigint
-			enqueue(next, "objects", r.tree, bits, "tree")
-			for (const par of r.parents) enqueue(next, "commits", par, bits, "commit")
+			enqueue(next, "objects", row.treeOid, bits, "tree")
+			for (const parent of row.parents) {
+				enqueue(next, "commits", parent, bits, "commit")
+			}
 		}
 
 		// 2. Tag rows, for unknowns that were not commits.
@@ -461,20 +475,22 @@ export async function originClosure(
 
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = merge(
-			new Map([...commitProbe].filter(([o]) => !commitRows.has(o) && !tagProbe.has(o))),
-			new Map([...tagProbe].filter(([o]) => !tagRows.has(o))),
+			new Map(
+				[...commitProbe].filter(([oid]) => !commitRows.has(oid) && !tagProbe.has(oid)),
+			),
+			new Map([...tagProbe].filter(([oid]) => !tagRows.has(oid))),
 			level.objects,
 		)
-		const metas = await loadObjectMeta(db, id, objectProbe.keys())
-		for (const [oid, m] of metas) {
+		const objectMetadata = await loadObjectMeta(db, id, objectProbe.keys())
+		for (const [oid, metadata] of objectMetadata) {
 			// Typed-edge violations: the graph is malformed. "reject" fails
 			// connectivity like an absent object; "retain" keeps the object live
 			// (a valid edge elsewhere must keep it un-sweepable) and expands it
 			// by its ACTUAL type — either way the violation is recorded and the
 			// epoch withheld. A commit/tag with no derived row stays a LOUD
 			// corruption crash, never a sweepable "missing".
-			const verdict = judgeProbedType(expected.get(oid), m.type)
-			if (verdict === "corruption") throwMissingDerivedRow(oid, m.type)
+			const verdict = judgeProbedType(expected.get(oid), metadata.type)
+			if (verdict === "corruption") throwMissingDerivedRow(oid, metadata.type)
 			if (verdict === "violation") {
 				violations.add(oid)
 				if (onViolation === "reject") {
@@ -483,26 +499,26 @@ export async function originClosure(
 					continue
 				}
 			}
-			if (m.type === PACK_OBJ_TYPE.TREE) {
-				if (m.content === null) {
+			if (metadata.type === PACK_OBJ_TYPE.TREE) {
+				if (metadata.content === null) {
 					throw new Error(`pggit reachability: tree ${oid} returned no content`)
 				}
 				const bits = objectProbe.get(oid) as bigint
-				for (const e of treeEntries(m.content)) {
-					if (e.mode !== GITLINK_MODE) {
+				for (const entry of treeEntries(metadata.content)) {
+					if (entry.mode !== GITLINK_MODE) {
 						enqueue(
 							next,
 							"objects",
-							e.oid,
+							entry.oid,
 							bits,
-							isTreeEntryMode(e.mode) ? "tree" : "blob",
+							isTreeEntryMode(entry.mode) ? "tree" : "blob",
 						)
 					}
 				}
 			}
 		}
 		for (const oid of objectProbe.keys()) {
-			if (!metas.has(oid)) {
+			if (!objectMetadata.has(oid)) {
 				missing.add(oid)
 				masks.delete(oid)
 			}
@@ -539,10 +555,10 @@ export async function ancestry(
 	db: Kysely<Database>,
 	id: ReposId,
 	want: string,
-	commonBufs: Buffer[],
+	commonOids: Buffer[],
 ): Promise<boolean> {
-	if (commonBufs.length === 0) return false
-	const commons = sql.join(commonBufs.map((b) => sql`(${b}::bytea)`))
+	if (commonOids.length === 0) return false
+	const commonValues = sql.join(commonOids.map((oid) => sql`(${oid}::bytea)`))
 	const result = await sql<{
 		reached: boolean
 		corrupt_oid: string | null
@@ -570,7 +586,7 @@ export async function ancestry(
 			limit 1
 		)
 		select exists (
-			select 1 from anc join (values ${commons}) as common(oid) on common.oid = anc.oid
+			select 1 from anc join (values ${commonValues}) as common(oid) on common.oid = anc.oid
 		) as reached,
 		(select encode(oid, 'hex') from corrupt) as corrupt_oid,
 		(select type from corrupt) as corrupt_type
@@ -622,14 +638,18 @@ type EpochServeAttempt = { state: "fallback" } | { state: "served"; result: Serv
  * descending; `commit_time` descending breaks ties and orders NULL regions
  * (git's pre-generation heuristic — can only ever OVER-send, never under). */
 function frontierBefore(
-	a: { gen: number | null; time: number },
-	b: { gen: number | null; time: number },
+	left: { generation: number | null; commitTime: number },
+	right: { generation: number | null; commitTime: number },
 ): number {
-	if (a.gen === null && b.gen === null) return b.time - a.time
-	if (a.gen === null) return -1
-	if (b.gen === null) return 1
-	if (a.gen !== b.gen) return b.gen - a.gen
-	return b.time - a.time
+	if (left.generation === null && right.generation === null) {
+		return right.commitTime - left.commitTime
+	}
+	if (left.generation === null) return -1
+	if (right.generation === null) return 1
+	if (left.generation !== right.generation) {
+		return right.generation - left.generation
+	}
+	return right.commitTime - left.commitTime
 }
 
 /**
@@ -661,37 +681,37 @@ export async function frontier(
 	const warmBases = new Map<string, string>()
 	const rows = new Map<string, CommitRow | null>() // null ⇒ no row (absent)
 	const marks = new Map<string, Mark>()
-	const newCommits: string[] = []
+	const servedCommitOids: string[] = []
 	// Provenance: each have owns one bit; `meetBits` accumulates the bits of
 	// every have whose descent touched an INTERESTING commit — i.e. every have
 	// that justified an exclusion (see ServeSet.boundaryExact).
 	const haveBit = new Map<string, bigint>()
-	haves.forEach((h, i) => {
-		haveBit.set(h, (haveBit.get(h) ?? 0n) | (1n << BigInt(i)))
+	haves.forEach((have, index) => {
+		haveBit.set(have, (haveBit.get(have) ?? 0n) | (1n << BigInt(index)))
 	})
 	let meetBits = 0n
 
 	const loadRows = async (oids: string[]): Promise<void> => {
-		const need = [...new Set(oids)].filter((o) => !rows.has(o))
-		const got = await loadCommitRows(db, id, need)
-		for (const o of need) rows.set(o, got.get(o) ?? null)
+		const needed = [...new Set(oids)].filter((oid) => !rows.has(oid))
+		const loaded = await loadCommitRows(db, id, needed)
+		for (const oid of needed) rows.set(oid, loaded.get(oid) ?? null)
 	}
 
-	type QueueEntry = { oid: string; gen: number | null; time: number }
+	type QueueEntry = { oid: string; generation: number | null; commitTime: number }
 	const queue = new TinyQueue<QueueEntry>([], frontierBefore)
 	const inQueue = new Set<string>()
 	let interestingInQueue = 0
 
-	const isInterestingOnly = (m: Mark): boolean =>
-		m.interesting && m.uninterestingBits === 0n
+	const isInterestingOnly = (mark: Mark): boolean =>
+		mark.interesting && mark.uninterestingBits === 0n
 
 	const markOf = (oid: string): Mark => {
-		let m = marks.get(oid)
-		if (!m) {
-			m = { interesting: false, uninterestingBits: 0n }
-			marks.set(oid, m)
+		let mark = marks.get(oid)
+		if (!mark) {
+			mark = { interesting: false, uninterestingBits: 0n }
+			marks.set(oid, mark)
 		}
-		return m
+		return mark
 	}
 
 	/** Mark + enqueue (row must already be loaded). An absent commit is recorded
@@ -705,44 +725,46 @@ export async function frontier(
 			if (kind === "interesting") missing.add(oid)
 			return
 		}
-		const m = markOf(oid)
-		const wasInterestingOnly = isInterestingOnly(m)
+		const oidMark = markOf(oid)
+		const wasInterestingOnly = isInterestingOnly(oidMark)
 		if (kind === "interesting") {
-			if (m.interesting) return
-			m.interesting = true
-			meetBits |= m.uninterestingBits
+			if (oidMark.interesting) return
+			oidMark.interesting = true
+			meetBits |= oidMark.uninterestingBits
 		} else {
-			const news = bits & ~m.uninterestingBits
-			if (news === 0n) return
-			m.uninterestingBits |= news
-			if (m.interesting) meetBits |= news
+			const newBits = bits & ~oidMark.uninterestingBits
+			if (newBits === 0n) return
+			oidMark.uninterestingBits |= newBits
+			if (oidMark.interesting) meetBits |= newBits
 		}
 		if (inQueue.has(oid)) {
-			if (wasInterestingOnly && !isInterestingOnly(m)) interestingInQueue--
+			if (wasInterestingOnly && !isInterestingOnly(oidMark)) interestingInQueue--
 			return
 		}
-		queue.push({ gen: row.gen, oid, time: row.time })
+		queue.push({ commitTime: row.commitTime, generation: row.generation, oid })
 		inQueue.add(oid)
-		if (isInterestingOnly(m)) interestingInQueue++
+		if (isInterestingOnly(oidMark)) interestingInQueue++
 	}
 
 	await loadRows([...wants, ...haves])
-	for (const h of haves) mark(h, "uninteresting", haveBit.get(h) as bigint)
-	for (const w of wants) mark(w, "interesting")
+	for (const have of haves) mark(have, "uninteresting", haveBit.get(have) as bigint)
+	for (const want of wants) mark(want, "interesting")
 
 	while (queue.length > 0 && interestingInQueue > 0) {
 		const entry = queue.pop() as QueueEntry
 		inQueue.delete(entry.oid)
-		const m = markOf(entry.oid)
-		if (isInterestingOnly(m)) interestingInQueue--
+		const oidMark = markOf(entry.oid)
+		if (isInterestingOnly(oidMark)) interestingInQueue--
 		const row = rows.get(entry.oid) as CommitRow
 		await loadRows(row.parents)
-		if (m.uninterestingBits !== 0n) {
-			for (const p of row.parents) mark(p, "uninteresting", m.uninterestingBits)
+		if (oidMark.uninterestingBits !== 0n) {
+			for (const parent of row.parents) {
+				mark(parent, "uninteresting", oidMark.uninterestingBits)
+			}
 		} else {
-			newCommits.push(entry.oid)
+			servedCommitOids.push(entry.oid)
 			served.add(entry.oid)
-			for (const p of row.parents) mark(p, "interesting")
+			for (const parent of row.parents) mark(parent, "interesting")
 		}
 	}
 
@@ -778,9 +800,11 @@ export async function frontier(
 		served.add(treeOid)
 		const tree = await readTree(treeOid)
 		if (tree === null) return
-		for (const e of tree.entries) {
-			if (isTreeEntryMode(e.mode)) await serveWholeTree(e.oid)
-			else if (e.mode !== GITLINK_MODE && !omitBlobs) blobCandidates.add(e.oid)
+		for (const entry of tree.entries) {
+			if (isTreeEntryMode(entry.mode)) await serveWholeTree(entry.oid)
+			else if (entry.mode !== GITLINK_MODE && !omitBlobs) {
+				blobCandidates.add(entry.oid)
+			}
 		}
 	}
 
@@ -791,7 +815,7 @@ export async function frontier(
 		boundaryTrees: string[],
 		interestingTrees: string[],
 	): Promise<void> => {
-		for (const b of boundaryTrees) clientHas.add(b)
+		for (const boundaryTree of boundaryTrees) clientHas.add(boundaryTree)
 		if (boundaryTrees.includes(treeOid) || interestingTrees.includes(treeOid)) return
 		if (served.has(treeOid)) return
 		if (boundaryTrees.length === 0 && interestingTrees.length === 0) {
@@ -807,64 +831,72 @@ export async function frontier(
 		const tree = await readTree(treeOid)
 		if (tree === null) return
 
-		type OldSide = {
+		type PredecessorSide = {
 			boundary: boolean
 			entries: IndexedTree["byName"]
 		}
-		const oldSides: OldSide[] = []
+		const predecessorSides: PredecessorSide[] = []
 		for (const [boundary, list] of [
 			[true, boundaryTrees],
 			[false, interestingTrees],
 		] as const) {
-			for (const oldOid of list) {
-				const oldTree = await readTree(oldOid)
-				if (oldTree === null) continue
-				for (const e of oldTree.entries) {
-					// "Any oid seen on the old side" of a BOUNDARY diff is provably
+			for (const predecessorOid of list) {
+				const predecessorTree = await readTree(predecessorOid)
+				if (predecessorTree === null) continue
+				for (const entry of predecessorTree.entries) {
+					// Any oid seen on the predecessor side of a BOUNDARY diff is provably
 					// client-held — a boundary tree reachable from a stated have named it.
-					if (boundary && e.mode !== GITLINK_MODE) clientHas.add(e.oid)
+					if (boundary && entry.mode !== GITLINK_MODE) clientHas.add(entry.oid)
 				}
-				oldSides.push({ boundary, entries: oldTree.byName })
+				predecessorSides.push({ boundary, entries: predecessorTree.byName })
 			}
 		}
 
-		for (const e of tree.entries) {
-			if (e.mode === GITLINK_MODE) continue
-			const sameOid = oldSides.some((s) => s.entries.get(e.name)?.oid === e.oid)
+		for (const entry of tree.entries) {
+			if (entry.mode === GITLINK_MODE) continue
+			const sameOid = predecessorSides.some(
+				(side) => side.entries.get(entry.name)?.oid === entry.oid,
+			)
 			if (sameOid) continue
-			if (isTreeEntryMode(e.mode)) {
-				const boundarySub: string[] = []
-				const interestingSub: string[] = []
-				for (const s of oldSides) {
-					const old = s.entries.get(e.name)
-					if (old !== undefined && isTreeEntryMode(old.mode)) {
-						;(s.boundary ? boundarySub : interestingSub).push(old.oid)
+			if (isTreeEntryMode(entry.mode)) {
+				const boundarySubtrees: string[] = []
+				const interestingSubtrees: string[] = []
+				for (const side of predecessorSides) {
+					const predecessor = side.entries.get(entry.name)
+					if (predecessor !== undefined && isTreeEntryMode(predecessor.mode)) {
+						;(side.boundary ? boundarySubtrees : interestingSubtrees).push(
+							predecessor.oid,
+						)
 					}
 				}
-				await diffForServe(e.oid, boundarySub, interestingSub)
-			} else if (!omitBlobs && !served.has(e.oid)) {
-				blobCandidates.add(e.oid)
+				await diffForServe(entry.oid, boundarySubtrees, interestingSubtrees)
+			} else if (!omitBlobs && !served.has(entry.oid)) {
+				blobCandidates.add(entry.oid)
 			}
 		}
 	}
 
 	const edgeTrees = new Set<string>()
-	for (const c of newCommits) {
-		const row = rows.get(c) as CommitRow
+	for (const commitOid of servedCommitOids) {
+		const row = rows.get(commitOid) as CommitRow
 		const boundaryTrees: string[] = []
 		const interestingTrees: string[] = []
-		for (const p of row.parents) {
-			const prow = rows.get(p)
-			if (prow === null || prow === undefined) continue
-			const pm = marks.get(p)
-			if (pm !== undefined && isInterestingOnly(pm) && served.has(p)) {
-				interestingTrees.push(prow.tree)
+		for (const parentOid of row.parents) {
+			const parentRow = rows.get(parentOid)
+			if (parentRow === null || parentRow === undefined) continue
+			const parentMark = marks.get(parentOid)
+			if (
+				parentMark !== undefined &&
+				isInterestingOnly(parentMark) &&
+				served.has(parentOid)
+			) {
+				interestingTrees.push(parentRow.treeOid)
 			} else {
-				boundaryTrees.push(prow.tree)
-				edgeTrees.add(prow.tree)
+				boundaryTrees.push(parentRow.treeOid)
+				edgeTrees.add(parentRow.treeOid)
 			}
 		}
-		await diffForServe(row.tree, boundaryTrees, interestingTrees)
+		await diffForServe(row.treeOid, boundaryTrees, interestingTrees)
 	}
 
 	// ── Client-held content at the EDGES (R16's priced upgrade). ──
@@ -887,9 +919,9 @@ export async function frontier(
 		clientHas.add(treeOid)
 		const tree = await readTree(treeOid, "have")
 		if (tree === null) return
-		for (const e of tree.entries) {
-			if (isTreeEntryMode(e.mode)) await expandClientHeld(e.oid)
-			else if (e.mode !== GITLINK_MODE) clientHas.add(e.oid)
+		for (const entry of tree.entries) {
+			if (isTreeEntryMode(entry.mode)) await expandClientHeld(entry.oid)
+			else if (entry.mode !== GITLINK_MODE) clientHas.add(entry.oid)
 		}
 	}
 	for (const treeOid of edgeTrees) {
@@ -901,25 +933,25 @@ export async function frontier(
 	}
 
 	// ── Blob presence, batched (also the connectivity probe for blobs). ──
-	const probe = [...blobCandidates].filter((b) => !served.has(b))
-	for (const batch of batches(probe, LOOKUP_BATCH)) {
-		const got = await sql<{ oid: string }>`
+	const blobProbe = [...blobCandidates].filter((oid) => !served.has(oid))
+	for (const batch of batches(blobProbe, LOOKUP_BATCH)) {
+		const rows = await sql<{ oid: string }>`
 			select encode(oid, 'hex') as oid from git_object
 			where repo_id = ${id}::bigint
 				and oid in (${sql.join(batch.map((h) => sql`${Buffer.from(h, "hex")}`))})
 		`.execute(db)
-		const present = new Set(got.rows.map((r) => r.oid))
-		for (const b of batch) {
-			if (present.has(b)) served.add(b)
-			else missing.add(b)
+		const present = new Set(rows.rows.map((row) => row.oid))
+		for (const oid of batch) {
+			if (present.has(oid)) served.add(oid)
+			else missing.add(oid)
 		}
 	}
 
 	const boundaryHits = new Set<string>()
 	let hitBits = 0n
-	for (const [h, bit] of haveBit) {
-		if (marks.get(h)?.interesting) {
-			boundaryHits.add(h)
+	for (const [have, bit] of haveBit) {
+		if (marks.get(have)?.interesting) {
+			boundaryHits.add(have)
 			hitBits |= bit
 		}
 	}
@@ -963,19 +995,21 @@ async function epochServe(
 	const tipSet = new Set(epoch.tips)
 	const tipBitmaps = [...epoch.bitmaps].filter(([tip]) => tipSet.has(tip))
 	const uniqueWants = [...new Set(wants)]
-	const tipWants = uniqueWants.filter((w) => tipSet.has(w))
-	const rest = uniqueWants.filter((w) => !tipSet.has(w))
+	const tipWants = uniqueWants.filter((want) => tipSet.has(want))
+	const nonTipWants = uniqueWants.filter((want) => !tipSet.has(want))
 	const tipWantSet = new Set(tipWants)
-	const orBits = tipBitmaps.filter(([tip]) => tipWantSet.has(tip)).map(([, bits]) => bits)
+	const tipWantBitmaps = tipBitmaps
+		.filter(([tip]) => tipWantSet.has(tip))
+		.map(([, bitmap]) => bitmap)
 
-	if (rest.length === 0) {
+	if (nonTipWants.length === 0) {
 		return {
 			result: {
 				boundaryExact: true,
 				boundaryHits: new Set(),
 				clientHas: new Set(),
 				missing: new Set(),
-				served: new Set(oidsOfUnion(orBits, epoch.oids)),
+				served: new Set(oidsOfUnion(tipWantBitmaps, epoch.oids)),
 				warmBases: new Map(),
 			},
 			state: "served",
@@ -984,8 +1018,8 @@ async function epochServe(
 
 	// Non-tip wants must be commits (anything else — tree, blob, a tag object
 	// pushed since the drain — is the router's slow path's business).
-	const typed = await loadObjectTypes(db, id, [...rest, ...epoch.tips])
-	if (!rest.every((w) => typed.get(w) === PACK_OBJ_TYPE.COMMIT)) {
+	const objectTypes = await loadObjectTypes(db, id, [...nonTipWants, ...epoch.tips])
+	if (!nonTipWants.every((want) => objectTypes.get(want) === PACK_OBJ_TYPE.COMMIT)) {
 		return { state: "fallback" }
 	}
 
@@ -993,35 +1027,46 @@ async function epochServe(
 	// is recorded so a hit at the peeled commit can subtract it. Tips that peel
 	// to a non-commit carry no subtraction semantics (git's rule) — and cannot
 	// be reached by a commit walk — so they are simply not boundaries.
-	const boundaryOf = new Map<string, { chain: Set<string>; bits: Uint8Array }>()
-	for (const [tip, bits] of tipBitmaps) {
+	const boundaryByCommit = new Map<string, { chain: Set<string>; bitmap: Uint8Array }>()
+	for (const [tip, bitmap] of tipBitmaps) {
 		const peeled =
-			typed.get(tip) === PACK_OBJ_TYPE.TAG
-				? await peelTagChain(db, id, tip, typed)
+			objectTypes.get(tip) === PACK_OBJ_TYPE.TAG
+				? await peelTagChain(db, id, tip, objectTypes)
 				: { chain: [], state: "complete" as const, terminal: tip }
 		if (peeled.state === "missing") continue
 		const current = peeled.terminal
 		const chain = new Set(peeled.chain)
-		if (typed.get(current) !== PACK_OBJ_TYPE.COMMIT) continue
+		if (objectTypes.get(current) !== PACK_OBJ_TYPE.COMMIT) continue
 		// A commit tip beats a tag tip peeling to the same commit (no chain to
 		// subtract); first tag tip wins among equals — their peeled closures agree.
-		if (current === tip || !boundaryOf.has(current)) {
-			boundaryOf.set(current, { bits, chain })
+		if (current === tip || !boundaryByCommit.has(current)) {
+			boundaryByCommit.set(current, { bitmap, chain })
 		}
 	}
 
-	const fr = await frontier(db, id, rest, [...boundaryOf.keys()], false)
-	if (!fr.boundaryExact) return { state: "fallback" }
+	const frontierResult = await frontier(
+		db,
+		id,
+		nonTipWants,
+		[...boundaryByCommit.keys()],
+		false,
+	)
+	if (!frontierResult.boundaryExact) return { state: "fallback" }
 
-	const served = new Set(fr.served)
-	for (const hex of oidsOfUnion(orBits, epoch.oids)) served.add(hex)
-	for (const [commit, bound] of boundaryOf) {
-		if (!fr.boundaryHits.has(commit)) continue
-		if (bound.chain.size === 0) {
-			for (const hex of oidsOfUnion([bound.bits], epoch.oids)) served.add(hex)
+	const served = new Set(frontierResult.served)
+	for (const oid of oidsOfUnion(tipWantBitmaps, epoch.oids)) served.add(oid)
+	for (const [commit, boundary] of boundaryByCommit) {
+		if (!frontierResult.boundaryHits.has(commit)) continue
+		if (boundary.chain.size === 0) {
+			for (const oid of oidsOfUnion([boundary.bitmap], epoch.oids)) served.add(oid)
 		} else {
-			for (const pos of remapPositions(bound.bits, epoch.oids, epoch.oids, bound.chain)) {
-				served.add(oidAtPosition(epoch.oids, pos))
+			for (const position of remapPositions(
+				boundary.bitmap,
+				epoch.oids,
+				epoch.oids,
+				boundary.chain,
+			)) {
+				served.add(oidAtPosition(epoch.oids, position))
 			}
 		}
 	}
@@ -1031,7 +1076,7 @@ async function epochServe(
 			boundaryExact: true,
 			boundaryHits: new Set(),
 			clientHas: new Set(),
-			missing: fr.missing,
+			missing: frontierResult.missing,
 			served,
 			warmBases: new Map(),
 		},
@@ -1080,16 +1125,19 @@ export async function routeServeSet(
 	}
 
 	// Type both sides in one batched sweep.
-	const typed = await loadObjectTypes(db, id, new Set([...wants, ...haves]))
+	const objectTypes = await loadObjectTypes(db, id, new Set([...wants, ...haves]))
 
 	const served = new Set<string>()
 	const missing = new Set<string>()
 
 	/** Follow a tag chain, serving each tag object; returns the terminal non-tag
 	 * (or null when the chain dangles — recorded missing). */
-	const peelServing = async (tagOid: string, serve: boolean): Promise<string | null> => {
-		const peeled = await peelTagChain(db, id, tagOid, typed)
-		if (serve) for (const oid of peeled.chain) served.add(oid)
+	const peelServing = async (
+		tagOid: string,
+		includeTagChain: boolean,
+	): Promise<string | null> => {
+		const peeled = await peelTagChain(db, id, tagOid, objectTypes)
+		if (includeTagChain) for (const oid of peeled.chain) served.add(oid)
 		if (peeled.state === "complete") return peeled.terminal
 		missing.add(peeled.oid)
 		return null
@@ -1097,33 +1145,33 @@ export async function routeServeSet(
 
 	const commitWants: string[] = []
 	const treeWants: string[] = []
-	for (const w of wants) {
-		const t = typed.get(w)
-		if (t === undefined) {
-			missing.add(w)
-		} else if (t === PACK_OBJ_TYPE.COMMIT) {
-			commitWants.push(w)
-		} else if (t === PACK_OBJ_TYPE.TAG) {
-			const terminal = await peelServing(w, true)
+	for (const want of wants) {
+		const typeCode = objectTypes.get(want)
+		if (typeCode === undefined) {
+			missing.add(want)
+		} else if (typeCode === PACK_OBJ_TYPE.COMMIT) {
+			commitWants.push(want)
+		} else if (typeCode === PACK_OBJ_TYPE.TAG) {
+			const terminal = await peelServing(want, true)
 			if (terminal === null) continue
-			const tt = typed.get(terminal)
-			if (tt === PACK_OBJ_TYPE.COMMIT) commitWants.push(terminal)
-			else if (tt === PACK_OBJ_TYPE.TREE) treeWants.push(terminal)
+			const terminalType = objectTypes.get(terminal)
+			if (terminalType === PACK_OBJ_TYPE.COMMIT) commitWants.push(terminal)
+			else if (terminalType === PACK_OBJ_TYPE.TREE) treeWants.push(terminal)
 			else served.add(terminal)
-		} else if (t === PACK_OBJ_TYPE.TREE) {
-			treeWants.push(w)
+		} else if (typeCode === PACK_OBJ_TYPE.TREE) {
+			treeWants.push(want)
 		} else {
-			served.add(w) // an exact blob want: itself, never subtracted (promisor)
+			served.add(want) // an exact blob want: itself, never subtracted (promisor)
 		}
 	}
 
 	const commitHaves: string[] = []
-	for (const h of haves) {
-		const t = typed.get(h)
-		if (t === PACK_OBJ_TYPE.COMMIT) commitHaves.push(h)
-		else if (t === PACK_OBJ_TYPE.TAG) {
-			const terminal = await peelServing(h, false)
-			if (terminal !== null && typed.get(terminal) === PACK_OBJ_TYPE.COMMIT) {
+	for (const have of haves) {
+		const typeCode = objectTypes.get(have)
+		if (typeCode === PACK_OBJ_TYPE.COMMIT) commitHaves.push(have)
+		else if (typeCode === PACK_OBJ_TYPE.TAG) {
+			const terminal = await peelServing(have, false)
+			if (terminal !== null && objectTypes.get(terminal) === PACK_OBJ_TYPE.COMMIT) {
 				commitHaves.push(terminal)
 			}
 		}
@@ -1140,12 +1188,12 @@ export async function routeServeSet(
 					served: new Set<string>(),
 					warmBases: new Map<string, string>(),
 				}
-	for (const o of served) result.served.add(o)
-	for (const o of missing) result.missing.add(o)
+	for (const oid of served) result.served.add(oid)
+	for (const oid of missing) result.missing.add(oid)
 	if (treeWants.length > 0) {
-		const sub = await fullClosure(db, id, treeWants, omitBlobs)
-		for (const o of sub.present) result.served.add(o)
-		for (const o of sub.missing) result.missing.add(o)
+		const treeClosure = await fullClosure(db, id, treeWants, omitBlobs)
+		for (const oid of treeClosure.present) result.served.add(oid)
+		for (const oid of treeClosure.missing) result.missing.add(oid)
 	}
 	return result
 }

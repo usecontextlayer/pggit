@@ -10,8 +10,8 @@
  * boundary's 500. Missing-want rejection is pinned against a real store in
  * `object-store.test.ts` and over the wire in `fetch/missing-want.test.ts`; here we
  * pin that `handleFetch` propagates it. (band-3
- * stays deferred until serving becomes streaming — there is no mid-stream window to
- * signal on today.)
+ * stays deferred until serving becomes streaming — a materialized response has no
+ * mid-stream window to signal on.)
  */
 import { describe, expect, it } from "vitest"
 import { encodePkt, encodePktLine } from "@/protocol/pkt-line"

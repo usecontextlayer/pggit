@@ -4,10 +4,11 @@
  * most likely to get wrong:
  *   1. Connectivity rejection across random graphs — a pack that carries the tip
  *      commit but NOT its tree/parents must be rejected `ng missing necessary
- *      objects` with the ref unset (generalizes the hand-built m2-connectivity).
+ *      objects` with the ref unset (generalizes e2e/push/connectivity.test.ts).
  *   2. Empty-tree round-trip — deleting every file yields the canonical empty
  *      tree (4b825d…); it must serialize + clone back like any other object.
- * (Stale-CAS rejection under real divergence is covered by m2-concurrent-push.)
+ * Stale-CAS rejection under real divergence is covered by
+ * e2e/push/concurrent.test.ts.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

@@ -1,7 +1,5 @@
 /**
- * BREAKAGE (pg-txn) — a failure after the ref CAS tears the push three ways.
- * Converted from `breakage/pg-txn--post-cas-failure-tears-push.ts`; its rationale
- * verbatim:
+ * Postgres transaction regression — a failure after the ref CAS must preserve a truthful push result.
  *
  * FINDING: receive-pack's "the ref CAS never rolls back" has a torn tail. Any
  * failure inside `backend.applyRefUpdates` AFTER a CAS has committed escapes
@@ -43,8 +41,7 @@
  * pushed to two branches" case), so `insertObjects` early-returns before ITS own
  * post-commit stamp and the abort lands exactly on the ref stamp.
  *
- * The source script exits non-zero when the tear reproduces; the assertions below
- * encode the CORRECT contract — refined 2026-08-19 when the fixes landed: a
+ * The assertions below encode the contract: a
  * non-atomic multi-ref push MAY partially apply (canonical git: per-ref ok/ng,
  * exit 1 when any ref fails), so the binding rule is that the per-ref REPORT is
  * truthful, the projection matches the served tip, the watermark tracks the

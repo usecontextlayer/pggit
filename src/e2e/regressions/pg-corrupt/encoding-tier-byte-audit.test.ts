@@ -21,9 +21,6 @@
  *
  * A single mismatch here is silent corruption served as a verbatim byte copy.
  *
- * Converted from `breakage/pg-corrupt--encoding-tier-byte-audit.ts`, whose verdict
- * was: exit 0 = every byte survived and every encoding row reconstructs its object;
- * non-zero = reproduced, with the offending oid + offset printed.
  */
 import { createHash, randomBytes } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"

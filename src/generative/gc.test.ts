@@ -1,6 +1,6 @@
 /**
  * Property-based GC differential (`docs/2026-06-24-force-commit-gc-design.md` §4,
- * PBT-1/2/3). Random commit DAGs (the §6 `generative/commands.ts` generator) are
+ * PBT-1/2/3). Random commit DAGs (the `testing/repo-commands.ts` generator) are
  * driven through real `git` + the served store, then GC is checked against the
  * real-git reachable-closure oracle. These GENERALISE the example-based GC cases:
  *
@@ -34,9 +34,7 @@
  * every candidate — no dropped ref, hence nothing unreachable to reclaim — would leave
  * "GC deleted nothing" indistinguishable from "GC is correct", with every property green.
  *
- * Originated as the TDD spec for GC (§4) and ran RED against a throwing stub until GC
- * landed; it now pins the shipped contract. (`buildRepoFromCommands` builds in `/tmp`;
- * the caller cleans it.)
+ * `buildRepoFromCommands` builds in `/tmp`; the caller cleans it.
  */
 import { rmSync } from "node:fs"
 import fc from "fast-check"
@@ -274,7 +272,7 @@ function expectShapeFloors(label: string, cov: ShapeCoverage): void {
  * seed stays pinned (424_242) so every run — local or CI — is reproducible. The
  * environment distinction is parsed once by the shared test-configuration boundary.
  *
- * The local count is 30 because MEASUREMENT set it, not taste: at the historical 12 the
+ * The local count is 30 because MEASUREMENT set it, not taste: at 12 runs the
  * corpus realizes ZERO candidates with a dropped-ref unreachable set, so PBT-1 and
  * PBT-3 had nothing for GC to reclaim and a GC that deleted nothing passed both. 30 is
  * the smallest round count at this seed that reaches that corner (see `SHAPE_FLOORS`,

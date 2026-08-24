@@ -1,29 +1,21 @@
 /**
  * pgres — DOES AN OFFLINE REPACK STARVE THE SERVE PATH ON A SHARED POOL?
  *
- * `startServer` builds the request path over `postgres(databaseUrl)` — porsager's
- * DEFAULT `max: 10` — and deliberately gives the GC drain its OWN pool ("GC off the
- * hot path means off the hot pool", server.ts). Repack is not wired to any drain
- * yet (design W1), so where it lands is still an open decision; this harness prices
- * the two candidate wirings against each other.
+ * This harness models a host that serves clones from one application pool and
+ * invokes the exported repack pass either on that pool or on a separate background
+ * pool. The pool boundary is a host integration choice.
  *
  * Four arms over the SAME repo and the SAME server, N concurrent `git clone`s each:
  *   1 baseline      — clones alone.
- *   2 shared pool   — clones while `createRepack().repack()` runs on the SERVER'S
- *                     pool (what mounting the drain on the app's `Sql` would do).
- *   3 separate pool — clones while the same repack runs on its own small pool (what
- *                     `startServer` already does for GC).
- *   4 gc + repack   — the candidate per-repo sequence, on the server pool.
+ *   2 shared pool   — clones while `createRepack().repack()` uses the serve pool.
+ *   3 separate pool — clones while the same repack uses an independent two-connection pool.
+ *   4 gc + repack   — host-composed per-repo maintenance on the server pool.
  *
- * The arms are INTERLEAVED round-robin across cycles, not run in blocks. A first
- * attempt ran them in blocks and the closing baseline came back 2.6x FASTER than
- * the opening one — this box is shared with sibling agents and drifts by more than
- * the effect being measured, so block ordering measures the drift, not the arms.
- * Round-robin spreads the drift evenly over every arm.
+ * The arms are INTERLEAVED round-robin across cycles so shared-database drift is
+ * spread across every arm instead of being confounded with block ordering.
  *
- * Repack's read pattern is the thing under suspicion: design Concern C3 says it
- * reads content via single-row point reads, one round trip per object. Each of
- * those takes a pool slot for its duration.
+ * Repack's single-row point reads occupy a pool slot for their duration; the probe
+ * measures whether sharing those slots changes clone latency.
  *
  * Correctness judge stays real git: EVERY clone in every arm must exit 0, be
  * fsck-clean, and match the local git repo's refs and object set. That correctness
@@ -71,7 +63,6 @@ import {
 import { createIsolatedSchema } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-/** porsager's default `max` — exactly what `startServer` gets today. */
 const args = parseArgs(
 	z
 		.object({
@@ -83,8 +74,8 @@ const args = parseArgs(
 		})
 		.strict(),
 )
-const APP_POOL_MAX = args.pool
-/** Kept low on purpose: this Postgres is shared with sibling agents. */
+const SERVE_POOL_MAX = args.pool
+/** Limits concurrent load on the shared benchmark database. */
 const CLONES = args.clones
 /** Round-robin cycles; each cycle runs every arm once. */
 const CYCLES = args.cycles
@@ -118,20 +109,18 @@ function latencyPercentile(xs: number[], p: number): number {
 }
 
 async function main(): Promise<void> {
-	if (APP_POOL_MAX < 2 || CLONES < 1 || CYCLES < 1 || COMMITS < 1) {
+	if (SERVE_POOL_MAX < 2 || CLONES < 1 || CYCLES < 1 || COMMITS < 1) {
 		throw new Error(
 			"pool, clones, cycles, and commits must be positive; pool must be at least 2",
 		)
 	}
 	const iso = await createIsolatedSchema(PG_URL)
-	// The app's own pool, sized exactly like `startServer`'s.
-	const appPg = postgres(PG_URL, {
+	const servePool = postgres(PG_URL, {
 		connection: { application_name: APP_NAME, search_path: iso.schema },
-		max: APP_POOL_MAX,
+		max: SERVE_POOL_MAX,
 		onnotice: () => {},
 	})
-	// The "off the hot pool" pool, sized like `startServer`'s gcPg.
-	const sidePg = postgres(PG_URL, {
+	const backgroundPool = postgres(PG_URL, {
 		connection: { application_name: `${APP_NAME}-side`, search_path: iso.schema },
 		max: 2,
 		onnotice: () => {},
@@ -156,13 +145,13 @@ async function main(): Promise<void> {
 		if (eligibleObjects.length === 0) {
 			throw new Error("pool fixture produced no repack-eligible objects")
 		}
-		await seedObjects(appPg, REPO, objects)
-		await setMain(appPg, REPO, tip)
+		await seedObjects(servePool, REPO, objects)
+		await setMain(servePool, REPO, tip)
 
 		const wantObjects = await gitReachableOids(dir)
 		const wantRefs = await branchAndTagRefsOf(dir)
 
-		server = await serveOnPort(createGitApp(createGitDeps(appPg)), 0)
+		server = await serveOnPort(createGitApp(createGitDeps(servePool)), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 		const scratch = mkTmp("pool-clones")
 		let seq = 0
@@ -271,11 +260,11 @@ async function main(): Promise<void> {
 			return { latencies, ms: wallMs, overlap, peak, workload: evidence }
 		}
 
-		const repackShared = createRepack(appPg)
-		const repackSide = createRepack(sidePg)
-		const gcShared = createGc(appPg)
+		const sharedPoolRepack = createRepack(servePool)
+		const separatePoolRepack = createRepack(backgroundPool)
+		const sharedPoolGc = createGc(servePool)
 		const requireFixture = async (encodings: "absent" | "present"): Promise<void> => {
-			await assertCanonicalStoreFixture(appPg, REPO, {
+			await assertCanonicalStoreFixture(servePool, REPO, {
 				encodings:
 					encodings === "present"
 						? { kind: "exact", objects: eligibleObjects }
@@ -294,7 +283,7 @@ async function main(): Promise<void> {
 		// A repack must have work to do, so the tier is dropped before each arm that
 		// runs one. (`truncate` on the harness's own table, in the harness's own schema.)
 		const clearTier = async (): Promise<void> => {
-			await appPg.unsafe("truncate git_pack_encoding")
+			await servePool.unsafe("truncate git_pack_encoding")
 			await requireFixture("absent")
 			await sleep(150)
 		}
@@ -315,25 +304,25 @@ async function main(): Promise<void> {
 			{
 				kind: "background",
 				name: "2 clones + repack on the SERVER pool",
-				run: () => repackShared.repack(REPO),
+				run: () => sharedPoolRepack.repack(REPO),
 			},
 			{
 				kind: "background",
 				name: "3 clones + repack on a SEPARATE pool",
-				run: () => repackSide.repack(REPO),
+				run: () => separatePoolRepack.repack(REPO),
 			},
 			{
 				kind: "background",
 				name: "4 clones + gc+repack on the SERVER pool",
 				run: async () => {
-					const gcResult = await gcShared.gc(REPO, {
+					const gcResult = await sharedPoolGc.gc(REPO, {
 						graceSeconds: 3600,
 						maintain: false,
 					})
 					if (gcResult.deletedObjects !== 0) {
 						throw new Error(`no-op GC deleted ${gcResult.deletedObjects} objects`)
 					}
-					return repackShared.repack(REPO)
+					return sharedPoolRepack.repack(REPO)
 				},
 			},
 		]
@@ -378,7 +367,7 @@ async function main(): Promise<void> {
 
 		console.log("# pool contention: offline repack beside live clones\n")
 		console.log(
-			`server pool max=${APP_POOL_MAX} (porsager default, = startServer) · ${CLONES} concurrent clones × ${CYCLES} interleaved cycles · repo ${objects.length} objects\n`,
+			`serve pool max=${SERVE_POOL_MAX} · ${CLONES} concurrent clones × ${CYCLES} interleaved cycles · repo ${objects.length} objects\n`,
 		)
 		const base = requiredAt(arms, 0, "baseline arm")
 		const expectedSamples = CLONES * CYCLES
@@ -437,24 +426,24 @@ async function main(): Promise<void> {
 			`\nbaseline spread across cycles: ${bmin}–${bmax} ms (×${(bmax / bmin).toFixed(2)}) — this shared box's own drift. An arm difference smaller than that is noise.`,
 		)
 		const sharedRatio = latencyPercentile(shared.latencies, 95) / baseP95
-		const sepRatio = latencyPercentile(separate.latencies, 95) / baseP95
+		const separateRatio = latencyPercentile(separate.latencies, 95) / baseP95
 		console.log(
-			`\nshared-pool p95 ×${sharedRatio.toFixed(2)} · separate-pool p95 ×${sepRatio.toFixed(2)} · every measured clone passed canonical ref/OID/fsck verification`,
+			`\nshared-pool p95 ×${sharedRatio.toFixed(2)} · separate-pool p95 ×${separateRatio.toFixed(2)} · every measured clone passed canonical ref/OID/fsck verification`,
 		)
-		const poolIsTheBottleneck = sharedRatio > 3 && sepRatio <= 3
-		if (poolIsTheBottleneck) failed = true
+		const sharedPoolIsBottleneck = sharedRatio > 3 && separateRatio <= 3
+		if (sharedPoolIsBottleneck) failed = true
 		console.log(
-			`\n${failed ? "FAIL" : "ok  "}  BOUND: no clone fails, and the shared-pool p95 stays within 3× baseline (or the separate pool is no better, meaning the DATABASE, not the pool, is the constraint).`,
+			`\n${failed ? "FAIL" : "ok  "}  BOUND: no clone fails, and the shared-pool p95 stays within 3× baseline unless the separate-pool arm also exceeds 3× (which does not attribute the slowdown to pool sharing).`,
 		)
 	} finally {
 		try {
 			await server?.close()
 		} finally {
 			try {
-				await appPg.end()
+				await servePool.end()
 			} finally {
 				try {
-					await sidePg.end()
+					await backgroundPool.end()
 				} finally {
 					cleanupTmp()
 					await iso.drop()

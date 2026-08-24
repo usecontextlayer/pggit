@@ -1,11 +1,10 @@
 /**
  * §8.1 server-boundary DECODE negatives — the request-parsing trust boundary.
  *
- * SPEC-SUITE (`*.spec.test.ts`): the executable spec for how the three decode
+ * Executable boundary spec for how the three decode
  * functions (`parseV2Request`, `parseFetch`, `parseReceivePack`) and the
  * `handleUploadPack` dispatcher behave on MALFORMED input. Every byte a hostile
- * or buggy client sends flows through these; CLAUDE.md mandates "validate at the
- * boundary, fail loud". A malformed command line must error, never be silently
+ * or buggy client sends flows through these. A malformed command line must error, never be silently
  * dropped (which would apply a partial command set with no diagnostic).
  */
 import { describe, expect, it } from "vitest"

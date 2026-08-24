@@ -1,12 +1,8 @@
 /**
  * RACE: two `createGc().gc()` passes on the SAME repo, concurrently.
  *
- * The defect this originally reproduced (hunt C1) is FIXED by design: the live
- * set was a shared `gc_live_<id>` UNLOGGED table, so a second pass's
- * `truncate`/`drop` could wipe the first pass's live set mid-sweep and its
- * `NOT EXISTS` anti-join then matched the whole REACHABLE set. Since D12 the
- * live set is a TEMP table on the pass's own reserved connection —
- * session-private, collision-proof by construction. This test now PINS that
+ * Under D12, the live set is a TEMP table on the pass's own reserved connection —
+ * session-private and collision-proof by construction. This test pins that
  * property: `gc()` is still exported with no lock, so any two callers (an
  * operator script, a second process, a retry) may overlap, and must not be able
  * to destroy anything reachable.
@@ -16,15 +12,14 @@
  * NOTHING and every clone must keep working. The verdict is a real `git clone`
  * plus `git fsck --strict`, and whether the clone's HEAD still matches the ref.
  *
- * Converted from `breakage/race--concurrent-gc.ts` (`--iters=25 --runs=150
- * --passes=2 --hangms=60000`). Probabilistic — the ORIGINAL defect reproduced
+ * Probabilistic — the observed defect reproduced
  * roughly 1 iteration in 10–30, so unlike the serve-window races the iteration
  * count here is a measured detection-power budget against a regression of a
  * specific fixed bug, and it is deliberately NOT trimmed (ruling-5 trims were
  * applied to the rest of the family; this file holds at 25 until a mutation
  * experiment — re-introducing the shared-live-set defect and measuring the
  * catch rate — says a smaller count keeps the pin). The swept pass-stagger IS
- * calibrated: the source froze absolute milliseconds ([0..70]ms), which tie
+ * calibrated: absolute milliseconds would tie
  * the overlap shapes to one machine's gc speed; each run instead times one
  * un-raced pass and sweeps the second pass's start across FRACTIONS of that
  * measured wall. The per-iteration pre-race state (full history, tier built,

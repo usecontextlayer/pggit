@@ -42,8 +42,8 @@ export type Report = {
 			runs: number[]
 			rtt: RttEvidence
 		}
-		/** Postgres round-trips per clone — measured at the driver boundary, blind to
-		 *  table shape. The single number that most directly tracks the RTT problem. */
+		/** Postgres query executions per clone — measured at the driver boundary and
+		 *  blind to table shape. */
 		db: { queryCount: number; dbMs: number }
 		/** Protocol output: framed bytes on the wire + objects in the served pack. */
 		wire: { bytes: number; objectsServed: number }
@@ -264,7 +264,7 @@ export function assembleReport(input: AssembleInput): Report {
 		notes: [
 			"contract = Layer-1, implementation-agnostic. Survives a code/schema restructure; claim gains HERE.",
 			"diagnostics = Layer-2, coupled to the current design (phase split and implementation counters). Use them to explain a contract result, never as the result itself.",
-			"contract.db.queryCount is measured at the Postgres driver boundary, so it is blind to table shape and is the cleanest single readout of the per-object round-trip cost the rtt sweep exposes.",
+			"contract.db.queryCount is measured at the Postgres driver boundary, so it is blind to table shape and counts the query work whose serialized latency the rtt sweep exposes; it does not claim one network round-trip per execution.",
 			"memory.peakRssBytes is sampled off-thread, so it captures peaks during synchronous main-thread pack work that a main-thread timer would miss.",
 			"memory.peakRssBytes is the WARM-process RSS ceiling: the harness serves several clones in one process and RSS is sticky (the allocator reuses/holds pages), so it is cumulative — representative of a warm long-running server, NOT one clone's footprint.",
 			"memory.peakByField is the absolute warm-process peak of heapUsed/external/arrayBuffers during the measured clone. It is main-thread sampled and may understate a peak inside a synchronous block; it is composition evidence, not a per-clone delta.",

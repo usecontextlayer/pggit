@@ -487,10 +487,8 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 			if (validatedHaves.length === 0) return { acks: [], common: [] }
 			const id = await repos.resolveRepoId(repoId)
 			if (id === null) return { acks: [], common: [] }
-			// Batched: the have list is CLIENT-sized, one bind per oid,
-			// and the wire caps a statement at 65,534 binds — this was the store's last
-			// unbatched client-sized value list, and it 500'd exactly at the wall
-			// (pg-corrupt--fetch-haves-value-list).
+			// Batched because the have list is CLIENT-sized and spends one bind per oid;
+			// the wire caps a statement at 65,534 binds.
 			const present = new Set<string>()
 			for (const batch of batches(validatedHaves, PACK_BATCH)) {
 				const rows = await db
@@ -552,7 +550,8 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		 * ancestry reaches that marked set — a directional walk into
 		 * {haves ∪ parents(haves)}, NOT a merge-base test. The one-step parent
 		 * widening is what readies a SIBLING have (its parent is the shared
-		 * base on the want's chain — neg01) without over-readying a have whose
+		 * base on the want's chain, as pinned by `fetch/ready-sibling.test.ts`)
+		 * without over-readying a have whose
 		 * fork point lies deeper (git keeps negotiating there, and so do we).
 		 * Non-commit wants are SKIPPED, as git skips them — a blob want must
 		 * not hold negotiation open forever.
@@ -696,7 +695,7 @@ export function createObjectStore(pg: Sql, repoResolver?: RepoResolver) {
 		})
 		// Stamp the repo's GC-activity watermark AFTER the ingest commits — never inside
 		// the txn, where `clock_timestamp()` would be read BEFORE the commit. These objects
-		// are reclaim candidates (a force-commit orphans the prior snapshot the instant the
+		// are reclaim candidates (a force-commit orphans the prior tip's graph the instant the
 		// ref moves), so the self-scheduling drain must judge this repo eligible
 		// (gc-scheduler.ts §2). Stamping post-commit guarantees `last_pushed_at` is never
 		// earlier than the commit of the orphan it announces, so a drain reading

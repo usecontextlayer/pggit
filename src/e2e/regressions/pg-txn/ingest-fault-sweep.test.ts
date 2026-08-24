@@ -1,6 +1,5 @@
 /**
- * BREAKAGE (pg-txn) — a cancel on every statement of the ingest transaction.
- * Converted from `breakage/pg-txn--ingest-fault-sweep.ts`; its rationale verbatim:
+ * Postgres transaction regression — a cancel on every statement of the ingest transaction.
  *
  * HUNT: does the §10.1 object⟺derived-rows invariant survive a fault landing on
  * each statement of `insertObjects`' transaction — and on the post-commit stamp
@@ -33,14 +32,11 @@
  *   5. a retry push through a healthy connection succeeds, and a fresh mirror
  *      clone is fsck-clean and carries every source object
  *
- * One observation the source printed as a NOTE rather than a verdict, kept here
- * because it is real and deliberately NOT asserted: a cancelled push can leave
+ * One real observation is deliberately NOT asserted: a cancelled push can leave
  * objects committed while `repos.last_pushed_at` is still NULL — those objects are
  * invisible to the GC drain until some later push stamps that repo.
  *
- * The source script exits 0 when the invariants hold and every case converges — a
- * NEGATIVE result, so this suite is expected GREEN. The negative IS the finding:
- * these ingest fault points do not tear the object⟺derived-rows invariant.
+ * These ingest fault points must not tear the object⟺derived-rows invariant.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -341,7 +337,7 @@ describe("regressions/pg-txn — a cancel on every ingest statement", () => {
 	})
 
 	// Only points whose retry landed can be judged on the clone — a failed retry is
-	// already reported by the test above, exactly as the source script's `continue`
+	// already reported by the test above; continuing preserves the remaining fault cases
 	// stopped it from reporting the same cause twice.
 	it("the converged repo clones fsck-clean with every source object", () => {
 		const converged = results.filter((r) => r.retryOk)

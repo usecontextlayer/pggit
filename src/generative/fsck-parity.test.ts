@@ -35,7 +35,7 @@
  * recorded class to be realized BY A DIVERGENT CANDIDATE, so a recorded entry
  * cannot rot into a permanently-unexercised excuse.
  *
- * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
+ * Executable spec with a pinned seed.
  * HERMETIC: no Postgres, no server — one scratch repo + one `git fsck` per candidate.
  */
 import { cpSync, mkdtempSync, rmSync } from "node:fs"

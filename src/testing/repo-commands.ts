@@ -18,9 +18,9 @@
  * Every skip is a silent `return`, so a regression that makes a whole command kind
  * unreachable (branches never recorded, merges always skipped, tags never created)
  * would degrade every candidate in EVERY consuming differential to a linear
- * single-branch repo without reddening any of them. `commands.test.ts` is where that
- * is caught: it folds each candidate's realized shape in from the real-git oracle and
- * floors the corpus, so the silent-skip design cannot silently empty the corpus.
+ * single-branch repo without reddening any of them. `repo-commands.test.ts` catches
+ * that by folding each candidate's realized shape in from the real-git oracle and
+ * flooring the corpus, so the silent-skip design cannot silently empty the corpus.
  *
  * The differential ASSERTION is NOT here — it runs in the §7 properties AFTER the
  * whole list is replayed. This module only manufactures the candidate repo.
@@ -120,7 +120,8 @@ const commandArb: fc.Arbitrary<GenCommand> = fc.oneof(
 	},
 	// Weight 2, not 1, BECAUSE of `divergeAndMerge` below: that macro adds two
 	// branches' worth of refs to a candidate, and consumers that keep a ref SUBSET
-	// (gc.spec's PBT-1/PBT-3 keep index 0 of the name-sorted ref list plus a mask)
+	// (`generative/gc.test.ts`'s PBT-1/PBT-3 keep index 0 of the name-sorted ref
+	// list plus a mask)
 	// see `refs/tags/*` pushed down that list by every extra `refs/heads/*`. At
 	// weight 1 the annotated-tag-tip corner those properties floor dropped from 5
 	// candidates in 30 to 2; at weight 2 it is 7. Measured, not guessed.
@@ -134,9 +135,8 @@ const commandArb: fc.Arbitrary<GenCommand> = fc.oneof(
 	},
 	// Weighted like the other structural commands. A `merge` drawn on its own
 	// almost never lands a merge COMMIT (it needs six specific commands in the
-	// right order first — measured: zero merge commits over the whole pinned
-	// corpus before this macro existed), so the multi-parent dimension the six
-	// consuming differentials advertise comes from here.
+	// right order first), so the multi-parent dimension the six consuming
+	// differentials advertise comes from here.
 	{
 		arbitrary: fc.record({
 			kind: fc.constant<"divergeAndMerge">("divergeAndMerge"),
@@ -156,8 +156,8 @@ export function repoCommands(maxCommands: number): fc.Arbitrary<GenCommand[]> {
 }
 
 function writeContent(dir: string, path: string, content: ContentSpec): void {
-	const full = join(dir, path)
-	mkdirSync(dirname(full), { recursive: true })
+	const fullPath = join(dir, path)
+	mkdirSync(dirname(fullPath), { recursive: true })
 	let data: Buffer
 	switch (content.kind) {
 		case "empty":
@@ -172,7 +172,7 @@ function writeContent(dir: string, path: string, content: ContentSpec): void {
 		default:
 			assertNever(content)
 	}
-	writeFileSync(full, data)
+	writeFileSync(fullPath, data)
 }
 
 /** The offset into NAMES of the first name at-or-after `from` that is not yet a
@@ -180,10 +180,10 @@ function writeContent(dir: string, path: string, content: ContentSpec): void {
  * merge base is that tip. */
 type FreeName = { kind: "available"; index: number } | { kind: "exhausted" }
 
-function freeName(model: RepoModel, from: number): FreeName {
+function freeName(model: RepoModel, startingIndex: number): FreeName {
 	for (let i = 0; i < NAMES.length; i++) {
-		if (!model.existingBranches.has(cyclicAt(NAMES, from + i))) {
-			return { index: from + i, kind: "available" }
+		if (!model.existingBranches.has(cyclicAt(NAMES, startingIndex + i))) {
+			return { index: startingIndex + i, kind: "available" }
 		}
 	}
 	return { kind: "exhausted" }
@@ -198,9 +198,9 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 			return
 		}
 		case "deleteFile": {
-			const full = join(model.dir, cyclicAt(PATHS, cmd.idx))
-			if (existsSync(full)) {
-				rmSync(full)
+			const fullPath = join(model.dir, cyclicAt(PATHS, cmd.idx))
+			if (existsSync(fullPath)) {
+				rmSync(fullPath)
 				model.dirty = true
 			}
 			return
@@ -215,15 +215,15 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 				model.commitSeq++
 				model.commitCount++
 				model.existingBranches.add(model.currentBranch)
-			} catch (e) {
+			} catch (error) {
 				// The only expected failure is a net no-op ("nothing to commit"); the
 				// tree is then already == HEAD. Anything else is a real error — rethrow.
 				if (
-					!(e instanceof GitCommandError) ||
-					e.code <= 0 ||
-					!/nothing to commit/.test(e.stdout + e.stderr)
+					!(error instanceof GitCommandError) ||
+					error.code <= 0 ||
+					!/nothing to commit/.test(error.stdout + error.stderr)
 				) {
-					throw e
+					throw error
 				}
 			}
 			model.dirty = false
@@ -275,15 +275,15 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 				// A fast-forward moves HEAD to the target's already-counted commit; a
 				// distinct result is a newly-created merge commit and must count as such.
 				if (after !== before && after !== targetTip) model.commitCount++
-			} catch (e) {
+			} catch (error) {
 				// A content conflict is expected with random divergent branches: abort
 				// cleanly and skip. Anything else is real — rethrow after aborting.
 				// Every nonzero git exit is a GitCommandError, so the conflict must be
 				// PROVEN (unmerged index entries), not inferred from the error type —
 				// else broken config, corruption, and command regressions all skip.
-				if (!(e instanceof GitCommandError) || e.code <= 0) throw e
+				if (!(error instanceof GitCommandError) || error.code <= 0) throw error
 				const unmerged = await spawnGit(["ls-files", "-u"], { cwd: model.dir })
-				if (unmerged.stdout.trim() === "") throw e
+				if (unmerged.stdout.trim() === "") throw error
 				await spawnGit(["merge", "--abort"], { cwd: model.dir })
 			}
 			return
@@ -336,15 +336,15 @@ async function step(model: RepoModel, cmd: GenCommand): Promise<void> {
 				sibling = cyclicAt(NAMES, free.index)
 				await step(model, { idx: free.index, kind: "branch" })
 			}
-			const branchIdx = (name: string) => [...model.existingBranches].indexOf(name)
-			await step(model, { idx: branchIdx(sibling), kind: "checkout" })
+			const branchIndex = (name: string) => [...model.existingBranches].indexOf(name)
+			await step(model, { idx: branchIndex(sibling), kind: "checkout" })
 			await step(model, {
 				content: { kind: "text", value: `side ${model.commitSeq}\n` },
 				kind: "writeFile",
 				path: sidePath,
 			})
 			await step(model, { kind: "commit" })
-			await step(model, { idx: branchIdx(origin), kind: "checkout" })
+			await step(model, { idx: branchIndex(origin), kind: "checkout" })
 			await step(model, {
 				content: { kind: "text", value: `ours ${model.commitSeq}\n` },
 				kind: "writeFile",

@@ -1,10 +1,8 @@
 /**
- * The hazard the design names but nothing tests: "Base selection is contextual, not
- * intrinsic (a later branch can introduce new same-path pairs), so 'packed once, never
- * revisited' is an ENFORCED policy" (D4). Every existing check pushes one linear
- * history or the whole mirror at once — neither ever hands repack a PARTIAL DAG,
- * freezes anchors over it, and then extends the DAG with a branch whose first-parent
- * lineage interleaves with trees already anchored.
+ * Base selection is contextual: a later branch can introduce new same-path pairs,
+ * while existing encodings remain frozen. This probe hands repack a partial DAG,
+ * freezes anchors over it, then extends the DAG with a branch whose first-parent
+ * lineage interleaves with already-encoded trees.
  *
  * This does exactly that, on REAL repository history: push the mirror's refs ONE AT A
  * TIME with a repack between every push, in two different orders, and check both
@@ -12,7 +10,7 @@
  * sequence. Two orders because a frozen policy that is order-dependent in a way that
  * matters would show up as one order diverging and the other not.
  *
- * It also checks the design's central read-side invariant after the client has indexed the received pack: `git verify-pack -v` prints each delta entry's chain depth, so "depth <= 1, structurally" (D2/D9) is directly falsifiable. This is client-storage evidence, not a raw-wire byte measurement; thin-pack indexing may append external bases.
+ * It also checks the structural depth-one bound after the client has indexed the received pack. `git verify-pack -v` prints each delta entry's chain depth, making the bound directly falsifiable. This is client-storage evidence, not a raw-wire byte measurement; thin-pack indexing may append external bases.
  *
  * A perf harness rather than a vitest e2e test because its corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for — the same reason `perf/probes/delta-corpus.ts` lives here.
  *
@@ -118,8 +116,7 @@ async function runOrder(
 			return { state: "push-failed" }
 		}
 		accepted++
-		// repack after EVERY ref: anchors freeze over a partial DAG, then the next
-		// ref extends it. This is the D4 stress.
+		// Repack after every ref so anchors freeze over a partial DAG before it extends.
 		const r = await repackExactly(db.sql, repoId)
 		totalW += r.wholes
 		totalD += r.deltas

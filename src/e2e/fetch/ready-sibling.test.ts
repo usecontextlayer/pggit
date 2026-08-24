@@ -1,5 +1,5 @@
 /**
- * neg01 — `readyToGiveUp` must ready a SIBLING common have, like git's
+ * `readyToGiveUp` must ready a SIBLING common have, like git's
  * `ok_to_give_up`. An ACKed have marks itself and its direct parents common, and a
  * want is satisfiable once its own ancestry reaches that common region — so a have
  * that shares a base with the want but is not on its ancestor chain still readies.
@@ -12,11 +12,8 @@
  * expectation, so a shift in git's readying rules fails this test instead of aging
  * out of a comment.
  *
- * REGRESSION HISTORY: pggit's original check asked whether the want descends
- * from a BARE common, so a sibling have never readied and every such fetch
- * cost an extra round; this file was the parked expected-RED repro. Fixed
- * 2026-08-19 with git's exact `ok_to_give_up`: each ACKed have marks itself
- * AND ITS DIRECT PARENTS `THEY_HAVE`, and the want's ancestry must reach that
+ * Git's exact `ok_to_give_up` semantics require each ACKed have to mark itself
+ * AND ITS DIRECT PARENTS `THEY_HAVE`; the want's ancestry must reach that
  * set — the parent step is precisely what readies the sibling (c1 here) while
  * a deeper fork keeps negotiating, matching canonical git in both directions.
  */
@@ -37,7 +34,7 @@ import { spawnGit } from "@/testing/spawn-git"
 import { ackSection, spawnUploadPack } from "@/testing/upload-pack-oracle"
 import { fetchRequest } from "@/testing/wire-fetch"
 
-describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (git ok_to_give_up)", () => {
+describe("readyToGiveUp sends `ready` for a sibling common have", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
@@ -51,10 +48,10 @@ describe("neg01 — readyToGiveUp must send `ready` for a sibling common have (g
 		const refs = createRefStore(db.sql)
 		const projection = createRepoFileProjection(db.sql)
 		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
-		url = `http://127.0.0.1:${server.port}/neg01`
+		url = `http://127.0.0.1:${server.port}/ready-sibling`
 
 		// main: c1 ← c2 ← c3.  feature (off c1): f1 — a SIBLING, NOT an ancestor of c3.
-		src = mkdtempSync(join(tmpdir(), "pggit-neg01-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-ready-sibling-source-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		for (const v of ["1", "2", "3"]) {
 			writeFileSync(join(src, "a.txt"), `${v}\n`)

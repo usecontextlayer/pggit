@@ -1,12 +1,11 @@
 /**
- * PROBE: how many Postgres round-trips does ONE repack pass take, and what does
+ * PROBE: how many Postgres query executions does ONE repack pass take, and what does
  * that cost when the database is not on loopback?
  *
- * Design concern C3 carries an UNVERIFIED estimate ("14k reads × ~30 ms ≈ 7 min"). This probe invokes `createRepack` directly — the production drain currently runs GC only — and measures the multiplier instead of guessing it. A porsager client built with the driver's public `debug` hook counts each query execution exactly without touching pggit internals. The same is done for a full clone off the wire and for one GC pass, so explicit maintenance work can be compared with the serve path.
+ * This probe invokes the exported host-driven repack directly. A porsager client built with the driver's public `debug` hook counts query executions without touching pggit internals. The same is done for a full clone off the wire and for one GC pass, so explicit maintenance work can be compared with the serve path.
  *
- * The modeled columns are count × RTT — the honest lower bound for a serialized
- * request/response workload (every read here is awaited before the next is
- * issued).
+ * The modeled columns multiply query count by an assumed RTT. They model latency
+ * rather than claiming that every observed query execution was a network round-trip.
  *
  *   npx tsx perf/probes/perf/repack-roundtrips.ts [--sizes=250,500,1000,2000]
  */
@@ -195,7 +194,7 @@ async function main(): Promise<void> {
 	const rows: Row[] = []
 	for (const n of SIZES) rows.push(await measure(n))
 
-	console.log("# Postgres round-trips per explicit operation (append-only repo)\n")
+	console.log("# Postgres query executions per explicit operation (append-only repo)\n")
 	console.log(
 		table(
 			[
@@ -221,10 +220,14 @@ async function main(): Promise<void> {
 		),
 	)
 	console.log(
-		`\nbusiest repack statements at the largest size:\n  ${requiredAt(rows, rows.length - 1, "largest repack-roundtrip measurement").top}`,
+		`\nbusiest repack statements at the largest size:\n  ${requiredAt(rows, rows.length - 1, "largest repack query-execution measurement").top}`,
 	)
 
-	const last = requiredAt(rows, rows.length - 1, "largest repack-roundtrip measurement")
+	const last = requiredAt(
+		rows,
+		rows.length - 1,
+		"largest repack query-execution measurement",
+	)
 	const modeled = (last.repack * 30) / 60000
 	console.log(
 		`\nFAIL CONDITION: one repo's first repack modeled at 30 ms RTT exceeds ${MODELED_MINUTES_LIMIT} min.`,

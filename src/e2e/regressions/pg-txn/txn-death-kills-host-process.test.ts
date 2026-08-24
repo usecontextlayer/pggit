@@ -1,7 +1,5 @@
 /**
- * BREAKAGE (pg-txn) — a backend death inside `pg.begin` kills the host process.
- * Converted from `breakage/pg-txn--txn-death-kills-host-process.ts`; its rationale
- * verbatim:
+ * Postgres transaction regression — a backend death inside `pg.begin` must not kill the host process.
  *
  * FINDING: a Postgres backend that dies while ANY `pg.begin` transaction is open
  * kills the ENTIRE host process with an UNCATCHABLE TypeError — not a rejected
@@ -51,8 +49,7 @@
  * `tsconfig.json`'s `include` (`src/**`, `perf/**`, `manage.ts`), so a stray copy
  * can never break `tsc` — and removed in `afterAll`.
  *
- * The source script exited non-zero when a child died. The patched driver's live
- * contract is that a killed backend fails the request, never the host, so all four
+ * The driver's live contract is that a killed backend fails the request, never the host, so all four
  * modes below must remain green.
  */
 import { spawn } from "node:child_process"

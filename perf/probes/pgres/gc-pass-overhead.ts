@@ -1,26 +1,20 @@
 /**
- * pgres — WHAT DOES A GC PASS COST NOW, AND WHAT DOES IT LEAVE BEHIND?
+ * pgres — WHAT DOES A GC PASS COST, AND WHAT DOES IT LEAVE BEHIND?
  *
- * HISTORY (2026-08-16): this harness originally priced `sweepEncodings` (concern
- * C2) and the shared `gc_live_<id>` UNLOGGED staging table. D14 deleted the sweep
- * (the 0008 FK cascades do the tier's bookkeeping inside the object DELETEs) and
- * D12 replaced the shared staging table with a per-pass TEMP table on a reserved
- * connection. The measurements stay meaningful in their new roles:
+ * 1. Tier-presence overhead on a no-op pass — encoding rows are removed by
+ *    foreign-key cascades during object deletion, so the tier should add
+ *    approximately nothing to a pass that reclaims nothing. The paired same-repo
+ *    bound (≤15%) catches per-pass tier work.
  *
- * 1. Tier-presence overhead on a no-op pass — now a REGRESSION GUARD: with no
- *    sweep left, the tier's presence should add ~nothing to a pass that reclaims
- *    nothing. The paired same-repo bound (≤15%) must hold; it firing
- *    again means someone reintroduced per-pass tier work.
- *
- * 2. Staging-table catalog churn — still real, mechanism changed: a TEMP table is
- *    created and dropped per pass, and each cycle still writes and deletes rows in
+ * 2. Staging-table catalog churn — a TEMP table is created and dropped per pass,
+ *    and each cycle writes and deletes rows in
  *    the DATABASE's system catalogs (`pg_class`, `pg_attribute`, `pg_type`,
  *    `pg_depend`, …), which are shared by every schema and never touched by
  *    `maintain()`. Measured here as catalog rows churned per GC pass.
  *
  * Also asserted: after every fleet and scale pass, ZERO `gc_live_%` relations
  * remain in the harness's own schema (TEMP tables live in `pg_temp`, so any
- * survivor here means the design regressed to schema tables).
+ * survivor is an unexpected schema-scoped staging relation).
  *
  * NOISE: `pg_stat_sys_tables` counters are DATABASE-wide and this Postgres is
  * shared, so an idle control window of the same duration is measured and printed
@@ -32,7 +26,7 @@
  * production — the tier's presence adds more than
  * 15% to a no-op pass. The unpaired fleet arm above it is reported for context but
  * NOT bounded: its two halves run in blocks minutes apart, and this shared box
- * drifts by more than the effect, which flipped sign between runs.
+ * drifts by more than the effect.
  *
  *   npx tsx perf/probes/pgres/gc-pass-overhead.ts --passes=120 --repos=12
  */
@@ -157,7 +151,7 @@ async function main(): Promise<void> {
 			await requireFixture(pg, n, objects, tip, [])
 		}
 
-		// ── C2: the cost of a NO-OP pass, tier absent vs tier present ───────────
+		// ── cost of a NO-OP pass, tier absent vs tier present ───────────────────
 		// A pass over a repo with nothing unreachable reclaims nothing; what is left
 		// is the fixed cost — the TEMP live table, reachability plan, and object sweep.
 		const noop = async (rounds: number): Promise<number[]> => {
@@ -186,7 +180,7 @@ async function main(): Promise<void> {
 		const c1 = await catalogState(pg)
 
 		// Idle control window of the same duration — the ambient catalog churn from
-		// the sibling agents on this shared instance.
+		// concurrent workloads on this shared instance.
 		await sleep(bareMs)
 		const c2 = await catalogState(pg)
 
@@ -269,7 +263,7 @@ async function main(): Promise<void> {
 		)
 		const overhead = withTierMedian / bareMedian - 1
 		console.log(
-			`\ntier-presence overhead on a NO-OP pass (regression guard; the sweep itself is gone, D14): ${(overhead * 100).toFixed(0)}% (median ${bareMedian.toFixed(1)} → ${withTierMedian.toFixed(1)} ms)`,
+			`\ntier-presence overhead on a NO-OP pass: ${(overhead * 100).toFixed(0)}% (median ${bareMedian.toFixed(1)} → ${withTierMedian.toFixed(1)} ms)`,
 		)
 
 		console.log("\n## system-catalog churn (DATABASE-wide — noisy, control included)\n")
@@ -303,7 +297,7 @@ async function main(): Promise<void> {
 			),
 		)
 		console.log(
-			"\nEvery GC invocation creates and drops one `gc_live` TEMP table (D12; the old shared `gc_live_<id>` UNLOGGED table is gone). The create/drop cycle still churns catalog rows in pg_class/pg_attribute/pg_depend — shared by every repo and schema in the database, never vacuumed by `maintain()`. In production, the scheduler invokes GC only for repos eligible in that tick.",
+			"\nEvery GC invocation creates and drops one `gc_live` TEMP table. The create/drop cycle churns catalog rows in pg_class/pg_attribute/pg_depend — shared by every repo and schema in the database, never vacuumed by `maintain()`. The scheduler invokes GC only for repos eligible in that tick.",
 		)
 
 		// ── does the no-op sweep cost scale with the tier's SIZE? ───────────────

@@ -1,5 +1,5 @@
 /**
- * mod — non-UTF-8 filenames are REJECTED at push ingest (design D16).
+ * Non-UTF-8 filenames are REJECTED at push ingest (design D16).
  *
  * A git path is an arbitrary byte string (only NUL and `/` are forbidden). A
  * tree entry named `bad\xff\xfename.txt` is perfectly valid to canonical git and
@@ -7,10 +7,8 @@
  * entry-name bytes at the ingest boundary (`validateObject`, GitFormatError
  * `non-utf8-path`), so the queryable `repo_file path text` projection is EXACT.
  *
- * This replaces the previous contract (byte-faithful objects + a documented
- * lossy U+FFFD projection, decision 2026-06-22): the lossy decode was not
- * injective, so two byte-distinct paths could collapse onto one projection row
- * and the second was SILENTLY dropped from the published read surface (see
+ * A lossy U+FFFD decode would not be injective: two byte-distinct paths could
+ * collapse onto one projection row and one be SILENTLY dropped (see
  * `src/e2e/regressions/pg-corrupt/non-utf8-path-collision.test.ts`). Rejection at
  * the boundary removes that class instead of handling it.
  *
@@ -33,7 +31,7 @@ import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
-describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact", () => {
+describe("non-UTF-8 filename: rejected at ingest, projection stays exact", () => {
 	let isolated: IsolatedDb
 	let server: GitServer
 	let url: string
@@ -63,7 +61,7 @@ describe("mod — non-UTF-8 filename: rejected at ingest, projection stays exact
 	})
 
 	it("rejects the push at unpack and leaves nothing behind; a clean push then lands", async () => {
-		const src = mkdtempSync(join(tmpdir(), "mod-badutf-"))
+		const src = mkdtempSync(join(tmpdir(), "pggit-non-utf8-path-"))
 		dirs.push(src)
 		await spawnGit(["init", "--quiet", src])
 

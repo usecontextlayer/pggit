@@ -75,7 +75,6 @@ async function seedStore(
 	return { objectCount: allObjects.length, objects, refs }
 }
 
-/** One `git clone` over loopback; returns its wall time in ms. */
 async function cloneOnce(port: number, expectedOids: readonly Oid[]): Promise<number> {
 	return withTempDir("pggit-perf-clone-", async (dest) => {
 		const t0 = process.hrtime.bigint()

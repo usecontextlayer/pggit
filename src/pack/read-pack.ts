@@ -36,21 +36,21 @@ type Resolved = { type: GitObjectType; content: Buffer }
  */
 function inflateOne(buf: Buffer): Promise<{ data: Buffer; compressedLength: number }> {
 	return new Promise((resolve, reject) => {
-		const inf = createInflate()
+		const inflater = createInflate()
 		const chunks: Buffer[] = []
-		inf.on("data", (chunk: Buffer) => chunks.push(chunk))
-		inf.on("end", () =>
-			resolve({ compressedLength: inf.bytesWritten, data: Buffer.concat(chunks) }),
+		inflater.on("data", (chunk: Buffer) => chunks.push(chunk))
+		inflater.on("end", () =>
+			resolve({ compressedLength: inflater.bytesWritten, data: Buffer.concat(chunks) }),
 		)
-		inf.on("error", (e) =>
+		inflater.on("error", (error) =>
 			reject(
 				new GitFormatError(
 					"inflate-failed",
-					`pack: zlib inflate failed: ${e instanceof Error ? e.message : String(e)}`,
+					`pack: zlib inflate failed: ${error instanceof Error ? error.message : String(error)}`,
 				),
 			),
 		)
-		inf.end(buf)
+		inflater.end(buf)
 	})
 }
 
@@ -79,13 +79,13 @@ function readOffsetVarint(
 	buf: Buffer,
 	offset: number,
 ): { value: number; bytesRead: number } {
-	let b = buf.readUInt8(offset)
+	let byte = buf.readUInt8(offset)
 	let bytesRead = 1
-	let value = b & 0x7f
-	while (b & 0x80) {
-		b = buf.readUInt8(offset + bytesRead)
+	let value = byte & 0x7f
+	while (byte & 0x80) {
+		byte = buf.readUInt8(offset + bytesRead)
 		bytesRead += 1
-		value = (value + 1) * 128 + (b & 0x7f)
+		value = (value + 1) * 128 + (byte & 0x7f)
 	}
 	return { bytesRead, value }
 }
@@ -132,8 +132,11 @@ export async function readPack(
 		offset += bytesRead
 
 		if (type === PACK_OBJ_TYPE.OFS_DELTA) {
-			const { value: negOffset, bytesRead: ob } = readOffsetVarint(pack, offset)
-			offset += ob
+			const { value: negativeOffset, bytesRead: offsetBytesRead } = readOffsetVarint(
+				pack,
+				offset,
+			)
+			offset += offsetBytesRead
 			const { data, compressedLength } = await inflateOne(pack.subarray(offset))
 			count("bytesInflated", data.length)
 			offset += compressedLength
@@ -143,7 +146,11 @@ export async function readPack(
 			// The minimum lives HERE, at the wire boundary: our own encoder may
 			// legally produce a 2-byte program for an empty target internally.
 			validateDeltaProgram(data, size, start)
-			entries.set(start, { baseOffset: start - negOffset, delta: data, kind: "ofs" })
+			entries.set(start, {
+				baseOffset: start - negativeOffset,
+				delta: data,
+				kind: "ofs",
+			})
 		} else if (type === PACK_OBJ_TYPE.REF_DELTA) {
 			const baseOid = pack.subarray(offset, offset + 20).toString("hex")
 			offset += 20
@@ -200,36 +207,36 @@ export async function readPack(
 		return fetched
 	}
 
-	const record = (off: number, type: GitObjectType, content: Buffer): void => {
-		const obj: ParsedObject = { content, oid: computeOid(type, content), type }
-		resolved.set(off, obj)
-		byOid.set(obj.oid, obj)
+	const record = (entryOffset: number, type: GitObjectType, content: Buffer): void => {
+		const object: ParsedObject = { content, oid: computeOid(type, content), type }
+		resolved.set(entryOffset, object)
+		byOid.set(object.oid, object)
 	}
 
-	for (const off of order) {
-		const entry = entries.get(off)
-		if (entry?.kind === "base") record(off, entry.type, entry.content)
+	for (const entryOffset of order) {
+		const entry = entries.get(entryOffset)
+		if (entry?.kind === "base") record(entryOffset, entry.type, entry.content)
 	}
 
-	let pending = order.filter((off) => !resolved.has(off))
+	let pending = order.filter((entryOffset) => !resolved.has(entryOffset))
 	while (pending.length > 0) {
 		const stillPending: number[] = []
-		for (const off of pending) {
-			const entry = entries.get(off)
+		for (const entryOffset of pending) {
+			const entry = entries.get(entryOffset)
 			if (!entry || entry.kind === "base") continue
 			const base: Resolved | null =
 				entry.kind === "ofs"
 					? (resolved.get(entry.baseOffset) ?? null)
 					: (byOid.get(entry.baseOid) ?? (await fetchExternal(entry.baseOid)))
 			if (!base) {
-				stillPending.push(off)
+				stillPending.push(entryOffset)
 				continue
 			}
-			record(off, base.type, applyDelta(base.content, entry.delta))
+			record(entryOffset, base.type, applyDelta(base.content, entry.delta))
 		}
 		if (stillPending.length === pending.length) {
-			const off = stillPending[0] as number
-			const entry = entries.get(off)
+			const entryOffset = stillPending[0] as number
+			const entry = entries.get(entryOffset)
 			const base =
 				entry?.kind === "ref"
 					? entry.baseOid
@@ -242,5 +249,5 @@ export async function readPack(
 		pending = stillPending
 	}
 
-	return order.map((off) => resolved.get(off) as ParsedObject)
+	return order.map((entryOffset) => resolved.get(entryOffset) as ParsedObject)
 }

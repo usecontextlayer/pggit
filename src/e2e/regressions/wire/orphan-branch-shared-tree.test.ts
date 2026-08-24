@@ -1,7 +1,7 @@
 /**
  * WIRE — a tree whose repack anchor is NOT reachable from every commit that reaches
  * it (the cross-lineage shared-tree shape), fetched through a closure that excludes
- * the anchor. (Converted from `breakage/wire--orphan-branch-shared-tree.ts`.)
+ * the anchor.
  *
  * Git trees are content-addressed, so one tree oid can sit in unrelated histories.
  * Repack fixes that tree's delta base once, from whichever lineage the topo walk

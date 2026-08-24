@@ -18,9 +18,8 @@
  * or a push git called successful whose ref is left pointing at objects that no
  * longer exist (a permanently unclonable repo).
  *
- * Converted from `breakage/race--deleterepo.ts` (`--iters=20 --runs=120`).
- * Probabilistic. The swept delete-start delays are NOT the source's: it froze
- * one absolute-millisecond table ([0..120]ms) across three actors whose walls
+ * Probabilistic. Fractional delete-start delays replace an absolute-millisecond
+ * table across three actors whose walls
  * differ by multiples, so on any box the delete crowded into each actor's head
  * and never raced its later phases. Each run instead times one un-raced
  * instance of EACH actor (a clone, a repack, a push) and sweeps the delete

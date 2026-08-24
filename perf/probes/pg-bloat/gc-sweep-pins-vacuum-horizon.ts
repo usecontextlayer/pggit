@@ -1,6 +1,6 @@
 /**
- * pg-bloat/gc-sweep-pins-vacuum-horizon — the drain's own GC sweep disables the
- * autovacuum it delegates cleanup to.
+ * pg-bloat/gc-sweep-pins-vacuum-horizon — can a GC sweep pin the vacuum horizon
+ * long enough to delay the autovacuum it delegates cleanup to?
  *
  * THE MECHANISM. `gc.ts` deliberately skips VACUUM on the drain's cadence and
  * relies on the leaf partitions' autovacuum reloptions to reclaim the dead tuples
@@ -11,7 +11,7 @@
  * table in every database.
  *
  * Two windows hold snapshots open: the live plan's `originClosure` walk (one
- * REPEATABLE READ transaction across the reachable closure, spine S2/S6) and each
+ * REPEATABLE READ transaction across the reachable closure) and each
  * `sweepObjects` batch against the pass-local `gc_live` TEMP table:
  *
  *     with victims as (select … from git_object o where not exists

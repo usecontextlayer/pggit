@@ -11,13 +11,10 @@ import {
 } from "@/testing/gc-helpers"
 
 /**
- * Denied-push reclamation + the deny-non-FF push contract
- * (originally `docs/2026-06-24-force-commit-gc-design.md` §4: GC-4, FC-1, FC-2 —
- * re-oriented 2026-07-05 when receive-pack grew the deny-non-FF policy).
+ * Denied-push reclamation + the deny-non-FF push contract (GC-4, FC-1, FC-2).
  *
- * The old §1 force-commit workload (a ref moving to a NON-descendant each turn)
- * is retired: refs only advance now. The orphan source in the deny-non-FF era is
- * the DENIED push — the wire protocol ingests the pack before the policy pass,
+ * The orphan source is a DENIED push: the wire protocol ingests the pack before
+ * the policy pass,
  * so a refused push leaves its objects in Postgres as unreachable garbage while
  * the ref stays untouched. GC reclaims those orphans once they age past `grace`,
  * so steady-state storage tracks the CURRENT reachable tree rather than growing

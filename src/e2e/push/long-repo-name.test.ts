@@ -1,5 +1,5 @@
 /**
- * nam03 (naming-isolation) — an over-long, INCOMPRESSIBLE repo name is rejected
+ * An over-long, INCOMPRESSIBLE repo name is rejected
  * by the Postgres btree limit on `repos_name_key` rather than by a boundary-level
  * length check. pggit has NO repo-name length validation: the name only enters via
  * the URL path and is inserted verbatim by `repos.ensureRepoId`. Whether a long
@@ -9,7 +9,7 @@
  * maximum 2704" and the INSERT throws inside the receive-pack ingest try/catch.
  *
  * That rejection is LOUD and NON-CORRUPTING — exactly the fail-CLEAN contract this
- * test LOCKS (like a10/a12), NOT a corruption bug:
+ * test LOCKS, NOT a corruption bug:
  *   - the push FAILS non-zero (`[remote rejected] ... (unpacker error)`), it does
  *     not silently half-succeed;
  *   - it is reported IN-BAND: git parsed a valid report-status, so the server
@@ -19,13 +19,9 @@
  *   - the server stays HEALTHY — a subsequent normal push to a short-named repo
  *     succeeds and round-trips.
  *
- * GREEN today (the fail-clean contract holds). It would RED if the over-long name
- * ever (a) silently half-inserts a repo row, (b) crashes the request to a 500 /
- * dropped connection, or (c) wedges the server for later pushes.
- *
  * KNOWN QUALITY GAP (intentionally NOT asserted as a hard contract here, so this
  * test stays GREEN and a clean fix doesn't need to touch it): the rejection reason
- * is currently a raw leaked PostgresError ("index row size 2816 exceeds btree
+ * is a raw leaked PostgresError ("index row size 2816 exceeds btree
  * version 4 maximum 2704 ...") framed as an `unpack` failure, when the real cause
  * is repo-name-too-long. A boundary-level repo-name length check producing a clean
  * message at the right layer is the recommended follow-up.
@@ -50,13 +46,13 @@ import { attemptGit, spawnGit } from "@/testing/spawn-git"
  * yields a string with no repeated block, so the btree index tuple cannot
  * be compressed under the 2704-byte ceiling — this is what trips `repos_name_key`.
  * (A repeated-block name of the same length would compress and insert fine, which
- * is exactly why the ceiling is content-dependent.) ~2800 hex chars + "nam-".
+ * is exactly why the ceiling is content-dependent.) ~2800 hex chars plus a prefix.
  */
-describe("nam03 — over-long incompressible repo name fails clean (in-band, atomic, server-healthy)", () => {
+describe("over-long incompressible repo name fails cleanly", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
-	const longName = `nam-${deterministicFiller("nam03-incompressible", 2800)}`
+	const longName = `long-${deterministicFiller("incompressible-repo-name", 2800)}`
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
@@ -65,7 +61,7 @@ describe("nam03 — over-long incompressible repo name fails clean (in-band, ato
 		const projection = createRepoFileProjection(db.sql)
 		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
 
-		src = mkdtempSync(join(tmpdir(), "pggit-nam03-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-long-repo-name-source-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		writeFileSync(join(src, "a.txt"), "alpha\n")
 		await spawnGit(["add", "."], { cwd: src })
@@ -102,7 +98,7 @@ describe("nam03 — over-long incompressible repo name fails clean (in-band, ato
 	})
 
 	it("stays healthy: a normal short-named push afterward still succeeds and round-trips", async () => {
-		const url = `http://127.0.0.1:${server.port}/nam03ok`
+		const url = `http://127.0.0.1:${server.port}/short-repo-name`
 		// Must NOT throw — the earlier rejection did not wedge the server.
 		await spawnGit(["push", url, "main"], { cwd: src })
 

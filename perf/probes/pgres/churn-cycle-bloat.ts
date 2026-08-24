@@ -6,22 +6,20 @@
  * N new commits, move `refs/heads/main` to the new tip (orphaning the previous
  * round), GC with `graceSeconds: 0`, then optionally repack. The LIVE set is
  * CONSTANT round over round — the same base plus one round's worth — so every
- * monotone increase in physical bytes is bloat, not data. The current production
- * scheduler invokes GC only; this harness composes repack explicitly in modes A/B.
+ * monotone increase in physical bytes is bloat, not data. The built-in scheduler
+ * invokes GC only; this harness models host-driven repack composition in modes A/B.
  *
  * Three modes, each in its own schema, so the tier's cost is isolated by control:
- *   A  repack + gc(maintain: true)     — an explicit direct-call maintenance path.
- *   B  repack + gc(maintain: false)    — a candidate GC-then-repack composition;
- *                                        it is not wired into the scheduler today.
- *   C  NO repack + gc(maintain: false) — the current production scheduler's GC
- *                                        shape, and the tier-absent control.
+ *   A  gc(maintain: true) → repack   — host composition with explicit vacuum.
+ *   B  gc(maintain: false) → repack  — host composition without explicit vacuum.
+ *   C  gc(maintain: false) only      — built-in scheduler shape and tier-absent control.
  *
  * Comparators inside every mode: `git_object` (same schema, same rounds, same
  * reloptions family — and `gc.ts maintain()` vacuums both it and the encoding
  * tier), and a real local git repo taking the identical force-update with
  * `git gc --prune=now` each round.
  *
- * SHARED-INSTANCE CAVEAT, measured per round: sibling agents hold REPEATABLE READ
+ * SHARED-INSTANCE CAVEAT, measured per round: other backends hold REPEATABLE READ
  * snapshots on this instance (GC's own closure walk does), which holds back the
  * global xmin horizon and makes VACUUM unable to remove recently-dead tuples. The
  * `xmin lag` column reports it. Every comparison here is INTERNAL to one round —
@@ -109,19 +107,19 @@ type Mode =
 const MODES: Mode[] = [
 	{
 		key: "A",
-		label: "A  repack + gc(maintain: true)     — explicit direct-call path",
+		label: "A  gc(maintain: true) → repack   — host composition with vacuum",
 		maintain: true,
 		repack: true,
 	},
 	{
 		key: "B",
-		label: "B  repack + gc(maintain: false)    — candidate composition (not wired)",
+		label: "B  gc(maintain: false) → repack  — host composition without vacuum",
 		maintain: false,
 		repack: true,
 	},
 	{
 		key: "C",
-		label: "C  NO repack + gc(maintain: false) — current scheduler; tier absent",
+		label: "C  gc(maintain: false) only      — built-in scheduler; tier absent",
 		maintain: false,
 		repack: false,
 	},
@@ -185,7 +183,7 @@ function tailGrowthPerLiveByte(rows: Row[]): number {
 const phys = (r: Row): number => r.encHeap + r.encToast + r.encIdx
 
 /** Seconds the OLDEST client backend has been holding a transaction snapshot — the
- * instance-wide xmin horizon lag. Shared: this is the sibling agents' load. */
+ * instance-wide xmin horizon lag, including other workloads on the shared database. */
 async function xminLag(pg: Sql): Promise<number> {
 	const [r] = await pg<{ lag: string | null }[]>`
 		select coalesce(max(extract(epoch from (clock_timestamp() - xact_start))), 0)::int::text as lag
@@ -257,8 +255,7 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			>`select count(*)::text as n from git_object`
 			if (!beforeGc) throw new Error(`${mode.key} round ${r}: missing pre-GC census`)
 
-			// GC then optional repack — explicit harness composition (design D5).
-			// The current production scheduler stops after GC.
+			// Model the host composition explicitly; the built-in scheduler stops after GC.
 			const g = await gc.gc(REPO, { graceSeconds: 0, maintain: mode.maintain })
 			const p = mode.repack ? await repack.repack(REPO) : { deltas: 0, wholes: 0 }
 			const liveObjects = [...baseObjects, ...roundObjects]

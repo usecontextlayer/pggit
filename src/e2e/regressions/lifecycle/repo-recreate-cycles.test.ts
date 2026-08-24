@@ -1,5 +1,5 @@
 /**
- * Lifecycle breakage — repo deletion and recreation, five cycles, with components
+ * Lifecycle regression — repo deletion and recreation, five cycles, with components
  * built FRESH each cycle (so the stale-resolver defect covered by
  * `repo-recreate-silent-noop-repack` is out of the way and only
  * data-level resurrection is under test).
@@ -12,8 +12,6 @@
  *
  * Full scale: 90 seed commits, five delete/recreate cycles.
  *
- * Originated as breakage probe `lifecycle--repo-recreate-cycles.ts` (exit 1 when
- * a cycle resurrected state from a previous incarnation); fixed.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -51,7 +49,7 @@ describe("regressions/lifecycle — repo recreate cycles", () => {
 
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-cycles-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-repo-recreate-cycles-"))
 		const dir = (name: string): string => join(root, name)
 
 		const src = dir("src")

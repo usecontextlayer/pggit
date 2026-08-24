@@ -2,12 +2,9 @@
  * WIRE — the ORDER pggit emits deltas in, and the client-side resolver that order
  * stresses.
  *
- * Before the wholes-first fix, `buildPack` emitted in closure-discovery order, so
- * newer deltas preceded the older anchors they referenced. The originating probe
- * measured that on the append-only shape this work targets: 100% of served
- * REF_DELTAs preceded their base, where canonical git's own packs were 0%. That
- * ordering is legal (REF_DELTA resolution is by OID, not offset) but pathological
- * for client-side resolution. This test pins the fixed emission order.
+ * Closure-discovery order can put newer deltas before the older anchors they
+ * reference. That ordering is legal (REF_DELTA resolution is by OID, not offset)
+ * but pathological for client-side resolution. This test pins wholes-first output.
  *
  * So this file does two things:
  *   1. Measures the ratio and requires that NO majority of served deltas precede
@@ -19,8 +16,6 @@
  *      no other test reaches it. Both a full clone and a small incremental fetch
  *      are forced down that path.
  *
- * Originated as breakage probe `wire--delta-before-base-ordering.ts`, which
- * measured the delta-ahead-of-base ratio; fixed.
  */
 import { statSync } from "node:fs"
 import { join } from "node:path"

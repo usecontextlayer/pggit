@@ -16,7 +16,7 @@ Drives a **real `git clone`** over loopback against the **in-process** server, c
 
 ```sh
 pnpm run perf -- --scenario=markdown          # the target workload (many small files)
-pnpm run perf -- --scenario=tiny --rtt=200    # expose per-query round-trip cost
+pnpm run perf -- --scenario=tiny --rtt=200    # expose per-query latency sensitivity
 pnpm run perf -- --scenario=adversarial       # many refs / deep history
 ```
 

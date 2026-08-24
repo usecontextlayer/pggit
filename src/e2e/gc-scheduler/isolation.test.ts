@@ -15,9 +15,7 @@
  * deterministic with `graceSeconds: 0` + `ageObjects`, never a wall-clock sleep;
  * concurrency is exercised (`concurrency: 4`) but only its OUTCOME is asserted.
  *
- * ORIGINATED as the TDD suite written against a throwing `createGcScheduler` stub
- * and a store that did not yet stamp `repos.last_pushed_at` — so no repo was even
- * judged eligible. Both landed per §6; this is their regression gate.
+ * These cases pin scheduler isolation and eligibility under §6.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createGcScheduler } from "@/store/gc-scheduler"

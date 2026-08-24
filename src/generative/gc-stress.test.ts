@@ -51,9 +51,7 @@
  * scale (chain depth, files, nesting, refs, orphan-set size) after `fc.assert` so the
  * deep/wide reach is VISIBLE.
  *
- * Originated as the TDD spec for GC at scale (§4/§8) and ran RED against a throwing
- * stub — the LARGE setup completed and the first `gc()` threw; it now pins the shipped
- * contract.
+ * This property pins the shipped GC contract at scale.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

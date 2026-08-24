@@ -139,7 +139,7 @@ describe("repack × crash — an interrupted pass and what it leaves behind", ()
 
 	beforeAll(async () => {
 		const pgBaseUrl = inject("pgBaseUrl")
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-interrupted-repack-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-interrupted-repack-"))
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		const srcOids = await allObjectOids(src)
 

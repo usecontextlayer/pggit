@@ -1,5 +1,5 @@
 /**
- * Lifecycle breakage — the randomized lifecycle SEQUENCE, as a fast-check property.
+ * Lifecycle regression — the randomized lifecycle SEQUENCE, as a fast-check property.
  *
  * Composes push / force-move (setRef) / ref-delete / orphan-commit / annotated tag
  * / branch-create / gc(grace) / object-aging / repack in a generated order, keeping
@@ -29,10 +29,7 @@
  *     `graceSeconds`, never a wall-clock sleep: `age` ages every row the store holds
  *     so far, so a later `gc` with a middling grace reclaims exactly the cohort that
  *     predates the aging and retains everything pushed after it — the split the
- *     original file bought with a 1.6 s `setTimeout`.
- *
- * Originated as exploration-7 probe `lifecycle--randomized-sequence-fuzz.ts`
- * (exit 1 on any mismatch against the file:// oracle); fixed, then converted.
+ *     time-based implementations might otherwise approximate with a sleep.
  */
 import { rmSync } from "node:fs"
 import { join } from "node:path"
@@ -135,7 +132,7 @@ const commandArb: fc.Arbitrary<Command> = fc.oneof(
 )
 
 /** How often each command kind actually EXECUTED across the corpus (a command whose
- * precondition failed is skipped, exactly like `generative/commands.ts`), plus the
+ * precondition failed is skipped, exactly like `testing/repo-commands.ts`), plus the
  * work GC and repack did. Floored after the run so a model regression that silently
  * degraded every candidate to "push once, clone" cannot pass unnoticed. */
 type Tally = {
@@ -182,7 +179,7 @@ async function runSequence(
 	commands: Command[],
 	tally: Tally,
 ): Promise<void> {
-	return withTempDir("pggit-breakage-fuzz-", async (root) => {
+	return withTempDir("pggit-lifecycle-fuzz-", async (root) => {
 		const dir = (name: string): string => join(root, name)
 		const fixture = await setupGitServerFixture(baseUrl)
 		const { db, server } = fixture

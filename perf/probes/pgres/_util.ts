@@ -128,7 +128,7 @@ export async function encodingCensus(
 	return { dataBytes: Number(r.bytes), deltas: Number(r.deltas), rows: Number(r.rows) }
 }
 
-/** Instance-wide WAL position. POLLUTED by sibling agents — relative only. */
+/** Instance-wide WAL position; deltas include concurrent writers and are not attributable. */
 export async function walLsn(pg: Sql): Promise<bigint> {
 	const [r] = await pg<{ n: string }[]>`select pg_current_wal_lsn() - '0/0' as n`
 	if (r === undefined) throw new Error("WAL position query returned no row")

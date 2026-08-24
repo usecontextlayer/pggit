@@ -13,11 +13,13 @@ export const AGENT = "pggit/0.0.0"
  * with a clear message. An absent `object-format` cap defaults to sha1 (git's
  * default), so it is accepted.
  */
-export function assertSupportedObjectFormat(caps: string[]): void {
-	const fmt = caps.find((c) => c.startsWith("object-format="))
-	if (fmt !== undefined && fmt !== "object-format=sha1") {
+export function assertSupportedObjectFormat(capabilities: string[]): void {
+	const objectFormat = capabilities.find((capability) =>
+		capability.startsWith("object-format="),
+	)
+	if (objectFormat !== undefined && objectFormat !== "object-format=sha1") {
 		throw new GitProtocolError(
-			`unsupported ${fmt} — only object-format=sha1 is supported`,
+			`unsupported ${objectFormat} — only object-format=sha1 is supported`,
 		)
 	}
 }

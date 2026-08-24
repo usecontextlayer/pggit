@@ -2,8 +2,8 @@
  * Compare pggit's and canonical git's exact protocol-v2 PACK bytes for a cold fetch
  * and for warm incremental fetches through real repository history.
  *
- * D8' permits a warm fetch to encode REF_DELTA entries against objects the client
- * proved it has. Such a response is thin: `index-pack --fix-thin` appends those
+ * A warm fetch may encode REF_DELTA entries against objects the client proved it
+ * has. Such a response is thin: `index-pack --fix-thin` appends those
  * external bases before writing a client pack, so client-side `.pack` growth is not
  * wire evidence. This harness captures the raw HTTP/upload-pack responses instead.
  * Canonical index-pack then proves that both raw packs contain the same transmitted

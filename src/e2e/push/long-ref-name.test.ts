@@ -2,12 +2,12 @@
  * Ref-name limits at the receive-pack boundary — the storable-name cap and the
  * state a rejection must not leave behind.
  *
- * Two describes, each driving the boundary differently (nam01 via an in-process
- * app.request, nam02 via real `git push` over the wire):
+ * Two describes drive the boundary differently: in-process `app.request` and a
+ * real `git push` over the wire.
  *
- *   - nam01 — the cap pinned in BOTH directions, and no orphaned objects behind a
+ *   - the cap pinned in BOTH directions, and no orphaned objects behind a
  *     rejection
- *   - nam02 — a mixed non-atomic push (valid + over-long ref) reports per-ref status
+ *   - a mixed non-atomic push (valid + over-long ref) reports per-ref status
  *     in-band; client and server never disagree about what landed
  *
  * THE RULE: receive-pack rejects a ref name longer than MAX_REF_NAME_BYTES (2000)
@@ -15,12 +15,8 @@
  * HTTP 200 — the shape canonical git answers with when its own backend cannot lock
  * the ref.
  *
- * ORIGINATED as the breakage probe for `git_ref`'s btree primary key on
- * (repo_id, name): an INCOMPRESSIBLE ~2800-byte name overflows the ~2704-byte
- * index-entry cap, and the raw Postgres error escaped the handler as an HTTP 500
- * after the pack had already been ingested — a torn half-push behind an opaque
- * status. Fixed by the boundary cap, which is why the over-long fixtures here stay
- * incompressible: that is the shape that used to reach the btree.
+ * The over-long fixtures stay incompressible because the `git_ref` btree primary
+ * key has a ~2704-byte index-entry cap; the boundary must reject them before ingest.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -38,15 +34,14 @@ import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 /**
- * nam01 — the ref-name cap in both directions, and the state a rejection leaves.
+ * The ref-name cap in both directions, and the state a rejection leaves.
  *
  * The cap is a byte-count rule applied before ingest, so the pair pins it: a name
  * of exactly 2000 bytes is ACCEPTED and stored; 2001 comes back as an in-band `ng`.
- * The historical over-long name (2832 incompressible bytes — the shape that used to
- * reach the btree and 500) is the third case, and carries the state assertion: a
+ * A 2832-byte incompressible name is the third case and carries the state assertion: a
  * rejected push leaves ZERO objects, because the boundary check runs before ingest.
  */
-describe("nam01 — the storable ref-name cap, pinned in both directions", () => {
+describe("the storable ref-name cap, pinned in both directions", () => {
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 	let src: string
@@ -58,7 +53,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 	const refAtCap = `refs/heads/${deterministicFiller("long-ref", MAX_REF_NAME_BYTES - "refs/heads/".length)}`
 	const refOverCap = `refs/heads/${deterministicFiller("long-ref", MAX_REF_NAME_BYTES + 1 - "refs/heads/".length)}`
 	// 2832 chars also overflows the btree's 2704-byte index-entry cap (the observed
-	// `index row size 2832 exceeds ... 2704`) — the original reproduction.
+	// `index row size 2832 exceeds ... 2704`).
 	const longRef = `refs/heads/${deterministicFiller("long-ref", 2832 - "refs/heads/".length)}`
 
 	beforeAll(async () => {
@@ -69,7 +64,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 		const projection = createRepoFileProjection(db.sql)
 		app = createGitApp({ objects, projection, refs })
 
-		src = mkdtempSync(join(tmpdir(), "nam01-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-long-ref-src-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		writeFileSync(join(src, "a.txt"), "alpha\n")
 		writeFileSync(join(src, "b.txt"), "beta\n")
@@ -94,7 +89,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 	it("stores a name of exactly the cap and rejects one byte more, in-band", async () => {
 		expect(Buffer.byteLength(refAtCap, "utf8")).toBe(MAX_REF_NAME_BYTES)
 		expect(Buffer.byteLength(refOverCap, "utf8")).toBe(MAX_REF_NAME_BYTES + 1)
-		const repo = "nam01-cap"
+		const repo = "ref-name-at-cap"
 		const refs = createRefStore(db.sql)
 
 		// At the cap: accepted, reported `ok`, and durably stored.
@@ -130,7 +125,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 	})
 
 	it("answers 200 report-status (ng) and leaves no orphaned objects", async () => {
-		const repo = "nam01-reflimit"
+		const repo = "overlong-ref"
 		const res = await postReceivePack(
 			app,
 			repo,
@@ -174,7 +169,7 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
 })
 
 /**
- * nam02 — a SINGLE non-atomic push carrying one valid ref (`refs/heads/ok`) and one
+ * A SINGLE non-atomic push carrying one valid ref (`refs/heads/ok`) and one
  * unstorably-long ref: client and server must agree about what landed.
  *
  * THE CONTRACT: a non-atomic push applies each command on its own, so the valid ref
@@ -184,14 +179,10 @@ describe("nam01 — the storable ref-name cap, pinned in both directions", () =>
  * `! [remote rejected]` for that ref alone). The push exits non-zero because one
  * command was rejected; that is agreement, not divergence.
  *
- * ORIGINATED as the breakage probe for the un-guarded per-command apply loop: the
- * over-long name's INSERT threw the raw btree error, which escaped as HTTP 500 with
- * NO report-status — so git reported the whole push as failed ("the remote end hung
- * up") while `refs/heads/ok` was already durably committed server-side, a state the
- * client could not see. Fixed by the pre-ingest name check, which turns it into a
- * per-ref `ng`.
+ * The pre-ingest name check turns the over-long command into a per-ref `ng`, while
+ * preserving the valid command's result.
  */
-describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diverge", () => {
+describe("mixed non-atomic push with an over-long ref reports every command", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
@@ -207,9 +198,9 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 		// repo_file projection — so the receive-pack path under test is identical.
 		const projection = createRepoFileProjection(db.sql)
 		server = await serveOnPort(createGitApp({ objects, projection, refs }), 0)
-		url = `http://127.0.0.1:${server.port}/nam02`
+		url = `http://127.0.0.1:${server.port}/mixed-overlong-ref`
 
-		src = mkdtempSync(join(tmpdir(), "pggit-nam02-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-mixed-overlong-ref-source-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		writeFileSync(join(src, "a.txt"), "alpha\n")
 		await spawnGit(["add", "."], { cwd: src })
@@ -232,7 +223,7 @@ describe("nam02 — mixed non-atomic push (valid + over-long ref) must not diver
 		// Whatever the pushing client observed, read the server's durable state and
 		// ask a fresh canonical client what the remote advertises. None may contradict.
 		const refs = createRefStore(db.sql)
-		const stored = new Set((await refs.listRefs("nam02")).map((r) => r.name))
+		const stored = new Set((await refs.listRefs("mixed-overlong-ref")).map((r) => r.name))
 		const okAppliedServerSide = stored.has("refs/heads/ok")
 		const longRefAppliedServerSide = stored.has(longRef)
 		const sourceOid = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()

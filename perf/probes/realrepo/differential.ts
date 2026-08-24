@@ -10,7 +10,7 @@
  *
  * The oracle is a plain `file://` bare remote replaying the same sequence.
  *
- * A perf harness rather than a vitest e2e test because its corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for — the same reason `perf/probes/delta-corpus.ts` lives here. The serve-size phase additionally scores a MEASURED ratio (`> 4.0x` is a finding), so the file carries both kinds of verdict into the one exit code, as the source script did.
+ * A perf harness rather than a vitest e2e test because its corpus is a REAL local repository selected at run time (`--repo=` or `--mirror=`), which no committed fixture can stand in for — the same reason `perf/probes/delta-corpus.ts` lives here. The serve-size phase additionally scores a MEASURED ratio (`> 4.0x` is a finding), so the file carries both kinds of verdict into one exit code.
  *
  *   npx tsx perf/probes/realrepo/differential.ts --repo=/path/to/checkout --slug=<name> \
  *     [--phases=full,shapes,size,replay] [--step=50]
@@ -392,7 +392,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 		])
 		await assertCanonicalRealRepoStore(db.sql, repoId, ORACLE, { kind: "repacked" })
 
-		// a second pass MUST be a no-op (design D4: frozen policy)
+		// Existing encodings are frozen, so a second pass over unchanged state must be a no-op.
 		const rp2 = await createRepack(db.sql).repack(repoId)
 		if (rp2.wholes !== 0 || rp2.deltas !== 0) {
 			fail(
@@ -449,7 +449,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 		])
 		summary.push(["full", "refs compared", (await refMap(refDir)).size])
 
-		// the pre-repack clone must be identical too (encoding is derived, D1)
+		// The pre-repack clone must be identical too because encodings are derived.
 		const cmpPre = await compareRepos(
 			"full",
 			"pre-repack mirror clone vs file:// oracle",
@@ -540,7 +540,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 			if (ratio > 4.0) {
 				fail(
 					"size",
-					`served pack is ${ratio.toFixed(2)}x git's — far worse than the ~2.4x parity the design measured`,
+					`served pack is ${ratio.toFixed(2)}x git's — above the configured 4.0x bar`,
 					`pggit ${mb(pggitPack)} vs git ${mb(gitPack)}`,
 				)
 			}
@@ -835,7 +835,7 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 					)
 			}
 
-			// (f) GC over the repacked state, then re-clone — the tier's hygiene (D7)
+			// (f) GC over the repacked state, then re-clone to verify tier hygiene.
 			const g = await createGc(db.sql).gc(repoId, { graceSeconds: 0 })
 			console.log(`  gc: ${g.deletedObjects} objects`)
 			const afterGcDir = join(scratch.mk("aftergc"), "c.git")
@@ -903,8 +903,8 @@ async function phaseFullAndShapes(db: IsolatedDb): Promise<void> {
 // ── PHASE: orphan objects → repack → GC → repack, all over the wire ─────────
 // receive-pack ingests the pack BEFORE the deny-non-FF policy runs, so a REJECTED
 // push leaves its objects in the store, unreachable. That is the only wire-reachable
-// way to make garbage on a refs-only-advance server — and it is exactly the state
-// the encoding tier's hygiene rules (design D7) exist for. Every step is checked by
+// way to make garbage on a refs-only-advance server — and it exercises the encoding
+// tier's orphan hygiene. Every step is checked by
 // a clone: the orphans must never leak into a served pack, before or after GC.
 async function phaseOrphan(db: IsolatedDb): Promise<void> {
 	console.log(`\n## orphan / gc hygiene (denied push leaves objects behind)`)

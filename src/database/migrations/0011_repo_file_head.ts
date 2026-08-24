@@ -2,7 +2,7 @@ import { type Kysely, sql } from "kysely"
 
 // The derived-state spine, chunk 4 (slice S3): `repo_file_head` records which
 // commit each branch's `repo_file` snapshot currently reflects. The basis is
-// PERSISTED, never inferred (R12): `syncRefSnapshot` runs after the push commits
+// PERSISTED, never inferred (R12): `syncRefProjection` runs after the push commits
 // and carries no old oid, so inferring the basis from the push command would make
 // a TORN projection representable — a diff applied onto rows from a different
 // basis matches no commit, permanently. With the basis in the database and read

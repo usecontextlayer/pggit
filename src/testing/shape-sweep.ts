@@ -1,23 +1,12 @@
 /**
- * The shared driver behind the four `shapes--negative-sweep-*` suites: the `Shape`
- * contract they register against, the fast-import helpers they build fixtures with,
- * and `runShape` — the pipeline that judges one shape against a `file://` control.
- * A test DRIVER shared by sibling suites, the same category as `append-only-repo.ts`,
- * which is why it lives here rather than beside any one suite.
- *
- * The four suites were a single file until the split recorded in
- * `docs/2026-08-20-test-efficiency.md`: the sweep is the longest file in the gate and
- * its solo placement rested on a false claim (no verdict here is timing-based), so the
- * 22 shapes now spread across four sibling files that run in the parallel pool.
- * Identical shapes, identical verdicts — only the file boundaries moved.
+ * The shared driver behind the four `regressions/shapes/negative-sweep-*` suites:
+ * the `Shape` contract they register against, the fast-import helpers they build
+ * fixtures with, and `runShape` — the pipeline that judges one shape against a
+ * `file://` control. A test DRIVER shared by sibling suites, the same category as
+ * `append-only-repo.ts`, which is why it lives here rather than beside any one suite.
  *
  * NEGATIVE RESULTS — the adversarial repo-shape sweep that pggit's delta-pack
  * pipeline SURVIVED. Every shape here was built to break it and did not.
- *
- * Converted from `breakage/shapes--negative-sweep.ts` (exit 0 = every shape held
- * up · exit 1 = a shape diverged from real git). The script's verdict is a pure
- * CORRECTNESS property over hermetically-built repos, so it lands here as a plain
- * e2e test — one `it` per shape, GREEN today, and a regression detector forever.
  *
  * Each shape builds a REAL git repo in $TMPDIR and drives the whole pipeline over
  * the real wire — `git push` → `createRepack().repack()` → `git clone` →
@@ -47,20 +36,24 @@ import { spawnGit } from "@/testing/spawn-git"
 
 const PUSH_REFSPECS = ["refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"]
 
-// Fixture scale. These were the source script's env-overridable defaults; the
-// shapes are only adversarial AT these sizes (a 20-level nest or a 200-commit
-// linear history exercises nothing), so they are pinned constants here.
+// The shapes are only adversarial AT these sizes (a 20-level nest or a 200-commit
+// linear history exercises nothing), so fixture scale is pinned here.
 export const DEPTH = 2000
 export const WIDE = 20_000
 export const LINEAR = 10_000
 
-export type Mk = (tag: string) => string
+export type ScratchDirectoryFactory = (tag: string) => string
 
 export type Shape = {
 	build: (dir: string) => Promise<void>
 	extend?: (dir: string) => Promise<void>
 	/** arbitrary ref surgery pushed to BOTH remotes (deletes, orphan refs, …) */
-	mutate?: (dir: string, url: string, mirror: string, mk: Mk) => Promise<void>
+	mutate?: (
+		directory: string,
+		remoteUrl: string,
+		mirrorDirectory: string,
+		createScratchDirectory: ScratchDirectoryFactory,
+	) => Promise<void>
 	/** Floor on the REF_DELTA entries the post-repack clone must be served. Set on
 	 * every shape built so "the delta actually wins"; omitted where a shape
 	 * legitimately serves none (`tags`, `blob-edges`), so that exception is stated
@@ -158,155 +151,185 @@ export function growing(opts: {
 export async function runShape(
 	{ server, repack, gc }: ShapeSweepContext,
 	name: string,
-	s: Shape,
+	shape: Shape,
 ): Promise<void> {
 	const scratch: string[] = []
-	const mk: Mk = (tag) => {
-		const d = mkdtempSync(join(tmpdir(), `pggit-brk-${tag}-`))
-		scratch.push(d)
-		return d
+	const createScratchDirectory: ScratchDirectoryFactory = (tag) => {
+		const directory = mkdtempSync(join(tmpdir(), `pggit-shape-${tag}-`))
+		scratch.push(directory)
+		return directory
 	}
 
 	try {
-		const src = join(mk(name), "src")
-		await spawnGit(["init", "-q", "-b", "main", src])
-		await s.build(src)
-		const srcObjs = await objectList(src)
+		const source = join(createScratchDirectory(name), "src")
+		await spawnGit(["init", "-q", "-b", "main", source])
+		await shape.build(source)
+		const sourceObjects = await objectList(source)
 		console.log(
-			`shape ${name} — source: ${srcObjs.length} objects, ${(await refList(src)).length} refs`,
+			`shape ${name} — source: ${sourceObjects.length} objects, ${(await refList(source)).length} refs`,
 		)
 
 		// The oracle: a plain bare git remote driven through the identical dance.
-		const mirror = join(mk(`${name}-mirror`), "m.git")
+		const mirror = join(createScratchDirectory(`${name}-mirror`), "m.git")
 		await spawnGit(["init", "-q", "--bare", mirror])
 		await spawnGit(["config", "uploadpack.allowFilter", "true"], { cwd: mirror })
 		await spawnGit(["config", "uploadpack.allowAnySHA1InWant", "true"], { cwd: mirror })
-		await spawnGit(["push", "-q", mirror, ...PUSH_REFSPECS], { cwd: src })
-		const ctl = join(mk(`${name}-ctl`), "c.git")
-		await spawnGit(["clone", "-q", "--bare", `file://${mirror}`, ctl])
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: ctl })
-		const ctlObjs = await objectList(ctl)
+		await spawnGit(["push", "-q", mirror, ...PUSH_REFSPECS], { cwd: source })
+		const control = join(createScratchDirectory(`${name}-control`), "c.git")
+		await spawnGit(["clone", "-q", "--bare", `file://${mirror}`, control])
+		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: control })
+		const controlObjects = await objectList(control)
 
-		const url = repoUrl(server, name)
-		await spawnGit(["push", "-q", url, ...PUSH_REFSPECS], { cwd: src })
+		const remoteUrl = repoUrl(server, name)
+		await spawnGit(["push", "-q", remoteUrl, ...PUSH_REFSPECS], { cwd: source })
 
-		const pre = join(mk(`${name}-pre`), "c.git")
-		await spawnGit(["clone", "-q", "--bare", url, pre])
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: pre })
-		const preObjs = await objectList(pre)
-		expect(preObjs.length).toBe(ctlObjs.length)
-		expect(preObjs.join("\n")).toBe(ctlObjs.join("\n"))
+		const beforeRepack = join(createScratchDirectory(`${name}-before-repack`), "c.git")
+		await spawnGit(["clone", "-q", "--bare", remoteUrl, beforeRepack])
+		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: beforeRepack })
+		const beforeRepackObjects = await objectList(beforeRepack)
+		expect(beforeRepackObjects.length).toBe(controlObjects.length)
+		expect(beforeRepackObjects.join("\n")).toBe(controlObjects.join("\n"))
 
-		const t0 = Date.now()
-		const res = await repack.repack(name)
+		const repackStartedAt = Date.now()
+		const repackResult = await repack.repack(name)
 		console.log(
-			`shape ${name} — repack: ${res.wholes} wholes + ${res.deltas} deltas in ${Date.now() - t0}ms`,
+			`shape ${name} — repack: ${repackResult.wholes} wholes + ${repackResult.deltas} deltas in ${Date.now() - repackStartedAt}ms`,
 		)
 
-		const post = join(mk(`${name}-post`), "c.git")
-		await spawnGit(["clone", "-q", "--bare", url, post])
-		const deltasServed = await servedDeltaCount(post)
+		const afterRepack = join(createScratchDirectory(`${name}-after-repack`), "c.git")
+		await spawnGit(["clone", "-q", "--bare", remoteUrl, afterRepack])
+		const deltasServed = await servedDeltaCount(afterRepack)
 		console.log(`shape ${name} — client retained ${deltasServed} delta entries`)
 		// The proof the delta path was actually ON for this shape. Every shape
 		// carrying a floor is built so the delta wins; without this the whole sweep
 		// stays green with deltified serving deleted.
-		if (s.minDeltasServed !== undefined) {
+		if (shape.minDeltasServed !== undefined) {
 			expect(
 				deltasServed,
 				`${name}: the delta serve path was not exercised`,
-			).toBeGreaterThanOrEqual(s.minDeltasServed)
+			).toBeGreaterThanOrEqual(shape.minDeltasServed)
 		}
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: post })
-		const postObjs = await objectList(post)
-		expect(postObjs.length).toBe(ctlObjs.length)
-		expect(postObjs.join("\n")).toBe(ctlObjs.join("\n"))
+		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: afterRepack })
+		const afterRepackObjects = await objectList(afterRepack)
+		expect(afterRepackObjects.length).toBe(controlObjects.length)
+		expect(afterRepackObjects.join("\n")).toBe(controlObjects.join("\n"))
 
 		// partial-clone filters against the repacked repo (a delta whose base is
 		// filtered OUT of the served set must fall back to its whole form).
-		for (const f of ["blob:none", "tree:0"]) {
-			const pf = join(mk(`${name}-pf`), "c.git")
-			const cf = join(mk(`${name}-cf`), "c.git")
-			await spawnGit(["clone", "-q", "--bare", `--filter=${f}`, `file://${mirror}`, cf])
-			await spawnGit(["clone", "-q", "--bare", `--filter=${f}`, url, pf])
+		for (const filter of ["blob:none", "tree:0"]) {
+			const filteredServed = join(
+				createScratchDirectory(`${name}-filtered-served`),
+				"c.git",
+			)
+			const filteredControl = join(
+				createScratchDirectory(`${name}-filtered-control`),
+				"c.git",
+			)
+			await spawnGit([
+				"clone",
+				"-q",
+				"--bare",
+				`--filter=${filter}`,
+				`file://${mirror}`,
+				filteredControl,
+			])
+			await spawnGit([
+				"clone",
+				"-q",
+				"--bare",
+				`--filter=${filter}`,
+				remoteUrl,
+				filteredServed,
+			])
 			// "usable" asserted, not assumed — every other clone in this function
 			// is fsck'd and these were not.
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: pf })
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: cf })
-			const pgSet = new Set(await objectList(pf))
-			const ctlSet = new Set(await objectList(cf))
-			if (f === "tree:0") {
-				// tree:0 is a KNOWN pre-existing gap (pggit ignores it and ships a
-				// superset — src/e2e/transport/filter-tree0.test.ts). Pin the
+			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: filteredServed })
+			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: filteredControl })
+			const servedSet = new Set(await objectList(filteredServed))
+			const controlSet = new Set(await objectList(filteredControl))
+			if (filter === "tree:0") {
+				// tree:0 is an intentional gap: pggit ignores it and ships a
+				// superset — src/e2e/transport/filter-tree0.test.ts. Pin the
 				// documented behaviour rather than nothing: the served set must
 				// CONTAIN the control's, so a change in the shape of the gap fails
 				// loudly instead of passing unnoticed.
 				expect(
-					[...ctlSet].filter((o) => !pgSet.has(o)),
+					[...controlSet].filter((oid) => !servedSet.has(oid)),
 					`${name}: pggit's tree:0 clone is MISSING objects the control served`,
 				).toEqual([])
 			} else {
-				expect([...pgSet].sort().join("\n")).toBe([...ctlSet].sort().join("\n"))
+				expect([...servedSet].sort().join("\n")).toBe([...controlSet].sort().join("\n"))
 			}
 		}
 
-		const postRefs = await refList(post)
-		const ctlRefs = await refList(ctl)
-		expect(postRefs).toEqual(ctlRefs)
+		const servedRefs = await refList(afterRepack)
+		const controlRefs = await refList(control)
+		expect(servedRefs).toEqual(controlRefs)
 
-		if (s.extend) {
-			await s.extend(src)
-			await spawnGit(["push", "-q", mirror, ...PUSH_REFSPECS], { cwd: src })
-			await spawnGit(["push", "-q", url, ...PUSH_REFSPECS], { cwd: src })
-			const res2 = await repack.repack(name)
+		if (shape.extend) {
+			await shape.extend(source)
+			await spawnGit(["push", "-q", mirror, ...PUSH_REFSPECS], { cwd: source })
+			await spawnGit(["push", "-q", remoteUrl, ...PUSH_REFSPECS], { cwd: source })
+			const incrementalRepack = await repack.repack(name)
 			console.log(
-				`shape ${name} — repack2: ${res2.wholes} wholes + ${res2.deltas} deltas`,
+				`shape ${name} — incremental repack: ${incrementalRepack.wholes} wholes + ${incrementalRepack.deltas} deltas`,
 			)
-			await spawnGit(["fetch", "-q", "--tags", "--force", url, ...PUSH_REFSPECS], {
-				cwd: post,
+			await spawnGit(["fetch", "-q", "--tags", "--force", remoteUrl, ...PUSH_REFSPECS], {
+				cwd: afterRepack,
 			})
 			await spawnGit(
 				["fetch", "-q", "--tags", "--force", `file://${mirror}`, ...PUSH_REFSPECS],
 				{
-					cwd: ctl,
+					cwd: control,
 				},
 			)
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: post })
-			const inc = await objectList(post)
-			const ctl2 = await objectList(ctl)
-			expect(inc.length).toBe(ctl2.length)
-			expect(inc.join("\n")).toBe(ctl2.join("\n"))
+			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: afterRepack })
+			const incrementalObjects = await objectList(afterRepack)
+			const incrementalControlObjects = await objectList(control)
+			expect(incrementalObjects.length).toBe(incrementalControlObjects.length)
+			expect(incrementalObjects.join("\n")).toBe(incrementalControlObjects.join("\n"))
 		}
 
-		if (s.mutate) {
-			await s.mutate(src, url, mirror, mk)
-			const resM = await repack.repack(name)
+		if (shape.mutate) {
+			await shape.mutate(source, remoteUrl, mirror, createScratchDirectory)
+			const mutationRepack = await repack.repack(name)
 			console.log(
-				`shape ${name} — repackM: ${resM.wholes} wholes + ${resM.deltas} deltas`,
+				`shape ${name} — mutation repack: ${mutationRepack.wholes} wholes + ${mutationRepack.deltas} deltas`,
 			)
-			const mp = join(mk(`${name}-mp`), "c.git")
-			const mc = join(mk(`${name}-mc`), "c.git")
-			await spawnGit(["clone", "-q", "--bare", url, mp])
-			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: mp })
-			await spawnGit(["clone", "-q", "--bare", `file://${mirror}`, mc])
-			expect((await objectList(mp)).join("\n")).toBe((await objectList(mc)).join("\n"))
-			expect(await refList(mp)).toEqual(await refList(mc))
+			const mutatedServed = join(
+				createScratchDirectory(`${name}-mutated-served`),
+				"c.git",
+			)
+			const mutatedControl = join(
+				createScratchDirectory(`${name}-mutated-control`),
+				"c.git",
+			)
+			await spawnGit(["clone", "-q", "--bare", remoteUrl, mutatedServed])
+			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: mutatedServed })
+			await spawnGit(["clone", "-q", "--bare", `file://${mirror}`, mutatedControl])
+			expect((await objectList(mutatedServed)).join("\n")).toBe(
+				(await objectList(mutatedControl)).join("\n"),
+			)
+			expect(await refList(mutatedServed)).toEqual(await refList(mutatedControl))
 		}
 
-		const gcRes = await gc.gc(name, { graceSeconds: 0 })
-		const res3 = await repack.repack(name)
+		const gcResult = await gc.gc(name, { graceSeconds: 0 })
+		const postGcRepack = await repack.repack(name)
 		console.log(
-			`shape ${name} — gc: ${gcRes.deletedObjects} objs; repack3: ${res3.wholes}+${res3.deltas}`,
+			`shape ${name} — gc: ${gcResult.deletedObjects} objects; post-GC repack: ${postGcRepack.wholes} wholes + ${postGcRepack.deltas} deltas`,
 		)
-		const gcd = join(mk(`${name}-gcd`), "c.git")
-		await spawnGit(["clone", "-q", "--bare", url, gcd])
-		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: gcd })
-		const gcdObjs = await objectList(gcd)
-		const ctlFresh = join(mk(`${name}-ctlf`), "c.git")
-		await spawnGit(["clone", "-q", "--bare", `file://${mirror}`, ctlFresh])
-		const ctlFinal = await objectList(ctlFresh)
-		expect(gcdObjs.length).toBe(ctlFinal.length)
-		expect(gcdObjs.join("\n")).toBe(ctlFinal.join("\n"))
+		const afterGc = join(createScratchDirectory(`${name}-after-gc`), "c.git")
+		await spawnGit(["clone", "-q", "--bare", remoteUrl, afterGc])
+		await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: afterGc })
+		const afterGcObjects = await objectList(afterGc)
+		const finalControl = join(createScratchDirectory(`${name}-final-control`), "c.git")
+		await spawnGit(["clone", "-q", "--bare", `file://${mirror}`, finalControl])
+		const finalControlObjects = await objectList(finalControl)
+		expect(afterGcObjects.length).toBe(finalControlObjects.length)
+		expect(afterGcObjects.join("\n")).toBe(finalControlObjects.join("\n"))
 	} finally {
-		for (const d of scratch) rmSync(d, { force: true, recursive: true })
+		for (const directory of scratch) {
+			rmSync(directory, { force: true, recursive: true })
+		}
 	}
 }

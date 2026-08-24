@@ -1,19 +1,17 @@
 /**
- * a12 protocol-config — pggit serves fetch over git protocol v2 ONLY (the charter:
+ * pggit serves fetch over git protocol v2 ONLY (the charter:
  * "v2 fetch, v0 push"). A v0/v1 fetch client is therefore out of scope; the CONTRACT
- * we hold pggit to is the fail-CLEAN one: such a client must FAIL LOUDLY, never the
- * original bug — a silent EMPTY clone that exits 0.
+ * we hold pggit to is the fail-CLEAN one: such a client must FAIL LOUDLY, never
+ * return a silent EMPTY clone that exits 0.
  *
- * The GET /info/refs?service=git-upload-pack handler now requires the client to have
+ * The GET /info/refs?service=git-upload-pack handler requires the client to have
  * negotiated v2 (a `Git-Protocol: version=2` request header; git ≥ 2.26 sends it by
  * default). A v0 client (`-c protocol.version=0`) sends no such header and gets a
  * clean HTTP 400 instead of a v2 advertisement it would misread as an empty repo — so
- * `ls-remote` / `clone` over v0 now error out non-zero rather than silently producing
+ * `ls-remote` / `clone` over v0 error out non-zero rather than silently producing
  * nothing.
  *
- * Drives a real v0 git client over the wire and asserts the loud failure. GREEN once
- * the v2-only gate is in place; it would RED again if a v0 client ever silently
- * "succeeded" with an empty result.
+ * Drives a real v0 git client over the wire and asserts the loud failure.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -28,7 +26,7 @@ import { createIsolatedSchema } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { withTempDir } from "@/testing/temp-dir"
 
-describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
+describe("protocol v0 fetch client fails loudly at the v2-only gate", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
@@ -39,9 +37,9 @@ describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
 		const objects = createObjectStore(db.sql)
 		const refs = createRefStore(db.sql)
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
-		url = `http://127.0.0.1:${server.port}/a12v0`
+		url = `http://127.0.0.1:${server.port}/protocol-v0`
 
-		src = mkdtempSync(join(tmpdir(), "pggit-a12-v0-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-protocol-v0-source-"))
 		await spawnGit(["init", "-q"], { cwd: src })
 		writeFileSync(join(src, "a.txt"), "alpha\n")
 		await spawnGit(["add", "."], { cwd: src })
@@ -63,7 +61,7 @@ describe("a12 — protocol v0 fetch client fails loudly (v2-only gate)", () => {
 	})
 
 	it("rejects a protocol.version=0 clone loudly (not a silent empty repo)", async () => {
-		await withTempDir("pggit-a12-v0-dest-", async (dest) => {
+		await withTempDir("pggit-protocol-v0-destination-", async (dest) => {
 			const outcome = await attemptGit([
 				"-c",
 				"protocol.version=0",

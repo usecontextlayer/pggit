@@ -1,10 +1,6 @@
 /**
  * HEAD symref establishment on first push to an auto-created repo.
  *
- * Merged from a01-head-on-first-push / a03-head-symref / a08-head-symref — three
- * fixtures that stood up three schemas, three servers and three pushes to assert
- * one contract, two of them asserting the same two observables.
- *
  * THE CONTRACT, which is canonical git's: receive-pack, creating the first branch
  * in an otherwise unborn repo, points HEAD at that branch. The smart-HTTP
  * advertisement then carries a `ref: refs/heads/<b>\tHEAD` symref line and a
@@ -13,11 +9,8 @@
  * what pushing to a fresh `git init --bare` (whose HEAD defaults to
  * refs/heads/main) produces.
  *
- * ORIGINATED as the breakage probe for the auto-create-via-push path, which only
- * inserted the repo name and never set a HEAD symref: the advert carried no HEAD at
- * all, so a real clone emitted "remote HEAD refers to nonexistent ref, unable to
- * checkout" and produced an EMPTY working tree beside a perfectly intact object
- * closure — correct data, no checkout. Fixed: receive-pack sets HEAD on first push.
+ * Receive-pack sets HEAD on the first push so a clone checks out the advertised
+ * branch rather than leaving a correct object closure with an empty worktree.
  */
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

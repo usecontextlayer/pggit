@@ -15,8 +15,7 @@
  *
  *   npx tsx perf/probes/realrepo/serve-size-vs-git.ts --repo=/path/to/checkout --slug=<name>
  *
- * Exit 0 = the served pack is within `--max-ratio` (default 3.0, i.e. the ~2.4x
- * parity the design measured on pggit's own history plus headroom).
+ * Exit 0 = the served pack is within the configured `--max-ratio` (default 3.0).
  * Exit 1 = reproduced: the ratio is past that, with the per-type attribution printed.
  */
 import { join } from "node:path"
@@ -264,7 +263,7 @@ async function main(): Promise<void> {
 		if (ratio > MAX_RATIO) {
 			console.log(
 				`\nREPRODUCED: ${SLUG} serves ${ratio.toFixed(2)}x git's raw pack (${mb(pggitPack.length)} vs ${mb(gitPack.length)}), ` +
-					`past the ${MAX_RATIO}x bar set by the design's measured ~2.4x parity.`,
+					`past the configured ${MAX_RATIO}x bar.`,
 			)
 			process.exitCode = 1
 		} else {

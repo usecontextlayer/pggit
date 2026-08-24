@@ -30,7 +30,7 @@ describe("spawnGit", () => {
 
 	it("rejects when the git child is killed by a signal", async () => {
 		// The alias shell signals its parent git process. Node reports that outcome as
-		// `code === null`, which must never be laundered into the old exit-0 default.
+		// `code === null`, which must never be laundered into an exit-0 default.
 		await expect(
 			spawnGit(["-c", "alias.self-destruct=!kill -TERM $PPID", "self-destruct"]),
 		).rejects.toThrow(/killed by SIGTERM/)

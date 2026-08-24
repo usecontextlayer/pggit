@@ -21,10 +21,8 @@
  * with no client-visible consequence, and is reported as such — it rides on the
  * assertion's message, never on the assertion.
  *
- * Converted from `breakage/race--concurrent-repack.ts` (`--iters=40 --runs=400
- * --passes=6 --push=0`). Probabilistic: the pass count and the jitter formula
- * are the source's. The swept start offsets are NOT: the source froze absolute
- * milliseconds ([0..250]ms), which tie the stagger to one machine's repack
+ * This race is probabilistic. Six passes plus jitter spread each cohort, while
+ * fractional start offsets avoid tying the stagger to one machine's repack
  * speed — on a box where a pass runs longer, every offset crowds into the first
  * COPY flush and the later phases are never raced. Each run instead times one
  * un-raced calibration pass and staggers the cohort across FRACTIONS of that

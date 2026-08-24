@@ -1,12 +1,9 @@
 /**
  * PROBE: what does the encoding tier's PRESENCE add to a zero-garbage gc pass?
  *
- * HISTORY (2026-08-16): this originally priced `sweepEncodings` (concern C2), a
- * delete-with-anti-join whose victim scan touched every encoding row on every
- * pass. D14 deleted that sweep — the 0008 FK cascades do the tier's bookkeeping
- * inside the object DELETEs — so the measured difference should now be ~zero,
- * and this probe survives as the REGRESSION GUARD for that: the bound firing
- * again means per-pass tier work crept back into `gc()`.
+ * Encoding rows are removed by foreign-key cascades during object deletion, so
+ * the tier's presence should add approximately no work to a pass that deletes
+ * nothing. The bound catches any per-pass tier work added to `gc()`.
  *
  * Isolated black-box: the SAME repo, the SAME reachable graph, gc'd before the
  * encoding tier exists and again after a full repack. The difference is the
@@ -43,8 +40,7 @@ const REPEATS = 5
 /** Added share of a zero-garbage pass at which this is called broken. */
 const OVERHEAD_LIMIT = 0.25
 
-/** Best of N — the statistic that survives a loaded machine; a median moves with
- * whatever else the box is doing, and this probe subtracts two timings. */
+/** The minimum reduces contention contamination before subtracting independent timings. */
 const best = (xs: number[]): number => Math.min(...xs)
 
 type Row = { n: number; objects: number; encodings: number; pre: number; post: number }
@@ -160,7 +156,7 @@ async function main(): Promise<void> {
 
 	const worst = Math.max(...rows.map((r) => (r.post - r.pre) / r.pre))
 	console.log(
-		`\nFAIL CONDITION: the tier's presence adds > ${(OVERHEAD_LIMIT * 100).toFixed(0)}% to a zero-garbage gc pass (regression guard — the sweep itself is gone, D14).`,
+		`\nFAIL CONDITION: the tier's presence adds > ${(OVERHEAD_LIMIT * 100).toFixed(0)}% to a zero-garbage gc pass.`,
 	)
 	console.log(`observed worst: ${(worst * 100).toFixed(0)}%`)
 	if (worst > OVERHEAD_LIMIT) process.exitCode = 1

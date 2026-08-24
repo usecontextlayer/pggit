@@ -3,12 +3,9 @@ import { PostgresJSDialect } from "kysely-postgres-js"
 import type { Sql } from "postgres"
 import { recordQuery } from "@/instrument"
 
-// Mirrors web/postgres.ts: Kysely over the porsager `postgres` driver via
-// PostgresJSDialect. Unlike web, pggit does NOT keep a module-level singleton —
-// the caller owns the porsager client and injects it; each store builds its own
-// Kysely from it (so the app stays a mountable sub-app and per-schema test
-// isolation works), and keeps the raw client for the COPY ingest path.
-/** Wrap a porsager client in a typed Kysely. */
+/** Wrap a caller-owned porsager client in a typed Kysely. Each store builds its
+ * own handle so independently mounted stores and per-schema tests stay isolated;
+ * callers retain the raw client for COPY ingest. */
 export function initKysely<T>(pg: Sql): Kysely<T> {
 	return new Kysely<T>({
 		dialect: new PostgresJSDialect({ postgres: pg }),

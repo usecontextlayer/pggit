@@ -60,14 +60,14 @@ export async function setupGcFixture(): Promise<GcFixture> {
 /** Tear the fixture down (call in `afterAll`, or per-candidate): close the server and
  * drop the schema (which ends its pooled clients). The shared container is left running
  * — `globalSetup` stops it once, after the whole run. */
-export async function teardownGcFixture(fx: GcFixture): Promise<void> {
-	await teardownGitServerFixture(fx)
+export async function teardownGcFixture(fixture: GcFixture): Promise<void> {
+	await teardownGitServerFixture(fixture)
 }
 
 /** The smart-HTTP URL of `repo` on the fixture's server (repo auto-created on
  * first push). */
-export function repoUrl(fx: Pick<GcFixture, "server">, repo: string): string {
-	return gitServerRepoUrl(fx.server, repo)
+export function repoUrl(fixture: Pick<GcFixture, "server">, repo: string): string {
+	return gitServerRepoUrl(fixture.server, repo)
 }
 
 /** The file one push writes — the options `pushFile` and `pushDenied` share. */
@@ -79,17 +79,15 @@ type PushContent = {
 /** `pushFile`'s options: the file written, and whether to REWIND the ref to
  * the new (non-descendant) commit at the STORE level afterwards.
  *
- * `rewind` replaces the pre-deny-non-FF `force` option: the wire now refuses
- * non-fast-forward moves (receive-pack policy), but the STORE still executes
- * any CAS-valid ref move — rewound states remain reachable internally
- * (pre-policy history, operator surgery), and the GC suites' workload model
- * ("the ref moved to a non-descendant; the old closure is orphaned") tests GC's
- * store-level reachability math, not push policy. Mechanically: the new root
- * is pushed to a throwaway ref (a CREATE — allowed), `main` is CAS-moved to it
- * through the store, and the throwaway ref is store-deleted. The DENIED-push
- * orphan flow (the production orphan source) is covered separately by
- * `pushDenied` (gc/denied-push, gc/integrity). */
-type PushOpts = PushContent & {
+ * The wire refuses non-fast-forward moves, but the STORE still executes any
+ * CAS-valid ref move. Rewound states remain reachable through operator surgery,
+ * and the GC suites need to test the store-level workload "the ref moved to a
+ * non-descendant; the old closure is orphaned" independently of push policy.
+ * Mechanically, the new root is pushed to a throwaway ref, `main` is CAS-moved to
+ * it through the store, and the throwaway ref is store-deleted. The denied-push
+ * orphan flow is covered separately by `pushDenied` (`gc/denied-push`,
+ * `gc/integrity`). */
+type PushOptions = PushContent & {
 	rewind?: boolean
 }
 
@@ -104,25 +102,27 @@ export type PushResult = { head: string; reachable: string[] }
  * exactly the objects GC must keep for this tip.
  */
 export async function pushFile(
-	fx: Pick<GcFixture, "server" | "refs">,
+	fixture: Pick<GcFixture, "server" | "refs">,
 	repo: string,
-	opts: PushOpts,
+	options: PushOptions,
 ): Promise<PushResult> {
-	return withTempDir("pggit-gc-src-", async (src) => {
-		const url = repoUrl(fx, repo)
-		const path = opts.path ?? "file.txt"
-		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
-		writeFileSync(join(src, path), opts.content)
-		await spawnGit(["add", "."], { cwd: src })
-		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
-		const head = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
-		if (opts.rewind) {
+	return withTempDir("pggit-gc-src-", async (sourceDirectory) => {
+		const url = repoUrl(fixture, repo)
+		const path = options.path ?? "file.txt"
+		await spawnGit(["init", "-q", "-b", "main"], { cwd: sourceDirectory })
+		writeFileSync(join(sourceDirectory, path), options.content)
+		await spawnGit(["add", "."], { cwd: sourceDirectory })
+		await spawnGit(["commit", "-q", "-m", "c"], { cwd: sourceDirectory })
+		const head = (
+			await spawnGit(["rev-parse", "HEAD"], { cwd: sourceDirectory })
+		).stdout.trim()
+		if (options.rewind) {
 			// Land the objects via a throwaway CREATE, then rewind `main` through
-			// the store (see PushOpts.rewind for why this bypasses the wire policy).
-			const tmpRef = `refs/heads/rewind-${head.slice(0, 12)}`
-			await spawnGit(["push", url, `HEAD:${tmpRef}`], { cwd: src })
-			const current = (await fx.refs.listRefs(repo)).find(
-				(r) => r.name === "refs/heads/main",
+			// the store (see PushOptions.rewind for why this bypasses the wire policy).
+			const temporaryRef = `refs/heads/rewind-${head.slice(0, 12)}`
+			await spawnGit(["push", url, `HEAD:${temporaryRef}`], { cwd: sourceDirectory })
+			const current = (await fixture.refs.listRefs(repo)).find(
+				(ref) => ref.name === "refs/heads/main",
 			)
 			// A rewind's whole point is orphaning an EXISTING tip; falling back to a
 			// create here would silently under-exercise the GC workload.
@@ -131,7 +131,7 @@ export async function pushFile(
 					`pushFile rewind: refs/heads/main missing in ${repo} — seed the ref before rewinding it`,
 				)
 			}
-			const moved = await fx.refs.applyRefUpdates(
+			const moved = await fixture.refs.applyRefUpdates(
 				repo,
 				[
 					{
@@ -139,7 +139,7 @@ export async function pushFile(
 						oldOid: current.oid,
 						ref: "refs/heads/main",
 					},
-					{ newOid: ZERO_OID, oldOid: head, ref: tmpRef },
+					{ newOid: ZERO_OID, oldOid: head, ref: temporaryRef },
 				],
 				false,
 			)
@@ -147,89 +147,98 @@ export async function pushFile(
 				throw new Error(`pushFile rewind: store ref updates failed (${moved})`)
 			}
 		} else {
-			await spawnGit(["push", url, "HEAD:refs/heads/main"], { cwd: src })
+			await spawnGit(["push", url, "HEAD:refs/heads/main"], {
+				cwd: sourceDirectory,
+			})
 		}
-		const reachable = await gitReachableOids(src)
+		const reachable = await gitReachableOids(sourceDirectory)
 		return { head, reachable }
 	})
 }
 
 /**
- * The deny-non-FF-era orphan generator (replaces the retired force-commit
- * workload): attempt a `push --force` of an INDEPENDENT root commit and EXPECT
- * the server to ng it (`non-fast-forward`). The wire protocol ingests the pack
+ * Denied-push orphan generator: attempt a `push --force` of an INDEPENDENT root
+ * commit and expect the server to report `ng` (`non-fast-forward`). The wire
+ * protocol ingests the pack
  * BEFORE the policy pass, so the denied push's objects land in Postgres as
  * unreachable orphans while the ref stays untouched — exactly the garbage GC
  * exists to reclaim. Returns the denied tip and its would-be closure (the
  * orphan oracle). Throws if the push unexpectedly SUCCEEDS.
  */
 export async function pushDenied(
-	fx: Pick<GcFixture, "server">,
+	fixture: Pick<GcFixture, "server">,
 	repo: string,
-	opts: PushContent,
+	options: PushContent,
 ): Promise<PushResult> {
-	return withTempDir("pggit-gc-denied-", async (src) => {
-		const url = repoUrl(fx, repo)
-		const path = opts.path ?? "file.txt"
-		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
-		writeFileSync(join(src, path), opts.content)
-		await spawnGit(["add", "."], { cwd: src })
-		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
-		const push = await attemptGit(["push", "--force", url, "HEAD:refs/heads/main"], src)
+	return withTempDir("pggit-gc-denied-", async (sourceDirectory) => {
+		const url = repoUrl(fixture, repo)
+		const path = options.path ?? "file.txt"
+		await spawnGit(["init", "-q", "-b", "main"], { cwd: sourceDirectory })
+		writeFileSync(join(sourceDirectory, path), options.content)
+		await spawnGit(["add", "."], { cwd: sourceDirectory })
+		await spawnGit(["commit", "-q", "-m", "c"], { cwd: sourceDirectory })
+		const push = await attemptGit(
+			["push", "--force", url, "HEAD:refs/heads/main"],
+			sourceDirectory,
+		)
 		if (push.ok) {
 			throw new Error("pushDenied: the force push unexpectedly succeeded")
 		}
 		if (!/non-fast-forward/i.test(push.stderr)) {
 			throw new Error(`pushDenied: unexpected git failure: ${push.stderr.trim()}`)
 		}
-		const head = (await spawnGit(["rev-parse", "HEAD"], { cwd: src })).stdout.trim()
-		const reachable = await gitReachableOids(src)
+		const head = (
+			await spawnGit(["rev-parse", "HEAD"], { cwd: sourceDirectory })
+		).stdout.trim()
+		const reachable = await gitReachableOids(sourceDirectory)
 		return { head, reachable }
 	})
 }
 
 /** The result of cloning/fetching a ref back: the FETCH_HEAD oid, the full sorted
- * object set fetched, and the checked-out content of `file`. fsck has already
+ * object set fetched, and the checked-out content of `filePath`. fsck has already
  * passed (this throws otherwise). */
 type CloneResult = { head: string; objects: string[]; fileContent: string }
 
 /**
- * Fetch `ref` (default `refs/heads/main`) into a throwaway back dir, run
+ * Fetch `refName` (default `refs/heads/main`) into a throwaway clone directory, run
  * `fsck --full` (throws on any corruption/dangling), and return the FETCH_HEAD
- * oid, the fetched object set, and the checked-out `file` content. The canonical
+ * oid, the fetched object set, and the checked-out `filePath` content. The canonical
  * "the repo still clones clean" check — use it before AND after GC to prove
- * liveness preserved (GC-1) and idempotence (GC-6). The back dir is discarded.
+ * liveness preserved (GC-1) and idempotence (GC-6). The clone directory is discarded.
  */
 export async function cloneAndFsck(
-	fx: Pick<GcFixture, "server">,
+	fixture: Pick<GcFixture, "server">,
 	repo: string,
-	ref = "refs/heads/main",
-	file = "file.txt",
+	refName = "refs/heads/main",
+	filePath = "file.txt",
 ): Promise<CloneResult> {
-	return withTempDir("pggit-gc-back-", async (back) => {
-		const url = repoUrl(fx, repo)
-		await spawnGit(["init", "-q"], { cwd: back })
-		await spawnGit(["-c", "protocol.version=2", "fetch", url, ref], { cwd: back })
-		await spawnGit(["fsck", "--full"], { cwd: back })
+	return withTempDir("pggit-gc-back-", async (cloneDirectory) => {
+		const url = repoUrl(fixture, repo)
+		await spawnGit(["init", "-q"], { cwd: cloneDirectory })
+		await spawnGit(["-c", "protocol.version=2", "fetch", url, refName], {
+			cwd: cloneDirectory,
+		})
+		await spawnGit(["fsck", "--full"], { cwd: cloneDirectory })
 		const head = (
-			await spawnGit(["rev-parse", "FETCH_HEAD"], { cwd: back })
+			await spawnGit(["rev-parse", "FETCH_HEAD"], { cwd: cloneDirectory })
 		).stdout.trim()
-		const objects = await allObjectOids(back)
-		await spawnGit(["checkout", "-q", "FETCH_HEAD"], { cwd: back })
-		const fileContent = readFileSync(join(back, file), "utf8")
+		const objects = await allObjectOids(cloneDirectory)
+		await spawnGit(["checkout", "-q", "FETCH_HEAD"], { cwd: cloneDirectory })
+		const fileContent = readFileSync(join(cloneDirectory, filePath), "utf8")
 		return { fileContent, head, objects }
 	})
 }
 
 /** Canonical git's reachable OIDs after fetching the served `main` ref. */
 export async function servedMainReachableOids(
-	fx: Pick<GcFixture, "server">,
+	fixture: Pick<GcFixture, "server">,
 	repo: string,
 ): Promise<string[]> {
 	return withTempDir("pggit-reachable-main-", async (dir) => {
 		await spawnGit(["init", "-q"], { cwd: dir })
 		await spawnGit(
-			["-c", "protocol.version=2", "fetch", repoUrl(fx, repo), "refs/heads/main"],
+			["-c", "protocol.version=2", "fetch", repoUrl(fixture, repo), "refs/heads/main"],
 			{ cwd: dir },
 		)
 		await spawnGit(["update-ref", "refs/heads/main", "FETCH_HEAD"], { cwd: dir })
@@ -274,8 +283,7 @@ export async function countObjects(
  * The derived `git_commit`/`git_tag` rows for `repo` in ONE canonical sorted
  * text form — `commit <oid> tree=<t> parents=<p1,p2> time=<epoch>` /
  * `tag <oid> target=<t> type=<code>` — so suites can snapshot and diff the whole
- * derived surface with plain array equality (the spine-era successor of the old
- * `git_edge` row dump: the object⟺derived-rows invariant, GC-5).
+ * object⟺derived-rows surface with plain array equality (GC-5).
  */
 export async function derivedRows(
 	db: Pick<IsolatedDb, "sql">,

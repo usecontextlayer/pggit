@@ -1,12 +1,8 @@
 /**
  * pg-bloat/topology-growth — the growth curve of the topology surface, measured
- * against the packfile for the same history. The FLIPPED successor of
- * `pg-bloat--git-edge-quadratic` (spine slice S2): that harness measured
- * `git_edge` growing as N²/2 on the append-only shape (exponent 1.99 at komal)
- * and exit-1'd on super-linearity; the spine deleted the table, so this run is
- * the standing regression guard that the topology surface — `git_commit` +
- * `git_tag` rows — stays LINEAR in history, and that no `git_edge` relation
- * exists to quietly resurrect the old curve.
+ * against the packfile for the same history. Commit and annotated-tag derived rows
+ * must stay linear in history. A `git_edge` relation is forbidden because it would
+ * materialize per-reference closure edges and restore quadratic growth.
  *
  * EXIT NON-ZERO when the measured growth exponent exceeds `EXPONENT_LIMIT`
  * (super-linear: doubling a repo's age more than doubles its topology bytes), or
@@ -171,8 +167,7 @@ async function main(): Promise<void> {
 		console.log(`# topology-surface growth against the packfile for the same history\n`)
 		console.log(
 			`Shape: an append-only \`.engine/runs/planner-updates/\` directory gaining one\n` +
-				`run-uuid subdirectory per commit — the shape that grew \`git_edge\` as N²/2\n` +
-				`before spine S2 dropped it. The topology surface is now one \`git_commit\`\n` +
+				`run-uuid subdirectory per commit. The topology surface is one \`git_commit\`\n` +
 				`row per commit (+ \`git_tag\` per annotated tag): linear by construction,\n` +
 				`asserted here so it stays that way.\n`,
 		)
@@ -207,13 +202,12 @@ async function main(): Promise<void> {
 
 		console.log(
 			`\nheadline: ${last.commits} commits of this shape cost the topology surface ` +
-				`${mb(last.topoTotal)} MB (one row per commit) where pre-S2 \`git_edge\` paid ` +
-				`quadratically; git's packfile for the same history is ${mb(last.packBytes)} MB.`,
+				`${mb(last.topoTotal)} MB (one row per commit); git's packfile for the same history is ${mb(last.packBytes)} MB.`,
 		)
 
 		if (points.some((p) => p.edgeTableExists)) {
 			console.log(
-				`\nFAIL: a git_edge table exists — the dropped quadratic surface is back.`,
+				`\nFAIL: a git_edge table exists, reintroducing a quadratic topology surface.`,
 			)
 			process.exitCode = 1
 		}

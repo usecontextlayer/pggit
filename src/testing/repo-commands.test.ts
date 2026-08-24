@@ -97,16 +97,14 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 			{ numRuns: 30, seed: 424_242 },
 		)
 
-		// The corpus floors: the counts the pinned seed realizes today. Each one falling
+		// The corpus floors: the counts realized by the pinned seed. Each one falling
 		// means the corresponding command kind stopped landing and every consuming
 		// differential quietly lost that dimension. Raising a floor is fine (a richer
-		// corpus); dropping one is the regression these exist to red.
+		// corpus); dropping one means that dimension disappeared.
 		//
 		// MERGE is floored on the RANDOM corpus, which is the only floor that protects
 		// the six consumers: the hand-picked case below proves the vocabulary can reach
-		// a merge, but the consumers never replay it. Before `divergeAndMerge` existed
-		// this corpus realized ZERO merge commits, so every differential built on this
-		// generator had only ever seen single-parent history.
+		// a merge, but the consumers never replay it.
 		console.log(
 			`[repoCommands corpus] candidates=${shape.candidates} merge=${shape.withMerge} ` +
 				`tag-object=${shape.withTagObject} second-branch=${shape.withSecondBranch} ` +
@@ -167,15 +165,15 @@ describe("repoCommands generator + buildRepoFromCommands replay", () => {
 		// branch `dev` and a tag `dev` present, a bare `git branch <new>` exits 128
 		// (`ambiguous object name: 'dev'`) — which breaks the generator's contract that
 		// a replay never makes git exit non-zero, and did: the sequence below is the
-		// shape fast-check shrank a gc.spec PBT-1 failure down to. The replay throwing
-		// is the regression; `buildRepoFromCommands` propagates it.
+		// shape pinned by generative/gc.test.ts. `buildRepoFromCommands` must propagate
+		// any replay failure.
 		const { dir, model } = await buildRepoFromCommands([
 			{ content: { kind: "text", value: "alpha\n" }, kind: "writeFile", path: "a.txt" },
 			{ kind: "commit" },
 			{ idx: 2, kind: "branch" }, // "dev"
 			{ annotated: false, idx: 2, kind: "tag" }, // a TAG also called "dev"
 			{ idx: 1, kind: "checkout" }, // HEAD onto branch "dev"
-			{ idx: 0, kind: "branch" }, // "feature" — the call that used to fatal
+			{ idx: 0, kind: "branch" }, // "feature" — the ambiguous branch creation
 		])
 		try {
 			expect([...model.existingBranches].sort()).toEqual(["dev", "feature", "main"])

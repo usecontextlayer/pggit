@@ -1,17 +1,16 @@
 /**
  * Transport gzip request-body handling for the smart-HTTP upload-pack endpoint.
  *
- * Merged from two regression suites:
- *  - http-gzip-request: the happy/identity/unsupported-encoding decode boundary
+ * Two complementary groups cover this boundary:
+ *  - the happy/identity/unsupported-encoding decode boundary
  *    (real git clones a many-ref repo whose fetch request git gzip-compresses;
  *    plus deterministic manual gzip, identity, and unsupported-encoding cases).
- *  - pro02 (post-with-content-encoding-gzip-but-a-non-gzip-body): a body that
+ *  - a body that
  *    LIES about being gzip must yield a clean 400, never a 500, consistent with
  *    the sibling unsupported encodings (deflate / br / unknownfoo).
  *
- * Both suites are kept as their own top-level describe blocks (the safe combine):
- * their `postUploadPack` helpers have different signatures, so each lives in its
- * own block scope to avoid a top-level redeclaration. The git-oracle helpers come
+ * The groups use separate top-level describe blocks because their `postUploadPack`
+ * helpers have different signatures. The git-oracle helpers come
  * from `@/testing/git-fixtures` — a local copy would miss every guarantee added at
  * that seam.
  */
@@ -33,8 +32,7 @@ import { withTempDir } from "@/testing/temp-dir"
 
 // A minimal, valid v2 `ls-refs` request (command + delim + flush, no args → list
 // every ref). Built from our own pkt-line encoders so the gzip cases test the
-// transport, not a hand-authored byte string. Identical in both source suites,
-// so kept as a single module-level const.
+// transport, not a hand-authored byte string.
 const LS_REFS_REQUEST = Buffer.concat([
 	encodePktLine(Buffer.from("command=ls-refs\n")),
 	encodePkt({ type: "delim" }),
@@ -44,7 +42,7 @@ const LS_REFS_REQUEST = Buffer.concat([
 // git gzip-compresses the upload-pack *fetch* request (Content-Encoding: gzip)
 // once it carries enough `want` lines. A clone wants one per advertised ref, so
 // fanning out many refs at the tip pushes the request past git's compression
-// threshold — the smart-HTTP transport detail single-ref m0/m1 clones never hit.
+// threshold — a smart-HTTP transport detail single-ref clones do not hit.
 const REF_COUNT = 64
 
 describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
@@ -52,9 +50,9 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 	let server: GitServer
 	let src: string
 
-	// File-1 variant: a free function parameterized by `port`, returning the full
+	// This helper is parameterized by `port` and returns the full
 	// Response (callers assert status + body). Kept in block scope to avoid a
-	// top-level collision with the pro02 variant's same-named helper.
+	// top-level collision with the other group's same-named helper.
 	function postUploadPack(
 		port: number,
 		body: Buffer,
@@ -98,8 +96,8 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 	})
 
 	// End-to-end: real git clones a many-ref repo, which makes git gzip the fetch
-	// request. The original bug (server fed the gzip body to the pkt-line parser)
-	// surfaced here as HTTP 500 "expected 'packfile'".
+	// request. Feeding those compressed bytes to the pkt-line parser would surface
+	// as HTTP 500 "expected 'packfile'".
 	it("real git clones a many-ref repo (gzipped fetch request) cleanly", async () => {
 		await withTempDir("pggit-gzip-dest-", async (dest) => {
 			await spawnGit([
@@ -142,37 +140,36 @@ describe("smart-HTTP — request body Content-Encoding (gzip)", () => {
 })
 
 /**
- * pro02 protocol-http-boundary — a POST that declares `Content-Encoding: gzip` but
+ * A POST that declares `Content-Encoding: gzip` but
  * carries a body that is NOT valid gzip is a CLIENT-side wire fault, and it comes
  * back as a clean HTTP 400 — exactly like every other malformed or unsupported
  * encoding (`deflate`, `br`, `unknownfoo`, all via `GitProtocolError`), and like
  * `git http-backend`, which never 500s on a malformed request body.
  *
- * ORIGINATED as the breakage probe for an UNGUARDED `gunzipSync` in the request-body
- * reader: a body that failed to inflate threw a zlib error, which — not being a
- * `GitProtocolError` — fell through to onError as HTTP 500, a server fault reported
- * for a client mistake and an inconsistency with every sibling encoding. Fixed by
- * rethrowing the inflate failure as a GitProtocolError onto the shared 400 path.
+ * Inflate failures are translated to `GitProtocolError` so they follow the shared
+ * client-error path.
  *
  * Observed against the wire (the in-process Hono app over a real listening port),
  * asserting only the HTTP status the client sees — not any internal zlib detail.
  */
-describe("pro02 — Content-Encoding: gzip with a non-gzip body yields a clean 400, never 500", () => {
+describe("Content-Encoding: gzip with a non-gzip body yields a clean 400", () => {
 	let db: IsolatedDb
 	let server: GitServer
 
-	// pro02 variant: closes over `server` and returns only the HTTP status. Kept
-	// in block scope to avoid a top-level collision with the File-1 variant.
+	// This helper closes over `server` and returns only the HTTP status.
 	async function postUploadPack(body: Buffer, contentEncoding: string): Promise<number> {
-		const res = await fetch(`http://127.0.0.1:${server.port}/pro02/git-upload-pack`, {
-			body,
-			headers: {
-				"content-encoding": contentEncoding,
-				"content-type": "application/x-git-upload-pack-request",
-				"git-protocol": "version=2",
+		const res = await fetch(
+			`http://127.0.0.1:${server.port}/malformed-gzip/git-upload-pack`,
+			{
+				body,
+				headers: {
+					"content-encoding": contentEncoding,
+					"content-type": "application/x-git-upload-pack-request",
+					"git-protocol": "version=2",
+				},
+				method: "POST",
 			},
-			method: "POST",
-		})
+		)
 		return res.status
 	}
 

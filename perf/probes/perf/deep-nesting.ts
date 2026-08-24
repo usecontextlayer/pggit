@@ -149,7 +149,7 @@ async function main(): Promise<void> {
 					outcome,
 				])
 
-				// Deepest case: a real clone must round-trip through canonical git.
+				// The deepest case must also serve canonical state to a real git client.
 				if (depth === DEPTHS[DEPTHS.length - 1] && !caseCrashed) {
 					const server = await serveOnPort(createGitApp(createGitDeps(db.sql)), 0)
 					const dest = join(mkTmp("deep-clone"), "c")

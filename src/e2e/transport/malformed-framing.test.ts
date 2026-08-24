@@ -1,13 +1,12 @@
 /**
- * Transport-level malformed pkt-line framing — merged from a12 (malformed
- * pkt-line POST body) + mal03 (overrun/truncated pkt-line length swallowed).
+ * Transport-level malformed pkt-line framing.
  *
  * Both describes pin one contract from different angles: a malformed pkt-line on
  * the wire is the CLIENT's fault and comes back as HTTP 400 — never an unhandled
  * 500, and never a swallowed 200 that reinterprets framing garbage as payload.
  *
- * The two suites use DIFFERENT `post` helpers (a12 hits `app.request` and
- * returns just the status; mal03 hits a real listening port via `fetch` and
+ * The two groups use DIFFERENT `post` helpers: one hits `app.request` and
+ * returns just the status; the other hits a real listening port via `fetch` and
  * returns `{status, text}`). To avoid a top-level redeclaration collision, each
  * `post` is scoped inside its own describe block.
  */
@@ -20,18 +19,14 @@ import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 
 /**
- * a12 — a malformed pkt-line in a POST body is the CLIENT's fault and surfaces as
+ * A malformed pkt-line in a POST body is the CLIENT's fault and surfaces as
  * a clean HTTP 400 (GitProtocolError), exactly like an empty body ("upload-pack:
  * unsupported command") or an unsupported capability. Each case below is a distinct
  * malformed-framing shape a real or adversarial client can put on the wire.
  *
- * ORIGINATED as the breakage probe for the pkt-line parser (`parseLen` /
- * `decodePktStream`) throwing a bare `Error` rather than a `GitProtocolError`, so
- * the app's onError answered 500 "internal server error" — a server fault reported
- * for a client mistake. Fixed; the status asserted here is the one the client sees,
- * not any parser detail.
+ * The status asserted here is the one the client sees, not any parser detail.
  */
-describe("a12 — malformed pkt-line POST body yields 400", () => {
+describe("malformed pkt-line POST body yields 400", () => {
 	let db: IsolatedDb
 	let app: ReturnType<typeof createGitApp>
 
@@ -73,7 +68,7 @@ describe("a12 — malformed pkt-line POST body yields 400", () => {
 })
 
 /**
- * mal03 — a pkt-line whose declared length OVERRUNS the bytes present, or a command
+ * A pkt-line whose declared length OVERRUNS the bytes present, or a command
  * list that ends without a flush, is a framing error on a COMPLETE HTTP body: the
  * server answers 400 and never reinterprets the leftover as pack payload or drops
  * it to an empty argument set.
@@ -83,18 +78,10 @@ describe("a12 — malformed pkt-line POST body yields 400", () => {
  * trailing packet is right for a streaming chunk with more bytes coming, and wrong
  * for a request body where there is no next chunk.
  *
- * ORIGINATED as the breakage probe for exactly that confusion. On receive-pack, an
- * unterminated command list fell out of the decode loop with no packets and the
- * whole malformed buffer as `rest`, which became the "pack" — a body of
- * `0064hello` (declares 100 payload bytes, supplies 5) answered HTTP 200 with an
- * in-band `unpack ... bad magic`, i.e. a framing fault swallowed as a pack fault.
- * On upload-pack, an overrun `want` line was dropped from the decoded packets, so
- * the request silently became a zero-want no-op answered with `acknowledgments /
- * NAK`. A crafted overrun whose leftover landed on valid-looking PACK bytes could
- * mask a partial command set with no diagnostic at all. Fixed: a complete body with
- * an overrun or unflushed command stream is rejected as a framing error.
+ * A complete body with an overrun or unflushed command stream is rejected as a
+ * framing error, never reinterpreted as pack bytes or a zero-want request.
  */
-describe("mal03 — overrun/unterminated pkt-line is a framing error, not swallowed", () => {
+describe("overrun/unterminated pkt-line is a framing error", () => {
 	let db: IsolatedDb
 	let server: GitServer
 
@@ -128,7 +115,7 @@ describe("mal03 — overrun/unterminated pkt-line is a framing error, not swallo
 		// `0064` declares a 0x64 = 100-byte pkt-line, but only 9 bytes are present.
 		// No flush ever appears before the (nonexistent) pack.
 		const body = Buffer.from("0064hello", "latin1")
-		const { status, text } = await post("/mal03rp/git-receive-pack", body, {
+		const { status, text } = await post("/overrun-command/git-receive-pack", body, {
 			"Content-Type": "application/x-git-receive-pack-request",
 		})
 
@@ -141,7 +128,7 @@ describe("mal03 — overrun/unterminated pkt-line is a framing error, not swallo
 	it("receive-pack: a 2-byte truncated length prefix is rejected, not swallowed", async () => {
 		// A bare `00` — an incomplete length prefix on a complete body.
 		const body = Buffer.from("00", "latin1")
-		const { status } = await post("/mal03rp2/git-receive-pack", body, {
+		const { status } = await post("/truncated-prefix/git-receive-pack", body, {
 			"Content-Type": "application/x-git-receive-pack-request",
 		})
 		expect(status).toBe(400)
@@ -149,7 +136,7 @@ describe("mal03 — overrun/unterminated pkt-line is a framing error, not swallo
 
 	it("upload-pack: an overrun want pkt-line is rejected, not dropped to an empty want set", async () => {
 		// command=fetch, delim (0001), then `00ff` declares 0xff-4 = 251 payload bytes
-		// but supplies far fewer — the shape that used to be dropped into a silent NAK.
+		// but supplies far fewer — a shape that must not be dropped into a silent NAK.
 		const body = Buffer.from(
 			"0012command=fetch\n" +
 				"0001" +
@@ -157,7 +144,7 @@ describe("mal03 — overrun/unterminated pkt-line is a framing error, not swallo
 				"0000",
 			"latin1",
 		)
-		const { status, text } = await post("/mal03up/git-upload-pack", body, {
+		const { status, text } = await post("/overrun-want/git-upload-pack", body, {
 			"Content-Type": "application/x-git-upload-pack-request",
 			"Git-Protocol": "version=2",
 		})

@@ -26,7 +26,7 @@
  * overhead, snapshot hold, pool contention, WAL per repack) prices resources and
  * lives in `perf/probes/pgres/`.
  *
- * The source probe EXITED non-zero when: any leaf's `data` column is not
+ * The contract fails when any leaf's `data` column is not
  * `attstorage='e'` (C4 falsified), or observed TOAST bytes for the wide-tree repo
  * are smaller than the stored deflated bytes they must hold out of line (a second
  * compression pass). It REPORTED the reloptions drift rather than bounding it ("a
@@ -286,7 +286,7 @@ describe("encoding tier storage profile — C4 propagation + the 0008 reloptions
 			`wide: ${wide.rows - narrow.rows} rows, ${wideData}B deflated, heap ${wideHeap}B / TOAST ${wideToast}B · ` +
 			`sizes p50=${d.p50}B p99=${d.p99}B max=${d.maxv}B rows>2KB=${d.over2k}`
 
-		// The fixture precondition the source probe used as its FAIL gate: without a
+		// Fixture precondition: without a
 		// megabyte of oversize rows the placement check would be vacuous.
 		expect(
 			bigBytes,

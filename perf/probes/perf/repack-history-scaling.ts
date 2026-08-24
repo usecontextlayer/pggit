@@ -6,8 +6,8 @@
  * The shape's tree bytes are inherently QUADRATIC in commit count, so absolute
  * time must grow ~N². The question is whether pggit grows FASTER than the data,
  * and how its wall compares to real `git repack -adf` doing the equivalent job on
- * the identical object set. Peak process RSS is sampled through the pass
- * (design concern C1: the content cache is unbounded).
+ * the identical object set. Peak process RSS is sampled through the pass because
+ * its content cache is unbounded.
  *
  *   NODE_OPTIONS=--expose-gc npx tsx perf/probes/perf/repack-history-scaling.ts [--sizes=250,500,1000,2000]
  */

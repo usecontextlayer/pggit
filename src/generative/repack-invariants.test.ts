@@ -29,7 +29,7 @@ const SEED_WIDTH = 30
 // ── the generated edit language ─────────────────────────────────────────────
 // Every command carries its own parameters; indices wrap into the model's live
 // path list, so a shrunk sequence stays replayable (the `cyclicAt` discipline from
-// generative/commands.ts).
+// testing/repo-commands.ts).
 
 type Edit =
 	| { kind: "append"; dir: number }
@@ -114,7 +114,7 @@ type Snapshot = { mark: number; files: Map<string, Entry> }
  * report which shapes it realized. The model tracks the tree of `refs/heads/main`
  * so every emitted command is valid (no rewrite of an absent path, no mode swap to
  * the mode it already has) — invalid draws are skipped silently, exactly like
- * `generative/commands.ts`, and the floors below are what keep that honest.
+ * `testing/repo-commands.ts`, and the floors below are what keep that honest.
  */
 async function buildRepo(dir: string, edits: Edit[]): Promise<Shape> {
 	const stream: string[] = []

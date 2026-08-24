@@ -28,42 +28,49 @@ const args = parseArgs(
 		})
 		.strict(),
 )
-const MINE = ["realrepo/", "races/", "border/", "warm/", "sizecheck/"]
+const HARNESS_REPO_PREFIXES = ["realrepo/", "races/", "border/", "warm/", "sizecheck/"]
 
 async function main(): Promise<void> {
 	const sql = postgres(args.pg, { max: 1, onnotice: () => {} })
 	try {
 		const schemas = await sql<{ nspname: string }[]>`
 			select nspname from pg_namespace where nspname like 't\\_%' order by nspname`
-		const mine: { schema: string; repos: string[] }[] = []
-		let foreign = 0
+		const attributed: { schema: string; repos: string[] }[] = []
+		let unattributed = 0
 		for (const { nspname } of schemas) {
 			const [has] = await sql<{ n: number }[]>`
 				select count(*)::int as n from pg_class c
 				join pg_namespace n on n.oid = c.relnamespace
 				where n.nspname = ${nspname} and c.relname = 'repos'`
 			if (!has || has.n === 0) {
-				foreign++
+				unattributed++
 				continue
 			}
 			const rows = await sql<{ name: string }[]>`select name from ${sql(nspname)}.repos`
 			const names = rows.map((r) => r.name)
-			if (names.length > 0 && names.every((n) => MINE.some((p) => n.startsWith(p)))) {
-				mine.push({ repos: names, schema: nspname })
+			if (
+				names.length > 0 &&
+				names.every((name) =>
+					HARNESS_REPO_PREFIXES.some((prefix) => name.startsWith(prefix)),
+				)
+			) {
+				attributed.push({ repos: names, schema: nspname })
 			} else {
-				foreign++
+				unattributed++
 			}
 		}
 		console.log(
-			`${schemas.length} t_* schemas; ${mine.length} attributable to this exercise, ${foreign} NOT mine (left alone)`,
+			`${schemas.length} t_* schemas; ${attributed.length} attributable to this exercise, ${unattributed} unattributed (left alone)`,
 		)
-		for (const m of mine) console.log(`  ${m.schema}  repos: ${m.repos.join(", ")}`)
+		for (const entry of attributed) {
+			console.log(`  ${entry.schema}  repos: ${entry.repos.join(", ")}`)
+		}
 		if (args.drop) {
-			for (const m of mine) {
-				await sql`drop schema ${sql(m.schema)} cascade`
-				console.log(`  dropped ${m.schema}`)
+			for (const entry of attributed) {
+				await sql`drop schema ${sql(entry.schema)} cascade`
+				console.log(`  dropped ${entry.schema}`)
 			}
-		} else if (mine.length > 0) {
+		} else if (attributed.length > 0) {
 			console.log(`\nre-run with --drop=true to remove them`)
 		}
 	} finally {

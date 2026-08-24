@@ -28,9 +28,7 @@ import { withTempDir } from "@/testing/temp-dir"
  * pushes themselves (each push is a distinct round-trip, so `clock_timestamp()`
  * advances between them — no wall-clock sleep, no `ageObjects`).
  *
- * ORIGINATED as the TDD suite for the activity stamp, written while the store did
- * not yet write `repos.last_pushed_at` at all (it stayed NULL after a push). The
- * stamp landed per §3; these cases are its regression gate.
+ * These cases pin the §3 activity-stamp contract.
  */
 describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 	let fx: GcFixture
@@ -85,8 +83,8 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		const afterFf = await pushedAt(repo)
 		expect(afterFf.getTime()).toBeGreaterThan(afterCreate.getTime())
 
-		// A store-level rewind (the retired force-commit workload's internal twin):
-		// an independent root orphans the prior tip and re-stamps the column,
+		// A store-level rewind to an independent root orphans the prior tip and
+		// re-stamps the column,
 		// strictly later than the ff stamp (applyRefUpdates stamps on mutation).
 		await pushFile(fx, repo, { content: "third (rewind)\n", rewind: true })
 		const afterRewind = await pushedAt(repo)
@@ -126,7 +124,7 @@ describe("GC scheduler — activity signal (§6: SCH-1, SCH-2)", () => {
 		})
 		expect(await pushedAt(repo)).toEqual(afterCreateTopic)
 
-		// The STORE-level delete (the internal path a retired ref takes) is a ref
+		// The STORE-level delete is a ref
 		// update with no pack, no new object — and must still stamp activity.
 		// Bracketed by existence checks: the store reports an absent-ref delete as
 		// a `true` no-op too, so `[true]` alone would not prove removal.

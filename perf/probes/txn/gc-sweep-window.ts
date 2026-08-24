@@ -1,7 +1,7 @@
 /**
  * PROBE 5 — how do a GC pass's measured SQL milliseconds divide between the object sweep and the surrounding pass work?
  *
- * HISTORY (2026-08-16): this originally timed separate object, edge, and encoding sweeps. D14 deleted the encoding sweep in favor of the 0008 FK cascade, and spine S2 deleted `git_edge` and its sweep entirely. The only destructive statement left is the object sweep; its transaction now carries the commit/tag/encoding cascades. This probe measures that current shape instead of preserving retired sweep vocabulary.
+ * The object sweep is the pass's only destructive statement; its transaction also carries the commit, tag, and encoding foreign-key cascades. The probe separates that statement's time from the surrounding pass work.
  *
  * It is a PERF harness, not a vitest test, because its verdict is a TIMING MEASUREMENT. Like `perf/probes/delta-probe.ts` it is one-shot and diagnostic: not a performance gate, but it fails loudly if the fixture reclaims no objects or the timing wrapper observes no object-sweep statement.
  *
@@ -110,7 +110,7 @@ async function main(): Promise<void> {
 		await refs.setRef(REPO, "refs/heads/main", rewindTo)
 
 		console.log(
-			`# txn--gc-sweep-window — ${RUNS} runs, main rewound to commit #${REWIND_TO}\n`,
+			`# txn/gc-sweep-window — ${RUNS} runs, main rewound to commit #${REWIND_TO}\n`,
 		)
 		const perSweep = new Map<string, number>()
 		const res = await createGc(timed(db.sql, perSweep)).gc(REPO, {
@@ -163,7 +163,7 @@ async function main(): Promise<void> {
 		)
 
 		console.log(
-			`\nobject sweep (now carrying the cascade work) = ${objectMs.toFixed(0)} ms ` +
+			`\nobject sweep (carrying the cascade work) = ${objectMs.toFixed(0)} ms ` +
 				`of the ${total.toFixed(0)} ms pass (${((objectMs / total) * 100).toFixed(1)}%)`,
 		)
 	} finally {

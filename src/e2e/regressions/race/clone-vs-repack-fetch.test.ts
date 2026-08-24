@@ -9,17 +9,16 @@
  * The server state is the `half` template: the encoding tier covers the OLD
  * history (exactly what the client already has), the newly pushed tail is
  * pending, and the raced repack encodes that tail mid-serve. RUNS=600 (~5k
- * objects) halves the source script's fixture per ruling 6 of
+ * objects) is the scale chosen by ruling 6 of
  * docs/2026-08-20-test-efficiency.md — the served increment still spans the
  * batch seam the hunt needs; the property is seam EXISTENCE, not seam count.
  *
  * Verdict is git's: fetch + ff-merge exit status, `git fsck --strict`, and the
  * client's object set vs the source repo's.
  *
- * Converted from `breakage/race--clone-vs-repack.ts` (`--iters=30 --runs=1200
- * --mode=all`), split per mode so the three modes parallelize across workers
- * instead of anchoring the gate's wall time as one serial file. The source (and
- * the first conversion) swept absolute delays but CLAMPED them to
+ * The three modes are split so they parallelize across workers instead of
+ * anchoring the gate's wall time as one serial file. An absolute-delay sweep
+ * clamped to
  * `min(delay, 60)` in this mode, because an incremental serve is far shorter
  * than a clone serve — which silently collapsed 8 of the 12 sweep arms onto
  * 60 ms. Calibration replaces the clamp with its intent: one un-raced

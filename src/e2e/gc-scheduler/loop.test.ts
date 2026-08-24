@@ -29,9 +29,7 @@ import {
  * stay free to change. Determinism comes from the scheduler's `graceSeconds`,
  * never a wall-clock wait.
  *
- * ORIGINATED as the TDD suite written against a throwing `createGcScheduler` stub
- * and a store that never stamped `repos.last_pushed_at`. The activity stamp and
- * the drain loop honour the §6 contract now; this is their regression gate.
+ * These cases pin the activity stamp and drain-loop contract under §6.
  */
 describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", () => {
 	let fx: GcFixture

@@ -26,8 +26,6 @@
  * oids. Both schemas come from `inject("pgBaseUrl")` — the SAME container database,
  * which is the entire point.
  *
- * Converted from `breakage/pg-corrupt--cross-schema-bleed.ts`, whose verdict was:
- * exit 0 = no bleed; non-zero = cross-contamination, with the leaked oids printed.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

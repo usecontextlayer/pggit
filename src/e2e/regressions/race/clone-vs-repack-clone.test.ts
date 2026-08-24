@@ -12,16 +12,14 @@
  * emitted raw-deflated while object B, read later, is emitted as a REF_DELTA
  * against an object that already went out in whole form. RUNS=600 (~5k objects,
  * ~5 batch reads) keeps 4 inter-batch seams; the property is seam EXISTENCE,
- * not seam count (docs/2026-08-20-test-efficiency.md, ruling 6 — halved from
- * the source script's 1200).
+ * not seam count (docs/2026-08-20-test-efficiency.md, ruling 6).
  *
  * Verdict is git's: clone exit status, `git fsck --strict`, and the client's
  * object set vs the source repo's.
  *
- * Converted from `breakage/race--clone-vs-repack.ts` (`--iters=30 --runs=1200
- * --mode=all`), split per mode so the three modes parallelize across workers
- * instead of anchoring the gate's wall time as one serial file. The source's
- * frozen absolute delays ([0..1100]ms) tied the sweep to one machine's serve
+ * The three modes are split so they parallelize across workers instead of
+ * anchoring the gate's wall time as one serial file. Frozen absolute delays
+ * would tie the sweep to one machine's serve
  * speed — on a slower or loaded box they crowd into the serve's head and the
  * late batch seams are never raced. Each run instead times one un-raced
  * calibration clone and sweeps the repack's start across FRACTIONS of that

@@ -12,7 +12,7 @@ import { encodeSidebandData } from "@/protocol/sideband"
  * advertising them flips clients onto unimplemented paths.
  */
 export function encodeAdvertisement(): Buffer {
-	const caps = [
+	const capabilities = [
 		"version 2",
 		`agent=${AGENT}`,
 		"ls-refs=unborn",
@@ -20,7 +20,7 @@ export function encodeAdvertisement(): Buffer {
 		"object-format=sha1",
 	]
 	return Buffer.concat([
-		...caps.map((c) => encodePktLine(Buffer.from(`${c}\n`))),
+		...capabilities.map((capability) => encodePktLine(Buffer.from(`${capability}\n`))),
 		encodePkt({ type: "flush" }),
 	])
 }
@@ -49,13 +49,13 @@ export function parseV2Request(body: Buffer): V2Request {
 	const capabilities: string[] = []
 	const args: string[] = []
 	let afterDelim = false
-	for (const p of packets) {
-		if (p.type === "delim") {
+	for (const packet of packets) {
+		if (packet.type === "delim") {
 			afterDelim = true
 			continue
 		}
-		if (p.type !== "data") continue
-		const line = p.payload.toString("utf8").replace(/\n$/, "")
+		if (packet.type !== "data") continue
+		const line = packet.payload.toString("utf8").replace(/\n$/, "")
 		if (afterDelim) args.push(line)
 		else if (line.startsWith("command=")) command = line.slice("command=".length)
 		else capabilities.push(line)
@@ -151,10 +151,10 @@ export type LsRefEntry =
 
 /** ls-refs response: one line per ref (+ symref-target / peeled), then flush. */
 export function encodeLsRefsResponse(entries: LsRefEntry[]): Buffer {
-	const lines = entries.map((e) => {
-		let line = "unborn" in e ? `unborn ${e.name}` : `${e.oid} ${e.name}`
-		if (e.symrefTarget) line += ` symref-target:${e.symrefTarget}`
-		if ("peeled" in e && e.peeled) line += ` peeled:${e.peeled}`
+	const lines = entries.map((entry) => {
+		let line = "unborn" in entry ? `unborn ${entry.name}` : `${entry.oid} ${entry.name}`
+		if (entry.symrefTarget) line += ` symref-target:${entry.symrefTarget}`
+		if ("peeled" in entry && entry.peeled) line += ` peeled:${entry.peeled}`
 		return encodePktLine(Buffer.from(`${line}\n`))
 	})
 	return Buffer.concat([...lines, encodePkt({ type: "flush" })])

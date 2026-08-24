@@ -8,8 +8,9 @@
  * bases before storage. Canonical index-pack validates each raw pack and proves that
  * all three servers transmitted the same object OIDs before any ratio is reported.
  *
- *   D2/D9 — star topology, depth ≤ 1: no entry pggit serves may have chain depth > 1.
- *   D8'   — a warm fetch may ship a thin REF_DELTA against a proven client `have`.
+ * Stored encodings form a star topology, so no entry pggit serves may have chain
+ * depth greater than one. A warm fetch may ship a thin REF_DELTA against an object
+ * the client proved it has.
  *
  * Failure conditions (exit non-zero):
  *   - a client-indexed delta chain deeper than 1 from the encoded pggit remote
@@ -152,7 +153,7 @@ async function requireCloneParity(
 }
 
 async function main(): Promise<void> {
-	console.log(`# wire--pack-shape-vs-git — ${RUNS_1} runs, +${RUNS_2} on the fetch\n`)
+	console.log(`# wire/pack-shape-vs-git — ${RUNS_1} runs, +${RUNS_2} on the fetch\n`)
 	const src = await createAppendOnlyRepo({ docs: 6, runs: RUNS_1 })
 	scratch.own(src)
 	const bare = join(mk("bare"), "oracle.git")

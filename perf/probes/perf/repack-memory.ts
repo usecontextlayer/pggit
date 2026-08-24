@@ -1,6 +1,6 @@
 /**
- * PROBE: `createRepack`'s content cache is unbounded (design concern C1 — "the
- * pass holds roughly the repo's tree bytes in memory"). How big must a repo be
+ * PROBE: `createRepack`'s content cache is unbounded, so the pass holds roughly
+ * the repo's tree bytes in memory. How big must a repo be
  * before one offline pass in the platform process needs gigabytes, and how does
  * that compare to what real `git repack -adf` needs for the same job?
  *

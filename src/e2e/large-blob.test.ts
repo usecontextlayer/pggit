@@ -20,11 +20,7 @@
  * blob-tipped tag), which isolates the string-cap subject from the
  * branch-tips-must-be-commits policy without faking a commit wrapper.
  *
- * ORIGINATED as two breakage probes over the same shape — a07 (INGEST: the push
- * came back with an unpacker error and no ref) and blb01 (SERVE: the blob stored
- * but every fetch died with `RPC failed; HTTP 500`, i.e. write-only storage). Both
- * fixed; merged into one describe because two byte-identical 270MB fixtures were
- * paying twice for one shape.
+ * One fixture exercises both ingest and serve so the 270MB setup is paid once.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

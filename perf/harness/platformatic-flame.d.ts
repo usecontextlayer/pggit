@@ -1,5 +1,4 @@
-// @platformatic/flame ships no type declarations; the profile wrapper validates
-// the unknown parsed profile at its boundary.
+// Keep parsed profiles unknown here; the profile wrapper validates them at its boundary.
 declare module "@platformatic/flame" {
 	export function generateMarkdown(
 		profilePath: string,

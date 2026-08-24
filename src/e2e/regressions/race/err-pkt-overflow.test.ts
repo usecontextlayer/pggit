@@ -23,12 +23,11 @@
  * sweeps a large orphaned span, counting how often the refusal degrades into a
  * 500 with the pkt-line cap as the underlying server error.
  *
- * Converted from `breakage/race--err-pkt-overflow.ts` (`--iters=20 --runs=1200
- * --rewind=1100`). Part 1 is DETERMINISTIC — above ~1,597 missing oids the
+ * Part 1 is DETERMINISTIC — above ~1,597 missing oids the
  * refusal is always a 500 — so its N sweep is frozen exactly, and `RUNS`/`REWIND`
- * stay at the source's scale: the raced half needs the orphaned span to be
+ * stay at this scale: the raced half needs the orphaned span to be
  * thousands of objects for the sweep to cross the ceiling. Part 2's gc-start
- * delays are NOT frozen: the source's absolute milliseconds ([0..180]ms) tie the
+ * delays are NOT frozen: absolute milliseconds would tie the
  * race to one machine's serve speed, so each run times one un-raced fetch of the
  * same shape and sweeps the gc start across FRACTIONS of that measured wall
  * (0–16%, the serve's opening phase — the gc must get ahead of the serve's

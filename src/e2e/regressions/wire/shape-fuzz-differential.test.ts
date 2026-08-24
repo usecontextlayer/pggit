@@ -1,6 +1,6 @@
 /**
  * WIRE — seeded differential fuzz over repository SHAPES, against a plain bare git
- * remote. (Converted from `breakage/wire--shape-fuzz-differential.ts`.)
+ * remote.
  *
  * The repack pass recovers "lineages" by diffing each commit's root tree against
  * its FIRST parent's and recursing into same-NAME subtrees. That recursion is where

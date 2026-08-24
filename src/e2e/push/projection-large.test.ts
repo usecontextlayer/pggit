@@ -1,5 +1,5 @@
 /**
- * a06 scale-objects — the queryable-view snapshot insert stays under the Postgres
+ * The repo-file projection insert stays under the Postgres
  * bind-parameter ceiling.
  *
  * `repo_file` binds 5 columns per row, so a single commit whose tree holds 13107
@@ -14,11 +14,6 @@
  * exiting 0 and the ref being advertised hold whether the insert wrote every row or
  * none. Only reading `repo_file` tells "the chunked insert landed" from "the insert
  * threw and was logged".
- *
- * ORIGINATED as the breakage probe for that un-chunked INSERT: the driver raised
- * MAX_PARAMETERS_EXCEEDED, which at the time escaped the receive-pack handler as an
- * HTTP 500 and killed the client's push ("the remote end hung up unexpectedly")
- * even though objects and ref had committed. Fixed by chunking the rebuild.
  *
  * The live server wires `projection: createRepoFileProjection(db)`, and so does this
  * fixture — the path under test is production's.
@@ -35,7 +30,7 @@ import { createRefStore } from "@/store/refs-store"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-describe("a06 — repo_file projection insert stays under the bind-parameter ceiling", () => {
+describe("repo_file projection insert stays under the bind-parameter ceiling", () => {
 	let isolated: IsolatedDb
 	let server: GitServer
 	let url: string
@@ -61,7 +56,7 @@ describe("a06 — repo_file projection insert stays under the bind-parameter cei
 	it("pushes a single commit whose tree holds 13107 files (>65534 bind params)", async () => {
 		// 13107 files * 5 repo_file columns = 65535 bound params > the 65534 cap.
 		const N = 13_107
-		const src = mkdtempSync(join(tmpdir(), "a06-snap-src-"))
+		const src = mkdtempSync(join(tmpdir(), "repo-file-large-src-"))
 		dirs.push(src)
 		await spawnGit(["init", "--quiet", src])
 		for (let i = 0; i < N; i++) {
@@ -87,13 +82,13 @@ describe("a06 — repo_file projection insert stays under the bind-parameter cei
 			select count(*)::int as n
 			from repo_file f join repos r on r.id = f.repo_id
 			where r.name = 'repo'`
-		if (files === undefined) throw new Error("snapshot count query returned no row")
+		if (files === undefined) throw new Error("projection count query returned no row")
 		expect(files.n).toBe(N)
 		const [head] = await isolated.sql<{ commit_oid: Buffer; ref_name: string }[]>`
 			select h.ref_name, h.commit_oid
 			from repo_file_head h join repos r on r.id = h.repo_id
 			where r.name = 'repo'`
-		if (head === undefined) throw new Error("snapshot head row missing")
+		if (head === undefined) throw new Error("projection head row missing")
 		expect(head.commit_oid.toString("hex")).toBe(tip)
 	}, 120_000)
 })

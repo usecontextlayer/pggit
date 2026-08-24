@@ -1,17 +1,15 @@
 /**
- * Repack's small-object bind-parameter wall (breakage probe
- * `perf--repack-small-object-wall.ts`).
+ * Repack's small-object bind-parameter wall.
  *
  * `createRepack().repack()` has NO hard object-count wall: the pass completes and
  * covers the whole inventory at every fixture size, on repos `git repack -adf`
  * handles fine.
  *
- * THE DEFECT THIS PINS: repack's phase-2 coverage sweep once batched pending
- * objects by BYTES only (a 16 MB round-trip) and fed each batch to an
+ * Repack's phase-2 coverage sweep must not batch pending objects by BYTES only
+ * (a 16 MB round-trip) and feed an unbounded batch to an
  * `oid in (…)` value list, so a repo of many SMALL objects packed an unbounded
  * number of oids into one query. porsager refuses at 65,534 bind parameters
- * (Postgres' int16 ceiling), and the whole pass threw — no partial progress, no
- * encoding tier, forever. The sweep now also flushes on oid COUNT, so the batch
+ * (Postgres' int16 ceiling). The sweep flushes on oid COUNT as well, so the batch
  * is bounded on both axes.
  *
  * Black-box: one commit with W tiny files, seeded through `putPack`, then
@@ -27,8 +25,6 @@
  * boundary the defect lived on, and the suite would go green having exercised
  * nothing near it.
  *
- * Originated as breakage probe `perf--repack-small-object-wall.ts`, which
- * reproduced the bind-parameter wall; fixed.
  */
 import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -111,18 +107,18 @@ describe("repack — the small-object bind-parameter wall", () => {
 
 	/** Seed a real repo's objects + refs through the public store. */
 	async function seedRepo(
-		repoId: string,
+		repo: string,
 		dir: string,
 		objs: PackInputObject[],
 	): Promise<void> {
 		for (let i = 0; i < objs.length; i += SEED_BATCH) {
-			await objects.putPack(repoId, objs.slice(i, i + SEED_BATCH))
+			await objects.putPack(repo, objs.slice(i, i + SEED_BATCH))
 		}
 		for (const ref of await branchAndTagRefsOf(dir)) {
-			await refs.setRef(repoId, ref.name, ref.oid)
+			await refs.setRef(repo, ref.name, ref.oid)
 		}
 		const head = (await spawnGit(["symbolic-ref", "HEAD"], { cwd: dir })).stdout.trim()
-		await refs.setSymref(repoId, "HEAD", head)
+		await refs.setSymref(repo, "HEAD", head)
 	}
 
 	beforeAll(async () => {
@@ -139,14 +135,14 @@ describe("repack — the small-object bind-parameter wall", () => {
 
 	for (const w of SIZES) {
 		it(`covers a ${w}-file repo that \`git repack -adf\` handles fine`, async () => {
-			const repoId = `small-${w}`
+			const repo = `small-${w}`
 			const dir = await importRepo(`w${w}`, stream(w))
 			const git = await gitRepack(dir, `w${w}-git`)
 			const objs = await loadReachableObjects(dir, ["--all"])
-			await seedRepo(repoId, dir, objs)
+			await seedRepo(repo, dir, objs)
 
 			const t0 = Date.now()
-			const result = await repack.repack(repoId)
+			const result = await repack.repack(repo)
 			const ms = Date.now() - t0
 			console.log(
 				`${w} files → ${objs.length} objects · pggit repack ${(ms / 1000).toFixed(2)}s ` +

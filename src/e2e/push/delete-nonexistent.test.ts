@@ -1,11 +1,8 @@
 /**
  * Push-delete of a NONEXISTENT ref is reported per-ref, never an HTTP 500.
  *
- * Merged from a01-delete-nonexistent-ref.bug + a02-delete-nonexistent.bug — two
- * fixtures driving the identical `<zero> <zero> <ref>` command with the identical
- * expectations; the only distinct idea between them is the body shape (a delete
- * carries no objects, but a client may still append an empty pack), so both shapes
- * survive here as two `it`s over one schema.
+ * The two body shapes differ only in whether an empty pack follows the delete
+ * command, so both are exercised over one schema.
  *
  * THE WIRE SHAPE: when the client knows no current value for the ref it is
  * deleting — `git push <remote> :refs/heads/doesnotexist` — it sends old=zero and
@@ -16,10 +13,7 @@
  * `ng <ref> deletion denied (refs only advance)` — a deliberate divergence in the
  * reason, not in the shape.
  *
- * ORIGINATED as the breakage probe for that command being classified as "a create
- * whose target is the zero OID", which THREW: the client saw `RPC failed; HTTP 500`
- * / `send-pack: unexpected disconnect` / `the remote end hung up unexpectedly`
- * instead of a per-ref answer. Fixed.
+ * The command must be classified as a delete and answered per-ref.
  */
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"

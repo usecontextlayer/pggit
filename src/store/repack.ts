@@ -14,7 +14,8 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * (`git_pack_encoding`, migration 0008; the design and its provenance:
  * docs/2026-08-15-delta-pack-design.md). The sibling of `store/gc.ts` in every
  * structural respect: built over a porsager client at the wire→DB boundary,
- * invoked per repo by the background drain, never on the push/fetch hot path.
+ * invoked per repo by a host's maintenance schedule, never on the push/fetch
+ * hot path.
  *
  * What one pass produces, and the invariants the e2e suite pins:
  *
@@ -53,8 +54,9 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * Scheduling: repack stamps its own `repos.last_repack_at` watermark on success —
  * the pass-START `clock_timestamp()`, so an object ingested mid-pass (invisible to
  * this pass's reads) stays newer than the stamp and the next pass treats it as
- * ordinary new work, never as a hole. The drain serializes repack per repo AFTER
- * GC (D5) so it encodes survivors, not garbage.
+ * ordinary new work, never as a hole. A host that runs both maintenance passes
+ * must serialize repack per repo AFTER GC (D5) so it encodes survivors, not
+ * garbage.
  */
 
 /** Anchor cadence: a segment holds one whole anchor plus at most K−1 deltas
@@ -108,8 +110,9 @@ export function createRepack(pg: Sql) {
 
 			// The watermark this pass will stamp on success: captured BEFORE the pending
 			// read (see the module doc's Scheduling note for why start, not end).
-			const [t0] = await pg<{ now: Date }[]>`select clock_timestamp() as now`
-			if (!t0) throw new Error("pggit repack: clock_timestamp returned no row")
+			const [startedAt] = await pg<{ timestamp: Date }[]>`
+				select clock_timestamp() as timestamp`
+			if (!startedAt) throw new Error("pggit repack: clock_timestamp returned no row")
 
 			// The pending set: inventory minus encodings. Objects past the driver-safe
 			// cap are excluded by design (see MAX_INLINE_BYTEA_BYTES). `stale` is judged
@@ -127,7 +130,7 @@ export function createRepack(pg: Sql) {
 						where e.repo_id = o.repo_id and e.oid = o.oid
 					)`
 			const stamp = async (): Promise<void> => {
-				await pg`update repos set last_repack_at = ${t0.now} where id = ${id}::bigint`
+				await pg`update repos set last_repack_at = ${startedAt.timestamp} where id = ${id}::bigint`
 			}
 			if (pending.length === 0) {
 				await stamp()

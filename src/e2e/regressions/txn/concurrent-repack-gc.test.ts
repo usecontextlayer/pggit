@@ -4,7 +4,7 @@
  * The design (D5) serializes GC-then-repack per repo INSIDE one drain. Nothing
  * enforces that: `createRepack` and `createGc` are exported, `manage.ts` drives
  * them by hand, and the drain is a per-instance loop. Two overlapping actors on
- * one repo are therefore reachable today. This overlaps them deliberately and asks
+ * one repo are therefore reachable through public APIs. This overlaps them deliberately and asks
  * whether any interleaving can leave a state that is WORSE than loud.
  *
  * Scenarios:
@@ -127,7 +127,7 @@ describe("repack × GC × clone — overlapping actors on one repo", () => {
 
 	beforeAll(async () => {
 		pgBaseUrl = inject("pgBaseUrl")
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-concurrent-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-concurrent-repack-gc-"))
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		const commits = await commitsOldestFirst(src)
 		const forkBase = commits[FORK_AT]

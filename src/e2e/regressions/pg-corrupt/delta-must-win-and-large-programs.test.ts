@@ -25,8 +25,6 @@
  *   - the pack a client receives WITH the tier is never larger than without it
  *   - both clones are fsck-clean and byte-identical to the source
  *
- * Converted from `breakage/pg-corrupt--delta-must-win-and-large-programs.ts`, whose
- * verdict was: exit 0 = the guards hold; non-zero = reproduced.
  */
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"

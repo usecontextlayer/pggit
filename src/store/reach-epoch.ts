@@ -67,16 +67,17 @@ export async function loadEpoch(db: Kysely<Database>, id: ReposId): Promise<Epoc
 	).rows
 	if (!row) return { state: "absent" }
 	// The bitmap read is PINNED to the epoch the first statement saw: a GC pass
-	// can replace the epoch between the two reads, and E's array combined with
-	// E+1's bitmaps would serve substituted objects. Pinned, a mid-replacement
+	// can replace the epoch between the two reads, and the prior epoch's array
+	// combined with the replacement's bitmaps would serve substituted objects.
+	// Pinned, a mid-replacement
 	// read simply comes back short and the serve-side missing-bitmap guard
 	// falls back to the walk.
-	const bits = await sql<{ tip: string; bits: Buffer }>`
+	const bitmapRows = await sql<{ tip: string; bits: Buffer }>`
 		select encode(tip_oid, 'hex') as tip, bits from git_reach_bitmap
 		where repo_id = ${id}::bigint and epoch = ${row.epoch}::bigint
 	`.execute(db)
 	const bitmaps = new Map<string, Uint8Array>()
-	for (const b of bits.rows) bitmaps.set(b.tip, b.bits)
+	for (const bitmapRow of bitmapRows.rows) bitmaps.set(bitmapRow.tip, bitmapRow.bits)
 	const epoch = {
 		bitmaps,
 		epoch: Number(row.epoch),
@@ -95,37 +96,37 @@ export async function loadEpoch(db: Kysely<Database>, id: ReposId): Promise<Epoc
  * (the epoch's tips were carried in JS from the walk snapshot; a walk that
  * reported missing objects never reaches this — see gc.ts). */
 export async function writeEpoch(
-	conn: ReservedSql,
+	connection: ReservedSql,
 	id: ReposId,
 	payload: Epoch,
 ): Promise<void> {
 	try {
-		await conn`begin`
-		await conn.unsafe(`delete from git_reach_epoch where repo_id = $1::bigint`, [
+		await connection`begin`
+		await connection.unsafe(`delete from git_reach_epoch where repo_id = $1::bigint`, [
 			String(id),
 		])
-		await conn.unsafe(
+		await connection.unsafe(
 			`insert into git_reach_epoch (repo_id, epoch, tips, oids) values ($1::bigint, $2::bigint, $3, $4)`,
 			[String(id), String(payload.epoch), concatSortedOids(payload.tips), payload.oids],
 		)
 		for (const [tip, bits] of payload.bitmaps) {
-			await conn.unsafe(
+			await connection.unsafe(
 				`insert into git_reach_bitmap (repo_id, epoch, tip_oid, bits) values ($1::bigint, $2::bigint, $3, $4)`,
 				[String(id), String(payload.epoch), Buffer.from(tip, "hex"), Buffer.from(bits)],
 			)
 		}
-		await conn`commit`
+		await connection`commit`
 	} catch (err) {
 		// Same discipline as gc.ts's walk: never hand the pool an open aborted
 		// transaction; the write's own error must propagate, never this cleanup's.
-		await conn`rollback`.catch(() => {})
+		await connection`rollback`.catch(() => {})
 		throw err
 	}
 }
 
 /** Delete the repo's epoch (the no-refs case — an empty epoch is not stored). */
-export async function deleteEpoch(conn: ReservedSql, id: ReposId): Promise<void> {
-	await conn.unsafe(`delete from git_reach_epoch where repo_id = $1::bigint`, [
+export async function deleteEpoch(connection: ReservedSql, id: ReposId): Promise<void> {
+	await connection.unsafe(`delete from git_reach_epoch where repo_id = $1::bigint`, [
 		String(id),
 	])
 }
@@ -134,20 +135,20 @@ export async function deleteEpoch(conn: ReservedSql, id: ReposId): Promise<void>
  * ONE place the positional ordering is defined. */
 export function concatSortedOids(hexes: Iterable<string>): Buffer {
 	const sorted = [...new Set(hexes)].sort()
-	const out = Buffer.allocUnsafe(sorted.length * OID_BYTES)
-	sorted.forEach((h, i) => {
-		out.write(h, i * OID_BYTES, "hex")
+	const concatenated = Buffer.allocUnsafe(sorted.length * OID_BYTES)
+	sorted.forEach((oid, index) => {
+		concatenated.write(oid, index * OID_BYTES, "hex")
 	})
-	return out
+	return concatenated
 }
 
 /** The hex oids of a concatenated array, in position order. */
 export function splitOids(oids: Buffer): string[] {
-	const out: string[] = []
-	for (let i = 0; i < oids.length; i += OID_BYTES) {
-		out.push(oidAtPosition(oids, i / OID_BYTES))
+	const split: string[] = []
+	for (let offset = 0; offset < oids.length; offset += OID_BYTES) {
+		split.push(oidAtPosition(oids, offset / OID_BYTES))
 	}
-	return out
+	return split
 }
 
 /** Read the hex OID at one epoch bit position. */
@@ -157,63 +158,67 @@ export function oidAtPosition(oids: Buffer, position: number): string {
 
 /** Binary-search a hex oid's bit position in a concatenated sorted array;
  * -1 when absent. */
-export function positionOf(oids: Buffer, hex: string): number {
-	const needle = Buffer.from(hex, "hex")
-	let lo = 0
-	let hi = oids.length / OID_BYTES - 1
-	while (lo <= hi) {
-		const mid = (lo + hi) >> 1
-		const cmp = needle.compare(oids, mid * OID_BYTES, (mid + 1) * OID_BYTES)
-		if (cmp === 0) return mid
-		if (cmp < 0) hi = mid - 1
-		else lo = mid + 1
+export function positionOf(oids: Buffer, hexOid: string): number {
+	const needle = Buffer.from(hexOid, "hex")
+	let lower = 0
+	let upper = oids.length / OID_BYTES - 1
+	while (lower <= upper) {
+		const midpoint = (lower + upper) >> 1
+		const comparison = needle.compare(
+			oids,
+			midpoint * OID_BYTES,
+			(midpoint + 1) * OID_BYTES,
+		)
+		if (comparison === 0) return midpoint
+		if (comparison < 0) upper = midpoint - 1
+		else lower = midpoint + 1
 	}
 	return -1
 }
 
 /** Serialize a set of bit positions as a CRoaring-portable bitmap. */
 export function bitmapFromPositions(positions: Iterable<number>): Uint8Array {
-	const bm = new RoaringBitmap32()
+	const bitmap = new RoaringBitmap32()
 	try {
-		for (const p of positions) bm.add(p)
-		bm.optimize()
-		return bm.serialize("portable")
+		for (const position of positions) bitmap.add(position)
+		bitmap.optimize()
+		return bitmap.serialize("portable")
 	} finally {
-		bm.dispose()
+		bitmap.dispose()
 	}
 }
 
 /** The hex oids named by the UNION of the given bitmaps, over one epoch's
  * array — the no-have serve path's whole read. */
 export function oidsOfUnion(bitmaps: Iterable<Uint8Array>, oids: Buffer): string[] {
-	const acc = new RoaringBitmap32()
+	const union = new RoaringBitmap32()
 	try {
 		for (const bytes of bitmaps) {
-			const bm = RoaringBitmap32.deserialize(bytes, "portable")
+			const bitmap = RoaringBitmap32.deserialize(bytes, "portable")
 			try {
-				acc.orInPlace(bm)
+				union.orInPlace(bitmap)
 			} finally {
-				bm.dispose()
+				bitmap.dispose()
 			}
 		}
-		const out: string[] = []
-		for (const p of acc.toUint32Array()) {
-			out.push(oidAtPosition(oids, p))
+		const unionOids: string[] = []
+		for (const position of union.toUint32Array()) {
+			unionOids.push(oidAtPosition(oids, position))
 		}
-		return out
+		return unionOids
 	} finally {
-		acc.dispose()
+		union.dispose()
 	}
 }
 
-/** Whether position `pos` is set in any of the given bitmaps. */
-export function unionHas(bitmaps: Iterable<Uint8Array>, pos: number): boolean {
+/** Whether `position` is set in any of the given bitmaps. */
+export function unionHas(bitmaps: Iterable<Uint8Array>, position: number): boolean {
 	for (const bytes of bitmaps) {
-		const bm = RoaringBitmap32.deserialize(bytes, "portable")
+		const bitmap = RoaringBitmap32.deserialize(bytes, "portable")
 		try {
-			if (bm.has(pos)) return true
+			if (bitmap.has(position)) return true
 		} finally {
-			bm.dispose()
+			bitmap.dispose()
 		}
 	}
 	return false
@@ -229,22 +234,22 @@ export function remapPositions(
 	newOids: Buffer,
 	dropHexes?: ReadonlySet<string>,
 ): number[] {
-	const bm = RoaringBitmap32.deserialize(bits, "portable")
+	const bitmap = RoaringBitmap32.deserialize(bits, "portable")
 	try {
-		const out: number[] = []
-		for (const p of bm.toUint32Array()) {
-			const hex = oidAtPosition(oldOids, p)
-			if (dropHexes?.has(hex)) continue
-			const np = positionOf(newOids, hex)
-			if (np === -1) {
+		const remappedPositions: number[] = []
+		for (const oldPosition of bitmap.toUint32Array()) {
+			const oid = oidAtPosition(oldOids, oldPosition)
+			if (dropHexes?.has(oid)) continue
+			const newPosition = positionOf(newOids, oid)
+			if (newPosition === -1) {
 				throw new Error(
-					`pggit reach-epoch: oid ${hex} of the prior epoch is absent from the new array — the steady-state precondition (refs only advanced) was violated after it was checked`,
+					`pggit reach-epoch: oid ${oid} of the prior epoch is absent from the new array — the steady-state precondition (refs only advanced) was violated after it was checked`,
 				)
 			}
-			out.push(np)
+			remappedPositions.push(newPosition)
 		}
-		return out
+		return remappedPositions
 	} finally {
-		bm.dispose()
+		bitmap.dispose()
 	}
 }

@@ -10,12 +10,12 @@
  *   B. the POSTGRES side: what `git_object` (+ its TOAST) actually costs on disk,
  *      and what the trees alone cost through the same lz4 column.
  *   C. the CLONE side: a real `git clone` over loopback against the in-process
- *      server, decomposed into Postgres-read time vs zlib-deflate time.
+ *      server, with pack-encoding time compared against standalone zlib-deflate time.
  *   C2. the clone AFTER a real repack — the stored tier's cold-clone path end to end.
  *   D. delta topology sweeps with the REAL encoder (src/pack/delta.ts), scored
  *      with the structural base heuristic (same path, previous commit).
  *
- * One-shot and diagnostic, like the rest of `perf/`: not a gate, not a fixture.
+ * One-shot diagnostic; not a gate or fixture.
  * The source repo is COPIED before anything runs, so a customer mirror stays
  * byte-for-byte pristine.
  *
@@ -153,19 +153,6 @@ function buildStream(): string {
 }
 
 // ---------------------------------------------------------------------------
-// D. Delta feasibility — driven by the REAL encoder (src/pack/delta.ts), the same
-// one the repack tier ships. This probe predates it and briefly carried its own;
-// keeping a second encoder would mean maintaining two.
-// ---------------------------------------------------------------------------
-
-/**
- * Base pairs from ONE `git log --raw` pass: for every commit, each changed path's
- * (old oid → new oid). That is precisely the "same path, one commit earlier"
- * heuristic — no window, no sorting, no size search. `-t` includes tree entries,
- * so the intermediate directories that dominate this shape are covered; the root
- * tree is paired separately from each commit's own `%T`.
- */
-// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -284,9 +271,8 @@ async function main(): Promise<void> {
 			`raw content ingested: ${mb(rawTotal)} → stored at **${(total / rawTotal).toFixed(2)}×** of raw`,
 		)
 
-		// The topology surface (spine chunk 1): one `git_commit` row per commit,
-		// linear in history — the quadratic `git_edge` table this section once
-		// measured is dropped (S2), which IS the storage headline.
+		// Commit and tag rows are the complete stored topology surface, so their
+		// footprint must remain linear in history.
 		const [topoSizes] = await db.sql<{ total: string }[]>`
 			select (
 				(select coalesce(sum(pg_total_relation_size(inhrelid)), 0)
@@ -298,7 +284,7 @@ async function main(): Promise<void> {
 		console.log(
 			`\ntopology rows (\`git_commit\` + \`git_tag\`) on disk: ` +
 				`**${mb(Number(topoSizes.total))}** — ${expectedCommits} commit rows, ` +
-				`${expectedTags} tag rows (linear in history; the quadratic git_edge table is gone, S2)`,
+				`${expectedTags} tag rows (linear in history)`,
 		)
 
 		await db.sql`create table probe_trees (content bytea compression lz4)`
@@ -381,7 +367,7 @@ async function main(): Promise<void> {
 		console.log(
 			`deflate alone over the same objects: **${deflateOnlyMs}ms** = ` +
 				`${((deflateOnlyMs / encodeMs) * 100).toFixed(0)}% of pack-encode ` +
-				`(the remainder is the Postgres read)`,
+				`(the remainder includes Postgres reads and pack assembly)`,
 		)
 
 		// --- C2. the clone side, AFTER repack --------------------------------

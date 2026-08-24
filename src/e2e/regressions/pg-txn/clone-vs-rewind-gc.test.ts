@@ -1,6 +1,5 @@
 /**
- * BREAKAGE (pg-txn) — a clone raced by a ref rewind + gc(0).
- * Converted from `breakage/pg-txn--clone-vs-rewind-gc.ts`; its rationale verbatim:
+ * Postgres transaction regression — a clone raced by a ref rewind + gc(0).
  *
  * HUNT: a clone's closure computation is NOT under one snapshot — the reachability
  * walk's batched derived-row, tree-content, and blob-presence reads, followed by
@@ -24,10 +23,7 @@
  *     ("did not receive expected object", "pack is corrupt", "index-pack failed",
  *     "unable to read", "bad object")
  *
- * The source script exits non-zero when the claim is falsified; the assertions
- * below encode the CORRECT contract, so a reproduction shows up as a red test.
- * The fixture scale (1200 append-only runs) and the 12-iteration loop are the
- * source's. The delays are NOT: the source froze absolute milliseconds, which tie
+ * The fixture scale is 1200 append-only runs over a 12-iteration loop. Fractional delays avoid absolute milliseconds, which tie
  * the race to one machine's serve speed — measured here, the want-presence check
  * lands seconds into the serve, so a fixed sub-second spread can lose all 12
  * races and starve the anti-vacuousness floor below. Each run instead times one

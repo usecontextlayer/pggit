@@ -8,8 +8,8 @@
  * t5702 ready-delim lock). Each transcript is compared against real
  * `git upload-pack --stateless-rpc` fed the IDENTICAL request bytes, so ACK order,
  * `ready` timing and the ready-delim lock are a differential against canonical git
- * rather than a transcription of one. The negotiation logic lives in the store now,
- * so this drives a store-backed backend rather than an in-memory map.
+ * rather than a transcription of one. This drives the store-backed negotiation
+ * backend rather than an in-memory map.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -121,7 +121,7 @@ describe("M1 multi-round negotiation", () => {
 		// Oracle: real git upload-pack answers a `want` it does not have IN-BAND with
 		// `ERR upload-pack: not our ref <oid>` (an HTTP-200 protocol error the client
 		// reads), not a transport-level rejection/500 — and never ships a short/partial
-		// pack. (Earlier this rejected; that diverged from the oracle — see smoke/mal01.)
+		// pack, matching the oracle.
 		const request = fetchRequest({
 			done: true,
 			haves: [],

@@ -18,9 +18,7 @@
  * clone's HEAD equals whatever `git ls-remote` says the ref is — both with the
  * tier as the race left it AND after one more converging repack.
  *
- * Converted from `breakage/race--two-pushes-repack.ts` (`--iters=25 --runs=400`).
- * Probabilistic. The swept repack-start delays are NOT the source's: it froze
- * absolute milliseconds ([0..220]ms), which tie the race to one machine's push
+ * Probabilistic. Fractional repack-start delays avoid tying the race to one machine's push
  * speed — the window under attack is the wire push's server-side ingest, and
  * frozen offsets crowd into its head on any slower or loaded box. Each run
  * instead times one un-raced calibration push of the same shape and sweeps the

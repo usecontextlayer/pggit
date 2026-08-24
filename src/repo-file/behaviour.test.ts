@@ -27,7 +27,7 @@ function requireOnly<T>(rows: T[], context: string): T {
 	return row
 }
 
-// The EXTERNAL contract of the queryable file view, end to end: real `git push`
+// The EXTERNAL contract of the repo-file projection, end to end: real `git push`
 // is the input; the documented SQL surface — `repo_file` joined to `git_object`
 // for content (resolving the wire repo name via `repos`) — is the read interface
 // (output); real git is the oracle. Nothing here reaches into the decode / walk /
@@ -36,7 +36,7 @@ function requireOnly<T>(rows: T[], context: string): T {
 
 type FileRow = { path: string; mode: string; content: Buffer }
 
-describe("repo-file — queryable file view (behaviour, real git)", () => {
+describe("repo-file projection (behaviour, real git)", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let objects: ObjectStore
@@ -61,24 +61,24 @@ describe("repo-file — queryable file view (behaviour, real git)", () => {
 	 * (`collate "C"`, matching `indexRows` below) so it agrees with the git oracle's
 	 * ordering for every path: the database's default collation is linguistic and
 	 * reorders punctuation (`a-b.txt` vs `ab.txt`) against git's byte order. */
-	async function queryFiles(repoId: string, ref: string): Promise<FileRow[]> {
+	async function queryFiles(repo: string, ref: string): Promise<FileRow[]> {
 		const rows = await db.sql<FileRow[]>`
 			select f.path, f.mode, o.content
 			from repo_file f
 			join repos r on r.id = f.repo_id
 			join git_object o on o.repo_id = f.repo_id and o.oid = f.blob_oid
-			where r.name = ${repoId} and f.ref_name = ${ref}
+			where r.name = ${repo} and f.ref_name = ${ref}
 			order by f.path collate "C"
 		`
 		return rows.map((r) => ({ content: r.content, mode: r.mode, path: r.path }))
 	}
 
 	/** Index rows for a ref — the projection is tip-bounded, not history-bounded. */
-	async function fileRowCount(repoId: string, ref: string): Promise<number> {
+	async function fileRowCount(repo: string, ref: string): Promise<number> {
 		const rows = await db.sql<{ n: number }[]>`
 			select count(*)::int as n from repo_file f
 			join repos r on r.id = f.repo_id
-			where r.name = ${repoId} and f.ref_name = ${ref}
+			where r.name = ${repo} and f.ref_name = ${ref}
 		`
 		const [row] = rows
 		if (row === undefined) throw new Error("file row count aggregate returned no row")
@@ -88,14 +88,14 @@ describe("repo-file — queryable file view (behaviour, real git)", () => {
 	/** Path + blob oid per file at a ref — the same direct-SQL read surface a consumer
 	 * uses (no read-API method), enough to observe content-addressed dedup across refs. */
 	async function indexRows(
-		repoId: string,
+		repo: string,
 		ref: string,
 	): Promise<{ path: string; blobOid: string }[]> {
 		const rows = await db.sql<{ path: string; blob_oid: Buffer }[]>`
 			select f.path, f.blob_oid
 			from repo_file f
 			join repos r on r.id = f.repo_id
-			where r.name = ${repoId} and f.ref_name = ${ref}
+			where r.name = ${repo} and f.ref_name = ${ref}
 			order by f.path collate "C"
 		`
 		return rows.map((r) => ({ blobOid: r.blob_oid.toString("hex"), path: r.path }))
@@ -126,8 +126,8 @@ describe("repo-file — queryable file view (behaviour, real git)", () => {
 		await spawnGit(["commit", "-q", "-m", msg], { cwd: dir })
 	}
 
-	async function push(dir: string, repoId: string, refspec: string): Promise<void> {
-		await spawnGit(["push", `http://127.0.0.1:${server.port}/${repoId}`, refspec], {
+	async function push(dir: string, repo: string, refspec: string): Promise<void> {
+		await spawnGit(["push", `http://127.0.0.1:${server.port}/${repo}`, refspec], {
 			cwd: dir,
 		})
 	}
@@ -235,15 +235,15 @@ describe("repo-file — queryable file view (behaviour, real git)", () => {
 			await push(dir, "delbranch", "HEAD:refs/heads/main")
 			expect((await queryFiles("delbranch", "refs/heads/main")).length).toBe(1)
 
-			// The wire refuses ref deletion outright (deny-non-FF policy, 2026-07-05) —
-			// and a refused delete must leave the view intact.
+			// The wire refuses ref deletion outright; a refused delete must leave the
+			// projection intact.
 			await expect(push(dir, "delbranch", ":refs/heads/main")).rejects.toThrow(
 				/deletion denied/i,
 			)
 			expect((await queryFiles("delbranch", "refs/heads/main")).length).toBe(1)
 
-			// Deletion is now an INTERNAL operation (store + explicit view sync — the
-			// path an operator/retirement flow takes). The view empties.
+			// Deletion is an INTERNAL operation (store + explicit projection sync — the
+			// path an operator/retirement flow takes). The projection empties.
 			const deleted = await refs.applyRefUpdates(
 				"delbranch",
 				[{ newOid: "0".repeat(40), oldOid: "0".repeat(40), ref: "refs/heads/main" }],

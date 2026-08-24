@@ -3,7 +3,7 @@
  * branch projection.
  *
  * `repo_file` is the per-branch-tip `path → (mode, blob_oid)` index that IS
- * pggit's public read surface. The first snapshot uses the full-rebuild COPY;
+ * pggit's public read surface. The initial projection uses the full-rebuild COPY;
  * subsequent monotone ref advances diff the persisted basis and update only
  * changed paths. A one-file push must therefore produce one row update while the
  * live projection remains exactly equal to canonical git.
@@ -13,7 +13,7 @@
  *   1. **Write amplification stays O(change).** The measured insert/delete/update
  *      counters must show exactly one update per one-file push.
  *   2. **Physical churn stays bounded.** The occupied hash leaf may accumulate
- *      dead update versions, so the on-disk ratio against the base snapshot
+ *      dead update versions, so the on-disk ratio against the base projection
  *      remains a useful autovacuum/bloat gate.
  *
  * WHAT IT PRINTS: per push, the projection's on-disk size split heap/index, its

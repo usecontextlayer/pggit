@@ -1,7 +1,5 @@
 /**
- * BREAKAGE (pg-txn) — two concurrent pushes leave repo_file on a superseded tip.
- * Converted from `breakage/pg-txn--projection-stale-overwrite.ts`; its rationale
- * verbatim:
+ * Postgres transaction regression — two concurrent pushes must not leave repo_file on a superseded tip.
  *
  * FINDING: the `repo_file` projection is written OUTSIDE the ref CAS that decides
  * it, with no version guard — so two ordinary concurrent pushes to the same
@@ -30,11 +28,9 @@
  * honestly: A's tip has many directories (its tree walk is one round-trip per
  * tree), B's tip has few. Both are ordinary pushes over real HTTP with real git.
  *
- * The source script exits non-zero the first attempt it reproduces; the
- * assertions below encode the CORRECT contract (the projection always describes
- * the ref tip, and any divergence is repaired by gc+repack), so a reproduction is
- * a red test. The 3000-directory wide tip and the 4-attempt loop are the source's
- * — the race window is the width of A's tree walk.
+ * The assertions encode the contract: the projection always describes the ref
+ * tip, and any divergence is repaired by gc+repack. The 3000-directory wide tip
+ * and 4-attempt loop make the race window the width of A's tree walk.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

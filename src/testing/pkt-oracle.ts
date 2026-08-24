@@ -7,9 +7,8 @@
  *   - `sidebandDemux`   ← `unpack-sideband` (binary-safe, per-band)
  *   - `renderRefAdvertV0` ← NUL-aware v0 push-advert decode
  *
- * All four are pure and build on the existing `decodePktStream`, so they share
- * one battle-tested framing reader. They are the measuring instrument for the
- * §8.1 goldens, so their own tests (`pkt-oracle.test.ts`) stay GREEN on the gate.
+ * All four are pure and build on `decodePktStream`, keeping the oracle's framing
+ * semantics identical to the production decoder's.
  */
 import { assertNever } from "@/lang"
 import { decodePktStream } from "@/protocol/pkt-line"
@@ -27,7 +26,7 @@ function decodeComplete(buf: Buffer): ReturnType<typeof decodePktStream> {
 	return decoded
 }
 
-/** test_oid values, verbatim from `/tmp/git-src/t/oid-info/hash-info` (sha1 rows). */
+/** Canonical SHA-1 object IDs used by the pkt-line goldens. */
 export const ZERO_OID = "0".repeat(40)
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 export const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"

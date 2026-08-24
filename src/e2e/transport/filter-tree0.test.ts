@@ -1,5 +1,5 @@
 /**
- * a10 partial-clone dimension — pggit advertises the `filter` fetch capability
+ * pggit advertises the `filter` fetch capability
  * (`fetch=filter`), so a client may send any filter spec it likes, `tree:0`
  * included. The contract is that such a clone COMPLETES.
  *
@@ -8,14 +8,12 @@
  * protocol lets a server send more than a filter requests, and the client accepts
  * the superset with nothing left to lazily fetch, whereas a hard rejection aborts
  * the clone outright. So the assertion here is a SUPERSET relation against a
- * canonical `file://` control cloned with the identical flags: it holds today
+ * canonical `file://` control cloned with the identical flags: it holds under the current
  * (over-serve), it holds if `tree:0` is ever honored exactly, and it fails the
  * moment a filtered clone comes back SHORT of what canonical git serves.
  *
- * ORIGINATED as the breakage probe for advertising `filter` and then answering
- * `filter tree:0` with HTTP 400 — the client, lured by the advertisement, hard-
- * failed a clone it would otherwise have completed (`error: RPC failed; HTTP 400`
- * / `fatal: expected 'packfile'`). Fixed by over-serving unsupported filters.
+ * Advertising `filter` commits the server to completing this request; unsupported
+ * filters are therefore over-served rather than rejected.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -29,7 +27,7 @@ import { allObjectOids, objectsByType } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
 
-describe("a10 — an advertised filter must complete the clone (tree:0)", () => {
+describe("an advertised filter completes the clone (tree:0)", () => {
 	let db: IsolatedDb
 	let server: GitServer
 	let src: string
@@ -43,7 +41,7 @@ describe("a10 — an advertised filter must complete the clone (tree:0)", () => 
 		server = await serveOnPort(createGitApp({ objects, refs }), 0)
 
 		const { writeFileSync } = await import("node:fs")
-		src = mkdtempSync(join(tmpdir(), "a10-tree0-src-"))
+		src = mkdtempSync(join(tmpdir(), "pggit-tree0-source-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
 		for (const c of ["c1", "c2"]) {
 			// real content so a tree:0 filter has trees + blobs to omit
@@ -58,7 +56,7 @@ describe("a10 — an advertised filter must complete the clone (tree:0)", () => 
 
 		// The canonical control: the same history behind a `file://` bare remote that
 		// allows filters, so `tree:0` there is answered by real upload-pack.
-		bare = mkdtempSync(join(tmpdir(), "a10-tree0-bare-"))
+		bare = mkdtempSync(join(tmpdir(), "pggit-tree0-bare-"))
 		await spawnGit(["clone", "--bare", "-q", src, bare])
 		await spawnGit(["config", "uploadpack.allowFilter", "true"], { cwd: bare })
 	}, 180_000)
@@ -71,8 +69,8 @@ describe("a10 — an advertised filter must complete the clone (tree:0)", () => 
 	})
 
 	it("a --filter=tree:0 clone completes and carries at least the canonical filtered set", async () => {
-		const dest = mkdtempSync(join(tmpdir(), "a10-tree0-dest-"))
-		const control = mkdtempSync(join(tmpdir(), "a10-tree0-control-"))
+		const dest = mkdtempSync(join(tmpdir(), "pggit-tree0-destination-"))
+		const control = mkdtempSync(join(tmpdir(), "pggit-tree0-control-"))
 		try {
 			const url = `http://127.0.0.1:${server.port}/repo`
 			// spawnGit rejects on any non-zero exit, so each call IS an assertion: the

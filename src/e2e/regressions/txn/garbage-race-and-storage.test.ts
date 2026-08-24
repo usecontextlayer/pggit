@@ -6,7 +6,7 @@
  * so when the two overlap, repack is encoding rows for objects the sweep is
  * deleting underneath it. This drives that head-on: rewind FIRST (so the
  * garbage has no encoding rows yet), then run both at once. The race is
- * probabilistic, so it keeps the source probe's five trials rather than one.
+ * probabilistic, so it runs five trials rather than one.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -57,7 +57,7 @@ describe("repack × GC over garbage — the race", () => {
 
 	beforeAll(async () => {
 		const pgBaseUrl = inject("pgBaseUrl")
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-garbage-race-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-garbage-race-"))
 		src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 		const commits = await commitsOldestFirst(src)
 		const rewindTo = commits[REWIND_TO]

@@ -1,5 +1,5 @@
 /**
- * Lifecycle breakage — 50-round incremental chain against a LONG-LIVED clone:
+ * Lifecycle regression — 50-round incremental chain against a LONG-LIVED clone:
  * push 3 commits → (sometimes) repack → (sometimes) gc → fetch. Every round the
  * clone must stay fsck-clean and object-identical to a file:// reference remote
  * subjected to the same sequence. Mixed encoded/unencoded serving throughout.
@@ -10,8 +10,6 @@
  * rounds and gc every 7th, so the served pack mixes encoded and unencoded
  * objects.
  *
- * Originated as exploration-6 probe `lifecycle--long-lived-clone-chain.ts` (exit
- * 1 when a round diverged from the reference remote); fixed.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -59,7 +57,7 @@ describe("regressions/lifecycle — long-lived clone chain", () => {
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-chain-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-long-lived-clone-chain-"))
 		const dir = (name: string): string => join(root, name)
 
 		const src = dir("src")

@@ -173,8 +173,8 @@ async function run(
 			`http://127.0.0.1:${server.port}/${REPO}`,
 			dest,
 		])
-		// The correctness sub-check the probe carried: a resumed tier must still serve
-		// a repository canonical git accepts. `spawnGit` throws on a non-zero exit.
+		// A resumed tier must serve a repository canonical git accepts; transfer-size
+		// evidence is invalid without that correctness prerequisite.
 		const [expected, expectedRefs, actualRefs] = await Promise.all([
 			gitReachableOids(src),
 			branchAndTagRefsOf(src),
@@ -208,7 +208,7 @@ async function main(): Promise<void> {
 	const src = await createAppendOnlyRepo({ docs: 4, runs: RUNS })
 	scratch.own(src)
 	try {
-		console.log(`# txn--interrupted-repack-cost — ${RUNS} runs\n`)
+		console.log(`# txn/interrupted-repack-cost — ${RUNS} runs\n`)
 		const base = await run("uninterrupted", [], src, join(root, "a"))
 		const one = await run("one crash mid-phase-1", [2], src, join(root, "b"))
 		const two = await run("crashes at flush 2 then 3", [2, 3], src, join(root, "c"))

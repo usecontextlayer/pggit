@@ -1,5 +1,5 @@
 /**
- * Lifecycle breakage — degenerate ends of the sequence space:
+ * Lifecycle regression — degenerate ends of the sequence space:
  *  1. delete EVERY ref, gc(0) to zero objects, repack an empty repo, clone it
  *  2. refill with the identical history (same oids, fresh rows) and repack again
  *  3. a ref that points straight at a TREE whose encoding is a delta, with the
@@ -8,10 +8,7 @@
  * Every step is checked against a file:// reference remote replaying the same
  * visible history: clone, fsck --strict, object-set equality, byte digest.
  *
- * Converted from `breakage/lifecycle--drain-to-empty-and-refill.ts`, mechanically
- * and at full scale (60 seed commits). The source exits 1 when a step reproduces
- * the bug; here each assertion states the CORRECT outcome, so a reproduction is a
- * RED test.
+ * The fixture retains its full scale of 60 seed commits.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -53,7 +50,7 @@ describe("regressions/lifecycle — drain to empty and refill", () => {
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-degen-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-drain-empty-refill-"))
 		const dir = (name: string): string => join(root, name)
 
 		const src = dir("src")

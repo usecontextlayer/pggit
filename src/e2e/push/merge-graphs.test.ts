@@ -50,10 +50,10 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 	})
 
 	/** Push every branch, clone back --no-checkout, fsck, and assert exact parity. */
-	async function pushAndVerify(src: string, repoId: string): Promise<void> {
-		const repo = `${url}/${repoId}`
+	async function pushAndVerify(src: string, repoName: string): Promise<void> {
+		const repo = `${url}/${repoName}`
 		await spawnGit(["push", repo, "refs/heads/*:refs/heads/*"], { cwd: src })
-		await withTempDir(`pggit-merge-back-${repoId}-`, async (back) => {
+		await withTempDir(`pggit-merge-back-${repoName}-`, async (back) => {
 			await spawnGit([
 				"clone",
 				"-c",
@@ -67,7 +67,7 @@ describe("merge graph shapes — octopus + criss-cross differential", () => {
 			// Git's merge strategy leaves an unreachable intermediate tree in the source,
 			// so parity is over the ref-reachable closure, not the raw object database.
 			expect(await gitReachableOids(back)).toEqual(await gitReachableOids(src))
-			const stored = (await createRefStore(db.sql).listRefs(repoId)).sort((a, b) =>
+			const stored = (await createRefStore(db.sql).listRefs(repoName)).sort((a, b) =>
 				a.name.localeCompare(b.name),
 			)
 			expect(stored).toEqual(await branchAndTagRefsOf(src))

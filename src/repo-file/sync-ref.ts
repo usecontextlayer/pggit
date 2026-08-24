@@ -37,7 +37,7 @@ export async function buildFileList(
 }
 
 /**
- * Refresh `refName`'s file projection after a push applied it. Non-branch refs are
+ * Synchronize `refName`'s file projection after a push applied it. Non-branch refs are
  * ignored; a delete (zero oid) drops the projection; otherwise
  * the projection advances to the new tip — incrementally from its recorded basis
  * when the tip descends from it, by full rebuild when no basis exists, and NOT AT
@@ -80,8 +80,8 @@ export async function syncRefProjection(
 
 /**
  * Rebuild a repo's entire projection from its current branch tips — the backfill
- * for an existing repo, and the "nuke and rebuild" backstop if the cache ever
- * drifts. Everything is re-derived from the canonical objects; `clearRepo` also
+ * for an existing repo and the full-rebuild backstop if the projection drifts.
+ * Everything is re-derived from the canonical objects; `clearRepo` also
  * clears the recorded bases, so every branch takes the full-rebuild path.
  */
 export async function rebuildAllProjections(

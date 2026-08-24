@@ -1,11 +1,11 @@
 /**
- * THE SERVED-SET ORACLE (spine S4 — built BEFORE the frontier, deliberately):
+ * THE SERVED-SET ORACLE (spine S4):
  * for every (want, have) pair over a topology-rich fixture, a client holding
  * exactly `have`'s closure fetches `want` from pggit and from canonical git, and
  * the OBJECT SETS the two fetches transfer must be identical. This is R16's
- * arbiter: name-paired boundary diffing ships only if this oracle cannot tell it
- * from git (the priced upgrade — full boundary-tree expansion — fires only on a
- * disagreement), and it is the only trustworthy net under the riskiest slice.
+ * arbiter for the shipped rule: retain name-paired boundary diffing, and expand
+ * only trees reachable from boundary parents when needed. This oracle must not be
+ * able to distinguish that rule from git.
  *
  * The comparison is END-TO-END: real `git fetch` against both servers, so
  * negotiation, ack lines, and pack encoding are all inside the measured surface

@@ -4,9 +4,8 @@
  *
  * A git push writes, on disk, roughly the deflated bytes of the objects it
  * carries. pggit writes those objects as rows, plus one `git_commit` row per
- * commit (spine chunk 1 — the old per-reference `git_edge` rows are gone), plus
- * the incremental `repo_file` changes for the branch, plus the WAL for all of it,
- * plus (when repack runs) an encoding row per new object. This harness
+ * commit, the incremental `repo_file` changes for the branch, WAL for all of it,
+ * and (when repack runs) one encoding row per eligible new object. This harness
  * measures the ratio on identical pushes, over tree shapes chosen to separate
  * the three cost drivers:
  *
@@ -19,10 +18,9 @@
  * not that pggit is expensive there, it is the RATIO, which isolates what
  * Postgres adds on top of git's own cost.
  *
- * The derived-state spine replaced the former delete-all/reinsert-all projection
- * with a persisted basis and tree diff. The gate now proves that a push touching
- * F files writes O(F) projection tuples; a retired full rewrite cannot return
- * unnoticed.
+ * The projection uses a persisted basis and tree diff. The gate proves that a
+ * push touching F files writes O(F) projection tuples; a full projection rewrite
+ * would breach the bound.
  *
  * WHAT IT PRINTS, per shape and per F: rows written per table, bytes on disk per
  * table, WAL bytes, and the same push's cost in a bare git repo (`du` delta),
@@ -30,7 +28,7 @@
  *
  * EXIT NON-ZERO when the `repo_file` rows written by a one-file commit exceed
  * `AMP_LIMIT`× the number of files the commit actually changed — evidence that
- * the retired rewrite-everything behavior has returned and turned an O(F) push into an O(N) write.
+ * the projection path has turned an O(F) push into an O(N) write.
  *
  *   npx tsx perf/probes/pg-bloat/push-amplification.ts
  */

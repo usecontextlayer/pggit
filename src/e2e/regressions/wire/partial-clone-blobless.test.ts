@@ -1,8 +1,6 @@
 /**
  * WIRE — `git clone --filter=blob:none` against a repacked pggit remote, then the
  * promisor (lazy) blob fetches a checkout forces.
- * (Converted from `breakage/wire--partial-clone-blobless.ts`.)
- *
  * A blobless clone's served set is commits+trees only, so tree deltas ship as
  * REF_DELTA with tree bases — the deltified path at its most exposed. Then git
  * lazily fetches individual blobs by exact OID (`want <blob>` + `filter blob:none`),

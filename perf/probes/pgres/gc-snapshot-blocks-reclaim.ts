@@ -4,9 +4,9 @@
  *
  * `gc.ts` reserves one connection and `livePlan()` opens `begin isolation level
  * repeatable read` across the ref read and epoch plan. On a fresh fixture the absent
- * epoch forces a full `originClosure` walk inside that snapshot. That is deliberate
- * and correct — §5 defense (a), one MVCC snapshot so a concurrent push cannot
- * interleave. The resource consequence is what this harness prices:
+ * epoch forces a full `originClosure` walk inside that snapshot. One MVCC snapshot
+ * prevents a concurrent push from interleaving. The resource consequence is what
+ * this harness prices:
  *
  *   While ANY transaction holds a snapshot, VACUUM — autovacuum included — cannot
  *   remove a tuple deleted after that snapshot began. Not just in the GC'd repo:
@@ -15,7 +15,7 @@
  *
  * A host can run GC passes back to back over a fleet. If the per-repo hold is long
  * relative to the interval, the horizon can be held nearly continuously; the
- * sibling-agent lag printed below is context, not evidence about this harness.
+ * other-backend lag printed below is context, not evidence about this harness.
  *
  * Part 1 — MEASUREMENT: how long is the snapshot held, as a function of repo size?
  * Sampled from `pg_stat_activity` filtered to this harness's OWN application_name.
@@ -123,7 +123,7 @@ async function ownSnapshotAge(watch: Sql): Promise<number> {
 	return requireNonnegativeInteger(r.ms, "own-snapshot age")
 }
 
-/** Longest-held snapshot age (s) among OTHER backends — the sibling agents. */
+/** Longest-held snapshot age (s) among other backends. */
 async function othersLag(watch: Sql): Promise<number> {
 	const [r] = await watch<{ s: string }[]>`
 		select coalesce(max(extract(epoch from (clock_timestamp() - xact_start))), 0)::int::text as s
@@ -243,10 +243,10 @@ async function main(): Promise<void> {
 		const smallest = requiredAt(samples, 0, "smallest snapshot sample")
 		const biggest = requiredAt(samples, samples.length - 1, "largest snapshot sample")
 		console.log(
-			`\nsnapshot hold scales with the closure walk: ${(biggest.holdMs / smallest.holdMs).toFixed(1)}× from ${smallest.objects} to ${biggest.objects} objects.`,
+			`\nobserved snapshot hold changed ${(biggest.holdMs / smallest.holdMs).toFixed(1)}× from ${smallest.objects} to ${biggest.objects} objects.`,
 		)
 		console.log(
-			`worst duty cycle ${(worst * 100).toFixed(0)}% — with the drain running passes back to back over a fleet, the DATABASE-WIDE xmin horizon is held ~that fraction of the time.`,
+			`worst duty cycle ${(worst * 100).toFixed(0)}% — back-to-back passes over a fleet would make the DATABASE-WIDE xmin hold approach that fraction.`,
 		)
 
 		// ── Part 2: the causal demonstration ────────────────────────────────────

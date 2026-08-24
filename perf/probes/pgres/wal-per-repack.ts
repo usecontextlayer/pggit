@@ -14,16 +14,16 @@
  *             is the FK cascade. Trials run with the tier BOTH present and absent,
  *             isolating the encoding rows' contribution to that cascade.
  *
- * NOISE, stated plainly: `pg_current_wal_lsn()` is INSTANCE-WIDE and this Postgres
- * is shared with sibling agents, so every delta here includes their writes. Three
+ * NOISE, stated plainly: `pg_current_wal_lsn()` is INSTANCE-WIDE, so every delta
+ * includes concurrent writers on the same Postgres instance. Three
  * mitigations: (1) N trials, medians reported, spread shown; (2) an idle "control"
  * window of the same wall-clock duration is measured between phases, so the reader
  * can see the ambient rate; (3) phases are short. Treat the RATIO of repack-WAL to
  * push-WAL as the finding, never the absolute bytes.
  *
- * This instance also runs `full_page_writes = off` and `fsync = off` (checked and
- * printed), which SUPPRESSES full-page-image WAL — so every number here is a
- * LOWER BOUND on what a production instance with FPW on would write.
+ * The probe prints `full_page_writes` and `fsync`. When full-page writes are off,
+ * observed WAL excludes full-page images and is lower than an equivalent run with
+ * them enabled.
  *
  * FAILURE BOUND (non-zero exit): the median repack WAL exceeds 1.5× the median
  * push WAL for the identical content — i.e. building the derived tier costs more
@@ -150,7 +150,7 @@ async function trial(
 		const w1 = await walLsn(pg)
 		await assertRows(objects, [], tip)
 
-		// IDLE control window of comparable duration — the ambient sibling-agent rate.
+		// IDLE control window of comparable duration — the ambient concurrent-write rate.
 		await sleep(Math.min(2000, Math.max(300, pushMs)))
 		const w2 = await walLsn(pg)
 
@@ -392,7 +392,7 @@ async function main(): Promise<void> {
 		`WAL amplification vs the bytes actually stored: push ${(push / t0.rawBytes).toFixed(2)}× raw · repack ${(repack / t0.encBytes).toFixed(2)}× deflated-encoding`,
 	)
 	console.log(
-		`\nNOTE: full_page_writes=${cfg.fpw} here. With FPW on (any production instance) both numbers rise; this lower-bound fixture does not quantify that production difference.`,
+		`\nNOTE: full_page_writes=${cfg.fpw} here. Enabling it can raise both numbers; this fixture does not model that difference.`,
 	)
 
 	cleanupTmp()

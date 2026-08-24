@@ -1,51 +1,10 @@
 /**
- * BREAKAGE (pg-txn) — an aborted GC walk poisons the pooled connection.
- * Converted from `breakage/pg-txn--gc-poisons-pooled-connection.ts`; its rationale
- * verbatim:
+ * Postgres transaction regression — an aborted GC walk must not poison the pooled connection.
  *
- * FINDING: an aborted GC live-set walk PERMANENTLY POISONS the pooled connection
- * it borrowed — it is released back into the pool still inside an open, aborted
- * REPEATABLE READ transaction. Every later user of that connection fails with
- * `25P02 current transaction is aborted, commands ignored until end of
- * transaction block`, forever, and if the pool is shared with the git app that
- * means clones and pushes fail.
- *
- * `store/gc.ts liveSet()` pins one connection for the multi-statement closure
- * walk (it must: the walk needs ONE MVCC snapshot):
- *
- *     const conn = await pg.reserve()
- *     try {
- *       await conn`begin isolation level repeatable read`
- *       …
- *       await conn`commit`          // ← only reached on the happy path
- *       return present
- *     } finally {
- *       conn.release()              // ← no ROLLBACK on the error path
- *     }
- *
- * `postgres`'s `reserve()/release()` does not reset session state, so any failure
- * between the BEGIN and the COMMIT — a `statement_timeout`, a `lock_timeout`, a
- * cancel, an OOM, a malformed object thrown out of the tree walk — leaks an open
- * aborted transaction into the pool. Nothing in pggit ever rolls it back.
- *
- * Three consequences, all pinned below (mechanism as ORIGINALLY found — the fix
- * reshaped gc onto a reserved connection with an in-try ROLLBACK, D12, so the
- * specific `gc_live_<id>` finally-drop named here no longer exists; the test now
- * pins that the poisoning CANNOT recur):
- *   1. the very error the operator sees was WRONG: the cleanup drop ran on the
- *      poisoned connection and its 25P02 REPLACED the real cause, so the log said
- *      "current transaction is aborted" and never mentioned the timeout;
- *   2. GC is dead from then on — every subsequent pass that lands on that
- *      connection fails the same way, and the drain has a pool of only
- *      `concurrency + 1` connections to lose (`server.ts`);
- *   3. on a shared pool — the natural composition for a host that mounts
- *      `createGitApp(createGitDeps(pg))` and starts `createGcScheduler(pg)` over
- *      the same client — ordinary CLONES AND PUSHES start failing, intermittently,
- *      with a Postgres error that has nothing to do with what they were doing.
- *
- * It never converges: no gc, repack, or clone repairs it, because the damage is
- * session state in a live connection, not rows. Only a process restart (or pool
- * recycle) clears it.
+ * The live-set walk needs one REPEATABLE READ snapshot, so it pins a reserved
+ * connection. Any failure between BEGIN and COMMIT must roll that connection back
+ * before release; `reserve()/release()` does not reset session state. Otherwise a
+ * later GC or request can inherit an aborted transaction and fail with 25P02.
  *
  * FAULT INJECTED: a `statement_timeout` abort of the closure walk — set as a
  * connection parameter on the test's own pool. No pggit code is modified. The
@@ -53,16 +12,14 @@
  * REINDEX, a VACUUM FULL, a migration, or gc's own `maintain()` all take
  * conflicting locks) meeting that statement_timeout.
  *
- * THE CONTRACT, in order: the fault fires at all (the walk aborts with 57014, a
+ * THE CONTRACT, in order: the fault fires (the walk aborts with 57014, a
  * cancelled statement — everything after it is vacuous over an undisturbed pool),
  * gc reports that REAL cause rather than a 25P02 from its own cleanup, the
  * borrowed connection returns to the pool with no open transaction, gc and repack
  * keep working on that pool, ordinary clones through it are untouched, and a clean
  * gc+repack leaves it serving.
  *
- * Originated as breakage probe `pg-txn--gc-poisons-pooled-connection.ts`, which
- * reproduced the poisoning (exit non-zero); fixed by reshaping gc onto a reserved
- * connection with an in-try ROLLBACK (D12).
+ * GC therefore runs on a reserved connection with an in-try ROLLBACK (D12).
  */
 import { randomUUID } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -121,8 +78,7 @@ describe("regressions/pg-txn — an aborted GC pass must not poison its pool", (
 		// `statement_timeout` is the abort lever; it is a normal server-side setting
 		// (Azure Postgres and pgbouncer deployments commonly set one).
 		// `application_name` tags the shared pool's backends so the idle-in-transaction
-		// probe below reads only connections THIS test opened — the source script had a
-		// container to itself; here the globalSetup container is shared with every
+		// probe below reads only connections THIS test opened because the globalSetup container is shared with every
 		// other test file.
 		shared = postgres(baseUrl, {
 			connection: {

@@ -1,5 +1,5 @@
 /**
- * Typed-graph policy (adversarial-review fix, 2026-08-19). Two layers:
+ * Typed-graph policy. Two layers:
  *
  * 1. Branch tips must be COMMITS — canonical receive-pack rejects a blob or
  *    tree pushed to refs/heads/* per-ref ("invalid new value provided",
@@ -94,8 +94,7 @@ describe("typed-graph policy", () => {
 	})
 
 	it("a parent whose derived row is MISSING crashes loud — corruption, never a sweepable miss", async () => {
-		// The adversarial review's critical: judged as a typed-edge "missing", a
-		// reachable parent with a missing derived row would be EXCLUDED from
+		// Judged as a typed-edge "missing", a reachable parent with a missing derived row would be EXCLUDED from
 		// GC's live set and swept — corruption converted into data loss. It must
 		// crash the walk instead, in connectivity AND in the GC pass.
 		const repo = "policy/corrupt"

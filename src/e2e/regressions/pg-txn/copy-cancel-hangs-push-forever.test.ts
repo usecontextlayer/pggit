@@ -1,62 +1,27 @@
 /**
- * BREAKAGE (pg-txn) — a cancelled ingest COPY hangs the push forever.
- * Converted from `breakage/pg-txn--copy-cancel-hangs-push-forever.ts`; its
- * rationale verbatim:
+ * Postgres transaction regression — a cancelled ingest COPY must not hang the push.
  *
- * FINDING: when Postgres cancels the COPY that `copy-insert.ts` is streaming, the
- * ingest promise NEVER SETTLES. The `git push` hangs forever with no error, the
- * HTTP handler never returns, and the pooled connection is stranded in an open
- * aborted transaction and never returned to the pool.
+ * A cancelled COPY must settle through the patched stream/final-error path so the
+ * transaction can roll back, receive-pack can report the failure, the connection
+ * can return to the pool, and server shutdown can complete.
  *
- * `copyInsert` drives the COPY through a `writable()` stream:
- *
- *     await new Promise<void>((resolve, reject) => {
- *       writable.on("error", reject)
- *       writable.on("finish", () => resolve())
- *       writable.write(payload, (err) => { if (err) reject(err); else writable.end() })
- *     })
- *
- * A server-side cancel of the COPY (a `statement_timeout`, a `pg_cancel_backend`,
- * an admin cancel, a `lock_timeout`) makes the backend abort the transaction and
- * go to `idle in transaction (aborted)` waiting on Client — but `postgres@3.4.9`
- * emits NEITHER 'error' NOR 'finish' on that writable. The promise stays pending
- * for the life of the process. Every guard pggit has is downstream of a settled
- * promise, so none of them fire: no `pg.begin` rollback, no `unpack` error, no
- * `ng` line, no 500.
- *
- * The store stays CONSISTENT — no rows land, the transaction never commits — so
- * this is not corruption. It is an availability failure with no timeout anywhere:
- *   - `git push` blocks indefinitely (observed >9 minutes before being killed);
- *   - the Node handler never returns, so `server.close()` never resolves either
- *     (a clean SIGTERM shutdown hangs too);
- *   - the connection is stranded mid-transaction, so the pool loses it
- *     permanently — N such pushes take a `max: N` pool to zero and every later
- *     request queues forever.
- *
- * A `statement_timeout` is ordinary production configuration (Azure Postgres
- * deployments and pgbouncer front-ends commonly set one), and pggit's own ingest
- * COPY is the longest single statement it ever issues — exactly the statement a
- * timeout is most likely to hit.
+ * Server-side cancellation can come from `statement_timeout`, `pg_cancel_backend`,
+ * an administrator, or `lock_timeout`. The patched postgres stream reports its
+ * final error so every guard downstream of settlement can run.
  *
  * FAULT INJECTED: `pg_cancel_backend` against the server's own connection, fired
  * the moment that connection is inside the ingest COPY. No pggit code is modified.
  *
- * WHY NOT A `statement_timeout`, which is what the source script used and what the
- * paragraph above calls the realistic production trigger: a wall-clock timeout
- * cannot be AIMED. Measured on this fixture (RUNS=700), the whole push completes
- * in ~1.9 s and its COPY finishes far inside the 500 ms timeout the suite used to
- * set — so the fault never fired, the push exited 0, and every assertion below was
- * satisfied by a plainly successful push. Sizing the fixture until a COPY outlives
- * a fixed timeout would make the whole suite a hardware race. Polling
- * `pg_stat_activity` for the COPY itself lands the abort exactly where the finding
- * is, on any machine, and raises the SAME error class a timeout would (SQLSTATE
+ * WHY NOT A `statement_timeout`: a wall-clock timeout cannot be AIMED. The COPY
+ * may finish before the bound, satisfying every assertion with a successful push;
+ * sizing it to outlive a fixed timeout would make the suite a hardware race. Polling
+ * `pg_stat_activity` lands the abort at the COPY on any machine and raises the same
+ * error class a timeout would (SQLSTATE
  * 57014, `canceling statement …`) — which is why the assertion accepts either
  * wording. `copyCancelled` is the barrier that keeps this honest.
  *
- * The source script exits non-zero when the hang reproduces; the assertions below
- * encode the CORRECT contract (the push settles and reports the cancel, the
- * connection comes back, the pool keeps serving, shutdown completes), so a
- * reproduction is a red test.
+ * The assertions require the push to settle and report the cancellation, the
+ * connection to return, the pool to keep serving, and shutdown to complete.
  */
 import { rmSync } from "node:fs"
 import { setTimeout as sleep } from "node:timers/promises"
@@ -183,7 +148,7 @@ describe("regressions/pg-txn — a cancelled ingest COPY must not hang the push"
 	afterAll(async () => {
 		// Teardown must not inherit the hang: the stranded backend holds locks that
 		// would block `drop schema cascade` forever. Terminate ONLY the pid this test
-		// opened, then tear down as the source script did.
+		// opened, then tear down.
 		if (pid > 0) {
 			await admin`select pg_terminate_backend(${pid})`.catch(() => {})
 		}

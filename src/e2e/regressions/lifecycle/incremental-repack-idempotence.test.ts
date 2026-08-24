@@ -12,9 +12,6 @@
  * nothing to write. Every round's clone must then be fsck-clean and carry exactly
  * the oracle's object set and refs.
  *
- * Originated as exploration-1 probe
- * `lifecycle--incremental-repack-idempotence.ts` (exit 1 when the second pass
- * wrote anything), which reproduced non-idempotent repack; fixed.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -57,7 +54,7 @@ describe("regressions/lifecycle — incremental repack idempotence", () => {
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-incr-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-incremental-repack-"))
 		const dir = (name: string): string => join(root, name)
 
 		const src = dir("src")

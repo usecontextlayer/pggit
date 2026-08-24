@@ -19,7 +19,6 @@
  * repo and compare the bytes that ARRIVED (the client's own pack files) against
  * a control repo that used a fresh Repack instance.
  *
- * Converted from `breakage/race--repo-recreate-stale-resolver.ts` (`--runs=400`).
  * Deterministic — no loop to preserve.
  */
 import { mkdtempSync, rmSync } from "node:fs"

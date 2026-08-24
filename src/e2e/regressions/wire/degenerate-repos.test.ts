@@ -1,8 +1,6 @@
 /**
  * WIRE — degenerate repository states through the repack + deltified serve path:
  * the shapes where "there is nothing to delta" must still be exactly right.
- * (Converted from `breakage/wire--degenerate-repos.ts`.)
- *
  *   1. A repo name never written: clone must behave as it did before the tier.
  *   2. An empty repo (HEAD unborn, refs pushed then… nothing) — repack over it.
  *   3. A single orphan commit (one commit, no parents) — repack, clone.

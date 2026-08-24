@@ -1,5 +1,5 @@
 /**
- * Lifecycle breakage — histories the commit walk has to work for: merges (2 and 3
+ * Lifecycle regression — histories the commit walk has to work for: merges (2 and 3
  * parents), reverts (a commit whose tree EQUALS an ancestor's tree, so a lineage
  * runs backwards), criss-cross merges, and identical-content branches. Each
  * shape is repacked, gc'd, force-moved and cloned against a file:// oracle.
@@ -8,9 +8,6 @@
  * octopus merge, a criss-cross pair, a twin root, then a collapse (every branch
  * force-moved back to commit 10) followed by gc(0) and a repair repack.
  *
- * Originated as exploration-9 probe
- * `lifecycle--merge-revert-history-shapes.ts` (exit 1 on a mismatch against the
- * file:// oracle); fixed.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -53,7 +50,7 @@ describe("regressions/lifecycle — merge, revert and criss-cross history shapes
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-shapes-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-merge-revert-shapes-"))
 		const dir = (name: string): string => join(root, name)
 
 		const src = dir("src")

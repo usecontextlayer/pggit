@@ -31,7 +31,7 @@ describe("M2 — ref command modes: deny-non-FF policy (real git)", () => {
 		await db?.drop()
 	})
 
-	it("DENIES a delete-only push (refs only advance; was: accepted pre-2026-07-05)", async () => {
+	it("DENIES a delete-only push because refs only advance", async () => {
 		await withTempDir("pggit-del-", async (src) => {
 			await spawnGit(["init", "-q"], { cwd: src })
 			writeFileSync(join(src, "a.txt"), "alpha\n")
@@ -53,7 +53,7 @@ describe("M2 — ref command modes: deny-non-FF policy (real git)", () => {
 		})
 	})
 
-	it("DENIES a non-fast-forward force push; a genuine FF still lands (was: accepted pre-2026-07-05)", async () => {
+	it("DENIES a non-fast-forward force push; a genuine FF still lands", async () => {
 		const src = mkdtempSync(join(tmpdir(), "pggit-nonff-"))
 		const back = mkdtempSync(join(tmpdir(), "pggit-nonff-back-"))
 		const repo = `${url}/repo-nonff`

@@ -115,14 +115,14 @@ export async function diffFileLists(
 
 async function diffLevel(
 	read: TreeReader,
-	aOid: string,
-	bOid: string,
+	beforeOid: string,
+	afterOid: string,
 	prefix: string,
 	diff: FileDiff,
 ): Promise<void> {
-	if (aOid === bOid) return
-	const before = await readIndexedTree(read, aOid)
-	const after = await readIndexedTree(read, bOid)
+	if (beforeOid === afterOid) return
+	const before = await readIndexedTree(read, beforeOid)
+	const after = await readIndexedTree(read, afterOid)
 
 	const addSide = async (e: TreeEntry, path: string): Promise<void> => {
 		if (isTreeEntryMode(e.mode)) {
@@ -148,25 +148,34 @@ async function diffLevel(
 			await removeSide(pair.before, prefix + pair.before.name)
 			continue
 		}
-		const ae = pair.before
-		const be = pair.after
-		const path = prefix + be.name
-		const aTree = isTreeEntryMode(ae.mode)
-		const bTree = isTreeEntryMode(be.mode)
-		if (aTree && bTree) {
-			if (ae.oid !== be.oid) await diffLevel(read, ae.oid, be.oid, `${path}/`, diff)
-		} else if (aTree || bTree) {
+		const beforeEntry = pair.before
+		const afterEntry = pair.after
+		const path = prefix + afterEntry.name
+		const beforeIsTree = isTreeEntryMode(beforeEntry.mode)
+		const afterIsTree = isTreeEntryMode(afterEntry.mode)
+		if (beforeIsTree && afterIsTree) {
+			if (beforeEntry.oid !== afterEntry.oid) {
+				await diffLevel(read, beforeEntry.oid, afterEntry.oid, `${path}/`, diff)
+			}
+		} else if (beforeIsTree || afterIsTree) {
 			// dir↔file swap at one name: the old side's files go, the new side comes.
-			await removeSide(ae, path)
-			await addSide(be, path)
-		} else if (ae.mode !== be.mode || ae.oid !== be.oid) {
+			await removeSide(beforeEntry, path)
+			await addSide(afterEntry, path)
+		} else if (
+			beforeEntry.mode !== afterEntry.mode ||
+			beforeEntry.oid !== afterEntry.oid
+		) {
 			// Both non-tree. A gitlink flip is add/remove of the visible side;
 			// a same-shape change upserts with the after-side (mode, oid).
-			if (ae.mode === GITLINK_MODE || be.mode === GITLINK_MODE) {
-				await removeSide(ae, path)
-				await addSide(be, path)
+			if (beforeEntry.mode === GITLINK_MODE || afterEntry.mode === GITLINK_MODE) {
+				await removeSide(beforeEntry, path)
+				await addSide(afterEntry, path)
 			} else {
-				diff.upserts.push({ blobOid: be.oid, mode: be.mode, path })
+				diff.upserts.push({
+					blobOid: afterEntry.oid,
+					mode: afterEntry.mode,
+					path,
+				})
 			}
 		}
 	}

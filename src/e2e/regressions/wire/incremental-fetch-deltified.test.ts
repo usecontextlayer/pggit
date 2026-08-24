@@ -1,8 +1,6 @@
 /**
  * WIRE — incremental fetch against a repacked (deltified) pggit remote,
  * differentially against a plain bare git remote.
- * (Converted from `breakage/wire--incremental-fetch-deltified.ts`.)
- *
  * The serve rule (design D8') emits a stored delta when its base is in the served
  * set or, for a thin pack, proven in the client's `have`s. Otherwise it falls back
  * to the whole form. Incremental negotiation exercises both legal outcomes; a

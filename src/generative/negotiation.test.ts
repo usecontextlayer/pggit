@@ -284,12 +284,11 @@ describe("§8.4 generative — negotiation transcript differential", () => {
 			{ numRuns: 8, seed: 424_242 },
 		)
 
-		// The corpus floors, calibrated on what the pinned seed realizes today
+		// The corpus floors, calibrated on what the pinned seed realizes
 		// (pairs=41 ready=21 not-ready=20 nak=10 multi-ack=12 with-pack=21). A
 		// transcript differential that only ever saw READY transcripts — or only
 		// NAK ones — agrees with git on one branch of `ok_to_give_up` and never
-		// tests the other, which is exactly how both shipped regressions stayed
-		// green under the set-comparing properties. Raising a floor is fine (a
+		// tests the other. Raising a floor is fine (a
 		// richer corpus); dropping one is the collapse these exist to red.
 		console.log(
 			`[negotiation corpus] pairs=${shape.pairs} ready=${shape.ready} ` +

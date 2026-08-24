@@ -1,15 +1,13 @@
 /**
- * Lifecycle breakage — the anchor-dies-delta-survives shape (design N3), iterated:
+ * Lifecycle regression — the anchor-dies-delta-survives shape (design N3), iterated:
  * an orphan commit on a side ref reuses a MID-history tree, main rewinds, gc(0)
  * must sweep the now-dangling delta, and the tier must repair over many cycles.
  *
- * Converted from `breakage/lifecycle--anchor-death-cycles.ts` (exploration 3),
- * mechanically and at full scale — 200 seed commits, 5 cycles, a 50-commit
+ * Full scale is 200 seed commits, 5 cycles, and a 50-commit
  * divergent lineage per cycle. The oracle is a plain `file://` bare remote
  * replaying exactly the same visible history: every mirror clone taken from pggit
  * must be `fsck --strict` clean and carry precisely the oracle's object set and
- * refs. The source script exits 1 when the bug reproduces; here the assertions
- * encode the CORRECT outcome, so a live reproduction shows up as a RED test.
+ * refs.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -58,7 +56,7 @@ describe("regressions/lifecycle — anchor death cycles", () => {
 		const fixture = await setupGitServerFixture()
 		db = fixture.db
 		server = fixture.server
-		root = mkdtempSync(join(tmpdir(), "pggit-breakage-anchor-"))
+		root = mkdtempSync(join(tmpdir(), "pggit-anchor-death-cycles-"))
 		const dir = (name: string): string => join(root, name)
 
 		const src = dir("src")

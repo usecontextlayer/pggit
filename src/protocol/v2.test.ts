@@ -6,8 +6,8 @@ import { parseFetch, parseV2Request } from "@/protocol/v2"
  * v2 request DECODE — the happy path of `parseV2Request`/`parseFetch` (the
  * malformed and boundary cases are v2.parse.test.ts's). The v2 ENCODE
  * surfaces (advertisement, ls-refs response, packfile section) are goldens in
- * upload-pack-wire.test.ts and live there only: a second, looser copy here
- * used to pass while the capability set drifted underneath it.
+ * upload-pack-wire.test.ts and live there only so the capability contract has a
+ * single executable definition.
  */
 
 const A = "a".repeat(40)

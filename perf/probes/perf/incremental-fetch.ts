@@ -4,8 +4,8 @@
  *
  * A client that is one commit behind should pay for one commit. The derived-state
  * spine routes haveful fetches through the frontier and computes same-path warm
- * tree deltas against the boundary; this is the standing regression gate that
- * the retired two-full-closure serve path does not return.
+ * tree deltas against the boundary; this gate requires the fetch to stay
+ * proportional to the newly reachable region rather than both full closures.
  *
  * Both sides are driven identically: all objects exist server-side up front, the
  * ref is walked forward one commit at a time, and a real `git fetch` runs after
@@ -272,7 +272,7 @@ async function main(): Promise<void> {
 	const last = requiredAt(rows, rows.length - 1, "largest incremental-fetch measurement")
 	const ratio = last.pggitBest / last.gitBest
 	console.log(
-		`\nFAIL CONDITION: a one-commit fetch costs > ${RATIO_LIMIT}× canonical git's, or grows with history length.`,
+		`\nFAIL CONDITION: at the largest size, a one-commit fetch costs > ${RATIO_LIMIT}× canonical git's.`,
 	)
 	console.log(`observed: ${ratio.toFixed(1)}× at ${last.n + 1} commits`)
 	if (ratio > RATIO_LIMIT) process.exitCode = 1

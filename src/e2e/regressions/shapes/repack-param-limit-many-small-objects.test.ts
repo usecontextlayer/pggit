@@ -3,13 +3,13 @@
  * 65,534 pending objects gathered into a single read batch — and the repo stays
  * clonable and object-identical afterwards.
  *
- * THE DEFECT THIS PINS: repack's phase-2 coverage sweep once batched only by
- * BYTES (a 16 MB window) and then read that batch with `oid in ${pg(list)}`,
+ * Repack's phase-2 coverage sweep must not batch only by BYTES (a 16 MB window)
+ * and then read an unbounded batch with `oid in ${pg(list)}`,
  * which spends ONE bind parameter per oid. Postgres' extended protocol caps a
  * statement at 65,535 parameters (porsager enforces 65,534) and the query
  * already spends one on `repo_id`, so any repo whose objects average under
  * ~244 bytes crossed the parameter ceiling before it crossed 16 MB and the pass
- * threw `MAX_PARAMETERS_EXCEEDED` before writing anything. The sweep is now
+ * would throw `MAX_PARAMETERS_EXCEEDED` before writing anything. The sweep is
  * bounded by oid COUNT as well as bytes, matching every other batched read in
  * the codebase.
  *
@@ -29,17 +29,11 @@
  * THE CONTRACT, asserted per shape: real git serves the shape (the control
  * `file://` remote clones it fsck-clean), pggit's wire path serves it (push and
  * the pre-repack clone are object-identical to the source), `repack` does real
- * work, an immediately repeated `repack` is a no-op — the old failure threw
- * before emitting anything and reproduced identically on every retry, so
- * convergence is the observable that separates "the pass completed" from "the
- * pass keeps failing the same way" — and the post-repack clone is still
+ * work, an immediately repeated `repack` is a no-op — convergence is the
+ * observable that separates "the pass completed" from "the pass keeps failing
+ * the same way" — and the post-repack clone is still
  * fsck-clean and object-identical.
  *
- * Originated as breakage probe `shapes--repack-param-limit-many-small-objects.ts`
- * (exit 0 = correct behavior · exit 1 = bug reproduced), which reproduced the
- * bind-parameter ceiling; fixed. The retry-convergence assertion is folded in
- * from the retired `lifecycle--repack-bind-parameter-ceiling` probe, which
- * covered the same defect at the same boundary.
  */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

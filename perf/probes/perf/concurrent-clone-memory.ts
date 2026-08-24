@@ -1,6 +1,6 @@
 /**
  * PROBE: `buildPack` materializes the ENTIRE pack as one Buffer before the first
- * byte leaves (design W4). What does that cost the serving process when more than
+ * byte leaves. What does that cost the serving process when more than
  * one client clones at once, and what does canonical git spend serving the same
  * clones?
  *

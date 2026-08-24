@@ -2,8 +2,7 @@
  * pg-bloat/encoding-tier-vs-git-pack — does the derived tier cost what a packfile
  * costs?
  *
- * The delta-pack design's premise (D1/D6) is that `git_pack_encoding` holds
- * exactly the bytes a served pack is made of, so the tier should weigh roughly
+ * `git_pack_encoding` holds the bytes a served pack is made of, so the tier should weigh roughly
  * what git's own packfile weighs for the same objects. That is the claim this
  * harness checks, and it checks the tier's complete physical footprint rather
  * than the payload: a row in Postgres is not just its bytes — it carries a 24-byte tuple header, a line
@@ -12,8 +11,8 @@
  * partitions each pay their own relation, index, TOAST relation and TOAST index
  * floor on top.
  *
- * It also states the number the design deliberately accepted (D1: "the canonical
- * ~73 MB does not shrink"): the encoding tier is ADDITIVE, so the storage
+ * The encoding tier is ADDITIVE: authoritative `git_object` content does not
+ * shrink when encodings are built, so the storage
  * question is not `encoding vs pack` but `git_object + git_commit + encoding` vs
  * `one packfile`.
  *
@@ -154,7 +153,7 @@ async function main(): Promise<void> {
 		// ── the source repo ─────────────────────────────────────────────────
 		const src = scratch.dir("src")
 		if (SOURCE.kind === "repository") {
-			// Never operate on the original: mirror-clone first (the design doc's rule).
+			// Mirror-clone first so the probe cannot mutate the selected source checkout.
 			await spawnGit(["clone", "-q", "--mirror", SOURCE.path, src])
 			console.log(`source: mirror clone of ${SOURCE.path}`)
 		} else {
@@ -352,11 +351,10 @@ async function main(): Promise<void> {
 
 		const ratio = enc.total / servedPack
 		console.log(
-			`\nthe tier weighs ${ratio.toFixed(2)}× the pack it exists to emit ` +
-				`(design premise: ~1×).`,
+			`\nthe tier weighs ${ratio.toFixed(2)}× the pack it exists to emit (expected: ~1×).`,
 		)
 		console.log(
-			`the design accepted that git_object does not shrink (D1); the measured consequence is\n` +
+			`git_object does not shrink when the derived tier is built; the measured consequence is\n` +
 				`that a repo whose packfile is ${mb(sizePack)} MB occupies ` +
 				`${mb(enc.total + obj.total + commit.total)} MB of Postgres — ` +
 				`${((enc.total + obj.total + commit.total) / sizePack).toFixed(1)}× — of which the\n` +

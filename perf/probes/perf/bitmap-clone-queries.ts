@@ -1,6 +1,6 @@
 /**
- * PROBE: what does the reachability epoch (spine chunk 5b, S6) actually save a
- * COLD CLONE, in Postgres round-trips and bytes-shaped reads?
+ * PROBE: what does the reachability epoch actually save a
+ * COLD CLONE, in Postgres query executions and bytes-shaped reads?
  *
  * The same repo is cloned off the wire twice through counting porsager clients:
  * once BEFORE any drain (no epoch — the serve walks `fullClosure`, reading every
@@ -11,9 +11,8 @@
  * that serves the wrong bytes cannot win.
  *
  * Exit 1 when the epoch-served clone does not cut serve-phase queries by at
- * least MIN_QUERY_FACTOR at the largest size — directional, deliberately far
- * under the design's ~230× at 10× scale (the ratio grows with history depth;
- * a local fixture is shallow).
+ * least MIN_QUERY_FACTOR at the largest size. The bound is directional because
+ * the ratio grows with history depth and this local fixture is shallow.
  *
  *   npx tsx perf/probes/perf/bitmap-clone-queries.ts [--sizes=250,500,1000,2000]
  */

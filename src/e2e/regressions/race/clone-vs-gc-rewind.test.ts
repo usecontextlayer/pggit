@@ -23,9 +23,7 @@
  * held to, so it is asserted here too (canonical git never hands a client a
  * corrupt result for this race).
  *
- * Converted from `breakage/race--clone-vs-gc-rewind.ts` (`--iters=40 --runs=150
- * --rewind=60`). Probabilistic. The swept gc-start delays are NOT the source's:
- * it froze absolute milliseconds ([0..45]ms), which tie the race to one
+ * Probabilistic. Fractional gc-start delays avoid tying the race to one
  * machine's serve speed. Each run instead times one un-raced fetch of the same
  * shape and sweeps the gc start across FRACTIONS of that measured wall — dense
  * in the serve's opening phase where the batch-by-batch deletion has to get

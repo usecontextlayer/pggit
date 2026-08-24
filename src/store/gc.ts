@@ -130,17 +130,14 @@ export function createGc(pg: Sql) {
 
 			// 2 + 3. Materialize the live set under a consistent snapshot.
 			//
-			// CONCURRENCY: the write/ingest path (`object-store.insertObjects`) does NOT
-			// yet take a per-repo `pg_advisory_xact_lock` — that lock was deferred to this
-			// GC chunk (redesign §5.4 / §12) and has no other consumer. So GC takes its
-			// safety from two defenses (§5): (a) a REPEATABLE READ transaction, so the
+			// CONCURRENCY: the write/ingest path (`object-store.insertObjects`) and GC do
+			// not share a per-repo advisory lock. GC therefore takes its safety from two
+			// defenses: (a) a REPEATABLE READ transaction, so the
 			// ref-tip read and the closure walk see ONE consistent MVCC snapshot that
 			// hides any push not yet committed when the snapshot opened; and (b) the
 			// `created_at` grace below, which protects the present-but-unreachable window
-			// (just-ingested objects a ref does not yet reach). When the write path adopts
-			// the same per-repo advisory lock, GC should take that SAME key around this
-			// read for full §5 mutual exclusion — DO NOT add a key here that the write path
-			// does not also hold, or the lock would guard nothing.
+			// (just-ingested objects a ref does not yet reach). A GC-only advisory lock
+			// would guard nothing because the writer would not participate in it.
 			//
 			// The live OIDs land in a TEMP table on this pass's one reserved connection —
 			// server-side, so the sweep's anti-join scales to a ~30k-orphan repo without
@@ -148,17 +145,15 @@ export function createGc(pg: Sql) {
 			// repo or not, this instance or another) can NEVER see or clobber each
 			// other's live set: `pg_temp` resolves ahead of the schema, and the table
 			// dies with its connection. A crashed pass's leftover is healed by the next
-			// pass's drop-if-exists on that pooled connection. The deferred advisory
-			// lock (redesign §5.4; scheduler design §8) is still wanted before a second
-			// INSTANCE ever runs — for the write-path interlock and to avoid duplicated
-			// sweep work — but staging-state correctness no longer depends on it.
-			const conn = await pg.reserve()
+			// pass's drop-if-exists on that pooled connection. Multiple instances can
+			// duplicate sweep work, but cannot share or corrupt this staging state.
+			const connection = await pg.reserve()
 			try {
-				await conn.unsafe(`drop table if exists ${LIVE_TABLE}`)
-				await conn.unsafe(`create temp table ${LIVE_TABLE} (oid bytea primary key)`)
+				await connection.unsafe(`drop table if exists ${LIVE_TABLE}`)
+				await connection.unsafe(`create temp table ${LIVE_TABLE} (oid bytea primary key)`)
 
-				const { live, plan } = await livePlan(conn, id)
-				await loadLive(conn, live)
+				const { live, plan } = await livePlan(connection, id)
+				await loadLive(connection, live)
 
 				// Give every sweep statement statistics that are correct AT PLAN TIME.
 				// Autovacuum's analyze cadence is a race, not a guarantee: a burst of
@@ -169,8 +164,8 @@ export function createGc(pg: Sql) {
 				// 46k-row partition. The TEMP live table is never visible to autovacuum
 				// at all. All three ANALYZEs are milliseconds-to-seconds, offline-pass
 				// budget; correctness of the pass never depended on them, only its cost.
-				await conn.unsafe(`analyze ${LIVE_TABLE}`)
-				await conn.unsafe(`analyze git_object`)
+				await connection.unsafe(`analyze ${LIVE_TABLE}`)
+				await connection.unsafe(`analyze git_object`)
 
 				// TEST SEAM (§5 in-flight safety): interpose a concurrent push here, between
 				// the live-set materialization and the object sweep.
@@ -185,7 +180,7 @@ export function createGc(pg: Sql) {
 				// surface can be torn from the inventory, mid-pass or mid-crash, and none
 				// needs a sweep of its own (design D7/D14, expressed as DDL).
 				const deletedObjects = await sweepObjects(
-					conn,
+					connection,
 					id,
 					options.graceSeconds,
 					options.batchLimit,
@@ -200,7 +195,7 @@ export function createGc(pg: Sql) {
 				// partitions' autovacuum (0001_init.ts) reclaims the GC churn.
 				// Observable-neutral either way.
 				if (options.maintain && deletedObjects > 0) {
-					await maintain(conn)
+					await maintain(connection)
 				}
 
 				// The reachability epoch, written AFTER the sweep on this
@@ -211,18 +206,18 @@ export function createGc(pg: Sql) {
 				// The sweep cannot invalidate the payload: it deletes only
 				// UNREACHABLE objects, and every epoch member is reachable.
 				if (plan.outcome === "cleared") {
-					await deleteEpoch(conn, id)
+					await deleteEpoch(connection, id)
 				} else if (plan.outcome === "advanced" || plan.outcome === "rebuilt") {
-					await writeEpoch(conn, id, plan)
+					await writeEpoch(connection, id, plan)
 				}
 
 				// Loud, and only on the success path: a FAILED pass skips this drop (its
 				// connection may be unusable, and a cleanup failure must never replace the
 				// pass's real error) — the next pass on this connection heals the leftover.
-				await conn.unsafe(`drop table if exists ${LIVE_TABLE}`)
+				await connection.unsafe(`drop table if exists ${LIVE_TABLE}`)
 				return { deletedObjects, epoch: plan.outcome }
 			} finally {
-				conn.release()
+				connection.release()
 			}
 		},
 	}
@@ -259,13 +254,13 @@ export function createGc(pg: Sql) {
 	 * sweep's own short write transactions begin.
 	 */
 	async function livePlan(
-		conn: ReservedSql,
+		connection: ReservedSql,
 		id: ReposId,
 	): Promise<{ live: readonly string[]; plan: EpochPlan }> {
 		try {
-			await conn`begin isolation level repeatable read`
-			const pinned = pinnedKysely(conn)
-			const rows = await conn<{ oid: Buffer | null }[]>`
+			await connection`begin isolation level repeatable read`
+			const pinned = pinnedKysely(connection)
+			const rows = await connection<{ oid: Buffer | null }[]>`
 				select oid from git_ref where repo_id = ${id} and oid is not null
 			`
 			const tips = [
@@ -273,22 +268,22 @@ export function createGc(pg: Sql) {
 			].sort()
 			const loadedEpoch = await loadEpoch(pinned, id)
 			const epoch = loadedEpoch.state === "absent" ? null : loadedEpoch.epoch
-			let out: { live: readonly string[]; plan: EpochPlan }
+			let decision: { live: readonly string[]; plan: EpochPlan }
 			if (tips.length === 0) {
-				out = { live: [], plan: { outcome: epoch ? "cleared" : "unchanged" } }
+				decision = { live: [], plan: { outcome: epoch ? "cleared" : "unchanged" } }
 			} else if (
 				loadedEpoch.state === "ready" &&
-				sameOids(tips, loadedEpoch.epoch.tips)
+				sameSortedOids(tips, loadedEpoch.epoch.tips)
 			) {
-				out = {
+				decision = {
 					live: splitOids(loadedEpoch.epoch.oids),
 					plan: { outcome: "unchanged" },
 				}
 			} else {
-				out = await planWalk(pinned, id, tips, epoch)
+				decision = await planWalk(pinned, id, tips, epoch)
 			}
-			await conn`commit`
-			return out
+			await connection`commit`
+			return decision
 		} catch (err) {
 			// The caller `release()`s this connection back to the POOL with its session
 			// state intact, so a walk that dies with the transaction open (a statement
@@ -298,7 +293,7 @@ export function createGc(pg: Sql) {
 			// restart. Roll back here. Best-effort: a dead backend has no transaction
 			// left to roll back, and the walk's own error must propagate, never this
 			// cleanup's.
-			await conn`rollback`.catch(() => {})
+			await connection`rollback`.catch(() => {})
 			throw err
 		}
 	}
@@ -333,8 +328,8 @@ export function createGc(pg: Sql) {
 		if (walk.missing.size > 0 || walk.violations.size > 0) return withheld(walk)
 		const oids = concatSortedOids(walk.masks.keys())
 		const bitmaps = new Map<string, Uint8Array>()
-		for (const [t, positions] of maskPositions(tips, walk, oids)) {
-			bitmaps.set(t, bitmapFromPositions(positions))
+		for (const [tip, positions] of maskPositions(tips, walk, oids)) {
+			bitmaps.set(tip, bitmapFromPositions(positions))
 		}
 		return {
 			live: [...walk.masks.keys()],
@@ -367,23 +362,25 @@ export function createGc(pg: Sql) {
 	 * nor inside the new live set means the closure genuinely shrank (a
 	 * deleted or rewound ref), and keeping its objects would leak them forever. */
 	function buildAdvanced(tips: string[], epoch: Epoch, walk: OriginWalk): AdvanceAttempt {
-		const fresh = [...walk.masks.keys()].filter((h) => positionOf(epoch.oids, h) === -1)
-		const oids = concatSortedOids([...splitOids(epoch.oids), ...fresh])
+		const freshOids = [...walk.masks.keys()].filter(
+			(oid) => positionOf(epoch.oids, oid) === -1,
+		)
+		const oids = concatSortedOids([...splitOids(epoch.oids), ...freshOids])
 		const bitmaps = new Map<string, Uint8Array>()
-		for (const [t, positions] of maskPositions(tips, walk, oids)) {
-			const bit = 1n << BigInt(tips.indexOf(t))
+		for (const [tip, positions] of maskPositions(tips, walk, oids)) {
+			const bit = 1n << BigInt(tips.indexOf(tip))
 			for (const [stop, bits] of walk.hits) {
 				if ((bits & bit) === 0n) continue
-				const old = epoch.bitmaps.get(stop)
-				if (old === undefined) return { state: "rebuild" }
-				positions.push(...remapPositions(old, epoch.oids, oids))
+				const priorBitmap = epoch.bitmaps.get(stop)
+				if (priorBitmap === undefined) return { state: "rebuild" }
+				positions.push(...remapPositions(priorBitmap, epoch.oids, oids))
 			}
-			bitmaps.set(t, bitmapFromPositions(positions))
+			bitmaps.set(tip, bitmapFromPositions(positions))
 		}
-		for (const e of epoch.tips) {
-			if (walk.hits.has(e)) continue
-			const pos = positionOf(oids, e)
-			if (pos === -1 || !unionHas(bitmaps.values(), pos)) {
+		for (const oldTip of epoch.tips) {
+			if (walk.hits.has(oldTip)) continue
+			const position = positionOf(oids, oldTip)
+			if (position === -1 || !unionHas(bitmaps.values(), position)) {
 				return { state: "rebuild" }
 			}
 		}
@@ -407,22 +404,24 @@ export function createGc(pg: Sql) {
 		walk: OriginWalk,
 		oids: Buffer,
 	): Map<string, number[]> {
-		const out = new Map<string, number[]>()
+		const positionsByTip = new Map<string, number[]>()
 		for (let i = 0; i < tips.length; i++) {
-			const t = tips[i] as string
+			const tip = tips[i] as string
 			const bit = 1n << BigInt(i)
 			const positions: number[] = []
 			for (const [oid, bits] of walk.masks) {
 				if (bits & bit) positions.push(positionOf(oids, oid))
 			}
-			out.set(t, positions)
+			positionsByTip.set(tip, positions)
 		}
-		return out
+		return positionsByTip
 	}
 
 	/** Set equality of two SORTED, DEDUPLICATED hex arrays. */
-	function sameOids(a: readonly string[], b: readonly string[]): boolean {
-		return a.length === b.length && a.every((v, i) => v === b[i])
+	function sameSortedOids(left: readonly string[], right: readonly string[]): boolean {
+		return (
+			left.length === right.length && left.every((oid, index) => oid === right[index])
+		)
 	}
 
 	/** A Kysely pinned to a single porsager connection: its dialect `reserve()`s the
@@ -430,16 +429,16 @@ export function createGc(pg: Sql) {
 	 * snapshot) and `release()` is a no-op (the caller owns the connection's lifetime).
 	 * The shim is a callable with a `reserve` property, the shape the dialect probes
 	 * for (`isPostgresJSSql`). */
-	function pinnedKysely(conn: ReservedSql): Kysely<Database> {
+	function pinnedKysely(connection: ReservedSql): Kysely<Database> {
 		// The dialect only ever calls `.unsafe(sql, params)` then `.release()` on the
-		// reserved connection — so hand it the real `conn` for `.unsafe` but swallow
+		// reserved connection — so hand it the real connection for `.unsafe` but swallow
 		// `.release()` (a no-op), keeping the connection pinned across every closure
-		// statement. The caller releases `conn` exactly once when the snapshot is done.
-		const nonReleasing = new Proxy(conn, {
+		// statement. The caller releases it exactly once when the snapshot is done.
+		const nonReleasing = new Proxy(connection, {
 			get: (target, prop) =>
 				prop === "release" ? () => {} : Reflect.get(target, prop, target),
 		})
-		const handle = new Proxy(conn, {
+		const handle = new Proxy(connection, {
 			get: (target, prop) =>
 				prop === "reserve" ? async () => nonReleasing : Reflect.get(target, prop, target),
 			has: (target, prop) => prop === "reserve" || Reflect.has(target, prop),
@@ -451,12 +450,15 @@ export function createGc(pg: Sql) {
 	 * (`copyInto`, the bytea-safe bulk primitive — no staging and no transaction:
 	 * the oids are already unique, and each COPY is one statement), batched so the
 	 * JS payload stays bounded. */
-	async function loadLive(conn: ReservedSql, oids: readonly string[]): Promise<void> {
+	async function loadLive(
+		connection: ReservedSql,
+		oids: readonly string[],
+	): Promise<void> {
 		const all = oids
 		for (let i = 0; i < all.length; i += LIVE_LOAD_BATCH) {
 			const chunk = all.slice(i, i + LIVE_LOAD_BATCH)
 			await copyInto(
-				conn,
+				connection,
 				LIVE_TABLE,
 				["oid"],
 				chunk.map((hex) => [{ t: "bytea", v: Buffer.from(hex, "hex") }]),
@@ -472,14 +474,14 @@ export function createGc(pg: Sql) {
 	 * Each batch is its own (implicit) transaction, so `clock_timestamp()` re-evaluates
 	 * per batch and the grace cutoff advances. Returns total rows deleted. */
 	async function sweepObjects(
-		conn: ReservedSql,
+		connection: ReservedSql,
 		id: ReposId,
 		graceSeconds: number,
 		batchLimit: number,
 	): Promise<number> {
 		let total = 0
 		for (;;) {
-			const deleted = await conn.unsafe<{ n: number }[]>(
+			const deleted = await connection.unsafe<{ n: number }[]>(
 				`with victims as (
 					select o.oid from git_object o
 					where o.repo_id = $1::bigint
@@ -502,14 +504,14 @@ export function createGc(pg: Sql) {
 	 * transaction block, so these are standalone statements run outside any txn.
 	 * The table list is exactly what the sweep DELETEs touch: `git_object` directly,
 	 * `git_pack_encoding` through the 0008 cascades (its rows die with their objects
-	 * and bases, so its dead tuples are this pass's too — the gap hunt finding M10
-	 * flagged). `git_commit`/`git_tag` cascade-churn as well but are bytes-tiny and
+	 * and bases, so its dead tuples are this pass's too). `git_commit`/`git_tag`
+	 * cascade-churn as well but are bytes-tiny and
 	 * PK-only; their leaf autovacuum (0009's delete-aware profile) is enough. */
-	async function maintain(conn: ReservedSql): Promise<void> {
+	async function maintain(connection: ReservedSql): Promise<void> {
 		// On the pass's RESERVED connection (between transactions — VACUUM cannot
 		// run inside one): borrowing through the pool here self-deadlocks at
 		// `max: 1`, where the reserved connection IS the pool.
-		await conn.unsafe(`vacuum (analyze) git_object`)
-		await conn.unsafe(`vacuum (analyze) git_pack_encoding`)
+		await connection.unsafe(`vacuum (analyze) git_object`)
+		await connection.unsafe(`vacuum (analyze) git_pack_encoding`)
 	}
 }

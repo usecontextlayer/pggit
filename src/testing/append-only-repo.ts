@@ -118,7 +118,7 @@ export async function createAppendOnlyRepo(opts: AppendOnlyRepoOptions): Promise
 	return dir
 }
 
-/** Build the fixed append-only source shared by the lifecycle breakage suites. */
+/** Build the fixed append-only source shared by the lifecycle regression suites. */
 export async function buildLifecycleSource(
 	dir: string,
 	mainCommits: number,

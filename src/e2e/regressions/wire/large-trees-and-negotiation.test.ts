@@ -1,7 +1,5 @@
 /**
  * WIRE — two shapes no other test reaches.
- * (Converted from `breakage/wire--large-trees-and-negotiation.ts`.)
- *
  *  A. TREES LARGER THAN 64 KiB. The delta encoder splits a COPY run at 0xFFFF and
  *     must advance the copy OFFSET per split (the classic wrong-content bug is
  *     advancing the length only). A tree only crosses that threshold at ~700+

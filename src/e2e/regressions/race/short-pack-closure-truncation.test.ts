@@ -30,9 +30,7 @@
  *   SHORTPACK server said 200, git says the remote did not send everything  <-- the defect
  *   CORRUPT   clone exit 0, fsck fails                                      <-- the defect
  *
- * Converted from `breakage/race--short-pack-closure-truncation.ts` (`--iters=60
- * --runs=250 --rewind=120 --resurrect=trees`). Probabilistic. The swept
- * gc-start delays are NOT the source's: it froze absolute milliseconds
+ * Probabilistic. Fractional gc-start delays replace absolute milliseconds
  * ([0..60]ms), which tie the hunt to one machine's serve speed — the hunted gap
  * (between the closure CTE and the tree-content re-read) sits in the serve's
  * opening phase, and on a slower or loaded box 60 ms is still before the CTE
@@ -81,8 +79,8 @@ const DELAY_FRACTIONS = [
  * and trees are the only objects whose loss is SILENT (a lost blob still trips
  * the closure's presence check and a lost tree trips the serve path's guard —
  * only a tree that leaves and comes BACK slips between the two). */
-// "trees" is the mode that reproduces the race; "all"/"none" are the documented
-// alternatives the source script could be run with. Cast the initializer (not the
+// "trees" is the mode that reproduces the race; "all"/"none" retain the other
+// supported experiment shapes. Cast the initializer (not the
 // binding) so its apparent type stays the union — otherwise TS narrows a const to
 // its literal and flags the other two branches as dead (TS2367).
 const RESURRECT = "trees" as "trees" | "all" | "none"

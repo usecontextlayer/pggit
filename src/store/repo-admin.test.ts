@@ -14,7 +14,7 @@ async function freshDeps(): Promise<{ deps: GitDeps; db: IsolatedDb }> {
 
 /** Create `name` by writing a ref into it — the same lazy first-write birth a
  * real push performs (applyRefUpdates → ensureRepoId). */
-async function bearRepo(deps: GitDeps, name: string): Promise<void> {
+async function createRepoByRefWrite(deps: GitDeps, name: string): Promise<void> {
 	await deps.refs.applyRefUpdates(
 		name,
 		[{ newOid: A, oldOid: ZERO, ref: "refs/heads/main" }],
@@ -26,8 +26,8 @@ describe("repo admin — deleteRepo", () => {
 	it("deletes the repo's rows, leaves siblings intact, and no-ops on unknown names", async () => {
 		const { deps, db } = await freshDeps()
 		try {
-			await bearRepo(deps, "workspace/acme/w1")
-			await bearRepo(deps, "workspace/acme/w2")
+			await createRepoByRefWrite(deps, "workspace/acme/w1")
+			await createRepoByRefWrite(deps, "workspace/acme/w2")
 
 			expect(await deps.admin.deleteRepo("workspace/acme/w1")).toBe(true)
 
@@ -49,12 +49,12 @@ describe("repo admin — deleteRepo", () => {
 		const { deps, db } = await freshDeps()
 		try {
 			// First write warms the shared name→id cache through the ref store.
-			await bearRepo(deps, "workspace/acme/w1")
+			await createRepoByRefWrite(deps, "workspace/acme/w1")
 			await deps.admin.deleteRepo("workspace/acme/w1")
 
-			// Re-bearing the same name must get-or-create a fresh repos row. With a
+			// Recreating the same name must get-or-create a fresh repos row. With a
 			// stale cached id this insert would violate the git_ref→repos FK.
-			await bearRepo(deps, "workspace/acme/w1")
+			await createRepoByRefWrite(deps, "workspace/acme/w1")
 			expect(await deps.refs.listRefs("workspace/acme/w1")).toEqual([
 				{ name: "refs/heads/main", oid: A },
 			])
@@ -68,10 +68,10 @@ describe("repo admin — listRepos", () => {
 	it("lists names by plain prefix, sorted, without wildcard semantics", async () => {
 		const { deps, db } = await freshDeps()
 		try {
-			await bearRepo(deps, "claude/slate/w1/user-b")
-			await bearRepo(deps, "claude/slate/w1/user-a")
-			await bearRepo(deps, "claude/slate/w10/user-c")
-			await bearRepo(deps, "workspace/slate/w1")
+			await createRepoByRefWrite(deps, "claude/slate/w1/user-b")
+			await createRepoByRefWrite(deps, "claude/slate/w1/user-a")
+			await createRepoByRefWrite(deps, "claude/slate/w10/user-c")
+			await createRepoByRefWrite(deps, "workspace/slate/w1")
 
 			// The trailing separator scopes to w1 — w10 does not leak in.
 			expect(await deps.admin.listRepos("claude/slate/w1/")).toEqual([

@@ -1,9 +1,7 @@
 /**
  * §8.1 in-process pkt-line oracle — RECEIVE-PACK (push, protocol v0) wire goldens.
  *
- * SPEC-SUITE (`*.spec.test.ts`): the executable spec of the desired push wire
- * output, authored before the implementation was made to conform (spec §3), now on
- * the default gate (`pnpm run check`).
+ * These executable goldens define the required push wire output.
  *
  * The expected capability set/order is authored INDEPENDENTLY here (spec §4.6 —
  * "the test owns the canonical spec"); we deliberately do NOT import the handler's

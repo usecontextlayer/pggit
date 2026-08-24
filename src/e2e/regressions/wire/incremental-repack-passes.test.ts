@@ -1,8 +1,6 @@
 /**
  * WIRE — the frozen-policy / star-topology invariants across MANY repack passes,
  * which is how the drain will actually run (one pass per push burst).
- * (Converted from `breakage/wire--incremental-repack-passes.ts`.)
- *
  * Within one pass the anchor bookkeeping (`segmentFill`, each encoding's base) is
  * in memory. Across passes it is reloaded from what was written. If that reload is
  * off — a segment counted wrong, an anchor resolved through a row that is itself a

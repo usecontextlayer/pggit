@@ -1,5 +1,5 @@
 /**
- * pg-bloat/force-push-churn — what the candidate GC→repack maintenance sequence
+ * pg-bloat/force-push-churn — what a host-driven GC→repack maintenance sequence
  * costs under repeated force-push churn.
  *
  * THE CLAIM UNDER TEST. `gc.ts` skips VACUUM/REINDEX on the drain's hot cadence
@@ -14,9 +14,9 @@
  * motivating tenant produces: advance `refs/heads/main` by ADVANCE commits (real
  * objects ingested through the real store), rewrite the ref through the internal
  * platform API to the previous tip (the smart-HTTP wire denies rewinds), then run
- * `gc(graceSeconds: 0, maintain: false)` followed by `repack()`. The production GC
- * drain already chooses `maintain: false`; repack integration remains deferred, so
- * this harness invokes the intended engine-side sequence directly.
+ * `gc(graceSeconds: 0, maintain: false)` followed by `repack()`. The built-in
+ * scheduler invokes GC only; hosts invoke the exported repack pass as needed, so
+ * this harness drives that engine-side composition directly.
  *
  * WHAT IT PRINTS
  *   - per round: total/heap/toast/index bytes for all seven measured tables, dead tuples,
@@ -177,18 +177,18 @@ async function main(): Promise<void> {
 	const scratch = scratchRoot("churn")
 	const db = await createIsolatedSchema(PG_URL)
 	try {
-		console.log(`# Force-push churn economics under the candidate GC→repack sequence\n`)
+		console.log(`# Force-push churn economics under a host-driven GC→repack sequence\n`)
 		console.log(
 			`schema ${db.schema} · base ${BASE} commits · ${ROUNDS} rounds × advance ${ADVANCE} then rewind\n`,
 		)
-		const hz0 = await horizon(db.sql)
+		const initialHorizon = await horizon(db.sql)
 		console.log(
-			`vacuum horizon at start: lag ${hz0.ageXids} xids, oldest open client xact ` +
-				`${hz0.oldestXactSeconds.toFixed(1)}s${hz0.blockers.length > 0 ? ` (${hz0.blockers.length} over 5s)` : ""}\n`,
+			`vacuum horizon at start: lag ${initialHorizon.ageXids} xids, oldest open client xact ` +
+				`${initialHorizon.oldestXactSeconds.toFixed(1)}s${initialHorizon.blockers.length > 0 ? ` (${initialHorizon.blockers.length} over 5s)` : ""}\n`,
 		)
-		if (hz0.ageXids > 5000) {
+		if (initialHorizon.ageXids > 5000) {
 			throw new Error(
-				`vacuum horizon is already pinned by ${hz0.ageXids} xids; bloat would not be attributable`,
+				`vacuum horizon is already pinned by ${initialHorizon.ageXids} xids; bloat would not be attributable`,
 			)
 		}
 
@@ -205,7 +205,7 @@ async function main(): Promise<void> {
 		const deps = { objects: store, projection }
 
 		// Seed the base history exactly as a first push would, then repack it —
-		// the steady state the candidate maintenance sequence is meant to preserve.
+		// the steady state the measured maintenance sequence is meant to preserve.
 		const baseObjects = await objectsBetween(src, "refs/heads/main")
 		if (baseObjects.length === 0) throw new Error("base fixture produced no objects")
 		const eligibleBaseObjects = repackEligibleObjects(baseObjects)
@@ -521,9 +521,9 @@ async function main(): Promise<void> {
 		// re-densifies a page. So an index is the component that a plain VACUUM
 		// cannot fix and only REINDEX (or VACUUM FULL) can — the exact maintenance
 		// `maintain: false` declines to run.
-		const idxCommitLeft = await rawIndexSizes(db.sql, "git_commit")
-		const idxObjLeft = await rawIndexSizes(db.sql, "git_object")
-		const idxEncLeft = await rawIndexSizes(db.sql, "git_pack_encoding")
+		const commitIndexesBeforeRebuild = await rawIndexSizes(db.sql, "git_commit")
+		const objectIndexesBeforeRebuild = await rawIndexSizes(db.sql, "git_object")
+		const encodingIndexesBeforeRebuild = await rawIndexSizes(db.sql, "git_pack_encoding")
 
 		// Row counts, so "same reachable content" is a measured fact, not a claim.
 		const counts = new Map<string, number>()
@@ -544,7 +544,7 @@ async function main(): Promise<void> {
 		})
 
 		console.log(
-			`\n## what the candidate sequence leaves behind vs what vacuum can reclaim\n`,
+			`\n## what the host-driven sequence leaves behind vs what vacuum can reclaim\n`,
 		)
 		console.log(
 			`the BASE column is the same reachable content, freshly pushed — every round since\n` +
@@ -580,35 +580,49 @@ async function main(): Promise<void> {
 
 		// ── index-only view: what VACUUM cannot fix ──────────────────────────
 		console.log(`\n## index bloat — the component plain VACUUM cannot reclaim\n`)
-		const idxAfter = [
+		const indexesAfterRebuild = [
 			...(await rawIndexSizes(db.sql, "git_commit")),
 			...(await rawIndexSizes(db.sql, "git_object")),
 			...(await rawIndexSizes(db.sql, "git_pack_encoding")),
 		]
-		const idxBefore = [...idxCommitLeft, ...idxObjLeft, ...idxEncLeft]
+		const indexesBeforeRebuild = [
+			...commitIndexesBeforeRebuild,
+			...objectIndexesBeforeRebuild,
+			...encodingIndexesBeforeRebuild,
+		]
 		console.log(
 			`${padr("index", 34)} ${pad("as-left kB", 12)} ${pad("VAC FULL kB", 12)} ${pad("bloat ×", 9)} ${pad("live rows", 10)}`,
 		)
-		for (const b of idxBefore) {
-			if (b.bytes < 100_000) continue
-			const a = idxAfter.find((x) => x.name === b.name)
-			if (!a || a.bytes <= 0) throw new Error(`rebuilt index census omitted ${b.name}`)
+		for (const beforeIndex of indexesBeforeRebuild) {
+			if (beforeIndex.bytes < 100_000) continue
+			const afterIndex = indexesAfterRebuild.find(
+				(index) => index.name === beforeIndex.name,
+			)
+			if (!afterIndex || afterIndex.bytes <= 0) {
+				throw new Error(`rebuilt index census omitted ${beforeIndex.name}`)
+			}
 			console.log(
-				`${padr(b.name, 34)} ${pad((b.bytes / 1000).toFixed(0), 12)} ${pad((a.bytes / 1000).toFixed(0), 12)} ` +
-					`${pad((b.bytes / a.bytes).toFixed(2), 9)} ${pad(a.tuples.toFixed(0), 10)}`,
+				`${padr(beforeIndex.name, 34)} ${pad((beforeIndex.bytes / 1000).toFixed(0), 12)} ${pad((afterIndex.bytes / 1000).toFixed(0), 12)} ` +
+					`${pad((beforeIndex.bytes / afterIndex.bytes).toFixed(2), 9)} ${pad(afterIndex.tuples.toFixed(0), 10)}`,
 			)
 		}
-		const idxLeftTotal = idxBefore.reduce((n, i) => n + i.bytes, 0)
-		const idxFullTotal = idxAfter.reduce((n, i) => n + i.bytes, 0)
-		if (idxLeftTotal <= 0 || idxFullTotal <= 0) {
+		const indexesBeforeBytes = indexesBeforeRebuild.reduce(
+			(totalBytes, index) => totalBytes + index.bytes,
+			0,
+		)
+		const indexesAfterBytes = indexesAfterRebuild.reduce(
+			(totalBytes, index) => totalBytes + index.bytes,
+			0,
+		)
+		if (indexesBeforeBytes <= 0 || indexesAfterBytes <= 0) {
 			throw new Error("index size census returned an empty denominator")
 		}
 		console.log(
-			`\nindexes total: ${mb(idxLeftTotal)} MB as the sequence leaves them, ${mb(idxFullTotal)} MB rebuilt ` +
-				`= ${(idxLeftTotal / idxFullTotal).toFixed(2)}× bloat.`,
+			`\nindexes total: ${mb(indexesBeforeBytes)} MB as the sequence leaves them, ${mb(indexesAfterBytes)} MB rebuilt ` +
+				`= ${(indexesBeforeBytes / indexesAfterBytes).toFixed(2)}× bloat.`,
 		)
 		console.log(
-			`the candidate sequence runs no REINDEX, and plain VACUUM never re-densifies a btree page, so\n` +
+			`the measured sequence runs no REINDEX, and plain VACUUM never re-densifies a btree page, so\n` +
 				`only this rebuild recovers whatever density the churn cost.`,
 		)
 
@@ -617,7 +631,7 @@ async function main(): Promise<void> {
 			`${padr("table", 19)} ${pad("heap MB", 8)} ${pad("toast MB", 8)} ${pad("index MB", 8)} ${pad("total MB", 9)}`,
 		)
 		for (const t of TABLES) console.log(sizeLine(t, requiredSize(seedSizes, t, "base")))
-		console.log(`\nas the candidate sequence leaves it after ${ROUNDS} rounds:\n`)
+		console.log(`\nas the host-driven sequence leaves it after ${ROUNDS} rounds:\n`)
 		for (const t of TABLES) console.log(sizeLine(t, requiredSize(asLeft, t, "as-left")))
 		console.log(`\nafter VACUUM FULL (the rewrite floor):\n`)
 		for (const t of TABLES) {

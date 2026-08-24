@@ -1,5 +1,5 @@
 /**
- * PROBE 6 — D15 repair must re-deltify holes below covered roots without changing the tier.
+ * PROBE 6 — repair must re-deltify holes below covered roots without changing the tier.
  *
  * A live delta row disappears when GC reclaims its base and the 0008 FK cascade removes dependent encodings. The current repair mode detects pending objects older than the last completed pass, descends through covered trees for recursion, and must reconstruct those rows exactly; the ordinary covered-tree prune remains in force for new work.
  *
@@ -124,7 +124,7 @@ async function main(): Promise<void> {
 		assertTierCoverage("before holes", before)
 		await requireCanonicalTier("before holes")
 		console.log(
-			`# txn--hole-repair — ${RUNS} runs, seed pass ${seedPass.wholes} wholes + ${seedPass.deltas} deltas\n`,
+			`# txn/hole-repair — ${RUNS} runs, seed pass ${seedPass.wholes} wholes + ${seedPass.deltas} deltas\n`,
 		)
 
 		// The runs-dir lineage: the growing tree the whole design exists for.

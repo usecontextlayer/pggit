@@ -1,5 +1,5 @@
 /**
- * Executable spec for `encodeDelta` (spec §3.4, now symmetric). PURE — no git, no
+ * Executable spec for the symmetric `encodeDelta` contract (spec §3.4). PURE — no git, no
  * Postgres — so it runs at high `numRuns` on the default gate.
  *
  * Three layers, each catching what the one before it cannot:
@@ -12,7 +12,7 @@
  *      inside the encoder.
  *
  *   2. SIZE. Correctness alone passes for an encoder that emits nothing but literals
- *      — which is exactly today's undeltified behaviour wearing a delta header, and
+ *      — which is undeltified behaviour wearing a delta header, and
  *      the entire point of the work. So the spec pins that a delta actually FINDS the
  *      match: for one entry inserted into a tree, delta size must not grow with the
  *      tree.

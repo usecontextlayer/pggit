@@ -115,7 +115,7 @@ describe("createGitApp", () => {
 })
 
 // A malformed/unsupported request must surface as a clean 4xx with a readable
-// message — not a 500 stacktrace (CLAUDE.md: validate at the boundary, fail loud).
+// message — not a 500 stacktrace.
 describe("createGitApp — server-boundary error responses", () => {
 	it("400s a receive-pack body with a malformed command line", async () => {
 		const body = Buffer.concat([

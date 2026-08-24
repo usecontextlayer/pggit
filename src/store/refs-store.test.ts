@@ -54,7 +54,7 @@ describe("ref store — seeding + listing", () => {
 // is most likely to reshape (e.g. folding CAS into one SQL statement). These pin
 // its semantics by the OBSERVABLE post-state (which refs exist with which oid via
 // listRefs) — NOT the boolean[] return shape (that return→report-status mapping is
-// covered at the wire layer in m2-atomic). A behavior-preserving rewrite of the
+// covered at the wire layer in e2e/push/atomic.test.ts). A behavior-preserving rewrite of the
 // return type leaves these green.
 describe("ref store — applyRefUpdates (CAS / atomic)", () => {
 	it("non-atomic: applies independent commands, rejecting only the stale CAS", async () => {

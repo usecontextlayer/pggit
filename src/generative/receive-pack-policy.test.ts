@@ -632,23 +632,21 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 
 	/**
 	 * Two NEW directory/file-conflicting refs in ONE batch: canonical git keeps the
-	 * DEEPEST name and `ng`s every shorter one, independent of the order the client
-	 * sent them (measured on git 2.55 for `[a, a/b]`, `[a/b, a]`, and
-	 * `[a, a/b, a/b/c]` — the deepest survived in all three). This differential
-	 * found pggit keeping the FIRST eligible name in wire order instead; pggit's
-	 * D/F pass now implements deepest-wins and this test asserts the agreement.
+	 * DEEPEST name and `ng`s every shorter one. This case exercises the important
+	 * wire-order direction by sending the deeper ref second; pggit's D/F pass must
+	 * still implement deepest-wins.
 	 * (Folding a `dfPairNew` shape into the generator above remains open — the
 	 * position-keyed destinations currently keep it out.)
 	 *
 	 * The D/F case where the conflicting side ALREADY EXISTS is unchanged and both
 	 * sides agree — that one is fuzzed by the property above (`dfExisting`).
 	 */
-	it("two new D/F-conflicting refs in one batch — both remotes keep the deepest, in every order", async () => {
-		const repoId = "policy/df-pair"
+	it("two new D/F-conflicting refs keep the deeper ref when it is sent second", async () => {
+		const repo = "policy/df-pair"
 		await withTempDir("pggit-rppolicy-df-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
 			const controlUrl = `file://${bare}`
-			const pggitUrl = `http://127.0.0.1:${server.port}/${repoId}`
+			const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
 			await spawnGit(["push", "-q", controlUrl, `${fx.b}:refs/heads/base`], {
 				cwd: fx.dir,
 			})
@@ -683,7 +681,7 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 			}
 			const survivors = [`refs/heads/base ${fx.b}`, `refs/heads/pair/sub ${fx.c}`].sort()
 			expect(await controlRefs(bare)).toEqual(survivors)
-			expect(await pggitRefs(refs, repoId)).toEqual(survivors)
+			expect(await pggitRefs(refs, repo)).toEqual(survivors)
 		})
 	}, 180_000)
 })

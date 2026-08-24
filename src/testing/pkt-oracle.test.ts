@@ -14,8 +14,8 @@ import {
 
 // These expectations are derived verbatim from git's own test helpers, which we
 // MIRROR (not guess): `unpack`/`unpack-sideband` in
-// `/tmp/git-src/t/helper/test-pkt-line.c:42-130`, and the t5411 raw report form
-// in `/tmp/git-src/t/t5411/once-0010-report-status-v1.sh`. See spec §4.2/§4.3.
+// `t/helper/test-pkt-line.c:42-130`, and the t5411 raw report form in
+// `t/t5411/once-0010-report-status-v1.sh`. See spec §4.2/§4.3.
 
 const A = "a".repeat(40)
 const B = "b".repeat(40)
