@@ -236,7 +236,7 @@ export async function runShape(
 			const ctlSet = new Set(await objectList(cf))
 			if (f === "tree:0") {
 				// tree:0 is a KNOWN pre-existing gap (pggit ignores it and ships a
-				// superset — src/e2e/transport-filter-tree0.test.ts). Pin the
+				// superset — src/e2e/transport/filter-tree0.test.ts). Pin the
 				// documented behaviour rather than nothing: the served set must
 				// CONTAIN the control's, so a change in the shape of the gap fails
 				// loudly instead of passing unnoticed.

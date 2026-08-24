@@ -196,7 +196,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 	// SCH-7 — No-lost-garbage across a post-snapshot push (the DURABLE analog of the
 	// GC primitive's GC-9). The precise mid-pass interleave — a push that lands
 	// inside a single drain's GC window — is covered deterministically by GC-9 in
-	// `gc-isolation-concurrency.test.ts` (the gc.ts `_hooks.afterLiveSet` seam); you
+	// `gc/isolation-concurrency.test.ts` (the gc.ts `_hooks.afterLiveSet` seam); you
 	// cannot interpose inside one `drainOnce()` from the outside. Here we assert the
 	// DURABLE re-trigger that makes that safe at the scheduler layer: a push landing
 	// AFTER a drain stamped `last_gc_at = t0` re-stamps `last_pushed_at > t0`, so the

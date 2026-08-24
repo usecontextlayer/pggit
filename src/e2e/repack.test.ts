@@ -7,7 +7,7 @@
  * rows here, so the pack-blob soft-delete model (`packs.dead_at`, the TTL reaper,
  * the offline repack worker) does not exist; reclamation is GC's reachability
  * set-difference DELETE, whose behaviour belongs to the GC suites
- * (gc-integrity, gc-reclamation, the gc property, and the clone-vs-GC races).
+ * (gc/integrity, gc/reclamation, the gc property, and the clone-vs-GC races).
  */
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

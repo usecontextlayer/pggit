@@ -61,7 +61,7 @@ describe("M1 multi-round negotiation", () => {
 		await spawnGit(["commit", "-q", "-m", "f1"], { cwd: dir })
 		f1 = (await spawnGit(["rev-parse", "feature"], { cwd: dir })).stdout.trim()
 		// An orphan branch: shares NOTHING with main — the only have shape that
-		// does not ready (a sibling have DOES, canonically: fetch-ready-sibling).
+		// does not ready (a sibling have DOES, canonically: fetch/ready-sibling).
 		await spawnGit(["checkout", "-q", "--orphan", "unrelated"], { cwd: dir })
 		await spawnGit(["rm", "-rf", "--cached", "."], { cwd: dir })
 		writeFileSync(join(dir, "u.txt"), "unrelated\n")
@@ -81,7 +81,7 @@ describe("M1 multi-round negotiation", () => {
 	it("an UNRELATED have → acknowledgments + ACK + flush, and NO packfile", async () => {
 		// A have with NO merge base cannot satisfy the want — the only shape that
 		// keeps negotiating. (A SIBLING have that shares a base READIES, matching
-		// git's ok_to_give_up — pinned by fetch-ready-sibling.test.ts.)
+		// git's ok_to_give_up — pinned by fetch/ready-sibling.test.ts.)
 		const request = fetchRequest({ done: false, haves: [u1], wants: [c3] })
 		const out = await handleUploadPack(request, backend)
 		// The oracle: real `git upload-pack --stateless-rpc` over the same history,

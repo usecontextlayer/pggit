@@ -88,7 +88,7 @@ type PushContent = {
  * is pushed to a throwaway ref (a CREATE — allowed), `main` is CAS-moved to it
  * through the store, and the throwaway ref is store-deleted. The DENIED-push
  * orphan flow (the production orphan source) is covered separately by
- * `pushDenied` (gc-denied-push / gc-integrity). */
+ * `pushDenied` (gc/denied-push, gc/integrity). */
 type PushOpts = PushContent & {
 	rewind?: boolean
 }

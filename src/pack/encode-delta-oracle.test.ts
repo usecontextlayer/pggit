@@ -15,7 +15,7 @@
  * wrong path. Production emits deltas from the encoding tier — the push-side
  * encoder in `store/object-store.ts` and the repack pass in `store/repack.ts` —
  * and that emitter is itself git-verified end to end by the e2e serve suites
- * (`pack-encoding-serve`, `thin-pack-serve`: a real `git clone` of a repacked
+ * (`pack-encoding/serve`, `thin-pack-serve`: a real `git clone` of a repacked
  * repo, fsck-clean and object-identical). What THIS file owns is narrower and
  * covered nowhere else: that `encodeDelta`'s bytes are a format canonical git
  * accepts, isolated from the tier that decides which deltas to emit.

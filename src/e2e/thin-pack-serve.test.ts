@@ -71,7 +71,7 @@ describe("thin-pack serve — external bases only when negotiated", () => {
 		// delta in a served pack can ONLY be the serve-time warm delta (R9) — a
 		// stored delta whose base happens to be client-held would otherwise
 		// satisfy the same detector and let the warm path die unnoticed. The
-		// stored-delta serve path has its own suites (pack-encoding-serve).
+		// stored-delta serve path has its own suites (pack-encoding/serve).
 		const [encRow] = await db.sql<{ n: string }[]>`
 			select count(*)::text as n from git_pack_encoding`
 		if (encRow === undefined) throw new Error("encoding-tier count query returned no row")

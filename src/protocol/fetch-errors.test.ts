@@ -8,7 +8,7 @@
  * observable consequence: such a failure REJECTS (no Buffer is returned) rather
  * than being swallowed into an empty/partial pack — so it reaches the HTTP
  * boundary's 500. Missing-want rejection is pinned against a real store in
- * `object-store.test.ts` and over the wire in `fetch-missing-want.test.ts`; here we
+ * `object-store.test.ts` and over the wire in `fetch/missing-want.test.ts`; here we
  * pin that `handleFetch` propagates it. (band-3
  * stays deferred until serving becomes streaming — there is no mid-stream window to
  * signal on today.)

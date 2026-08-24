@@ -1,6 +1,6 @@
 # The excellence pass — charter, method, and running record
 
-> **Path note (2026-08-21 reorg):** suites this record names as `src/e2e/breakage/<lens>--<name>.test.ts` now live at `src/e2e/regressions/<lens>/<name>.test.ts`, and perf harnesses named `perf/breakage/<lens>--<name>.ts` at `perf/probes/<lens>/<name>.ts`. Mentions below keep the names that were current at the time of each dated entry.
+> **Path note (2026-08-21 reorg):** suites this record names as `src/e2e/breakage/<lens>--<name>.test.ts` now live at `src/e2e/regressions/<lens>/<name>.test.ts`, and perf harnesses named `perf/breakage/<lens>--<name>.ts` at `perf/probes/<lens>/<name>.ts`. Additionally (2026-08-24) the flat `src/e2e/` prefix clusters became folders with the prefix dropped — `push/`, `fetch/`, `gc/`, `gc-scheduler/`, `transport/`, `pack-encoding/` (e.g. `pack-encoding-derivation.test.ts` → `pack-encoding/derivation.test.ts`). Mentions below keep the names that were current at the time of each dated entry.
 
 The derived-state spine (S1–S7) landed on `delta-packs` as commits `ab4664a..db0dfa0`, survived three adversarial review rounds, and reached green on every gate. This document is the charter and running record of the pass that follows: making the repo **excellent**, not merely correct. It is the single source of truth for where the pass stands; the session driving it can die at any time, and a successor picks up from here.
 

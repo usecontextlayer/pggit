@@ -1,6 +1,6 @@
 # pggit source reorganization — design
 
-> **Rename note (2026-08-21 reorg):** a later reorganization renamed some of what this design placed: `src/repo-view/` is now `src/repo-file/`, `src/generative/commands.ts` → `src/testing/repo-commands.ts`, `src/testing/format-error.ts` → `src/testing/expect-format-error.ts` (`src/object/format-error.ts` is unchanged), `push-snapshot-large.test.ts` → `push-projection-large.test.ts`, and the `.spec.test.ts` infix was dropped from every test filename. Mentions below keep the names this design chose at the time.
+> **Rename note (2026-08-21 reorg):** a later reorganization renamed some of what this design placed: `src/repo-view/` is now `src/repo-file/`, `src/generative/commands.ts` → `src/testing/repo-commands.ts`, `src/testing/format-error.ts` → `src/testing/expect-format-error.ts` (`src/object/format-error.ts` is unchanged), `push-snapshot-large.test.ts` → `push-projection-large.test.ts`, and the `.spec.test.ts` infix was dropped from every test filename. Additionally (2026-08-24) the flat `src/e2e/` layout this design chose was revised: the prefix clusters became folders with the prefix dropped — `push/`, `fetch/`, `gc/`, `gc-scheduler/`, `transport/`, `pack-encoding/` (e.g. `push-atomic.test.ts` → `push/atomic.test.ts`; `push-snapshot-large` is now `push/projection-large.test.ts`). Mentions below keep the names this design chose at the time.
 
 - **Date:** 2026-06-23
 - **Status:** approved design, pre-implementation
