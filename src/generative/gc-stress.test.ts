@@ -1,6 +1,6 @@
 /**
  * Property-based GC STRESS differential (`docs/2026-06-24-force-commit-gc-design.md`
- * §4, §8). The existing PBT-1/2/3 (`gc.spec.test.ts`) sample MANY SMALL repos
+ * §4, §8). The existing PBT-1/2/3 (`gc.test.ts`) sample MANY SMALL repos
  * (~25 commands). This file is the complement: FEW fast-check runs, each candidate
  * a DEEP + WIDE repo with a LARGE orphan set, so GC's batched DELETE + anti-join, the
  * commit-parent recursion, the tree→subtree walk, and the blob-from-tree enumeration

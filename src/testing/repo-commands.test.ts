@@ -8,7 +8,7 @@ import { attemptGit, spawnGit } from "@/testing/spawn-git"
 // produce only SENSIBLE git command sequences — replaying any generated list
 // must yield a valid (fsck-clean) repo and never run an invalid command (which
 // would make `git` exit non-zero and `spawnGit` throw). This guards that core
-// directly; the differentials in `*.spec.test.ts` consume it. All run on one gate.
+// directly; the generative differentials consume it. All run on one gate.
 //
 // It must ALSO produce a corpus with real graph shape. Every invalid-op guard in
 // `step` is a silent `return`, so a regression that makes a command kind unreachable

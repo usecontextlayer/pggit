@@ -9,7 +9,7 @@
  *      REFERENCE ENCODER rather than the real `encodeDelta` (spec §7.2.6) — the
  *      reference builds arbitrary instruction STREAMS (including shapes the real
  *      encoder never emits), so the reader is exercised wider than the writer's
- *      output; `encodeDelta` has its own spec (encode-delta.spec.test.ts). Safe:
+ *      output; `encodeDelta` has its own spec (encode-delta.test.ts). Safe:
  *      `applyDelta` is already pinned against GIT-produced deltas in
  *      read-pack.test.ts, so this adds breadth, not a self-referential oracle. The
  *      `target` is built independently by concatenation, so a wrong encoder fails.

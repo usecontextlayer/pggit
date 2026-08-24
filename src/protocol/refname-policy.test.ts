@@ -10,7 +10,7 @@
  *
  * The two vector lists below are NAMED REGRESSIONS — each string is a rule someone
  * had to discover. The general agreement with canonical git is pinned generatively
- * against a spawned `git check-ref-format` in `src/generative/refname.spec.test.ts`;
+ * against a spawned `git check-ref-format` in `src/generative/refname.test.ts`;
  * a new rule learned the hard way still belongs here, by name.
  */
 import { describe, expect, it } from "vitest"

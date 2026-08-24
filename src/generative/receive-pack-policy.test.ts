@@ -38,7 +38,7 @@
  * that remains: both remotes fail identically and NEITHER moves a ref. The names that
  * do reach a server are the one-level ones (`refs/heads`, `refs/tags`, `refs/x`) —
  * accepted by the client, rejected by receive-pack as `funny refname`. The predicate
- * itself is exhaustively fuzzed against `git check-ref-format` in `refname.spec`.
+ * itself is exhaustively fuzzed against `git check-ref-format` in `refname.test.ts`.
  *
  * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).
  * A failure is a real receive-pack policy divergence, not a test to weaken.

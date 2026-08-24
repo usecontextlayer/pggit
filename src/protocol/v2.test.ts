@@ -4,9 +4,9 @@ import { parseFetch, parseV2Request } from "@/protocol/v2"
 
 /**
  * v2 request DECODE — the happy path of `parseV2Request`/`parseFetch` (the
- * malformed and boundary cases are v2.parse.spec.test.ts's). The v2 ENCODE
+ * malformed and boundary cases are v2.parse.test.ts's). The v2 ENCODE
  * surfaces (advertisement, ls-refs response, packfile section) are goldens in
- * upload-pack-wire.spec.test.ts and live there only: a second, looser copy here
+ * upload-pack-wire.test.ts and live there only: a second, looser copy here
  * used to pass while the capability set drifted underneath it.
  */
 

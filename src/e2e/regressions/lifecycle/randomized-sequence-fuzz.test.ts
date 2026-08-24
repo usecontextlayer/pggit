@@ -24,7 +24,7 @@
  *   - the fast-check seed is pinned (424_242), like every §8.4 differential;
  *   - EVERY run carves its own `createIsolatedSchema` + its own source/reference
  *     repos, so a shrink replay can never inherit the previous candidate's rows
- *     (the hazard recorded against `gc-scheduler.spec`);
+ *     (the hazard recorded against `gc-scheduler.test.ts`);
  *   - GC's grace window is made deterministic by `ageObjects` + a generated
  *     `graceSeconds`, never a wall-clock sleep: `age` ages every row the store holds
  *     so far, so a later `gc` with a middling grace reclaims exactly the cohort that

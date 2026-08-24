@@ -18,7 +18,7 @@
  * Provenance: `refNameProblem` drifted from git once already — it required a second
  * level below `refs/` only after a review round found receive-pack accepting one-level
  * names, a corner no hand-picked list contained. The hand-picked vectors live on in
- * `src/protocol/refname-policy.spec.test.ts` as named regressions; this is the
+ * `src/protocol/refname-policy.test.ts` as named regressions; this is the
  * generative coverage they cannot give.
  *
  * SPEC-SUITE (executable spec, on the default gate — `pnpm run check`, pinned seed).

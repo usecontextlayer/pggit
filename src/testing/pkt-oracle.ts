@@ -9,8 +9,7 @@
  *
  * All four are pure and build on the existing `decodePktStream`, so they share
  * one battle-tested framing reader. They are the measuring instrument for the
- * §8.1 goldens, so their own tests (`pkt-oracle.test.ts`) are a normal `*.test.ts`
- * and stay GREEN on the gate — never a `*.spec.test.ts`.
+ * §8.1 goldens, so their own tests (`pkt-oracle.test.ts`) stay GREEN on the gate.
  */
 import { assertNever } from "@/lang"
 import { decodePktStream } from "@/protocol/pkt-line"

@@ -1,7 +1,7 @@
 /**
  * Real-git conformance for `encodeDelta` — layer 2 of the delta spec.
  *
- * The pure spec (`encode-delta.spec.test.ts`) proves our own reader can undo our own
+ * The pure spec (`encode-delta.test.ts`) proves our own reader can undo our own
  * writer. That is necessary and NOT sufficient: two matching bugs in `applyDelta` and
  * `encodeDelta` would satisfy it perfectly while producing packs no git can read. The
  * only authority on the delta format is git, so here canonical `git` ingests packs
