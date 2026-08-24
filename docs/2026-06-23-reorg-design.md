@@ -1,5 +1,7 @@
 # pggit source reorganization — design
 
+> **Rename note (2026-08-21 reorg):** a later reorganization renamed some of what this design placed: `src/repo-view/` is now `src/repo-file/`, `src/generative/commands.ts` → `src/testing/repo-commands.ts`, `src/testing/format-error.ts` → `src/testing/expect-format-error.ts` (`src/object/format-error.ts` is unchanged), `push-snapshot-large.test.ts` → `push-projection-large.test.ts`, and the `.spec.test.ts` infix was dropped from every test filename. Mentions below keep the names this design chose at the time.
+
 - **Date:** 2026-06-23
 - **Status:** approved design, pre-implementation
 - **Scope:** relocate + rename + targeted source refactors (structure and naming only — no

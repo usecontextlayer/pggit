@@ -1,5 +1,7 @@
 # pggit — read-surface sharpening: `repo_file` is the public read API
 
+> **Rename note (2026-08-21 reorg):** `src/repo-view/` is now `src/repo-file/` (`repo-file-projection.ts` → `projection.ts`, `rebuild.ts` → `sync-ref.ts`, `repo-file-index.test.ts` → `path-prefix-index.test.ts`), and the snapshot vocabulary this doc's own change began retiring collapsed fully into projection (`syncRefSnapshot`/`dropRefSnapshot`/`rebuildAllSnapshots` → `syncRefProjection`/`dropRefProjection`/`rebuildAllProjections`). Mentions below keep the names that were current at the time.
+
 - **Date:** 2026-06-26
 - **Status:** **IMPLEMENTED 2026-06-26** — full gate green (biome `--error-on-warnings`,
   `tsc -b`, `tsdown` build, vitest 278 passed). What landed: the three read methods +

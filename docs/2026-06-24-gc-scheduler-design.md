@@ -1,5 +1,7 @@
 # pggit — self-scheduling GC (background drain): design
 
+> **Rename note (2026-08-21 reorg):** `src/gc-scheduler.ts` now lives at `src/store/gc-scheduler.ts`, `generative/gc-scheduler.spec.test.ts` is `generative/gc-scheduler.test.ts` (the `.spec` infix was dropped repo-wide), and `generative/commands.ts` → `src/testing/repo-commands.ts`. "Snapshot" below is MVCC/force-commit vocabulary, untouched by the rename. Mentions keep the names that were current when this was written.
+
 - **Date:** 2026-06-24
 - **Status:** approved design, pre-implementation. Next step is **tests-first** (behavioural, observable-only — see §7), then implementation.
 - **Scope:** the **invocation / scheduling** layer on top of the GC primitive — *when* GC runs and *how the server decides to run it*, off the hot path. Resolves the **open "surface shape" item (§9)** of the GC design. No change to the GC algorithm itself (`store/gc.ts`), to the wire protocol, or to any existing git-server behaviour.
