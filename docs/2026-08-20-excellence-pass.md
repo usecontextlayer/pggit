@@ -33,7 +33,7 @@ Codex prompts must tell it: massive chunks remain, use subagents liberally, Exec
 
 ## State of the cycles
 
-Branch: `spine-excellence` (faux worktree of pggit), pushed to origin. Base: `db0dfa0` (spine tip).
+Branch: `spine-excellence` (faux worktree of pggit), pushed to origin. Base: `db0dfa0` (spine tip). *(2026-08-24: MERGED — `main` fast-forwarded to `617f53f`, carrying the delta-pack tier, the spine (whose 14 commits had never reached a remote branch), and the whole excellence pass; the `spine-excellence` and `delta-packs` branches are deleted and the faux worktree is closed. Remaining pass work happens directly on `main` in the primary checkout, per owner ruling.)*
 
 ### Cycle A — cycleCore:implementation — DONE
 Commits `8b558ed`, `43a1e4f`, `b8b5801`. Highlight: production seam `bindRepoBackend(stores, repoId)` in `src/protocol/repo-backend.ts`.
@@ -70,7 +70,7 @@ Profiling instrumentation (temporary UNSTAGED scratch, still in the tree at time
 ### Remaining after cycle C close
 
 1. **File-rename + folder re-org pass** (owner-ordered, "at some point", before or early in cycle D): execute the verified reorg plan with recorded rulings — `lang.ts` extraction YES; `repo-view/` → `repo-file` naming + snapshots→projection collapse executed as ONE `refactor!` commit; `repack.ts` exports `createRepack`; full `.spec` suffix strip; mechanics: `codegraph sync` first, `git mv` + per-file import edits (never sed), commit-per-coherent-move. The full plan is durably committed as `docs/2026-08-20-reorg-plan.md` (commit `a707c2f`), with a staleness addendum that must be honored at execution time. *(Executed 2026-08-21→2026-08-24: all 15 steps + the `createRepack` export landed as `5b37e30..aad0a72`, statics green at every boundary; the plan's EXECUTION LEDGER carries the commit map and the deviations-as-rulings. A rename-blast-radius smoke run remains owner-scheduled.)*
-2. **Cycle D — cycleFull:repo**: functionality → layering → ownership → testing → language over the whole repo, serial, each with the full driver loop. The language/prose pass must also reconcile docs drift: the design doc's stale "sequential batches" doctrine, an R16 note, and a ledger addendum recording the observed depth-2 concurrent-repack instance (RECORDED race-family flake, seen once under load, arbitrated not-chased).
+2. **Cycle D — cycleFull:repo**: functionality → layering → ownership → testing → language over the whole repo, serial, each with the full driver loop. The language/prose pass must also reconcile docs drift: the design doc's stale "sequential batches" doctrine, an R16 note, and a ledger addendum recording the observed depth-2 concurrent-repack instance (RECORDED race-family flake, seen once under load, arbitrated not-chased). *(2026-08-24, owner ruling: cycle D is TRIMMED to the language pass only — the three core-pass re-runs and the testing pass are skipped as diminishing returns against a tree that has survived three adversarial rounds, the audit, the reorg, and a green full battery. The language pass runs post-merge, directly against the primary checkout — the owner explicitly waived the applychecks faux-worktree requirement for it.)*
 3. **Final comprehensive gate + report**: full suite (owner-scheduled), statics, probes re-measured, merge-ready summary. Merge back together with the owner at the end (their ruling).
 
 ### 2026-08-24 — owner-scheduled: full battery over the reorganized tree + probe re-measurement
