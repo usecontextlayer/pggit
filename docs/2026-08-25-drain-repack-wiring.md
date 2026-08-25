@@ -1,6 +1,6 @@
 # W1(a) — repack joins the GC drain
 
-**Date:** 2026-08-25 · **Status:** DESIGNED, pre-implementation (harness-first). This is work item W1(a) of `docs/2026-08-15-delta-pack-design.md` §What remains, sequenced by owner ruling BEFORE the v3.0.0 cut and the ContextLayer integration. It extends the scheduler of `docs/2026-06-24-gc-scheduler-design.md`; that doc's §6 contract (SCH-1…SCH-11 / PBT-S1) stays normative and untouched except where the PBT-S1 extension below strengthens it. The design conversation is Claude Code session `bcec9442-eacf-43f2-ba8f-ac60b4a16c1d` (transcripts are deleted after ~30 days — this doc must stand without it).
+**Date:** 2026-08-25 · **Status:** IMPLEMENTED, same day (harness-first: the SCH-R suite ran red-for-the-right-reason against the stubbed surface — 5 red / 12 green — before the behavior existed). Verification at implementation: gc-scheduler family + generative differential 17/17; SCH-R6 fault file 4/4 solo; statics green; full battery 170 files / 661 tests — 660 green plus ONE red arbitrated per its own documented procedure (`gc-repack-fault-sweep`'s anti-vacuousness guard under machine load, re-run 9/9 solo — the same arbitration recorded 2026-08-24, in a file this change does not touch). Applychecks: see the commit that lands this doc's change. This is work item W1(a) of `docs/2026-08-15-delta-pack-design.md` §What remains, sequenced by owner ruling BEFORE the v3.0.0 cut and the ContextLayer integration. It extends the scheduler of `docs/2026-06-24-gc-scheduler-design.md`; that doc's §6 contract (SCH-1…SCH-11 / PBT-S1) stays normative and untouched except where the PBT-S1 extension below strengthens it. The design conversation is Claude Code session `bcec9442-eacf-43f2-ba8f-ac60b4a16c1d` (transcripts are deleted after ~30 days — this doc must stand without it).
 
 ## The problem, in one paragraph
 
@@ -91,6 +91,7 @@ Same doctrine as the 2026-06-24 doc §6: three observable surfaces (Postgres row
 
 ### Traps
 
+- **`copyInsert` never issues `COPY git_pack_encoding`** — it stages through a temp table, so the wire statements name `copy_stg_git_pack_encoding` (create-temp, COPY, insert — all three per flush). An aimed fault or `pg_stat_activity` probe watching for the target table's name in a COPY will wait forever; watch the staging name (paid 2026-08-25: SCH-R6's first run missed on exactly this).
 - **Biome reformats SQL template literals when a backtick appears inside a SQL comment** (it mangled migration 0008 into invalid SQL once — delta doc N5). The candidate-query edit is exactly this territory: no backticks in SQL comments.
 - **Machine-local tooling (rots with the machine, not the repo):** the bare `pnpm` shim is broken (mise has no global default) — drive tsc/biome/vitest via `node_modules/.bin/*`, biome via the installed bin only. codex (applychecks) runs sandboxed: it cannot `rm -f` or run vitest, so after any codex edits re-run statics yourself including the `dist-types/tsconfig.tsbuildinfo` delete, then the battery.
 - **`gitc` discipline:** never chained with other commands; every commit waits on a 1Password click (`1Password: failed to fill whole buffer` → `failed to write commit object` means a human has not clicked, not breakage); the message generator omits `!` on breaking commits and has no prompt-leak sanitizer — check `git log -1`, amend via `git commit --amend -F <file>` keeping the generated body.
@@ -103,7 +104,7 @@ Same doctrine as the 2026-06-24 doc §6: three observable surfaces (Postgres row
 
 ### Open — implementation
 
-- SCH-R6's exact fault point and placement — decided against the fault-sweep harness when writing it. That family is solo-arbitrated: its anti-vacuousness guard reds under heavy machine load when an aimed cancel lands late; green solo is the arbitration, per the file's own placement note.
+- SCH-R6's exact fault point and placement — decided against the fault-sweep harness when writing it. That family is solo-arbitrated: its anti-vacuousness guard reds under heavy machine load when an aimed cancel lands late; green solo is the arbitration, per the file's own placement note. *(Resolved at implementation, 2026-08-25: its own sibling file `src/e2e/regressions/pg-txn/drain-repack-fault.test.ts`, solo-listed, driving `drainOnce` on a max-1 client with an aimed `pg_cancel_backend` at the first statement naming copyInsert's staging table; the entry itself is the vacuousness barrier — a missed aim yields `repack: {…}` and fails loudly.)*
 - `DrainAttempt`'s internal union shape is free; the emission rule ("entry iff at least one phase produced a result") is the contract.
 
 ### Concerns

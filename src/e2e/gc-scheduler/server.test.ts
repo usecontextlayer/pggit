@@ -11,6 +11,7 @@ import { createRefStore, type RefStore } from "@/store/refs-store"
 import {
 	ageObjects,
 	cloneAndFsck,
+	encodingViolations,
 	objectOids,
 	pushFile,
 	repoGcState,
@@ -160,16 +161,24 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 			// orphans without any wall-clock grace wait.
 			await ageObjects(sqlDb(), repo, "2 hours")
 
-			// The server's own interval must drive a drain that removes the orphans —
-			// poll the Postgres survivor set until none of the orphans remain.
-			await pollUntil(`${repo} orphans reclaimed by the server's scheduler`, async () => {
-				const survivors = new Set(await objectOids(sqlDb(), repo))
-				return orphans.every((oid) => !survivors.has(oid))
-			})
+			// The server's own interval must drive a drain that removes the orphans AND
+			// (repack phase, env-default-enabled — the drain-repack doc) brings the
+			// encoding tier to coverage. Polled as a conjunction: repack runs after GC
+			// within a pass, so orphans-gone alone could race the pass's second half.
+			await pollUntil(
+				`${repo} orphans reclaimed + tier covered by the scheduler`,
+				async () => {
+					const survivors = new Set(await objectOids(sqlDb(), repo))
+					if (!orphans.every((oid) => !survivors.has(oid))) return false
+					return (await encodingViolations(sqlDb(), repo)).length === 0
+				},
+			)
 
-			// Reclamation happened AND the repo still clones clean at the latest tip.
+			// Reclamation happened, the tier covers the survivors, AND the repo still
+			// clones clean at the latest tip.
 			const survivors = new Set(await objectOids(sqlDb(), repo))
 			for (const oid of orphans) expect(survivors.has(oid)).toBe(false)
+			expect(await encodingViolations(sqlDb(), repo)).toEqual([])
 			const clone = await cloneAndFsck(at(enabled), repo)
 			expect(clone.head).toBe(head)
 			expect(clone.fileContent).toBe(`${repo} v2\n`)

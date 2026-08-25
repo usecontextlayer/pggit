@@ -5,10 +5,14 @@ import {
 	cloneAndFsck,
 	countObjects,
 	derivedRows,
+	encodingRows,
+	encodingViolations,
 	type GcFixture,
 	objectOids,
+	pushBranch,
 	pushFile,
 	repoGcState,
+	repoRepackStamp,
 	servedMainReachableOids,
 	setupGcFixture,
 	teardownGcFixture,
@@ -75,13 +79,15 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			concurrency: 1,
 			graceSeconds: 3600,
 			intervalMs: 60_000,
+			repackEnabled: false,
 		})
 
 		const first = await scheduler.drainOnce()
 		const mine = first.find((e) => e.repo === repo)
 		if (mine === undefined) throw new Error(`drain summary omitted ${repo}`)
-		expect(mine.deletedObjects).toBe(0) // everything is younger than grace
-		expect(mine.settled).toBe(false)
+		if (mine.gc === null) throw new Error(`drain entry for ${repo} carries no GC result`)
+		expect(mine.gc.deletedObjects).toBe(0) // everything is younger than grace
+		expect(mine.gc.settled).toBe(false)
 
 		// Still eligible: the young garbage exists and MUST get a post-grace pass.
 		const eligible = await fx.db.sql<{ name: string }[]>`
@@ -99,8 +105,10 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		const second = await scheduler.drainOnce()
 		const settled = second.find((e) => e.repo === repo)
 		if (settled === undefined) throw new Error(`second drain summary omitted ${repo}`)
-		expect(settled.deletedObjects).toBeGreaterThan(0) // v1's orphans reclaimed
-		expect(settled.settled).toBe(true)
+		if (settled.gc === null)
+			throw new Error(`drain entry for ${repo} carries no GC result`)
+		expect(settled.gc.deletedObjects).toBeGreaterThan(0) // v1's orphans reclaimed
+		expect(settled.gc.settled).toBe(true)
 		const after = await fx.db.sql<{ name: string }[]>`
 			select name from repos
 			where last_pushed_at is not null
@@ -114,6 +122,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			concurrency: 4,
 			graceSeconds: 0,
 			intervalMs: 30_000,
+			repackEnabled: false,
 		})
 
 		// Establish the ref, then rewind to an independent root → the first tip's
@@ -145,7 +154,8 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		// the sole guard on the count surface).
 		const entry = summary.find((e) => e.repo === repo)
 		if (entry === undefined) throw new Error(`drain summary omitted ${repo}`)
-		expect(entry.deletedObjects).toBe(orphaned.length)
+		if (entry.gc === null) throw new Error(`drain entry for ${repo} carries no GC result`)
+		expect(entry.gc.deletedObjects).toBe(orphaned.length)
 
 		// Survivors == the current tip's reachable closure: nothing live lost AND no
 		// orphan survives. Equality fixes both directions at once.
@@ -210,6 +220,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			concurrency: 4,
 			graceSeconds: 0,
 			intervalMs: 30_000,
+			repackEnabled: false,
 		})
 
 		// Round 1: seed, rewind (orphans the seed), age, drain. This stamps
@@ -280,6 +291,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			concurrency: 4,
 			graceSeconds: 0,
 			intervalMs: 30_000,
+			repackEnabled: false,
 		})
 
 		// A loose blob with no ref pointing at it — the residue of a connectivity-
@@ -305,5 +317,110 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		const summary = await scheduler.drainOnce()
 		expect(summary.filter((e) => e.repo === repo)).toHaveLength(1)
 		expect(await objectOids(fx.db, repo)).not.toContain(orphan)
+	})
+
+	// SCH-R1 + SCH-R3 (docs/2026-08-25-drain-repack-wiring.md) — one repack-enabled
+	// drain brings the encoding tier to coverage, and encodes only GC's SURVIVORS.
+	// A push + rewind leaves orphans; a single drainOnce (grace 0, repack on) must
+	// (R3) leave the tier covering exactly the post-GC inventory — no row for any
+	// swept oid — and (R1) every sub-cap survivor with exactly one row, the entry's
+	// counts equal to the rows created, the watermark stamped, and the repo cloning
+	// fsck-clean through the now-tier-backed serve.
+	it("SCH-R1/R3: one drain reclaims the orphans and encodes exactly the survivors", async () => {
+		const repo = "schr1-coverage"
+		const scheduler = createGcScheduler(fx.db.sql, {
+			concurrency: 4,
+			graceSeconds: 0,
+			intervalMs: 30_000,
+			repackEnabled: true,
+		})
+		const v1 = await pushFile(fx, repo, { content: "r1 v1\n" })
+		const v2 = await pushFile(fx, repo, { content: "r1 v2\n", rewind: true })
+		const orphaned = v1.reachable.filter((oid) => !v2.reachable.includes(oid))
+		expect(orphaned.length).toBeGreaterThan(0)
+		await ageObjects(fx.db, repo, "1 hour")
+
+		const summary = await scheduler.drainOnce()
+		const entry = summary.find((e) => e.repo === repo)
+		if (entry === undefined) throw new Error(`drain summary omitted ${repo}`)
+		if (entry.gc === null) throw new Error(`drain entry for ${repo} carries no GC result`)
+		if (entry.repack === null) {
+			throw new Error(`drain entry for ${repo} carries no repack result`)
+		}
+		expect(entry.gc.deletedObjects).toBe(orphaned.length)
+
+		// R3 — ordering observable: the tier covers exactly the post-GC survivor set.
+		// Violations empty pins "every sub-cap survivor has a row"; count equality
+		// pins "and nothing else" (this fixture's objects are all sub-cap); the
+		// explicit orphan check reads the swept direction on the rows themselves.
+		expect(await encodingViolations(fx.db, repo)).toEqual([])
+		const rows = await encodingRows(fx.db, repo)
+		expect(rows.length).toBe(await countObjects(fx.db, repo))
+		const encodedOids = rows.map((line) => line.split(" ")[0])
+		for (const oid of orphaned) expect(encodedOids).not.toContain(oid)
+
+		// R1 — the entry's counts are REAL: the tier was empty before this pass, so
+		// wholes + deltas must equal every row now present; and repack stamped its
+		// own watermark (a completed pass).
+		expect(entry.repack.wholes + entry.repack.deltas).toBe(rows.length)
+		expect(await repoRepackStamp(fx.db, repo)).not.toBeNull()
+
+		// The repo still serves a complete, fsck-clean clone at the latest tip —
+		// served through the encoding tier now.
+		const clone = await cloneAndFsck(fx, repo)
+		expect(clone.head).toBe(v2.head)
+		expect(clone.fileContent).toBe("r1 v2\n")
+	})
+
+	// SCH-R2 (docs/2026-08-25-drain-repack-wiring.md) — self-terminating and
+	// incremental: repack's frozen policy (existing rows are never rewritten)
+	// observed through the drain. After a covering drain, a second pass with no
+	// intervening push omits the repo entirely. An ADDITIVE push (a side branch —
+	// new objects, nothing orphaned) then re-qualifies it, and the next drain
+	// encodes ONLY the new objects while leaving every pre-existing encoding row
+	// byte-identical — an impl that re-encodes, rewrites, or re-bases covered rows
+	// fails the equality on the md5-carrying row lines.
+	it("SCH-R2: a second drain is a no-op; a new push encodes only the delta, never rewriting covered rows", async () => {
+		const repo = "schr2-incremental"
+		const scheduler = createGcScheduler(fx.db.sql, {
+			concurrency: 4,
+			graceSeconds: 0,
+			intervalMs: 30_000,
+			repackEnabled: true,
+		})
+		await pushFile(fx, repo, { content: "r2 v1\n" })
+		await ageObjects(fx.db, repo, "1 hour")
+		const first = await scheduler.drainOnce()
+		expect(first.filter((e) => e.repo === repo)).toHaveLength(1)
+		const coveredRows = await encodingRows(fx.db, repo)
+		expect(coveredRows.length).toBeGreaterThan(0)
+
+		// Self-terminating: nothing pushed since, so pass 2 omits the repo — and the
+		// tier is untouched.
+		const second = await scheduler.drainOnce()
+		expect(second.map((e) => e.repo)).not.toContain(repo)
+		expect(await encodingRows(fx.db, repo)).toEqual(coveredRows)
+
+		// An additive push re-qualifies the repo; the next drain covers ONLY the new
+		// objects. The side branch keeps main's closure reachable, so GC sweeps
+		// nothing and the frozen-rows equality is meaningful.
+		const objectsBefore = await countObjects(fx.db, repo)
+		await pushBranch(fx, repo, "side-r2", "r2 side\n")
+		const objectsAfter = await countObjects(fx.db, repo)
+		expect(objectsAfter).toBeGreaterThan(objectsBefore)
+
+		const third = await scheduler.drainOnce()
+		const entry = third.find((e) => e.repo === repo)
+		if (entry === undefined) throw new Error(`incremental pass omitted ${repo}`)
+		if (entry.repack === null) {
+			throw new Error(`incremental entry for ${repo} carries no repack result`)
+		}
+		const afterRows = await encodingRows(fx.db, repo)
+		// Only the delta was encoded…
+		expect(entry.repack.wholes + entry.repack.deltas).toBe(objectsAfter - objectsBefore)
+		expect(afterRows.length).toBe(coveredRows.length + (objectsAfter - objectsBefore))
+		// …and every covered row survived BYTE-IDENTICAL (oid, base, size, md5).
+		for (const line of coveredRows) expect(afterRows).toContain(line)
+		expect(await encodingViolations(fx.db, repo)).toEqual([])
 	})
 })

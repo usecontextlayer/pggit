@@ -100,6 +100,7 @@ describe("GC scheduler isolation through one drain (§6: SCH-8)", () => {
 			concurrency: 4,
 			graceSeconds: 0,
 			intervalMs: 30_000,
+			repackEnabled: false,
 		})
 		const summary = await scheduler.drainOnce()
 

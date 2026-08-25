@@ -2,10 +2,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { createGcScheduler } from "@/store/gc-scheduler"
 import {
 	countObjects,
+	encodingRows,
+	encodingViolations,
 	type GcFixture,
 	objectOids,
 	pushFile,
 	repoGcState,
+	repoRepackStamp,
 	setupGcFixture,
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
@@ -72,6 +75,7 @@ describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", (
 			concurrency: 4,
 			graceSeconds: HUGE_GRACE,
 			intervalMs: 30_000,
+			repackEnabled: false,
 		})
 
 	const summaryRepos = (summary: { repo: string }[]): string[] =>
@@ -197,5 +201,60 @@ describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", (
 		expect(await objectOids(fx.db, idleDrained)).toEqual(drainedObjectsBefore)
 		expect(await countObjects(fx.db, idleDrained)).toBe(drainedCountBefore)
 		expect(await countObjects(fx.db, idleNeverPushed)).toBe(neverCountBefore)
+	})
+
+	// SCH-R5 → SCH-R4 (docs/2026-08-25-drain-repack-wiring.md) — the repack phase's
+	// switch, then its repack-only candidacy. Phase 1 (R5): a repack-disabled drain
+	// settles the repo's GC, creates NO encoding row, leaves `last_repack_at` NULL,
+	// and reports `repack: null` — byte-for-byte today's gc-only pass. Phase 2 (R4):
+	// a later repack-enabled drain with NO intervening push re-qualifies the repo on
+	// the repack arm ALONE — the entry is `{ gc: null, repack: {…} }`, coverage
+	// appears, the watermark stamps — pinning the union predicate's repack arm, the
+	// nested entry shape for a repack-only pass, and "enabling later just works". A
+	// third pass omits the repo entirely: self-terminating on the repack arm too.
+	it("SCH-R5 → SCH-R4: a repack-disabled drain creates no encodings; enabling later repacks without a new push", async () => {
+		const repo = "schr4-repack-only"
+		await pushFile(fx, repo, { content: "r4 v1\n" })
+		await backdatePastGrace(repo)
+
+		// Phase 1 — repack disabled (R5): GC settles, the tier stays empty.
+		const off = createGcScheduler(fx.db.sql, {
+			concurrency: 4,
+			graceSeconds: HUGE_GRACE,
+			intervalMs: 30_000,
+			repackEnabled: false,
+		})
+		const first = await off.drainOnce()
+		const firstEntry = first.find((e) => e.repo === repo)
+		if (firstEntry === undefined) throw new Error(`drain summary omitted ${repo}`)
+		expect(firstEntry.gc).not.toBeNull()
+		expect(firstEntry.repack).toBeNull()
+		expect(await encodingRows(fx.db, repo)).toEqual([])
+		expect(await repoRepackStamp(fx.db, repo)).toBeNull()
+
+		// Phase 2 — repack enabled, NO intervening push (R4): the settled gc arm is
+		// quiet, so only the repack arm can have re-qualified the repo.
+		const on = createGcScheduler(fx.db.sql, {
+			concurrency: 4,
+			graceSeconds: HUGE_GRACE,
+			intervalMs: 30_000,
+			repackEnabled: true,
+		})
+		const second = await on.drainOnce()
+		const entry = second.find((e) => e.repo === repo)
+		if (entry === undefined) throw new Error(`repack-only pass omitted ${repo}`)
+		expect(entry.gc).toBeNull()
+		if (entry.repack === null) {
+			throw new Error(`repack-only entry for ${repo} carries no repack result`)
+		}
+		const rows = await encodingRows(fx.db, repo)
+		expect(rows.length).toBeGreaterThan(0)
+		expect(entry.repack.wholes + entry.repack.deltas).toBe(rows.length)
+		expect(await encodingViolations(fx.db, repo)).toEqual([])
+		expect(await repoRepackStamp(fx.db, repo)).not.toBeNull()
+
+		// Self-terminating on the repack arm: both watermarks are caught up now.
+		const third = await on.drainOnce()
+		expect(third.map((e) => e.repo)).not.toContain(repo)
 	})
 })

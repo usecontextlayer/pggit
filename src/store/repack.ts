@@ -14,8 +14,8 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * (`git_pack_encoding`, migration 0008; the design and its provenance:
  * docs/2026-08-15-delta-pack-design.md). The sibling of `store/gc.ts` in every
  * structural respect: built over a porsager client at the wire→DB boundary,
- * invoked per repo by a host's maintenance schedule, never on the push/fetch
- * hot path.
+ * invoked per repo by the GC drain's repack phase (`store/gc-scheduler.ts`) or a
+ * host's own maintenance schedule, never on the push/fetch hot path.
  *
  * What one pass produces, and the invariants the e2e suite pins:
  *
@@ -54,9 +54,11 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * Scheduling: repack stamps its own `repos.last_repack_at` watermark on success —
  * the pass-START `clock_timestamp()`, so an object ingested mid-pass (invisible to
  * this pass's reads) stays newer than the stamp and the next pass treats it as
- * ordinary new work, never as a hole. A host that runs both maintenance passes
- * must serialize repack per repo AFTER GC (D5) so it encodes survivors, not
- * garbage.
+ * ordinary new work, never as a hole. Any invoker that runs both maintenance
+ * passes must serialize repack per repo AFTER GC (D5) so it encodes survivors,
+ * not garbage — the built-in drain (`store/gc-scheduler.ts`, eligibility
+ * `last_pushed_at > last_repack_at`) does exactly this; a host may also invoke
+ * `repack()` directly on its own schedule.
  */
 
 /** Anchor cadence: a segment holds one whole anchor plus at most K−1 deltas

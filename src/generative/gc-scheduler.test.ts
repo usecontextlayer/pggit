@@ -18,7 +18,14 @@
  *       is the only place the `last_pushed_at <= last_gc_at` state — the one the
  *       eligibility predicate exists to EXCLUDE — is ever constructed here, so it is
  *       what pins over-selection. (b) alone cannot: a repo row is created by its
- *       first push, so an "untouched repo" has no row to be wrongly selected.
+ *       first push, so an "untouched repo" has no row to be wrongly selected. With
+ *       the drain's repack phase enabled, this also pins repack's own arm of the
+ *       union predicate: the pass's completed repack stamped `last_repack_at`, so
+ *       neither watermark re-qualifies the repo; AND
+ *   (e) end the pass fully ENCODED (the drain-repack doc's coverage conjunct):
+ *       every surviving sub-cap object has exactly one `git_pack_encoding` row
+ *       (`encodingViolations` empty), and the post-drain oracle fetch — served
+ *       through that tier — fscks clean.
  *
  * This GENERALISES the example-based scheduler cases: SCH-3 (drains exactly the
  * eligible set), SCH-6 (end-to-end reclamation through the loop), SCH-8 (tenant
@@ -38,8 +45,6 @@
  *
  * The property pins the scheduler's shipped eligibility and survivor contracts.
  */
-import { writeFileSync } from "node:fs"
-import { join } from "node:path"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { assertNever } from "@/lang"
@@ -47,8 +52,10 @@ import { createGcScheduler } from "@/store/gc-scheduler"
 import { IS_CI } from "@/testing/ci"
 import {
 	ageObjects,
+	encodingViolations,
 	type GcFixture,
 	objectOids,
+	pushBranch,
 	pushFile,
 	repoUrl,
 	setupGcFixture,
@@ -108,31 +115,6 @@ const stepArb: fc.Arbitrary<Step> = fc.record({
 })
 
 /**
- * Push a fresh single-file root commit to `refs/heads/<name>` from a throwaway
- * source (then discard it) — the side-branch creator. `pushFile` only ever targets
- * `refs/heads/main`, so a side branch needs this raw push; it mirrors `pushFile`'s
- * "independent root, discard the source" shape so the branch's objects survive only
- * in Postgres (where a later store-level delete orphans them). Plain push — the
- * fresh ref is a CREATE, which the deny-non-FF wire policy allows.
- */
-async function pushBranch(
-	fx: Pick<GcFixture, "server">,
-	repo: string,
-	branch: string,
-	content: string,
-): Promise<void> {
-	await withTempDir("pggit-gcsch-br-", async (src) => {
-		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
-		writeFileSync(join(src, `${branch}.txt`), content)
-		await spawnGit(["add", "."], { cwd: src })
-		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
-		await spawnGit(["push", repoUrl(fx, repo), `HEAD:refs/heads/${branch}`], {
-			cwd: src,
-		})
-	})
-}
-
-/**
  * Delete a ref at the STORE level (ingesting no object) — SCH-2's
  * delete-only-orphans case, driven internally now that the wire denies deletes.
  */
@@ -180,6 +162,10 @@ async function reachableOverAllRefs(
 			],
 			{ cwd: dir },
 		)
+		// The post-drain fetch is served THROUGH the encoding tier (repack enabled),
+		// so fsck here is the wire-integrity conjunct: a corrupt or mis-based stored
+		// delta cannot survive it.
+		await spawnGit(["fsck", "--full"], { cwd: dir })
 		return gitReachableOids(dir)
 	})
 }
@@ -285,6 +271,7 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 						concurrency: 4,
 						graceSeconds: 0,
 						intervalMs: 30_000,
+						repackEnabled: true,
 					})
 					const summary = await scheduler.drainOnce()
 
@@ -310,7 +297,9 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 					// (`last_pushed_at + 0 <= t0`) must fire for every repo the pass reclaimed,
 					// so this reads the stamp directly instead of inferring it from (d).
 					expect(
-						summary.filter((entry) => !entry.settled).map((entry) => entry.repo),
+						summary
+							.filter((entry) => entry.gc === null || !entry.gc.settled)
+							.map((entry) => entry.repo),
 						"a drained repo did not settle",
 					).toEqual([])
 
@@ -330,6 +319,12 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 						const survivors = await objectOids(fx.db, repo)
 						const reachable = await reachableOverAllRefs(fx, repo)
 						expect(survivors).toEqual(reachable)
+
+						// Coverage conjunct (SCH-R1 generalised, drain-repack doc): with
+						// repack enabled, the settled drain leaves every surviving sub-cap
+						// object with exactly one encoding row — for EVERY repo, whatever
+						// op sequence produced it.
+						expect(await encodingViolations(fx.db, repo)).toEqual([])
 					}
 				},
 			),

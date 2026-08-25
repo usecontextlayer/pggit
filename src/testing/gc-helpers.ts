@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
 import { ZERO_OID } from "@/object/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
@@ -153,6 +154,33 @@ export async function pushFile(
 		}
 		const reachable = await gitReachableOids(sourceDirectory)
 		return { head, reachable }
+	})
+}
+
+/**
+ * Push a fresh single-file root commit to `refs/heads/<name>` from a throwaway
+ * source (then discard it) — the side-branch creator, the suites' one ADDITIVE
+ * op (new objects, nothing orphaned). `pushFile` only ever targets
+ * `refs/heads/main`, so a side branch needs this raw push; it mirrors
+ * `pushFile`'s "independent root, discard the source" shape so the branch's
+ * objects survive only in Postgres (where a later store-level delete orphans
+ * them). Plain push — the fresh ref is a CREATE, which the deny-non-FF wire
+ * policy allows.
+ */
+export async function pushBranch(
+	fixture: Pick<GcFixture, "server">,
+	repo: string,
+	branch: string,
+	content: string,
+): Promise<void> {
+	await withTempDir("pggit-gcsch-br-", async (src) => {
+		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
+		writeFileSync(join(src, `${branch}.txt`), content)
+		await spawnGit(["add", "."], { cwd: src })
+		await spawnGit(["commit", "-q", "-m", "c"], { cwd: src })
+		await spawnGit(["push", repoUrl(fixture, repo), `HEAD:refs/heads/${branch}`], {
+			cwd: src,
+		})
 	})
 }
 
@@ -357,6 +385,70 @@ export async function derivedRowViolations(
 		order by oid
 	`
 	return rows.map((row) => row.oid)
+}
+
+/**
+ * The repo's `git_pack_encoding` rows in ONE canonical sorted text form —
+ * `<oid> base=<hex|whole> size=<n> data=<md5>` — so suites can prove rows were
+ * created, and that a later pass left existing rows BYTE-IDENTICAL (SCH-R2,
+ * repack's frozen policy observed through the drain), with plain array
+ * equality. The md5 is Postgres's, over the stored deflated bytes.
+ */
+export async function encodingRows(
+	db: Pick<IsolatedDb, "sql">,
+	repo: string,
+): Promise<string[]> {
+	const rows = await db.sql<{ line: string }[]>`
+		select encode(e.oid, 'hex')
+			|| ' base=' || coalesce(encode(e.base_oid, 'hex'), 'whole')
+			|| ' size=' || e.data_size
+			|| ' data=' || md5(e.data) as line
+		from git_pack_encoding e
+		join repos r on r.id = e.repo_id
+		where r.name = ${repo}
+	`
+	return rows.map((r) => r.line).sort()
+}
+
+/** Coverage violations of the encoding tier for `repo` — both directions of the
+ * object⟺encoding invariant a repack-enabled drain owes (SCH-R1): a sub-cap
+ * `git_object` with no encoding row (`row-missing:<oid>`), and an encoding row
+ * whose object is gone (`object-missing:<oid>` — DDL-guaranteed by the 0008
+ * cascades; asserting it pins the wiring, exactly like `derivedRowViolations`).
+ * MUST come back empty after a repack-enabled drain covers a repo. */
+export async function encodingViolations(
+	db: Pick<IsolatedDb, "sql">,
+	repo: string,
+): Promise<string[]> {
+	const rows = await db.sql<{ oid: string }[]>`
+		select 'row-missing:' || encode(o.oid, 'hex') as oid
+		from git_object o join repos r on r.id = o.repo_id
+		where r.name = ${repo} and o.size < ${MAX_INLINE_BYTEA_BYTES}
+			and not exists (
+				select 1 from git_pack_encoding e
+				where e.repo_id = o.repo_id and e.oid = o.oid)
+		union all
+		select 'object-missing:' || encode(e.oid, 'hex') as oid
+		from git_pack_encoding e join repos r on r.id = e.repo_id
+		where r.name = ${repo} and not exists (
+			select 1 from git_object o where o.repo_id = e.repo_id and o.oid = e.oid)
+		order by oid
+	`
+	return rows.map((row) => row.oid)
+}
+
+/** The repo's `last_repack_at` watermark — non-null iff a repack pass COMPLETED
+ * for it (`repack()` stamps it itself on success; the drain never writes it).
+ * Null for an absent repo too: absent and never-repacked make the same claim
+ * ("no completed pass"); suites needing the distinction read `repoGcState`. */
+export async function repoRepackStamp(
+	db: Pick<IsolatedDb, "sql">,
+	repo: string,
+): Promise<Date | null> {
+	const [row] = await db.sql<{ last_repack_at: Date | null }[]>`
+		select last_repack_at from repos where name = ${repo}
+	`
+	return row?.last_repack_at ?? null
 }
 
 /**

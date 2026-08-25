@@ -26,6 +26,7 @@ const soloTests = [
 	"**/gc-scheduler/*.test.ts",
 	"**/gc-scheduler.test.ts",
 	"**/pg-txn/gc-repack-fault-sweep.test.ts",
+	"**/pg-txn/drain-repack-fault.test.ts",
 	"**/pg-txn/copy-cancel-hangs-push-forever.test.ts",
 ]
 

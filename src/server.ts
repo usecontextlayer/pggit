@@ -41,8 +41,10 @@ export async function startServer(
 	opts: {
 		port?: number
 		databaseUrl?: string
-		/** Self-scheduling GC overrides (docs/2026-06-24-gc-scheduler-design.md §4/§5).
-		 * Defaults come from `env` (`PGGIT_GC_*`); `enabled` gates the background drain. */
+		/** Self-scheduling GC overrides (docs/2026-06-24-gc-scheduler-design.md §4/§5;
+		 * repack phase: docs/2026-08-25-drain-repack-wiring.md). Defaults come from
+		 * `env` (`PGGIT_GC_*`); `enabled` gates the background drain as a whole,
+		 * `repackEnabled` just its repack phase. */
 		gc?: { enabled?: boolean } & Partial<GcSchedulerOptions>
 	} = {},
 ): Promise<GitServer> {
@@ -59,13 +61,16 @@ export async function startServer(
 	// The drain runs on a DEDICATED connection pool, separate from the request path:
 	// each concurrent gc() reserves a connection for its whole live-set plan and sweep,
 	// so sharing the request pool could starve clone/fetch/push under load. GC off the
-	// hot path means off the hot pool. Sized to `concurrency` (one reservation per
+	// hot path means off the hot pool — and the repack phase rides this same pool
+	// (a repo's repack runs its queries serially, at most one connection at a time,
+	// inside the headroom below). Sized to `concurrency` (one reservation per
 	// concurrent repo) + 1 for the per-repo bookkeeping queries.
 	const gcEnabled = opts.gc?.enabled ?? env.PGGIT_GC_ENABLED
 	const gcOptions = resolveGcSchedulerOptions({
 		concurrency: opts.gc?.concurrency ?? env.PGGIT_GC_CONCURRENCY,
 		graceSeconds: opts.gc?.graceSeconds ?? env.PGGIT_GC_GRACE_SECONDS,
 		intervalMs: opts.gc?.intervalMs ?? env.PGGIT_GC_INTERVAL_MS,
+		repackEnabled: opts.gc?.repackEnabled ?? env.PGGIT_GC_REPACK_ENABLED,
 	})
 	const pg = postgres(databaseUrl)
 	const app = createGitApp(createGitDeps(pg))

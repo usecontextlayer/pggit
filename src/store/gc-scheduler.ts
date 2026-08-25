@@ -1,43 +1,67 @@
 import type { Sql } from "postgres"
 import { z } from "zod"
 import { createGc, GcGraceSecondsSchema, type GcResult } from "@/store/gc"
+import { createRepack, type RepackResult } from "@/store/repack"
 
 /**
- * Self-scheduling GC — the background drain that decides WHEN the per-repo
- * reachability GC (`store/gc.ts`) runs, off the push/fetch hot path. See
- * `docs/2026-06-24-gc-scheduler-design.md`; the observable contract is §6 of that
- * doc (SCH-1 … SCH-11 / PBT-S1).
+ * Self-scheduling maintenance — the background drain that decides WHEN the
+ * per-repo reachability GC (`store/gc.ts`) and the repack pass (`store/repack.ts`)
+ * run, off the push/fetch hot path. "GC drain" is git's own umbrella vocabulary —
+ * `git gc` runs `git repack` — which is why the module, its exports, and the
+ * `PGGIT_GC_*` env family keep their names with repack aboard. See
+ * `docs/2026-06-24-gc-scheduler-design.md` (observable contract §6, SCH-1 …
+ * SCH-11 / PBT-S1) and `docs/2026-08-25-drain-repack-wiring.md` (the repack
+ * phase: SCH-R1 … SCH-R7).
  *
  * Mechanism (data-structures-first): every storage-mutating push stamps
  * `repos.last_pushed_at` in its own transaction (the store), so the scheduler is a
  * pure poll loop over Postgres with NO coupling to the request path. One pass
- * (`drainOnce`) selects the eligible repos — `last_pushed_at > last_gc_at`
- * (or `last_gc_at is null`) — and runs `gc()` on each (per-repo serialized,
- * bounded concurrency). A pass advances `last_gc_at` to its start time only after
- * the repo's grace horizon; a younger repo remains eligible, and a push landing
- * mid-pass also re-qualifies it (no lost garbage). `start` is just `drainOnce` on
- * a `setInterval`; all correctness lives in `drainOnce`, which tests drive
+ * (`drainOnce`) selects the repos where either phase owes work — GC when
+ * `last_pushed_at > last_gc_at`, repack when `last_pushed_at > last_repack_at`
+ * (each NULL-qualifying) — and runs the due phases on each, GC first (repack
+ * encodes SURVIVORS, never garbage), per-repo serialized, bounded concurrency. A
+ * pass advances `last_gc_at` to its start time only after the repo's grace
+ * horizon; a younger repo remains eligible, and a push landing mid-pass also
+ * re-qualifies it (no lost garbage). `last_repack_at` is stamped by `repack()`
+ * itself on success, never by the drain. `start` is just `drainOnce` on a
+ * `setInterval`; all correctness lives in `drainOnce`, which tests drive
  * directly.
  */
 
-/** One repo's outcome in a drain pass: the repo and what its GC reclaimed.
- * Emitted for EVERY repo the pass judged eligible (including zero-reclaim), so the
- * eligible set itself is observable (SCH-3). */
-export type DrainEntry = GcResult & {
+/** One repo's outcome in a drain pass, one nullable slot per phase. `null` means
+ * exactly "no result from this phase this pass" — ineligible, disabled, skipped
+ * because this pass's GC failed, or the phase itself threw; the REASON lives in
+ * the log line, never here (the summary reports completed work, the log reports
+ * failures — the standing contract). An emitted entry has at least one non-null
+ * phase; a repo where every phase that ran threw is dropped and retried next
+ * pass. Emitted for EVERY repo the pass completed any work on (including
+ * zero-reclaim / zero-encode), so the eligible set itself is observable (SCH-3,
+ * SCH-R4). */
+export type DrainEntry = {
 	repo: string
-	/** False while garbage YOUNGER than grace may still exist (the pass ran
-	 * inside the grace window): the repo deliberately stays eligible and is
-	 * re-drained next tick, so post-grace residue is never orphaned forever. */
-	settled: boolean
+	/** GC's outcome. `settled` is a GC concept: false while garbage YOUNGER than
+	 * grace may still exist (the pass ran inside the grace window) — the repo
+	 * deliberately stays eligible and is re-drained next tick, so post-grace
+	 * residue is never orphaned forever. */
+	gc: (GcResult & { settled: boolean }) | null
+	/** What repack encoded this pass. `{ wholes: 0, deltas: 0 }` is a real result
+	 * — the phase ran and the tier was already covered — distinct from `null`
+	 * (the phase did not run). */
+	repack: RepackResult | null
 }
 
 /** What one `drainOnce()` reclaimed, one entry per eligible repo. */
 export type DrainSummary = DrainEntry[]
 
-/** A candidate repo for one drain pass: its id + wire name. The pass-start
- * watermark is captured per-repo (in `drainRepo`, before that repo's GC snapshot)
- * and written back as `last_gc_at`. */
-type Candidate = { id: string; name: string }
+/** A candidate repo for one drain pass: its id + wire name, plus which phases the
+ * selection judged due. Each flag is its phase's own watermark predicate, computed
+ * in the same query that selects the row — so the WHERE and the flags can never
+ * disagree. The GC pass-start watermark is captured per-repo (in `drainRepo`,
+ * before that repo's GC snapshot) and written back as `last_gc_at`; repack's
+ * watermark is `repack()`'s own business (it stamps `last_repack_at` itself on
+ * success — the stamp must mean "a completed pass" for every invoker, so the
+ * drain never writes it). */
+type Candidate = { id: string; name: string; gc_due: boolean; repack_due: boolean }
 
 const MAX_TIMER_MS = 2_147_483_647
 
@@ -46,13 +70,16 @@ const GcSchedulerOptionsSchema = z
 		concurrency: z.number().int().positive(),
 		graceSeconds: GcGraceSecondsSchema,
 		intervalMs: z.number().int().positive().max(MAX_TIMER_MS),
+		repackEnabled: z.boolean(),
 	})
 	.strict()
 
 /** Scheduler tunables (resolved from `env` / `startServer` opts). `graceSeconds`
  * is passed straight to `gc()`; `intervalMs` is the drain cadence (the debounce
- * window); `concurrency` caps repos GC'd at once per pass so one large-orphan repo
- * cannot head-of-line-block the rest. */
+ * window); `concurrency` caps repos drained at once per pass so one large repo
+ * cannot head-of-line-block the rest — with repack enabled it is also the memory
+ * dial, since each in-flight repack holds roughly its repo's tree bytes in its
+ * pass cache (repack.ts). `repackEnabled` gates the drain's repack phase. */
 export type GcSchedulerOptions = z.infer<typeof GcSchedulerOptionsSchema>
 
 export type GcScheduler = ReturnType<typeof createGcScheduler>
@@ -64,9 +91,10 @@ export function resolveGcSchedulerOptions(opts: GcSchedulerOptions): GcScheduler
 
 /**
  * Build the GC scheduler over a porsager client (the same wire→DB boundary the
- * stores take). `drainOnce()` runs one poll+sweep pass; `start()`/`stop()` drive
- * it on `intervalMs`. Reachable objects are never touched — it only invokes the
- * per-repo GC primitive, which is reachability-safe.
+ * stores take). `drainOnce()` runs one poll+sweep pass — per repo, GC then (when
+ * enabled and due) repack; `start()`/`stop()` drive it on `intervalMs`. Reachable
+ * objects are never touched: GC is reachability-safe and repack only ever ADDS
+ * derived encoding rows.
  */
 export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 	return createGcSchedulerFromResolvedOptions(pg, resolveGcSchedulerOptions(opts))
@@ -74,72 +102,112 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 
 /** Internal composition seam for `startServer`, which resolves before sizing its pool. */
 export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerOptions) {
+	// Both phases ride the SAME client the scheduler was built over — in
+	// `startServer` that is the dedicated drain pool, so repack's reads and COPY
+	// flushes never contend with the request path. Constructed unconditionally:
+	// the switch's one enforcement point is the candidate query's `repack_due`
+	// arm, not scattered construction guards.
 	const gc = createGc(pg)
+	const repack = createRepack(pg)
 	let timer: ReturnType<typeof setInterval> | undefined
 	// The in-flight pass (if any). Doubles as the overlap guard (a tick skips while a
 	// pass runs, so two passes never touch the same repo at once) and the shutdown
 	// barrier (`stop()` awaits it).
 	let inFlight: Promise<unknown> | undefined
 
-	/** The eligible repos for this pass — the §2 predicate. */
+	/** The eligible repos for this pass — the union of the two phase predicates
+	 * (the GC design's §2 predicate, plus repack's `last_pushed_at >
+	 * last_repack_at` when the phase is enabled). The resolved switch is bound
+	 * into the query here and ONLY here — with it off, `repack_due` is false for
+	 * every candidate by construction, and no other code path gates the phase. */
 	async function selectCandidates(): Promise<Candidate[]> {
 		return pg<Candidate[]>`
-			select r.id::text as id, r.name
+			select r.id::text as id, r.name,
+				(r.last_gc_at is null or r.last_pushed_at > r.last_gc_at) as gc_due,
+				(${opts.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at)) as repack_due
 			from repos r
 			where r.last_pushed_at is not null
-				and (r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)
+				and ((r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)
+					or (${opts.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at)))
 		`
 	}
 
 	/**
-	 * GC one candidate. `t0 = clock_timestamp()` is captured BEFORE `gc()` opens its
-	 * snapshot, then written as `last_gc_at` after the sweep: any push committing
-	 * after t0 re-stamps `last_pushed_at > t0` (the store stamps after commit) and
-	 * re-qualifies the repo next pass (no lost garbage). A per-repo failure is
-	 * ISOLATED — logged and skipped (the repo keeps its old `last_gc_at`, so it
-	 * re-qualifies and is retried next pass) — so one poison repo never aborts the
-	 * rest of the pass. `maintain: false`: the drain leans on autovacuum, never a
+	 * Drain one candidate: the phases its flags license, GC first. `t0 =
+	 * clock_timestamp()` is captured BEFORE `gc()` opens its snapshot, then written
+	 * as `last_gc_at` after the sweep: any push committing after t0 re-stamps
+	 * `last_pushed_at > t0` (the store stamps after commit) and re-qualifies the
+	 * repo next pass (no lost garbage). A per-repo failure is ISOLATED — logged,
+	 * the failed phase's watermark left behind, retried next pass — so one poison
+	 * repo never aborts the rest of the pass; a GC failure also SKIPS this repo's
+	 * repack (repack encodes survivors, never what the completed sweep would have
+	 * deleted). Repack is invoked by NAME and stamps `last_repack_at` itself on
+	 * success — a completed-pass marker every invoker shares, which its repair
+	 * mode depends on. `maintain: false`: the drain leans on autovacuum, never a
 	 * per-pass full-table VACUUM (gc.ts).
 	 */
 	type DrainAttempt = { outcome: "drained"; entry: DrainEntry } | { outcome: "failed" }
 
 	async function drainRepo(c: Candidate): Promise<DrainAttempt> {
-		try {
-			const [{ t0 }] = await pg<[{ t0: string }]>`select clock_timestamp()::text as t0`
-			const { deletedObjects, epoch } = await gc.gc(c.name, {
-				graceSeconds: opts.graceSeconds,
-				maintain: false,
-			})
-			// Settle ONLY when this pass ran past the grace horizon of the repo's
-			// last push: a pass inside the window sees young garbage the grace
-			// cutoff protects, and stamping it caught-up would orphan that
-			// garbage FOREVER once it ages (nothing re-qualifies the repo). Not
-			// stamping keeps it eligible — a bounded number of cheap re-passes
-			// (unchanged tips skip the walk) until one runs post-grace. The WHERE
-			// also fails when a push landed mid-pass (last_pushed_at > t0), the
-			// standing no-lost-garbage rule.
-			const settledRows = await pg<{ id: string }[]>`
-				update repos set last_gc_at = ${t0}::timestamptz
-				where id = ${c.id}::bigint
-					and last_pushed_at + make_interval(secs => ${opts.graceSeconds}::float8)
-						<= ${t0}::timestamptz
-				returning id::text as id`
-			return {
-				entry: { deletedObjects, epoch, repo: c.name, settled: settledRows.length > 0 },
-				outcome: "drained",
+		let gcOutcome: DrainEntry["gc"] = null
+		if (c.gc_due) {
+			try {
+				const [{ t0 }] = await pg<[{ t0: string }]>`select clock_timestamp()::text as t0`
+				const gcResult = await gc.gc(c.name, {
+					graceSeconds: opts.graceSeconds,
+					maintain: false,
+				})
+				// Settle ONLY when this pass ran past the grace horizon of the repo's
+				// last push: a pass inside the window sees young garbage the grace
+				// cutoff protects, and stamping it caught-up would orphan that
+				// garbage FOREVER once it ages (nothing re-qualifies the repo). Not
+				// stamping keeps it eligible — a bounded number of cheap re-passes
+				// (unchanged tips skip the walk) until one runs post-grace. The WHERE
+				// also fails when a push landed mid-pass (last_pushed_at > t0), the
+				// standing no-lost-garbage rule.
+				const settledRows = await pg<{ id: string }[]>`
+					update repos set last_gc_at = ${t0}::timestamptz
+					where id = ${c.id}::bigint
+						and last_pushed_at + make_interval(secs => ${opts.graceSeconds}::float8)
+							<= ${t0}::timestamptz
+					returning id::text as id`
+				gcOutcome = { ...gcResult, settled: settledRows.length > 0 }
+			} catch (err) {
+				console.error(
+					`pggit gc-scheduler: GC of repo ${JSON.stringify(c.name)} failed (retried next pass):`,
+					err,
+				)
+				return { outcome: "failed" }
 			}
-		} catch (err) {
-			console.error(
-				`pggit gc-scheduler: GC of repo ${JSON.stringify(c.name)} failed (retried next pass):`,
-				err,
-			)
-			return { outcome: "failed" }
+		}
+
+		let repackOutcome: RepackResult | null = null
+		if (c.repack_due) {
+			try {
+				repackOutcome = await repack.repack(c.name)
+			} catch (err) {
+				console.error(
+					`pggit gc-scheduler: repack of repo ${JSON.stringify(c.name)} failed (retried next pass):`,
+					err,
+				)
+			}
+		}
+
+		// An entry is emitted iff at least one phase produced a result. A repo where
+		// every phase that ran threw was already logged above; dropping it keeps the
+		// summary a report of completed work, and its stale watermark(s) re-select
+		// it next pass.
+		if (gcOutcome === null && repackOutcome === null) return { outcome: "failed" }
+		return {
+			entry: { gc: gcOutcome, repack: repackOutcome, repo: c.name },
+			outcome: "drained",
 		}
 	}
 
-	/** One drain pass: GC every eligible repo (bounded concurrency, distinct repos so
-	 * a pass never double-GCs one). Returns an entry per repo GC'd this pass — a repo
-	 * whose GC threw is skipped (not in the summary) and retried next pass. */
+	/** One drain pass: run the due phases on every eligible repo (bounded
+	 * concurrency, distinct repos so a pass never touches one twice). Returns an
+	 * entry per repo that completed any work — a repo whose only-ran phase threw is
+	 * absent (logged) and retried next pass. */
 	async function drainOnce(): Promise<DrainSummary> {
 		const candidates = await selectCandidates()
 		const results = await mapPool(candidates, opts.concurrency, drainRepo)
