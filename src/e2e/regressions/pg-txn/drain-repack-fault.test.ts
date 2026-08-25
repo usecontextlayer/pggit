@@ -41,6 +41,7 @@ import { attemptGit } from "@/testing/spawn-git"
 const RUNS = 600
 const REPO = "txn/drain-repack-fault"
 const COPY_NEEDLE = "copy_stg_git_pack_encoding"
+const AIM_TIMEOUT_MS = 45_000
 
 /** Mirror-clone `url` and `fsck --strict` it; a string is the failure reason. */
 async function cloneClean(url: string, dest: string): Promise<string | null> {
@@ -59,23 +60,21 @@ async function cloneClean(url: string, dest: string): Promise<string | null> {
 	return null
 }
 
-/** Poll ONE pid until it is inside `needle`, then cancel that statement. Bounded;
+/** Poll ONE pid until it is inside repack's COPY staging work, then cancel that statement. Bounded;
  * `stop.now` ends the watch the moment the drain settles, so a miss costs one
  * poll — and reports false, which the entry-shape assertion turns into a loud
  * failure instead of a vacuous pass. */
-async function cancelWhenInside(
+async function cancelRepackCopyWhenActive(
 	admin: Sql,
 	pid: number,
-	needle: string,
 	stop: { now: boolean },
-	limitMs: number,
 ): Promise<boolean> {
 	const t0 = Date.now()
-	while (!stop.now && Date.now() - t0 < limitMs) {
+	while (!stop.now && Date.now() - t0 < AIM_TIMEOUT_MS) {
 		const [act] = await admin<{ q: string }[]>`
 			select query as q from pg_stat_activity
 			where pid = ${pid} and state = 'active'`
-		if (act?.q.toLowerCase().replace(/\s+/g, " ").includes(needle)) {
+		if (act?.q.toLowerCase().replace(/\s+/g, " ").includes(COPY_NEEDLE)) {
 			await admin`select pg_cancel_backend(${pid})`
 			return true
 		}
@@ -146,7 +145,7 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 		const [pidRow] = await drainSql<{ pid: number }[]>`select pg_backend_pid() as pid`
 		if (pidRow === undefined) throw new Error("pg_backend_pid returned no row")
 		const stop = { now: false }
-		const aimed = cancelWhenInside(admin, pidRow.pid, COPY_NEEDLE, stop, 45_000)
+		const aimed = cancelRepackCopyWhenActive(admin, pidRow.pid, stop)
 		const first = await scheduler.drainOnce()
 		stop.now = true
 		aimHit = await aimed

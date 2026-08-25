@@ -315,16 +315,22 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 					// This pins BOTH liveness (no live object dropped) and reclamation (every
 					// orphan from a rewind or a branch-delete gone) for EVERY repo at once
 					// — the multi-repo generalisation of SCH-6, isolated per repo (SCH-8).
-					for (const repo of repos) {
+					for (const [i, repo] of repos.entries()) {
+						const state = states[i]
+						if (state === undefined) {
+							throw new Error(`missing generated state at index ${i}`)
+						}
 						const survivors = await objectOids(fx.db, repo)
 						const reachable = await reachableOverAllRefs(fx, repo)
 						expect(survivors).toEqual(reachable)
 
 						// Coverage conjunct (SCH-R1 generalised, drain-repack doc): with
 						// repack enabled, the settled drain leaves every surviving sub-cap
-						// object with exactly one encoding row — for EVERY repo, whatever
-						// op sequence produced it.
-						expect(await encodingViolations(fx.db, repo)).toEqual([])
+						// object with exactly one encoding row — for every persisted repo,
+						// whatever op sequence produced it.
+						if (state.touched) {
+							expect(await encodingViolations(fx.db, repo)).toEqual([])
+						}
 					}
 				},
 			),

@@ -387,6 +387,21 @@ export async function derivedRowViolations(
 	return rows.map((row) => row.oid)
 }
 
+async function requireExistingRepoId(
+	db: Pick<IsolatedDb, "sql">,
+	repo: string,
+): Promise<string> {
+	const [row] = await db.sql<{ id: string }[]>`
+		select id::text as id from repos where name = ${repo}
+	`
+	if (row === undefined) {
+		throw new Error(
+			`GC test helper requires repo ${JSON.stringify(repo)} to exist; use repoGcState for presence`,
+		)
+	}
+	return row.id
+}
+
 /**
  * The repo's `git_pack_encoding` rows in ONE canonical sorted text form —
  * `<oid> base=<hex|whole> size=<n> data=<md5>` — so suites can prove rows were
@@ -398,14 +413,14 @@ export async function encodingRows(
 	db: Pick<IsolatedDb, "sql">,
 	repo: string,
 ): Promise<string[]> {
+	const repoId = await requireExistingRepoId(db, repo)
 	const rows = await db.sql<{ line: string }[]>`
 		select encode(e.oid, 'hex')
 			|| ' base=' || coalesce(encode(e.base_oid, 'hex'), 'whole')
 			|| ' size=' || e.data_size
 			|| ' data=' || md5(e.data) as line
 		from git_pack_encoding e
-		join repos r on r.id = e.repo_id
-		where r.name = ${repo}
+		where e.repo_id = ${repoId}::bigint
 	`
 	return rows.map((r) => r.line).sort()
 }
@@ -420,17 +435,18 @@ export async function encodingViolations(
 	db: Pick<IsolatedDb, "sql">,
 	repo: string,
 ): Promise<string[]> {
+	const repoId = await requireExistingRepoId(db, repo)
 	const rows = await db.sql<{ oid: string }[]>`
 		select 'row-missing:' || encode(o.oid, 'hex') as oid
-		from git_object o join repos r on r.id = o.repo_id
-		where r.name = ${repo} and o.size < ${MAX_INLINE_BYTEA_BYTES}
+		from git_object o
+		where o.repo_id = ${repoId}::bigint and o.size < ${MAX_INLINE_BYTEA_BYTES}
 			and not exists (
 				select 1 from git_pack_encoding e
 				where e.repo_id = o.repo_id and e.oid = o.oid)
 		union all
 		select 'object-missing:' || encode(e.oid, 'hex') as oid
-		from git_pack_encoding e join repos r on r.id = e.repo_id
-		where r.name = ${repo} and not exists (
+		from git_pack_encoding e
+		where e.repo_id = ${repoId}::bigint and not exists (
 			select 1 from git_object o where o.repo_id = e.repo_id and o.oid = e.oid)
 		order by oid
 	`
@@ -439,8 +455,7 @@ export async function encodingViolations(
 
 /** The repo's `last_repack_at` watermark — non-null iff a repack pass COMPLETED
  * for it (`repack()` stamps it itself on success; the drain never writes it).
- * Null for an absent repo too: absent and never-repacked make the same claim
- * ("no completed pass"); suites needing the distinction read `repoGcState`. */
+ * Presence belongs to `repoGcState`; this focused helper requires the repo. */
 export async function repoRepackStamp(
 	db: Pick<IsolatedDb, "sql">,
 	repo: string,
@@ -448,7 +463,12 @@ export async function repoRepackStamp(
 	const [row] = await db.sql<{ last_repack_at: Date | null }[]>`
 		select last_repack_at from repos where name = ${repo}
 	`
-	return row?.last_repack_at ?? null
+	if (row === undefined) {
+		throw new Error(
+			`repoRepackStamp: repo ${JSON.stringify(repo)} does not exist; use repoGcState for presence`,
+		)
+	}
+	return row.last_repack_at
 }
 
 /**
