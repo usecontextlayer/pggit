@@ -70,6 +70,7 @@ import { createRepack, type RepackResult } from "@/store/repack"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { parseRevListObjectOids } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { abortBackendWhenActive, type BackendAbort } from "@/testing/pg-fault"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 
 const RUNS = 600
@@ -176,9 +177,7 @@ async function liveClosure(url: string, dest: string): Promise<Set<string> | str
  * (`skip`+1)-th time and then kill the statement (`cancel`) or the whole
  * connection (`terminate`).
  */
-type Fault =
-	| { kind: "timeout"; ms: number }
-	| { kind: "cancel" | "terminate"; needle: string; skip: number }
+type Fault = { kind: "timeout"; ms: number } | BackendAbort
 type FaultCase = { label: string; fault: Fault }
 type CaseResult = {
 	label: string
@@ -196,40 +195,6 @@ type CaseResult = {
 	rp3: RepackResult
 	finalCloneError: string | null
 	lostVsTorn: number
-}
-
-/**
- * Watch ONE pid and abort it once it is inside the targeted statement. Statements
- * are told apart by `query_start` — each sweep batch is its own statement, so
- * counting distinct starts is what makes "abort at the Nth batch boundary"
- * expressible at all. Returns whether the abort was issued; `stop.now` lets the
- * caller end the watch the moment the pass settles, so a miss costs one poll
- * rather than the whole bound.
- */
-async function abortWhenInside(
-	admin: Sql,
-	pid: number,
-	fault: { kind: "cancel" | "terminate"; needle: string; skip: number },
-	stop: { now: boolean },
-	limitMs: number,
-): Promise<boolean> {
-	const starts = new Set<string>()
-	const t0 = Date.now()
-	while (!stop.now && Date.now() - t0 < limitMs) {
-		const [act] = await admin<{ s: string; q: string }[]>`
-			select query_start::text as s, query as q
-			from pg_stat_activity where pid = ${pid} and state = 'active'`
-		if (act?.s && act.q.toLowerCase().replace(/\s+/g, " ").includes(fault.needle)) {
-			starts.add(act.s)
-			if (starts.size > fault.skip) {
-				if (fault.kind === "cancel") await admin`select pg_cancel_backend(${pid})`
-				else await admin`select pg_terminate_backend(${pid})`
-				return true
-			}
-		}
-		await sleep(1)
-	}
-	return false
 }
 
 // No encoding/commit/tag kill points: since the 0008/0009 FK cascades, GC
@@ -345,7 +310,10 @@ describe("regressions/pg-txn — GC/repack aborted at every batch boundary", () 
 			} else {
 				const [pidRow] = await gcSql<{ pid: number }[]>`select pg_backend_pid() as pid`
 				if (pidRow === undefined) throw new Error("pg_backend_pid returned no row")
-				aimed = abortWhenInside(admin, pidRow.pid, c.fault, stop, 45_000)
+				aimed = abortBackendWhenActive(admin, pidRow.pid, c.fault, {
+					limitMs: 45_000,
+					stop,
+				})
 			}
 			let gcErr = "none"
 			let repackErr = "none"

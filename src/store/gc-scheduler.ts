@@ -11,7 +11,7 @@ import { createRepack, type RepackResult } from "@/store/repack"
  * `PGGIT_GC_*` env family keep their names with repack aboard. See
  * `docs/2026-06-24-gc-scheduler-design.md` (observable contract §6, SCH-1 …
  * SCH-11 / PBT-S1) and `docs/2026-08-25-drain-repack-wiring.md` (the repack
- * phase: SCH-R1 … SCH-R7).
+ * phase: SCH-R1 … SCH-R8).
  *
  * Mechanism (data-structures-first): every storage-mutating push stamps
  * `repos.last_pushed_at` in its own transaction (the store), so the scheduler is a
@@ -52,17 +52,10 @@ export type DrainEntry = {
 	repack: RepackResult | null
 }
 
-/** What one `drainOnce()` reclaimed, one entry per eligible repo. */
+/** Completed work from one `drainOnce()`, one entry per repo where at least one phase produced a result. */
 export type DrainSummary = DrainEntry[]
 
-/** A candidate repo for one drain pass: its id + wire name, plus which phases the
- * selection judged due. Each flag is its phase's own watermark predicate, computed
- * in the same query that selects the row — so the WHERE and the flags can never
- * disagree. The GC pass-start watermark is captured per-repo (in `drainRepo`,
- * before that repo's GC snapshot) and written back as `last_gc_at`; repack's
- * watermark is `repack()`'s own business (it stamps `last_repack_at` itself on
- * success — the stamp must mean "a completed pass" for every invoker, so the
- * drain never writes it). */
+/** A candidate repo for one drain pass: its id + wire name, plus which phases the selection judged due. Both flags are computed in the selecting query; `repack_due` includes its own watermark and the coupled GC arm. The GC pass-start watermark is captured per-repo (in `drainRepo`, before that repo's GC snapshot) and written back as `last_gc_at`; repack's watermark is `repack()`'s own business (it stamps `last_repack_at` itself on success — the stamp must mean "a completed pass" for every invoker, so the drain never writes it). */
 type Candidate = { id: string; name: string } & (
 	| { gc_due: true; repack_due: boolean }
 	| { gc_due: false; repack_due: true }

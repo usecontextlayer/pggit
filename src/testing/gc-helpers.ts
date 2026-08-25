@@ -1,11 +1,13 @@
 import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
+import type { ReposId } from "@/database/models/public/Repos"
 import { ZERO_OID } from "@/object/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
+import { lookupRepoId } from "@/store/repo-resolver"
 import { allObjectOids, gitReachableOids } from "@/testing/git-fixtures"
 import {
 	repoUrl as gitServerRepoUrl,
@@ -388,18 +390,16 @@ export async function derivedRowViolations(
 }
 
 async function requireExistingRepoId(
-	db: Pick<IsolatedDb, "sql">,
+	db: Pick<IsolatedDb, "db">,
 	repo: string,
-): Promise<string> {
-	const [row] = await db.sql<{ id: string }[]>`
-		select id::text as id from repos where name = ${repo}
-	`
-	if (row === undefined) {
+): Promise<ReposId> {
+	const id = await lookupRepoId(db.db, repo)
+	if (id === null) {
 		throw new Error(
 			`GC test helper requires repo ${JSON.stringify(repo)} to exist; use repoGcState for presence`,
 		)
 	}
-	return row.id
+	return id
 }
 
 /**
@@ -410,7 +410,7 @@ async function requireExistingRepoId(
  * equality. The md5 is Postgres's, over the stored deflated bytes.
  */
 export async function encodingRows(
-	db: Pick<IsolatedDb, "sql">,
+	db: Pick<IsolatedDb, "db" | "sql">,
 	repo: string,
 ): Promise<string[]> {
 	const repoId = await requireExistingRepoId(db, repo)
@@ -432,7 +432,7 @@ export async function encodingRows(
  * cascades; asserting it pins the wiring, exactly like `derivedRowViolations`).
  * MUST come back empty after a repack-enabled drain covers a repo. */
 export async function encodingViolations(
-	db: Pick<IsolatedDb, "sql">,
+	db: Pick<IsolatedDb, "db" | "sql">,
 	repo: string,
 ): Promise<string[]> {
 	const repoId = await requireExistingRepoId(db, repo)
@@ -457,17 +457,14 @@ export async function encodingViolations(
  * for it (`repack()` stamps it itself on success; the drain never writes it).
  * Presence belongs to `repoGcState`; this focused helper requires the repo. */
 export async function repoRepackStamp(
-	db: Pick<IsolatedDb, "sql">,
+	db: Pick<IsolatedDb, "db" | "sql">,
 	repo: string,
 ): Promise<Date | null> {
+	const repoId = await requireExistingRepoId(db, repo)
 	const [row] = await db.sql<{ last_repack_at: Date | null }[]>`
-		select last_repack_at from repos where name = ${repo}
+		select last_repack_at from repos where id = ${repoId}::bigint
 	`
-	if (row === undefined) {
-		throw new Error(
-			`repoRepackStamp: repo ${JSON.stringify(repo)} does not exist; use repoGcState for presence`,
-		)
-	}
+	if (row === undefined) throw new Error(`repoRepackStamp: repo ${repo} disappeared`)
 	return row.last_repack_at
 }
 

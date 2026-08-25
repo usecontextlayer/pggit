@@ -5,7 +5,7 @@ import { z } from "zod"
 const EnvSchema = z.object({
 	// porsager `postgres` is initialized DSN-only; lazily, per the server design.
 	PGGIT_DATABASE_URL: z.string().min(1).optional(),
-	// Max repos GC'd at once per pass (head-of-line-blocking guard).
+	// Max repos drained at once per pass; also bounds concurrent repack memory.
 	PGGIT_GC_CONCURRENCY: z.coerce.number().int().positive().default(4),
 
 	// Self-scheduling GC (docs/2026-06-24-gc-scheduler-design.md §5). The standalone

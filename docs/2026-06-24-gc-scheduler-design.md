@@ -2,7 +2,7 @@
 
 > **Rename note (2026-08-21 reorg):** `src/gc-scheduler.ts` now lives at `src/store/gc-scheduler.ts`, `generative/gc-scheduler.spec.test.ts` is `generative/gc-scheduler.test.ts` (the `.spec` infix was dropped repo-wide), and `generative/commands.ts` → `src/testing/repo-commands.ts`. "Snapshot" below is MVCC/force-commit vocabulary, untouched by the rename. Mentions keep the names that were current when this was written.
 
-> **Extension note (2026-08-25):** the drain gained a REPACK phase — per repo, GC then `repack()` over survivors, eligibility `last_pushed_at > last_repack_at`, switch `PGGIT_GC_REPACK_ENABLED`, and `DrainEntry` reshaped to nested `{ repo, gc, repack }`. The design, its provenance, and the SCH-R1…R7 contract live in `docs/2026-08-25-drain-repack-wiring.md`; this doc's §6 SCH-1…SCH-11 / PBT-S1 stay normative (PBT-S1 gained coverage conjuncts there). §4's "a mounted host … starts its own scheduler" and §5's table read with that phase added.
+> **Extension note (2026-08-25):** the drain gained a REPACK phase — per repo, GC then `repack()` over survivors; repack is due on its own `last_repack_at` watermark or whenever GC is due, closing holes a sweep can make in the encoding tier. The switch is `PGGIT_GC_REPACK_ENABLED`, and `DrainEntry` is nested `{ repo, gc, repack }`. The design, its provenance, and the SCH-R1…R8 contract live in `docs/2026-08-25-drain-repack-wiring.md`; this doc's §6 SCH-1…SCH-11 / PBT-S1 stay normative (PBT-S1 gained coverage conjuncts there). §4's "a mounted host … starts its own scheduler" and §5's table read with that phase added.
 
 - **Date:** 2026-06-24
 - **Status:** approved design, pre-implementation. Next step is **tests-first** (behavioural, observable-only — see §7), then implementation.

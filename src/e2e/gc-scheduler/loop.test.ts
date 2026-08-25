@@ -17,20 +17,9 @@ import {
  * GC scheduler — the drain loop's ELIGIBILITY policy
  * (`docs/2026-06-24-gc-scheduler-design.md` §6, items SCH-3, SCH-4, SCH-5).
  *
- * Eligibility is the whole policy (§2): a repo is drained by a pass iff
- * `last_pushed_at IS NOT NULL AND (last_gc_at IS NULL OR last_pushed_at >
- * last_gc_at)`. These cases pin WHICH repos a `drainOnce()` touches —
- * independent of how MUCH each reclaims — so the scheduler runs with a huge
- * grace (no orphan is ever old enough to reclaim) to fully decouple the
- * eligible-SET assertions from the reclaim amount. `drainOnce()` is driven
- * directly; the `setInterval` timer is never in the critical path (§7).
+ * The original cases pin the GC arm: with repack disabled, a repo is drained iff `last_pushed_at IS NOT NULL AND (last_gc_at IS NULL OR last_pushed_at > last_gc_at)`. They run with a huge grace to decouple the selected set from the reclaim amount. The SCH-R4/R5 case then pins the union's repack-only arm and late enablement. `drainOnce()` is driven directly; the timer is never in the critical path.
  *
- * OBSERVABLE-ONLY: every assertion is on the `DrainSummary` return value, the two
- * new `repos` columns via `repoGcState`, or `git_object` rows via
- * `objectOids`/`countObjects`. Nothing probes scheduler internals (timer
- * mechanics, candidate SQL, concurrency choreography, the per-repo guard) — those
- * stay free to change. Determinism comes from the scheduler's `graceSeconds`,
- * never a wall-clock wait.
+ * OBSERVABLE-ONLY: every assertion is on `DrainSummary`, the scheduling watermarks, or the object/encoding rows. Nothing probes scheduler internals. Determinism comes from `graceSeconds`, never a wall-clock wait.
  *
  * These cases pin the activity stamp and drain-loop contract under §6.
  */

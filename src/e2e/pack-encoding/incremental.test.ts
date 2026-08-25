@@ -17,6 +17,7 @@ import { createRefStore, type RefStore } from "@/store/refs-store"
 import { createRepack, type Repack } from "@/store/repack"
 import { lookupRepoId } from "@/store/repo-resolver"
 import { createAppendOnlyRepo, RUNS_DIR, runDirName } from "@/testing/append-only-repo"
+import { encodingRows } from "@/testing/gc-helpers"
 import { seedRepoIntoStore } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { spawnGit } from "@/testing/spawn-git"
@@ -44,7 +45,7 @@ describe("repack — incremental passes", () => {
 	let refs: RefStore
 	let repack: Repack
 	let src = ""
-	let firstPassRows = new Map<string, string>()
+	let firstPassRows: string[] = []
 	let secondPass: Awaited<ReturnType<Repack["repack"]>>
 
 	beforeAll(async () => {
@@ -56,7 +57,7 @@ describe("repack — incremental passes", () => {
 		src = await createAppendOnlyRepo({ docs: 4, runs: INITIAL_RUNS })
 		await seedRepoIntoStore(REPO, src, { objects, refs })
 		await repack.repack(REPO)
-		firstPassRows = await rowFingerprints()
+		firstPassRows = await encodingRows(db, REPO)
 
 		// The repo grows; re-seeding pushes the new objects and advances the ref
 		// (putPack is idempotent for the objects both histories share).
@@ -76,20 +77,6 @@ describe("repack — incremental passes", () => {
 		return id
 	}
 
-	/** oid → `${base}:${sha1ish-of-data}` for every encoding row. */
-	async function rowFingerprints(): Promise<Map<string, string>> {
-		const id = await repoId()
-		const rows = await db.sql<{ oid: Buffer; base_oid: Buffer | null; digest: string }[]>`
-			select oid, base_oid, md5(data) as digest
-			from git_pack_encoding where repo_id = ${id}::bigint`
-		return new Map(
-			rows.map((r) => [
-				r.oid.toString("hex"),
-				`${r.base_oid?.toString("hex") ?? "-"}:${r.digest}`,
-			]),
-		)
-	}
-
 	it("covers the grown inventory completely", async () => {
 		const id = await repoId()
 		const [counts] = await db.sql<{ objects: string; encodings: string }[]>`
@@ -99,7 +86,7 @@ describe("repack — incremental passes", () => {
 		if (counts === undefined) throw new Error("inventory count query returned no row")
 		expect(counts.encodings).toBe(counts.objects)
 		// And the growth was real: pass 2 had genuinely new objects to cover.
-		expect(Number(counts.objects)).toBeGreaterThan(firstPassRows.size)
+		expect(Number(counts.objects)).toBeGreaterThan(firstPassRows.length)
 	})
 
 	it("deltifies in the incremental pass — the star invariant has rows to judge", () => {
@@ -122,11 +109,9 @@ describe("repack — incremental passes", () => {
 	})
 
 	it("never rewrites a finalized encoding (the frozen policy)", async () => {
-		const after = await rowFingerprints()
-		for (const [oid, fingerprint] of firstPassRows) {
-			expect(after.get(oid), `encoding for ${oid} changed across passes`).toBe(
-				fingerprint,
-			)
-		}
+		// SUBSET, not equality: pass 2 legitimately ADDS rows for the grown
+		// inventory; frozen means every pass-1 row survives byte-identical.
+		const after = await encodingRows(db, REPO)
+		for (const line of firstPassRows) expect(after).toContain(line)
 	})
 })

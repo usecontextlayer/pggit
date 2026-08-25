@@ -53,10 +53,7 @@ export async function startServer(
 		throw new Error("pggit: PGGIT_DATABASE_URL is required to serve")
 	}
 
-	// Self-scheduling GC: the background drain that keeps storage bounded, off the
-	// request path (docs/2026-06-24-gc-scheduler-design.md §4). Enabled by default;
-	// opts override env (`PGGIT_GC_*`). A mounted host that wants GC instead starts
-	// its own scheduler over its `pg` — `createGitApp` stays scheduler-free.
+	// Self-scheduling maintenance: the background GC-then-repack drain, off the request path (docs/2026-08-25-drain-repack-wiring.md). Enabled by default; opts override env (`PGGIT_GC_*`). A mounted host starts its own scheduler over its `pg` — `createGitApp` stays scheduler-free.
 	//
 	// The drain runs on a DEDICATED connection pool, separate from the request path:
 	// each concurrent gc() reserves a connection for its whole live-set plan and sweep,
@@ -86,7 +83,7 @@ export async function startServer(
 	return {
 		close: async () => {
 			// Drain the in-flight pass before tearing down its pool — stop() awaits it,
-			// so no GC query runs into a closed pool (a clean SIGTERM, no spurious error).
+			// so no drain query runs into a closed pool (a clean SIGTERM, no spurious error).
 			await scheduler?.stop()
 			await server.close()
 			await pg.end()

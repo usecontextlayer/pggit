@@ -27,7 +27,6 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { setTimeout as sleep } from "node:timers/promises"
 import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps } from "@/index"
@@ -36,6 +35,7 @@ import { createGcScheduler, type DrainEntry } from "@/store/gc-scheduler"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { encodingViolations, repoRepackStamp } from "@/testing/gc-helpers"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { abortBackendWhenActive } from "@/testing/pg-fault"
 import { spawnGit } from "@/testing/spawn-git"
 import {
 	captureTestResult,
@@ -47,29 +47,6 @@ const RUNS = 600
 const REPO = "txn/drain-repack-fault"
 const COPY_NEEDLE = "copy_stg_git_pack_encoding"
 const AIM_TIMEOUT_MS = 45_000
-
-/** Poll ONE pid until it is inside repack's COPY staging work, then cancel that statement. Bounded;
- * `stop.now` ends the watch the moment the drain settles, so a miss costs one
- * poll — and reports false, which the entry-shape assertion turns into a loud
- * failure instead of a vacuous pass. */
-async function cancelRepackCopyWhenActive(
-	admin: Sql,
-	pid: number,
-	stop: { now: boolean },
-): Promise<boolean> {
-	const t0 = Date.now()
-	while (!stop.now && Date.now() - t0 < AIM_TIMEOUT_MS) {
-		const [act] = await admin<{ q: string }[]>`
-			select query as q from pg_stat_activity
-			where pid = ${pid} and state = 'active'`
-		if (act?.q.toLowerCase().replace(/\s+/g, " ").includes(COPY_NEEDLE)) {
-			await admin`select pg_cancel_backend(${pid})`
-			return true
-		}
-		await sleep(1)
-	}
-	return false
-}
 
 describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SCH-R6)", () => {
 	let db: IsolatedDb
@@ -132,19 +109,24 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 		const [pidRow] = await drainSql<{ pid: number }[]>`select pg_backend_pid() as pid`
 		if (pidRow === undefined) throw new Error("pg_backend_pid returned no row")
 		const stop = { now: false }
-		const aimed = cancelRepackCopyWhenActive(admin, pidRow.pid, stop)
+		const aimed = abortBackendWhenActive(
+			admin,
+			pidRow.pid,
+			{ kind: "cancel", needle: COPY_NEEDLE, skip: 0 },
+			{ limitMs: AIM_TIMEOUT_MS, stop },
+		)
 		const first = await scheduler.drainOnce()
 		stop.now = true
 		aimHit = await aimed
 		firstEntry = first.find((e) => e.repo === REPO)
-		stampAfterFault = await repoRepackStamp({ sql: admin }, REPO)
-		violationsAfterFault = await encodingViolations({ sql: admin }, REPO)
+		stampAfterFault = await repoRepackStamp(db, REPO)
+		violationsAfterFault = await encodingViolations(db, REPO)
 
 		// ── pass 2: recovery — the union re-selects the repo on the repack arm ─
 		const second = await scheduler.drainOnce()
 		secondEntry = second.find((e) => e.repo === REPO)
-		violationsAfterRecovery = await encodingViolations({ sql: admin }, REPO)
-		stampAfterRecovery = await repoRepackStamp({ sql: admin }, REPO)
+		violationsAfterRecovery = await encodingViolations(db, REPO)
+		stampAfterRecovery = await repoRepackStamp(db, REPO)
 
 		// ── pass 3: both watermarks caught up — the repo is no longer selected ─
 		thirdSummaryRepos = (await scheduler.drainOnce()).map((e) => e.repo)

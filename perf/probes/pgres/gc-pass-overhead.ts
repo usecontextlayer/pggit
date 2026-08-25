@@ -128,8 +128,7 @@ async function main(): Promise<void> {
 		const gc = createGc(pg)
 		const repack = createRepack(pg)
 
-		// A small fleet modeling one scheduler tick whose eligible set contains these
-		// repos. The production scheduler runs GC only for repos selected by that tick.
+		// A small fleet modeling the GC phase of one scheduler tick; this probe invokes GC directly to isolate that phase's cost from repack.
 		const dir = await initRepo("gcpass")
 		await fastImport(
 			dir,
@@ -297,7 +296,7 @@ async function main(): Promise<void> {
 			),
 		)
 		console.log(
-			"\nEvery GC invocation creates and drops one `gc_live` TEMP table. The create/drop cycle churns catalog rows in pg_class/pg_attribute/pg_depend — shared by every repo and schema in the database, never vacuumed by `maintain()`. The scheduler invokes GC only for repos eligible in that tick.",
+			"\nEvery GC invocation creates and drops one `gc_live` TEMP table. The create/drop cycle churns catalog rows in pg_class/pg_attribute/pg_depend — shared by every repo and schema in the database, never vacuumed by `maintain()`. The drain invokes this phase only for repos whose GC arm is due.",
 		)
 
 		// ── does the no-op sweep cost scale with the tier's SIZE? ───────────────

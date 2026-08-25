@@ -56,9 +56,9 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * this pass's reads) stays newer than the stamp and the next pass treats it as
  * ordinary new work, never as a hole. Any invoker that runs both maintenance
  * passes must serialize repack per repo AFTER GC (D5) so it encodes survivors,
- * not garbage — the built-in drain (`store/gc-scheduler.ts`, eligibility
- * `last_pushed_at > last_repack_at`) does exactly this; a host may also invoke
- * `repack()` directly on its own schedule.
+ * not garbage — the built-in drain (`store/gc-scheduler.ts`) does exactly this
+ * whenever repack's watermark or the coupled GC arm is due; a host may also
+ * invoke `repack()` directly on its own schedule.
  */
 
 /** Anchor cadence: a segment holds one whole anchor plus at most K−1 deltas

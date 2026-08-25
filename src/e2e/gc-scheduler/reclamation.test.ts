@@ -25,12 +25,7 @@ import {
  * scheduler) and SCH-7 (no-lost-garbage across a post-snapshot push; the durable
  * analog of the GC primitive's GC-9).
  *
- * These drive `createGcScheduler(...).drainOnce()` — NOT `gc()` directly — so the
- * reclamation is observed as the scheduler's eligible-set decision + GC effect,
- * exactly as the background drain runs it. Eligibility (§2) is the whole policy:
- * a repo is drained iff `last_pushed_at IS NOT NULL AND (last_gc_at IS NULL OR
- * last_pushed_at > last_gc_at)`; a pass stamps each eligible repo's `last_gc_at`
- * to the pass start time, so a push landing after the stamp re-qualifies it.
+ * These drive `createGcScheduler(...).drainOnce()` rather than `gc()` directly, so the effects are observed through the background drain's union selection and per-phase gating. The original cases run with repack disabled and pin the GC watermark; the SCH-R cases enable repack and pin coverage, ordering, incrementality, and the coupled GC→repack arm.
  *
  * OBSERVABLE-ONLY: every assertion reads (a) the real `git` oracle
  * (fetch/clone/fsck/rev-list via `gitReachableOids`/`cloneAndFsck`), (b) Postgres
@@ -42,7 +37,7 @@ import {
  * the orphans past the cutoff with `ageObjects`, never by sleeping on the wall
  * clock.
  *
- * These cases pin scheduler eligibility and reclamation under §6.
+ * These cases pin scheduler eligibility, reclamation, and repack coverage under §6 and SCH-R1/R2/R3/R8.
  */
 describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6, SCH-7)", () => {
 	let fx: GcFixture

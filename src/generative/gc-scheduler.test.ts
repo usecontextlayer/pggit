@@ -12,7 +12,7 @@
  *       op. Because every repo here is created by (and only by) such ops and starts
  *       with `last_gc_at IS NULL`, the eligible set === ALL touched repos. So the
  *       summary's repo set must equal the set of touched repos; AND
- *   (c) carry `settled: true` in that summary — with `graceSeconds: 0` the settle
+ *   (c) carry `gc.settled: true` in that summary — with `graceSeconds: 0` the settle
  *       stamp must land for every repo the pass drained; AND
  *   (d) be GONE from a second, immediately following `drainOnce()`. That second pass
  *       is the only place the `last_pushed_at <= last_gc_at` state — the one the
@@ -30,8 +30,7 @@
  * This GENERALISES the example-based scheduler cases: SCH-3 (drains exactly the
  * eligible set), SCH-6 (end-to-end reclamation through the loop), SCH-8 (tenant
  * isolation — every eligible repo ends up correctly GC'd regardless of the pass's
- * internal concurrency). The whole policy under test is the eligibility predicate
- * `last_pushed_at IS NOT NULL AND (last_gc_at IS NULL OR last_pushed_at > last_gc_at)`.
+ * internal concurrency). The policy under test is the union of the GC and repack watermarks, with every GC-due repo also repack-due while that phase is enabled.
  *
  * OBSERVABLE-ONLY (§6, non-negotiable): every assertion reads only the real-`git`
  * oracle (`fetch` / `rev-list` via `gitReachableOids`), Postgres rows

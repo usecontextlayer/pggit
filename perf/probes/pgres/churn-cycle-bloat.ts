@@ -6,13 +6,12 @@
  * N new commits, move `refs/heads/main` to the new tip (orphaning the previous
  * round), GC with `graceSeconds: 0`, then optionally repack. The LIVE set is
  * CONSTANT round over round — the same base plus one round's worth — so every
- * monotone increase in physical bytes is bloat, not data. The built-in scheduler
- * invokes GC only; this harness models host-driven repack composition in modes A/B.
+ * monotone increase in physical bytes is bloat, not data. The harness invokes the primitives directly so it can compare the drain's GC→repack shape with an explicitly repack-disabled control.
  *
  * Three modes, each in its own schema, so the tier's cost is isolated by control:
- *   A  gc(maintain: true) → repack   — host composition with explicit vacuum.
- *   B  gc(maintain: false) → repack  — host composition without explicit vacuum.
- *   C  gc(maintain: false) only      — built-in scheduler shape and tier-absent control.
+ *   A  gc(maintain: true) → repack   — drain order with explicit vacuum.
+ *   B  gc(maintain: false) → repack  — production drain order without explicit vacuum.
+ *   C  gc(maintain: false) only      — repack-disabled, tier-absent control.
  *
  * Comparators inside every mode: `git_object` (same schema, same rounds, same
  * reloptions family — and `gc.ts maintain()` vacuums both it and the encoding
@@ -107,19 +106,19 @@ type Mode =
 const MODES: Mode[] = [
 	{
 		key: "A",
-		label: "A  gc(maintain: true) → repack   — host composition with vacuum",
+		label: "A  gc(maintain: true) → repack   — drain order with vacuum",
 		maintain: true,
 		repack: true,
 	},
 	{
 		key: "B",
-		label: "B  gc(maintain: false) → repack  — host composition without vacuum",
+		label: "B  gc(maintain: false) → repack  — production drain order",
 		maintain: false,
 		repack: true,
 	},
 	{
 		key: "C",
-		label: "C  gc(maintain: false) only      — built-in scheduler; tier absent",
+		label: "C  gc(maintain: false) only      — repack disabled; tier absent",
 		maintain: false,
 		repack: false,
 	},
@@ -255,7 +254,7 @@ async function runMode(mode: Mode): Promise<ModeResult> {
 			>`select count(*)::text as n from git_object`
 			if (!beforeGc) throw new Error(`${mode.key} round ${r}: missing pre-GC census`)
 
-			// Model the host composition explicitly; the built-in scheduler stops after GC.
+			// Invoke the phases directly so each mode can choose maintenance and repack policy.
 			const g = await gc.gc(REPO, { graceSeconds: 0, maintain: mode.maintain })
 			const p = mode.repack ? await repack.repack(REPO) : { deltas: 0, wholes: 0 }
 			const liveObjects = [...baseObjects, ...roundObjects]

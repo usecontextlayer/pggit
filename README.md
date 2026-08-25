@@ -107,7 +107,7 @@ git's core data is immutable, content-addressed objects, so pggit stores them th
 
 Pushes ingest via binary `COPY` (no per-row bind-parameter ceiling, so a single push can carry huge blobs and tens of thousands of files). Thin-pack delta bases are resolved against objects already in the store. Fetches serve undeltified packs built straight from the closure. OIDs are SHA-1 throughout; correctness is pinned by a suite that round-trips every operation against the real `git` binary and diffs generated commit graphs with `fast-check`.
 
-Because objects are append-only, cleanup is deletion, not rewriting. A background **GC drain** keeps storage bounded: for any repo pushed since its last sweep, it reclaims objects unreachable from every ref and older than a grace window, using the same reachability engine the serve path uses — so a reachable object is never deleted — on a connection pool separate from the request path. The standalone server runs it on by default; a mounted host opts in with the exported `createGcScheduler`.
+Because objects are append-only, cleanup is deletion, not rewriting. A background **GC drain** keeps storage bounded and the derived pack-encoding tier covered: it selects any repo owing GC or repack work, reclaims objects unreachable from every ref and older than a grace window, then repacks the survivors when that phase is enabled. GC uses the same reachability engine as the serve path, so a reachable object is never deleted; both phases run on a connection pool separate from the request path. The standalone server runs the drain by default; a mounted host opts in with the exported `createGcScheduler`.
 
 ## Configuration
 
@@ -115,10 +115,11 @@ Because objects are append-only, cleanup is deletion, not rewriting. A backgroun
 |---|---|---|---|
 | `PGGIT_DATABASE_URL` | the server (`pnpm run dev`, `startServer`) | — | Required to serve; throws on boot if unset. |
 | `PGGIT_PORT` | the server | `8080` | Listen port. |
-| `PGGIT_GC_ENABLED` | the server | `true` | Runs the background GC drain that reclaims unreachable objects. |
+| `PGGIT_GC_ENABLED` | the server | `true` | Runs the background GC-then-repack drain. |
+| `PGGIT_GC_REPACK_ENABLED` | the server | `true` | Runs the drain's repack phase; disabling it leaves a GC-only drain and enabling it later backfills coverage. |
 | `PGGIT_GC_GRACE_SECONDS` | the server | `60` | Reclaim only objects unreachable for longer than this. |
 | `PGGIT_GC_INTERVAL_MS` | the server | `30000` | How often the drain polls for repos to sweep. |
-| `PGGIT_GC_CONCURRENCY` | the server | `4` | Max repos swept per drain pass. |
+| `PGGIT_GC_CONCURRENCY` | the server | `4` | Max repos drained concurrently; also bounds concurrent repack memory. |
 | `DATABASE_URL` | the migration CLI (`pnpm run db.manage`) | — | Required for `latest`/`up`/`down`/`reset`/`drop`. |
 
 ## Scope

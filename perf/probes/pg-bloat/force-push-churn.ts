@@ -1,6 +1,5 @@
 /**
- * pg-bloat/force-push-churn — what a host-driven GC→repack maintenance sequence
- * costs under repeated force-push churn.
+ * pg-bloat/force-push-churn — what the drain's GC→repack maintenance sequence costs under repeated force-push churn.
  *
  * THE CLAIM UNDER TEST. `gc.ts` skips VACUUM/REINDEX on the drain's hot cadence
  * ("autovacuum reclaims the GC churn instead"), and 0005/0008 tune every leaf
@@ -14,9 +13,7 @@
  * motivating tenant produces: advance `refs/heads/main` by ADVANCE commits (real
  * objects ingested through the real store), rewrite the ref through the internal
  * platform API to the previous tip (the smart-HTTP wire denies rewinds), then run
- * `gc(graceSeconds: 0, maintain: false)` followed by `repack()`. The built-in
- * scheduler invokes GC only; hosts invoke the exported repack pass as needed, so
- * this harness drives that engine-side composition directly.
+ * `gc(graceSeconds: 0, maintain: false)` followed by `repack()`. This is the built-in drain's phase order; the harness invokes both exported primitives directly to control each measured round.
  *
  * WHAT IT PRINTS
  *   - per round: total/heap/toast/index bytes for all seven measured tables, dead tuples,
@@ -177,7 +174,7 @@ async function main(): Promise<void> {
 	const scratch = scratchRoot("churn")
 	const db = await createIsolatedSchema(PG_URL)
 	try {
-		console.log(`# Force-push churn economics under a host-driven GC→repack sequence\n`)
+		console.log(`# Force-push churn economics under the drain's GC→repack sequence\n`)
 		console.log(
 			`schema ${db.schema} · base ${BASE} commits · ${ROUNDS} rounds × advance ${ADVANCE} then rewind\n`,
 		)

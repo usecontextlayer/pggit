@@ -31,6 +31,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
+import { abortBackendWhenActive } from "@/testing/pg-fault"
 import { type SpawnGitBoundedResult, spawnGitBounded } from "@/testing/spawn-git"
 
 const RUNS = 700
@@ -50,24 +51,6 @@ const REPO = "txn/copy-hang"
  * itself stays active for a few hundred ms.
  */
 const COPY_NEEDLE = 'copy "copy_stg_git_object"'
-
-/** Poll `pid` until it is executing the ingest COPY, then cancel THAT statement;
- * report whether it ever fired. Bounded by `WAIT_S` so a push that never reaches
- * the COPY ends the watch instead of hanging the suite — and reports `false`, which
- * the barrier turns into a failure rather than a silent green. */
-async function cancelIngestCopy(admin: Sql, pid: number): Promise<boolean> {
-	const t0 = Date.now()
-	while (Date.now() - t0 < WAIT_S * 1000) {
-		const [act] = await admin<{ q: string }[]>`
-			select query as q from pg_stat_activity where pid = ${pid} and state = 'active'`
-		if (act?.q?.includes(COPY_NEEDLE)) {
-			await admin`select pg_cancel_backend(${pid})`
-			return true
-		}
-		await sleep(1)
-	}
-	return false
-}
 
 describe("regressions/pg-txn — a cancelled ingest COPY must not hang the push", () => {
 	type BackendObservation =
@@ -116,7 +99,12 @@ describe("regressions/pg-txn — a cancelled ingest COPY must not hang the push"
 
 		// FAULT POINT: the watcher cancels the ingest COPY as soon as the server is
 		// inside it. Started BEFORE the push so it cannot miss a fast COPY.
-		const watcher = cancelIngestCopy(admin, pid)
+		const watcher = abortBackendWhenActive(
+			admin,
+			pid,
+			{ kind: "cancel", needle: COPY_NEEDLE, skip: 0 },
+			{ limitMs: WAIT_S * 1000 },
+		)
 		push = await spawnGitBounded(
 			["push", url, "refs/heads/main:refs/heads/main"],
 			src,

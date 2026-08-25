@@ -24,16 +24,17 @@ The drain (`src/store/gc-scheduler.ts`) runs GC only; repack (`src/store/repack.
 ```sql
 select r.id::text as id, r.name,
   (r.last_gc_at is null or r.last_pushed_at > r.last_gc_at) as gc_due,
-  (${repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at)) as repack_due
+  (${repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at
+    or r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)) as repack_due
 from repos r
 where r.last_pushed_at is not null
   and ((r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)
     or (${repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at)))
 ```
 
-`Candidate` becomes `{ id, name, gcDue, repackDue }`.
+`Candidate` is the raw query row, tightened so the selected invariant is representable in its type: `{ id, name } & ({ gc_due: true, repack_due: boolean } | { gc_due: false, repack_due: true })`.
 
-**`drainRepo`, two-phase.** If `gcDue`: run gc exactly as today — t0 capture, `gc()`, the settled UPDATE, all unchanged. If gc threw: skip repack (D5 — never encode what the next sweep deletes) and drop the repo from this pass's summary, as today. If `repackDue` and gc did not fail this pass: run `repack.repack(name)`; on throw, log loudly and record no repack result. **Emission rule, subsuming every case: an entry is emitted iff at least one phase produced a result.** So gc-threw → dropped, retried next tick; repack-only-and-threw → dropped, retried next tick; gc-ok-repack-threw → emitted with the real gc numbers and `repack: null`. Both watermarks stay behind on any failure and the union keeps the repo a candidate: eventually correct with zero new retry machinery. Neither phase needs new crash-safety — gc's t0-before-snapshot argument and repack's stamp-at-pass-start discipline (an object ingested mid-pass stays newer than the stamp) are each already self-contained; the drain only decides who runs.
+**`drainRepo`, two-phase.** If `gc_due`: run gc exactly as today — t0 capture, `gc()`, the settled UPDATE, all unchanged. If gc threw: skip repack (D5 — never encode what the next sweep deletes) and drop the repo from this pass's summary, as today. If `repack_due` and gc did not fail this pass: run `repack.repack(name)`; on throw, log loudly and record no repack result. **Emission rule, subsuming every case: an entry is emitted iff at least one phase produced a result.** So gc-threw → dropped, retried next tick; repack-only-and-threw → dropped, retried next tick; gc-ok-repack-threw → emitted with the real gc numbers and `repack: null`. Both watermarks stay behind on any failure and the union keeps the repo a candidate: eventually correct with zero new retry machinery. Neither phase needs new crash-safety — gc's t0-before-snapshot argument and repack's stamp-at-pass-start discipline (an object ingested mid-pass stays newer than the stamp) are each already self-contained; the drain only decides who runs.
 
 **Deliberately unchanged:** `start()`/`stop()`/`inFlight`/`mapPool`, the timer, the per-repo failure-isolation shape, and `startServer`'s dedicated-pool sizing (`concurrency + 1`) — repack runs its queries serially per repo and its COPY flushes ride `pg.begin`'s single reserved connection, so a repo in its repack phase holds at most one connection at a time and the existing headroom covers it.
 
@@ -77,7 +78,7 @@ Same doctrine as the 2026-06-24 doc §6: three observable surfaces (Postgres row
 
 ### Decided — implementation
 
-- **The switch has exactly one enforcement point: the candidate query's `${repackEnabled}` bind.** `createRepack(pg)` is constructed unconditionally beside `createGc(pg)`, and `drainRepo` carries no `if (repackEnabled)` — when the switch is off, `repackDue` is false for every candidate by construction. Rejected: conditional construction or a second JS-side gate, which would be two places for "off" to disagree.
+- **The switch has exactly one enforcement point: the candidate query's `${repackEnabled}` bind.** `createRepack(pg)` is constructed unconditionally beside `createGc(pg)`, and `drainRepo` carries no `if (repackEnabled)` — when the switch is off, `repack_due` is false for every candidate by construction. Rejected: conditional construction or a second JS-side gate, which would be two places for "off" to disagree.
 - **Repack rides the scheduler's own `pg` handle** — in `startServer` that is the dedicated `gcPg` pool, so repack's reads and COPY flushes never touch the request pool. This falls out of building `createRepack` over the scheduler's `pg`; wiring it over the request `pg` instead would silently undo the connection-isolation decision the scheduler doc records (§9).
 - **`repack.repack(c.name)` by name, not by the candidate's `id`.** Repack re-resolves via `lookupRepoId` deliberately (its module doc: a long-lived instance must survive repo delete/re-create cycles). The obvious "optimization" — passing the id the candidate query already has — breaks that contract.
 - **`startServer`'s signature is unchanged**; the only edit there is one defaulting line in the resolve call (`repackEnabled: opts.gc?.repackEnabled ?? env.PGGIT_GC_REPACK_ENABLED`).
