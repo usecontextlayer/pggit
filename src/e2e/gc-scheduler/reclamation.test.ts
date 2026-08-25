@@ -421,4 +421,57 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		for (const line of coveredRows) expect(afterRows).toContain(line)
 		expect(await encodingViolations(fx.db, repo)).toEqual([])
 	})
+
+	// SCH-R8 (docs/2026-08-25-drain-repack-wiring.md, R-EL′) — the arms are
+	// COUPLED: any pass that runs GC on a repo also runs repack when the phase is
+	// enabled, whatever the repack watermark says. A GC sweep can hole the tier
+	// through the 0008 cascades (a surviving tree's delta whose anchor died with a
+	// rewound chain — pack-encoding/gc's dangling-base shape), and the watermark
+	// alone would strand that hole: an unsettled in-grace pass stamps
+	// last_repack_at, the later sweeping pass would be gc-only, gc settles, and
+	// nothing re-selects the repo until a future push. Coupling keeps coverage
+	// self-healing at the pass where holes can form.
+	it("SCH-R8: a sweeping pass runs repack too — the coupled arm keeps coverage self-healing", async () => {
+		const repo = "schr8-coupled-arms"
+		const scheduler = createGcScheduler(fx.db.sql, {
+			concurrency: 4,
+			graceSeconds: 3600,
+			intervalMs: 30_000,
+			repackEnabled: true,
+		})
+		// Pass 1, IN GRACE: gc runs and does not settle; repack runs and stamps —
+		// encoding everything, the young garbage included (the designed path).
+		await pushFile(fx, repo, { content: "r8 v1\n" })
+		await pushFile(fx, repo, { content: "r8 v2\n", rewind: true }) // v1 is young garbage
+		const first = await scheduler.drainOnce()
+		const e1 = first.find((e) => e.repo === repo)
+		if (e1 === undefined) throw new Error(`drain summary omitted ${repo}`)
+		if (e1.gc === null) throw new Error(`entry for ${repo} carries no GC result`)
+		expect(e1.gc.settled).toBe(false)
+		expect(e1.repack).not.toBeNull()
+		expect(await repoRepackStamp(fx.db, repo)).not.toBeNull()
+
+		// The push recedes past grace and the orphans age out. The repack WATERMARK
+		// is now quiet (last_repack_at postdates the push) while gc is still due —
+		// the exact shape that would strand a cascade hole under a pure-watermark
+		// predicate.
+		await fx.db.sql`
+			update repos set last_pushed_at = last_pushed_at - interval '2 hours'
+			where name = ${repo}`
+		await ageObjects(fx.db, repo, "2 hours")
+
+		// Pass 2: sweeps the aged orphans AND — the coupled arm — repacks in the
+		// same pass: the entry carries BOTH results and the tier stays covered.
+		const second = await scheduler.drainOnce()
+		const e2 = second.find((e) => e.repo === repo)
+		if (e2 === undefined) throw new Error(`second drain summary omitted ${repo}`)
+		if (e2.gc === null) throw new Error(`second entry for ${repo} carries no GC result`)
+		expect(e2.gc.deletedObjects).toBeGreaterThan(0)
+		expect(e2.gc.settled).toBe(true)
+		expect(e2.repack).not.toBeNull() // null under a pure-watermark predicate
+		expect(await encodingViolations(fx.db, repo)).toEqual([])
+
+		// Settled + covered: a third pass omits the repo (both arms quiet).
+		expect((await scheduler.drainOnce()).map((e) => e.repo)).not.toContain(repo)
+	})
 })

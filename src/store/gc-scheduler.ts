@@ -18,8 +18,10 @@ import { createRepack, type RepackResult } from "@/store/repack"
  * pure poll loop over Postgres with NO coupling to the request path. One pass
  * (`drainOnce`) selects the repos where either phase owes work — GC when
  * `last_pushed_at > last_gc_at`, repack when `last_pushed_at > last_repack_at`
- * (each NULL-qualifying) — and runs the due phases on each, GC first (repack
- * encodes SURVIVORS, never garbage), per-repo serialized, bounded concurrency. A
+ * OR when GC is due (each NULL-qualifying; the coupling is R-EL′/SCH-R8 — a
+ * sweep can hole the encoding tier, so a sweeping pass re-covers it) — and runs
+ * the due phases on each, GC first (repack encodes SURVIVORS, never garbage),
+ * per-repo serialized, bounded concurrency. A
  * pass advances `last_gc_at` to its start time only after the repo's grace
  * horizon; a younger repo remains eligible, and a push landing mid-pass also
  * re-qualifies it (no lost garbage). `last_repack_at` is stamped by `repack()`
@@ -120,14 +122,19 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 
 	/** The eligible repos for this pass — the union of the two phase predicates
 	 * (the GC design's §2 predicate, plus repack's `last_pushed_at >
-	 * last_repack_at` when the phase is enabled). The resolved switch is bound
-	 * into the query here and ONLY here — with it off, `repack_due` is false for
-	 * every candidate by construction, and no other code path gates the phase. */
+	 * last_repack_at` when the phase is enabled). The arms are COUPLED (R-EL′):
+	 * a gc-due repo is also repack-due, because a GC sweep can hole the encoding
+	 * tier through the 0008 cascades and the repack watermark alone would strand
+	 * that hole until the next push (SCH-R8) — a covered repo's extra repack is
+	 * one empty pending query plus a stamp. The resolved switch is bound into the
+	 * query here and ONLY here — with it off, `repack_due` is false for every
+	 * candidate by construction, and no other code path gates the phase. */
 	async function selectCandidates(): Promise<Candidate[]> {
 		return pg<Candidate[]>`
 			select r.id::text as id, r.name,
 				(r.last_gc_at is null or r.last_pushed_at > r.last_gc_at) as gc_due,
-				(${opts.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at)) as repack_due
+				(${opts.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at
+					or r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)) as repack_due
 			from repos r
 			where r.last_pushed_at is not null
 				and ((r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)
