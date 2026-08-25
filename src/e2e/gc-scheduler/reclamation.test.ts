@@ -350,14 +350,12 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		expect(entry.gc.deletedObjects).toBe(orphaned.length)
 
 		// R3 — ordering observable: the tier covers exactly the post-GC survivor set.
-		// Violations empty pins "every sub-cap survivor has a row"; count equality
-		// pins "and nothing else" (this fixture's objects are all sub-cap); the
-		// explicit orphan check reads the swept direction on the rows themselves.
+		// Violations empty pins both directions: every sub-cap survivor has a row and
+		// no row remains for an object GC swept. Count equality makes exact coverage
+		// explicit for this all-sub-cap fixture.
 		expect(await encodingViolations(fx.db, repo)).toEqual([])
 		const rows = await encodingRows(fx.db, repo)
 		expect(rows.length).toBe(await countObjects(fx.db, repo))
-		const encodedOids = rows.map((line) => line.split(" ")[0])
-		for (const oid of orphaned) expect(encodedOids).not.toContain(oid)
 
 		// R1 — the entry's counts are REAL: the tier was empty before this pass, so
 		// wholes + deltas must equal every row now present; and repack stamped its

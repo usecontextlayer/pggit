@@ -61,7 +61,10 @@ export type DrainSummary = DrainEntry[]
  * watermark is `repack()`'s own business (it stamps `last_repack_at` itself on
  * success — the stamp must mean "a completed pass" for every invoker, so the
  * drain never writes it). */
-type Candidate = { id: string; name: string; gc_due: boolean; repack_due: boolean }
+type Candidate = { id: string; name: string } & (
+	| { gc_due: true; repack_due: boolean }
+	| { gc_due: false; repack_due: true }
+)
 
 const MAX_TIMER_MS = 2_147_483_647
 

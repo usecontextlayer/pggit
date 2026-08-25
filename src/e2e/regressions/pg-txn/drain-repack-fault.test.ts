@@ -36,29 +36,17 @@ import { createGcScheduler, type DrainEntry } from "@/store/gc-scheduler"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
 import { encodingViolations, repoRepackStamp } from "@/testing/gc-helpers"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { attemptGit } from "@/testing/spawn-git"
+import { spawnGit } from "@/testing/spawn-git"
+import {
+	captureTestResult,
+	type TestResult,
+	testResultContext,
+} from "@/testing/test-result"
 
 const RUNS = 600
 const REPO = "txn/drain-repack-fault"
 const COPY_NEEDLE = "copy_stg_git_pack_encoding"
 const AIM_TIMEOUT_MS = 45_000
-
-/** Mirror-clone `url` and `fsck --strict` it; a string is the failure reason. */
-async function cloneClean(url: string, dest: string): Promise<string | null> {
-	const cl = await attemptGit([
-		"-c",
-		"protocol.version=2",
-		"clone",
-		"-q",
-		"--mirror",
-		url,
-		dest,
-	])
-	if (!cl.ok) return `clone failed: ${cl.stderr.trim().split("\n").slice(-2).join(" | ")}`
-	const fsck = await attemptGit(["fsck", "--strict", "--no-dangling"], dest)
-	if (!fsck.ok) return `fsck DIRTY: ${fsck.stderr.trim().slice(0, 200)}`
-	return null
-}
 
 /** Poll ONE pid until it is inside repack's COPY staging work, then cancel that statement. Bounded;
  * `stop.now` ends the watch the moment the drain settles, so a miss costs one
@@ -100,7 +88,7 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 	let violationsAfterRecovery: string[] = []
 	let stampAfterRecovery: Date | null = null
 	let thirdSummaryRepos: string[] = []
-	let finalCloneError: string | null = null
+	let finalClone: TestResult<void>
 
 	beforeAll(async () => {
 		const baseUrl = inject("pgBaseUrl")
@@ -123,8 +111,7 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 		const commits = await commitsOldestFirst(src, "main")
 		const tip = commits[commits.length - 1]
 		if (!tip) throw new Error("fixture produced no commits")
-		const push = await attemptGit(["push", "-q", url, `${tip}:refs/heads/main`], src)
-		if (!push.ok) throw new Error(`seed push failed: ${push.stderr}`)
+		await spawnGit(["push", "-q", url, `${tip}:refs/heads/main`], { cwd: src })
 
 		// max: 1 — every drain statement (both phases) runs on ONE backend, so the
 		// watcher's pid is deterministic. Both primitives are proven on max:1
@@ -163,7 +150,10 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 		thirdSummaryRepos = (await scheduler.drainOnce()).map((e) => e.repo)
 
 		const dest = join(root, "final")
-		finalCloneError = await cloneClean(url, dest)
+		finalClone = await captureTestResult(async () => {
+			await spawnGit(["-c", "protocol.version=2", "clone", "-q", "--mirror", url, dest])
+			await spawnGit(["fsck", "--strict", "--no-dangling"], { cwd: dest })
+		})
 		rmSync(dest, { force: true, recursive: true })
 	}, 600_000)
 
@@ -214,6 +204,8 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 
 	it("a third drain omits the repo, and the recovered repo serves a clean clone", () => {
 		expect(thirdSummaryRepos).not.toContain(REPO)
-		expect(finalCloneError).toBeNull()
+		expect(finalClone.kind, testResultContext(finalClone, "final clone")).toBe(
+			"succeeded",
+		)
 	})
 })
