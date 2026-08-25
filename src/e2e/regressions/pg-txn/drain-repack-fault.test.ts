@@ -33,7 +33,7 @@ import { createGitApp, createGitDeps } from "@/index"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGcScheduler, type DrainEntry } from "@/store/gc-scheduler"
 import { commitsOldestFirst, createAppendOnlyRepo } from "@/testing/append-only-repo"
-import { encodingViolations, repoRepackStamp } from "@/testing/gc-helpers"
+import { ageObjects, encodingViolations, repoRepackStamp } from "@/testing/gc-helpers"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { abortBackendWhenActive } from "@/testing/pg-fault"
 import { spawnGit } from "@/testing/spawn-git"
@@ -82,13 +82,21 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 			max: 5,
 			onnotice: () => {},
 		})
-		server = await serveOnPort(createGitApp(createGitDeps(appSql)), 0)
+		const deps = createGitDeps(appSql)
+		server = await serveOnPort(createGitApp(deps), 0)
 		const url = `http://127.0.0.1:${server.port}/${REPO}`
 
 		const commits = await commitsOldestFirst(src, "main")
 		const tip = commits[commits.length - 1]
 		if (!tip) throw new Error("fixture produced no commits")
 		await spawnGit(["push", "-q", url, `${tip}:refs/heads/main`], { cwd: src })
+		const { oids: orphanOids } = await deps.objects.putPack(REPO, [
+			{ content: Buffer.from("drain repack fault orphan\n"), type: "blob" },
+		])
+		if (orphanOids.length !== 1) {
+			throw new Error(`expected one loose orphan, got ${orphanOids.length}`)
+		}
+		await ageObjects(db, REPO, "1 hour")
 
 		// max: 1 — every drain statement (both phases) runs on ONE backend, so the
 		// watcher's pid is deterministic. Both primitives are proven on max:1
@@ -154,7 +162,11 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 		if (firstEntry.gc === null) {
 			throw new Error(`faulted drain entry carries no GC result`)
 		}
-		expect(firstEntry.gc.settled).toBe(true)
+		expect(firstEntry.gc).toEqual({
+			deletedObjects: 1,
+			epoch: "rebuilt",
+			settled: true,
+		})
 		// THE BARRIER: a non-null repack here means the aimed cancel missed and the
 		// pass completed — this file's whole subject (a torn tier) never existed.
 		if (firstEntry.repack !== null) {

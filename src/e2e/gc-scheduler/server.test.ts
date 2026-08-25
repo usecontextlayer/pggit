@@ -75,10 +75,10 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		await pg?.end()
 	})
 
-	/** The DB shape the row helpers want (`{ db, sql }`), backed by our public-schema
+	/** The DB shape the row helpers want (`{ sql }`), backed by our public-schema
 	 * client — `objectOids` / `ageObjects` / `repoGcState` resolve `git_object` and
 	 * `repos` in `public`. */
-	const sqlDb = (): { db: Kysely<Database>; sql: Sql } => ({ db, sql: pg })
+	const sqlDb = (): { sql: Sql } => ({ sql: pg })
 
 	/** A `Pick<GcFixture, "server" | "refs">` shape so the gc-helpers' URL builder,
 	 * `pushFile` (including its store-level rewind), and `cloneAndFsck` target one of

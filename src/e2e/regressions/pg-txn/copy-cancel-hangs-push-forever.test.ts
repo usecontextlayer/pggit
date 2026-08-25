@@ -196,6 +196,11 @@ describe("regressions/pg-txn — a cancelled ingest COPY must not hang the push"
 			probe.settled,
 			"an unrelated ls-remote also hangs — the stranded connection took the pool to zero and every later request queues forever",
 		).toBe(true)
+		if (!probe.settled) throw new Error("ls-remote did not settle")
+		expect(
+			probe.code,
+			`the pool answered, but ls-remote failed instead of serving normally: ${probe.out.trim().slice(-300)}`,
+		).toBe(0)
 	})
 
 	it("server.close() resolves — the process can still shut down cleanly", () => {

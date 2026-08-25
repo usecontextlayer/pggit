@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { ZERO_OID } from "@/object/oid"
 import { createGcScheduler } from "@/store/gc-scheduler"
 import {
 	countObjects,
@@ -203,7 +204,7 @@ describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", (
 	// third pass omits the repo entirely: self-terminating on the repack arm too.
 	it("SCH-R5 → SCH-R4: a repack-disabled drain creates no encodings; enabling later repacks without a new push", async () => {
 		const repo = "schr4-repack-only"
-		await pushFile(fx, repo, { content: "r4 v1\n" })
+		const pushed = await pushFile(fx, repo, { content: "r4 v1\n" })
 		await backdatePastGrace(repo)
 
 		// Phase 1 — repack disabled (R5): GC settles, the tier stays empty.
@@ -245,5 +246,28 @@ describe("GC scheduler drain loop — eligibility (§6: SCH-3, SCH-4, SCH-5)", (
 		// Self-terminating on the repack arm: both watermarks are caught up now.
 		const third = await on.drainOnce()
 		expect(third.map((e) => e.repo)).not.toContain(repo)
+
+		// A real ref-only mutation advances last_pushed_at but ingests no object. The
+		// coupled GC arm makes repack run over an already-covered inventory, so zeroes
+		// are the phase's real result — distinct from the disabled phase's null above.
+		const rowsBeforeDelete = await encodingRows(fx.db, repo)
+		const deleted = await fx.refs.applyRefUpdates(
+			repo,
+			[
+				{
+					newOid: ZERO_OID,
+					oldOid: pushed.head,
+					ref: "refs/heads/main",
+				},
+			],
+			false,
+		)
+		expect(deleted).toEqual([true])
+		const fourth = await on.drainOnce()
+		const zeroEntry = fourth.find((e) => e.repo === repo)
+		if (zeroEntry === undefined) throw new Error(`zero-result pass omitted ${repo}`)
+		expect(zeroEntry.gc).not.toBeNull()
+		expect(zeroEntry.repack).toEqual({ deltas: 0, wholes: 0 })
+		expect(await encodingRows(fx.db, repo)).toEqual(rowsBeforeDelete)
 	})
 })

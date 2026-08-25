@@ -1,13 +1,10 @@
 import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { MAX_INLINE_BYTEA_BYTES } from "@/database/bytea"
-import type { ReposId } from "@/database/models/public/Repos"
 import { ZERO_OID } from "@/object/oid"
 import type { GitServer } from "@/server"
 import { createGc, type Gc } from "@/store/gc"
 import type { ObjectStore } from "@/store/object-store"
 import type { RefStore } from "@/store/refs-store"
-import { lookupRepoId } from "@/store/repo-resolver"
 import { allObjectOids, gitReachableOids } from "@/testing/git-fixtures"
 import {
 	repoUrl as gitServerRepoUrl,
@@ -17,6 +14,10 @@ import {
 import type { IsolatedDb } from "@/testing/pg"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { withTempDir } from "@/testing/temp-dir"
+
+// Intentionally independent of the production constant: this is the test oracle
+// for the documented "every object under 200 MB" repack coverage contract.
+const EXPECTED_REPACK_COVERAGE_LIMIT_BYTES = 200_000_000
 
 /**
  * Shared scaffolding for the GC behavioural suite
@@ -390,16 +391,17 @@ export async function derivedRowViolations(
 }
 
 async function requireExistingRepoId(
-	db: Pick<IsolatedDb, "db">,
+	db: Pick<IsolatedDb, "sql">,
 	repo: string,
-): Promise<ReposId> {
-	const id = await lookupRepoId(db.db, repo)
-	if (id === null) {
+): Promise<string> {
+	const [row] = await db.sql<{ id: string }[]>`
+		select id::text as id from repos where name = ${repo}`
+	if (row === undefined) {
 		throw new Error(
 			`GC test helper requires repo ${JSON.stringify(repo)} to exist; use repoGcState for presence`,
 		)
 	}
-	return id
+	return row.id
 }
 
 /**
@@ -410,7 +412,7 @@ async function requireExistingRepoId(
  * equality. The md5 is Postgres's, over the stored deflated bytes.
  */
 export async function encodingRows(
-	db: Pick<IsolatedDb, "db" | "sql">,
+	db: Pick<IsolatedDb, "sql">,
 	repo: string,
 ): Promise<string[]> {
 	const repoId = await requireExistingRepoId(db, repo)
@@ -432,14 +434,15 @@ export async function encodingRows(
  * cascades; asserting it pins the wiring, exactly like `derivedRowViolations`).
  * MUST come back empty after a repack-enabled drain covers a repo. */
 export async function encodingViolations(
-	db: Pick<IsolatedDb, "db" | "sql">,
+	db: Pick<IsolatedDb, "sql">,
 	repo: string,
 ): Promise<string[]> {
 	const repoId = await requireExistingRepoId(db, repo)
 	const rows = await db.sql<{ oid: string }[]>`
 		select 'row-missing:' || encode(o.oid, 'hex') as oid
 		from git_object o
-		where o.repo_id = ${repoId}::bigint and o.size < ${MAX_INLINE_BYTEA_BYTES}
+		where o.repo_id = ${repoId}::bigint
+			and o.size < ${EXPECTED_REPACK_COVERAGE_LIMIT_BYTES}
 			and not exists (
 				select 1 from git_pack_encoding e
 				where e.repo_id = o.repo_id and e.oid = o.oid)
@@ -457,7 +460,7 @@ export async function encodingViolations(
  * for it (`repack()` stamps it itself on success; the drain never writes it).
  * Presence belongs to `repoGcState`; this focused helper requires the repo. */
 export async function repoRepackStamp(
-	db: Pick<IsolatedDb, "db" | "sql">,
+	db: Pick<IsolatedDb, "sql">,
 	repo: string,
 ): Promise<Date | null> {
 	const repoId = await requireExistingRepoId(db, repo)

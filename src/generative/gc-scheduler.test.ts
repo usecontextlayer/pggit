@@ -302,13 +302,6 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 						"a drained repo did not settle",
 					).toEqual([])
 
-					// (d) The over-selection direction. Every repo is now in the
-					// `last_pushed_at <= last_gc_at` state the predicate exists to exclude, and
-					// nothing has pushed since, so an immediate second pass must drain NOTHING.
-					// A predicate that over-selects, or a settle stamp that never landed, fails
-					// here — the states (b) is structurally unable to reach.
-					expect(await scheduler.drainOnce()).toEqual([])
-
 					// (a) Per-repo differential: after the single drain, each repo's surviving
 					// Postgres objects == its real-git reachable closure over its current refs.
 					// This pins BOTH liveness (no live object dropped) and reclamation (every
@@ -331,6 +324,12 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 							expect(await encodingViolations(fx.db, repo)).toEqual([])
 						}
 					}
+
+					// (d) The over-selection direction. Only after observing every one-pass
+					// invariant above do we drive a second pass: it must drain NOTHING. A
+					// predicate that over-selects, or a settle stamp that never landed, fails
+					// here — the state (b) is structurally unable to reach.
+					expect(await scheduler.drainOnce()).toEqual([])
 				},
 			),
 			{ numRuns: NUM_RUNS, seed: 424_242 },
