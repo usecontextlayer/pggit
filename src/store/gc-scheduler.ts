@@ -18,11 +18,9 @@ import { createRepack, type RepackResult } from "@/store/repack"
  * pure poll loop over Postgres with NO coupling to the request path. One pass
  * (`drainOnce`) selects the repos where either phase owes work — GC when
  * `last_pushed_at > last_gc_at`, repack when `last_pushed_at > last_repack_at`
- * OR when GC is due (each NULL-qualifying; the coupling is R-EL′/SCH-R8 — a
- * sweep can hole the encoding tier, so a sweeping pass re-covers it) — and runs
- * the due phases on each, GC first (repack encodes SURVIVORS, never garbage),
- * per-repo serialized, bounded concurrency. A
- * pass advances `last_gc_at` to its start time only after the repo's grace
+ * or when GC is due, each NULL-qualifying — and runs the due phases on each, GC
+ * first, per-repo serialized, with bounded concurrency. A pass advances
+ * `last_gc_at` to its start time only after the repo's grace
  * horizon; a younger repo remains eligible, and a push landing mid-pass also
  * re-qualifies it (no lost garbage). `last_repack_at` is stamped by `repack()`
  * itself on success, never by the drain. `start` is just `drainOnce` on a
@@ -30,32 +28,25 @@ import { createRepack, type RepackResult } from "@/store/repack"
  * directly.
  */
 
-/** One repo's outcome in a drain pass, one nullable slot per phase. `null` means
- * exactly "no result from this phase this pass" — ineligible, disabled, skipped
- * because this pass's GC failed, or the phase itself threw; the REASON lives in
- * the log line, never here (the summary reports completed work, the log reports
- * failures — the standing contract). An emitted entry has at least one non-null
- * phase; a repo where every phase that ran threw is dropped and retried next
- * pass. Emitted for EVERY repo the pass completed any work on (including
- * zero-reclaim / zero-encode), so the eligible set itself is observable (SCH-3,
- * SCH-R4). */
+/** One repo's outcome in a drain pass, one nullable result per phase. `null`
+ * means the phase produced no result; an emitted entry does not distinguish a
+ * phase that was not due or disabled from one that failed, while failures are
+ * logged. An entry exists only when at least one phase completed, including a
+ * zero-reclaim or zero-encode result. */
 export type DrainEntry = {
 	repo: string
-	/** GC's outcome. `settled` is a GC concept: false while garbage YOUNGER than
-	 * grace may still exist (the pass ran inside the grace window) — the repo
-	 * deliberately stays eligible and is re-drained next tick, so post-grace
-	 * residue is never orphaned forever. */
+	/** GC's outcome. `settled` is false when the repo could not safely be stamped
+	 * caught up: its grace horizon has not passed or activity advanced after the
+	 * pass watermark. The repo remains eligible for another pass. */
 	gc: (GcResult & { settled: boolean }) | null
-	/** What repack encoded this pass. `{ wholes: 0, deltas: 0 }` is a real result
-	 * — the phase ran and the tier was already covered — distinct from `null`
-	 * (the phase did not run). */
+	/** What repack encoded this pass. `{ wholes: 0, deltas: 0 }` means the phase
+	 * completed against an already-covered tier; `null` means it produced no result
+	 * because it did not run or failed. */
 	repack: RepackResult | null
 }
 
-/** Completed work from one `drainOnce()`, one entry per repo where at least one phase produced a result. */
 export type DrainSummary = DrainEntry[]
 
-/** A candidate repo for one drain pass: its id + wire name, plus which phases the selection judged due. Both flags are computed in the selecting query; `repack_due` includes its own watermark and the coupled GC arm. The GC pass-start watermark is captured per-repo (in `drainRepo`, before that repo's GC snapshot) and written back as `last_gc_at`; repack's watermark is `repack()`'s own business (it stamps `last_repack_at` itself on success — the stamp must mean "a completed pass" for every invoker, so the drain never writes it). */
 type Candidate = { id: string; name: string } & (
 	| { gc_due: true; repack_due: boolean }
 	| { gc_due: false; repack_due: true }
@@ -77,12 +68,11 @@ const GcSchedulerOptionsSchema = z
  * window); `concurrency` caps repos drained at once per pass so one large repo
  * cannot head-of-line-block the rest — with repack enabled it is also the memory
  * dial, since each in-flight repack holds roughly its repo's tree bytes in its
- * pass cache (repack.ts). `repackEnabled` gates the drain's repack phase. */
+ * pass cache (repack.ts). */
 export type GcSchedulerOptions = z.infer<typeof GcSchedulerOptionsSchema>
 
 export type GcScheduler = ReturnType<typeof createGcScheduler>
 
-/** Resolve the scheduler's configuration before any resource is opened from it. */
 export function resolveGcSchedulerOptions(opts: GcSchedulerOptions): GcSchedulerOptions {
 	return GcSchedulerOptionsSchema.parse(opts)
 }
@@ -90,9 +80,8 @@ export function resolveGcSchedulerOptions(opts: GcSchedulerOptions): GcScheduler
 /**
  * Build the GC scheduler over a porsager client (the same wire→DB boundary the
  * stores take). `drainOnce()` runs one poll+sweep pass — per repo, GC then (when
- * enabled and due) repack; `start()`/`stop()` drive it on `intervalMs`. Reachable
- * objects are never touched: GC is reachability-safe and repack only ever ADDS
- * derived encoding rows.
+ * enabled and due) repack; `start()`/`stop()` drive it on `intervalMs`. GC never
+ * deletes reachable objects, and repack only adds derived encoding rows.
  */
 export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 	return createGcSchedulerFromResolvedOptions(pg, resolveGcSchedulerOptions(opts))
@@ -100,11 +89,6 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 
 /** Internal composition seam for `startServer`, which resolves before sizing its pool. */
 export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerOptions) {
-	// Both phases ride the SAME client the scheduler was built over — in
-	// `startServer` that is the dedicated drain pool, so repack's reads and COPY
-	// flushes never contend with the request path. Constructed unconditionally:
-	// the switch's one enforcement point is the candidate query's `repack_due`
-	// arm, not scattered construction guards.
 	const gc = createGc(pg)
 	const repack = createRepack(pg)
 	let timer: ReturnType<typeof setInterval> | undefined
@@ -144,10 +128,8 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 	 * the failed phase's watermark left behind, retried next pass — so one poison
 	 * repo never aborts the rest of the pass; a GC failure also SKIPS this repo's
 	 * repack (repack encodes survivors, never what the completed sweep would have
-	 * deleted). Repack is invoked by NAME and stamps `last_repack_at` itself on
-	 * success — a completed-pass marker every invoker shares, which its repair
-	 * mode depends on. `maintain: false`: the drain leans on autovacuum, never a
-	 * per-pass full-table VACUUM (gc.ts).
+	 * deleted). `maintain: false`: the drain leans on autovacuum, never a per-pass
+	 * full-table VACUUM (gc.ts).
 	 */
 	type DrainAttempt = { outcome: "drained"; entry: DrainEntry } | { outcome: "failed" }
 
@@ -196,10 +178,6 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 			}
 		}
 
-		// An entry is emitted iff at least one phase produced a result. A repo where
-		// every phase that ran threw was already logged above; dropping it keeps the
-		// summary a report of completed work, and its stale watermark(s) re-select
-		// it next pass.
 		if (gcOutcome === null && repackOutcome === null) return { outcome: "failed" }
 		return {
 			entry: { gc: gcOutcome, repack: repackOutcome, repo: c.name },
@@ -207,10 +185,6 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 		}
 	}
 
-	/** One drain pass: run the due phases on every eligible repo (bounded
-	 * concurrency, distinct repos so a pass never touches one twice). Returns an
-	 * entry per repo that completed any work — a repo whose only-ran phase threw is
-	 * absent (logged) and retried next pass. */
 	async function drainOnce(): Promise<DrainSummary> {
 		const candidates = await selectCandidates()
 		const results = await mapPool(candidates, opts.concurrency, drainRepo)

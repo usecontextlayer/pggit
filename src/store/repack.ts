@@ -13,9 +13,9 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * Per-repo offline repack — the producer of the DERIVED pack-encoding tier
  * (`git_pack_encoding`, migration 0008; the design and its provenance:
  * docs/2026-08-15-delta-pack-design.md). The sibling of `store/gc.ts` in every
- * structural respect: built over a porsager client at the wire→DB boundary,
- * invoked per repo by the GC drain's repack phase (`store/gc-scheduler.ts`) or a
- * host's own maintenance schedule, never on the push/fetch hot path.
+ * structural respect: built over a porsager client at the wire→DB boundary and
+ * invoked per repo by an offline maintenance schedule, never on the push/fetch
+ * hot path.
  *
  * What one pass produces, and the invariants the e2e suite pins:
  *
@@ -56,9 +56,7 @@ import { lookupRepoId } from "@/store/repo-resolver"
  * this pass's reads) stays newer than the stamp and the next pass treats it as
  * ordinary new work, never as a hole. Any invoker that runs both maintenance
  * passes must serialize repack per repo AFTER GC (D5) so it encodes survivors,
- * not garbage — the built-in drain (`store/gc-scheduler.ts`) does exactly this
- * whenever repack's watermark or the coupled GC arm is due; a host may also
- * invoke `repack()` directly on its own schedule.
+ * not garbage.
  */
 
 /** Anchor cadence: a segment holds one whole anchor plus at most K−1 deltas

@@ -1,29 +1,3 @@
-/**
- * SCH-R6 (docs/2026-08-25-drain-repack-wiring.md) — repack failure isolation at
- * the DRAIN level. A repack phase killed mid-pass must: (a) surface as a drain
- * entry carrying the real GC result with `repack: null` — completed work is
- * reported, the failure lives in the log line; (b) leave `last_repack_at`
- * unstamped, so the union predicate re-selects the repo; and (c) let the NEXT
- * `drainOnce()` complete coverage over the torn tier — the committed flush
- * prefix is subtree-closed (repack's post-order emission), so the resumed walk
- * covers every hole. The retry-via-watermark mechanism itself is pinned by
- * SCH-R4; this file's unique content is the entry shape and recovery after a
- * MID-PASS death.
- *
- * The fault is AIMED, never timed (the gc-repack-fault-sweep lesson: timeout
- * rungs are a property of the machine, aimed cancels land identically anywhere):
- * a watcher polls `pg_stat_activity` for the drain connection's first statement
- * naming `copy_stg_git_pack_encoding` — copyInsert's staging table, so the
- * needle matches all three statements of every encoding flush transaction
- * (create-temp, COPY, insert) and nothing else the drain runs — and
- * `pg_cancel_backend`s it. That flush rolls back, earlier flushes stay
- * committed, and repack throws into the drain's per-phase catch. Vacuousness is
- * LOUD by construction: a missed aim lets repack complete, the entry then
- * carries `repack: {…}`, and the assertion fails naming the miss — this file
- * can never go green over an untorn store. Solo placement (vitest.config.ts):
- * the aim targets sub-second statement windows that parallel load makes
- * unhittable.
- */
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -45,7 +19,9 @@ import {
 
 const RUNS = 600
 const REPO = "txn/drain-repack-fault"
-const COPY_NEEDLE = "copy_stg_git_pack_encoding"
+// copyInsert names its staging table in each statement of an encoding flush, so
+// the first observed match is inside that flush regardless of which statement wins the poll.
+const ENCODING_FLUSH_NEEDLE = "copy_stg_git_pack_encoding"
 const AIM_TIMEOUT_MS = 45_000
 
 describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SCH-R6)", () => {
@@ -98,9 +74,7 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 		}
 		await ageObjects(db, REPO, "1 hour")
 
-		// max: 1 — every drain statement (both phases) runs on ONE backend, so the
-		// watcher's pid is deterministic. Both primitives are proven on max:1
-		// clients by the gc-repack-fault-sweep fixture.
+		// One backend makes the pid captured below the drain's deterministic target.
 		drainSql = postgres(baseUrl, {
 			connection: { search_path: db.schema },
 			max: 1,
@@ -113,30 +87,27 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 			repackEnabled: true,
 		})
 
-		// ── pass 1: GC completes, the aimed cancel kills repack mid-COPY ──────
 		const [pidRow] = await drainSql<{ pid: number }[]>`select pg_backend_pid() as pid`
 		if (pidRow === undefined) throw new Error("pg_backend_pid returned no row")
-		const stop = { now: false }
-		const aimed = abortBackendWhenActive(
+		const stopSignal = { now: false }
+		const abortAttempt = abortBackendWhenActive(
 			admin,
 			pidRow.pid,
-			{ kind: "cancel", needle: COPY_NEEDLE, skip: 0 },
-			{ limitMs: AIM_TIMEOUT_MS, stop },
+			{ kind: "cancel", needle: ENCODING_FLUSH_NEEDLE, skip: 0 },
+			{ limitMs: AIM_TIMEOUT_MS, stop: stopSignal },
 		)
 		const first = await scheduler.drainOnce()
-		stop.now = true
-		aimHit = await aimed
+		stopSignal.now = true
+		aimHit = await abortAttempt
 		firstEntry = first.find((e) => e.repo === REPO)
 		stampAfterFault = await repoRepackStamp(db, REPO)
 		violationsAfterFault = await encodingViolations(db, REPO)
 
-		// ── pass 2: recovery — the union re-selects the repo on the repack arm ─
 		const second = await scheduler.drainOnce()
 		secondEntry = second.find((e) => e.repo === REPO)
 		violationsAfterRecovery = await encodingViolations(db, REPO)
 		stampAfterRecovery = await repoRepackStamp(db, REPO)
 
-		// ── pass 3: both watermarks caught up — the repo is no longer selected ─
 		thirdSummaryRepos = (await scheduler.drainOnce()).map((e) => e.repo)
 
 		const dest = join(root, "final")
@@ -187,7 +158,7 @@ describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SC
 
 	it("the next drain completes coverage on the repack arm alone", () => {
 		if (secondEntry === undefined) throw new Error(`recovery drain omitted ${REPO}`)
-		expect(secondEntry.gc).toBeNull() // settled in pass 1; nothing re-pushed
+		expect(secondEntry.gc).toBeNull()
 		if (secondEntry.repack === null) {
 			throw new Error(`recovery entry carries no repack result`)
 		}

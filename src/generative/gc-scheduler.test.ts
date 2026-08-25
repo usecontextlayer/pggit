@@ -1,49 +1,3 @@
-/**
- * Property-based scheduler differential — `docs/2026-06-24-gc-scheduler-design.md`
- * §6, item PBT-S1 ("Multi-repo differential"). For a RANDOM sequence of operations
- * across several repos — each op a push, a rewind, or a side-branch delete —
- * one `drainOnce({ graceSeconds: 0 })` with every object aged must, for EVERY repo:
- *
- *   (a) leave the surviving `git_object` rows (`objectOids`) exactly equal to that
- *       repo's real-git reachable closure of its CURRENT refs (the §6 git oracle:
- *       re-fetch every surviving ref → `gitReachableOids`) — independent of any
- *       `pushFile` return value; AND
- *   (b) appear in the returned `DrainSummary` iff it received any storage-mutating
- *       op. Because every repo here is created by (and only by) such ops and starts
- *       with `last_gc_at IS NULL`, the eligible set === ALL touched repos. So the
- *       summary's repo set must equal the set of touched repos; AND
- *   (c) carry `gc.settled: true` in that summary — with `graceSeconds: 0` the settle
- *       stamp must land for every repo the pass drained; AND
- *   (d) be GONE from a second, immediately following `drainOnce()`. That second pass
- *       is the only place the `last_pushed_at <= last_gc_at` state — the one the
- *       eligibility predicate exists to EXCLUDE — is ever constructed here, so it is
- *       what pins over-selection. (b) alone cannot: a repo row is created by its
- *       first push, so an "untouched repo" has no row to be wrongly selected. With
- *       the drain's repack phase enabled, this also pins repack's own arm of the
- *       union predicate: the pass's completed repack stamped `last_repack_at`, so
- *       neither watermark re-qualifies the repo; AND
- *   (e) end the pass fully ENCODED (the drain-repack doc's coverage conjunct):
- *       every surviving sub-cap object has exactly one `git_pack_encoding` row
- *       (`encodingViolations` empty), and the post-drain oracle fetch — served
- *       through that tier — fscks clean.
- *
- * This GENERALISES the example-based scheduler cases: SCH-3 (drains exactly the
- * eligible set), SCH-6 (end-to-end reclamation through the loop), SCH-8 (tenant
- * isolation — every eligible repo ends up correctly GC'd regardless of the pass's
- * internal concurrency). The policy under test is the union of the GC and repack watermarks, with every GC-due repo also repack-due while that phase is enabled.
- *
- * OBSERVABLE-ONLY (§6, non-negotiable): every assertion reads only the real-`git`
- * oracle (`fetch` / `rev-list` via `gitReachableOids`), Postgres rows
- * (`objectOids` via `fx.db`), or the `drainOnce()` return value. Nothing here
- * probes scheduler internals — no temp tables, no candidate SQL, no batch/txn
- * shape, no concurrency choreography, no timer mechanics, no advisory locks. The
- * eligible SET and per-repo SURVIVORS are asserted as outcomes, never the
- * machinery that produced them. Determinism comes from `ageObjects` +
- * `graceSeconds: 0`, never a wall-clock sleep; the `setInterval` `start()` is
- * never exercised (only `drainOnce()` is driven).
- *
- * The property pins the scheduler's shipped eligibility and survivor contracts.
- */
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { assertNever } from "@/lang"
@@ -316,10 +270,6 @@ describe("§6 PBT-S1 — property-based scheduler differential", () => {
 						const reachable = await reachableOverAllRefs(fx, repo)
 						expect(survivors).toEqual(reachable)
 
-						// Coverage conjunct (SCH-R1 generalised, drain-repack doc): with
-						// repack enabled, the settled drain leaves every surviving sub-cap
-						// object with exactly one encoding row — for every persisted repo,
-						// whatever op sequence produced it.
 						if (state.touched) {
 							expect(await encodingViolations(fx.db, repo)).toEqual([])
 						}

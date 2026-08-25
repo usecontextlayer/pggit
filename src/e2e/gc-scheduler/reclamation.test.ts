@@ -18,27 +18,9 @@ import {
 	teardownGcFixture,
 } from "@/testing/gc-helpers"
 
-/**
- * GC-scheduler end-to-end reclamation THROUGH the drain loop —
- * `docs/2026-06-24-gc-scheduler-design.md` §6, items SCH-6 (end-to-end
- * reclamation + storage bound through the loop; GC-2/GC-4 reached via the
- * scheduler) and SCH-7 (no-lost-garbage across a post-snapshot push; the durable
- * analog of the GC primitive's GC-9).
- *
- * These drive `createGcScheduler(...).drainOnce()` rather than `gc()` directly, so the effects are observed through the background drain's union selection and per-phase gating. The original cases run with repack disabled and pin the GC watermark; the SCH-R cases enable repack and pin coverage, ordering, incrementality, and the coupled GC→repack arm.
- *
- * OBSERVABLE-ONLY: every assertion reads (a) the real `git` oracle
- * (fetch/clone/fsck/rev-list via `gitReachableOids`/`cloneAndFsck`), (b) Postgres
- * rows (`git_object` via `objectOids`/`countObjects`, the two scheduling columns
- * via `repoGcState`), or (c) the `DrainSummary` return value. Nothing here probes
- * scheduler internals (timer mechanics, the candidate SQL, concurrency
- * choreography, temp-table/txn shape) — those stay free to change. Grace is made
- * deterministic by constructing the scheduler with `graceSeconds: 0` and ageing
- * the orphans past the cutoff with `ageObjects`, never by sleeping on the wall
- * clock.
- *
- * These cases pin scheduler eligibility, reclamation, and repack coverage under §6 and SCH-R1/R2/R3/R8.
- */
+/** GC-specific cases disable repack to isolate the original watermark contract;
+ * repack cases enable it explicitly. Object ages and grace values make every
+ * selection deterministic without involving the timer. */
 describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6, SCH-7)", () => {
 	let fx: GcFixture
 
@@ -81,7 +63,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		const mine = first.find((e) => e.repo === repo)
 		if (mine === undefined) throw new Error(`drain summary omitted ${repo}`)
 		if (mine.gc === null) throw new Error(`drain entry for ${repo} carries no GC result`)
-		expect(mine.gc.deletedObjects).toBe(0) // everything is younger than grace
+		expect(mine.gc.deletedObjects).toBe(0)
 		expect(mine.gc.settled).toBe(false)
 
 		// Still eligible: the young garbage exists and MUST get a post-grace pass.
@@ -102,7 +84,7 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		if (settled === undefined) throw new Error(`second drain summary omitted ${repo}`)
 		if (settled.gc === null)
 			throw new Error(`drain entry for ${repo} carries no GC result`)
-		expect(settled.gc.deletedObjects).toBeGreaterThan(0) // v1's orphans reclaimed
+		expect(settled.gc.deletedObjects).toBeGreaterThan(0)
 		expect(settled.gc.settled).toBe(true)
 		const after = await fx.db.sql<{ name: string }[]>`
 			select name from repos
@@ -314,13 +296,6 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		expect(await objectOids(fx.db, repo)).not.toContain(orphan)
 	})
 
-	// SCH-R1 + SCH-R3 (docs/2026-08-25-drain-repack-wiring.md) — one repack-enabled
-	// drain brings the encoding tier to coverage, and encodes only GC's SURVIVORS.
-	// A push + rewind leaves orphans; a single drainOnce (grace 0, repack on) must
-	// (R3) leave the tier covering exactly the post-GC inventory — no row for any
-	// swept oid — and (R1) every sub-cap survivor with exactly one row, the entry's
-	// counts equal to the rows created, the watermark stamped, and the repo cloning
-	// fsck-clean through the now-tier-backed serve.
 	it("SCH-R1/R3: one drain reclaims the orphans and encodes exactly the survivors", async () => {
 		const repo = "schr1-coverage"
 		const scheduler = createGcScheduler(fx.db.sql, {
@@ -329,9 +304,11 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			intervalMs: 30_000,
 			repackEnabled: true,
 		})
-		const v1 = await pushFile(fx, repo, { content: "r1 v1\n" })
-		const v2 = await pushFile(fx, repo, { content: "r1 v2\n", rewind: true })
-		const orphaned = v1.reachable.filter((oid) => !v2.reachable.includes(oid))
+		const firstPush = await pushFile(fx, repo, { content: "r1 v1\n" })
+		const survivingPush = await pushFile(fx, repo, { content: "r1 v2\n", rewind: true })
+		const orphaned = firstPush.reachable.filter(
+			(oid) => !survivingPush.reachable.includes(oid),
+		)
 		expect(orphaned.length).toBeGreaterThan(0)
 		await ageObjects(fx.db, repo, "1 hour")
 
@@ -344,36 +321,19 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		}
 		expect(entry.gc.deletedObjects).toBe(orphaned.length)
 
-		// R3 — ordering observable: the tier covers exactly the post-GC survivor set.
-		// Violations empty pins both directions: every sub-cap survivor has a row and
-		// no row remains for an object GC swept. Count equality makes exact coverage
-		// explicit for this all-sub-cap fixture.
 		expect(await encodingViolations(fx.db, repo)).toEqual([])
-		const rows = await encodingRows(fx.db, repo)
-		expect(rows.length).toBe(await countObjects(fx.db, repo))
+		const encodings = await encodingRows(fx.db, repo)
+		expect(encodings.length).toBe(await countObjects(fx.db, repo))
 
-		// R1 — the entry's counts are REAL: the tier was empty before this pass, so
-		// wholes + deltas must equal every row now present; and repack stamped its
-		// own watermark (a completed pass).
-		expect(entry.repack.wholes + entry.repack.deltas).toBe(rows.length)
+		expect(entry.repack.wholes + entry.repack.deltas).toBe(encodings.length)
 		expect(await repoRepackStamp(fx.db, repo)).not.toBeNull()
 
-		// The repo still serves a complete, fsck-clean clone at the latest tip —
-		// served through the encoding tier now.
 		const clone = await cloneAndFsck(fx, repo)
-		expect(clone.head).toBe(v2.head)
+		expect(clone.head).toBe(survivingPush.head)
 		expect(clone.fileContent).toBe("r1 v2\n")
 	})
 
-	// SCH-R2 (docs/2026-08-25-drain-repack-wiring.md) — self-terminating and
-	// incremental: repack's frozen policy (existing rows are never rewritten)
-	// observed through the drain. After a covering drain, a second pass with no
-	// intervening push omits the repo entirely. An ADDITIVE push (a side branch —
-	// new objects, nothing orphaned) then re-qualifies it, and the next drain
-	// encodes ONLY the new objects while leaving every pre-existing encoding row
-	// byte-identical — an impl that re-encodes, rewrites, or re-bases covered rows
-	// fails the equality on the md5-carrying row lines.
-	it("SCH-R2: a second drain is a no-op; a new push encodes only the delta, never rewriting covered rows", async () => {
+	it("SCH-R2: a second drain is a no-op; a new push encodes only new objects, never rewriting covered rows", async () => {
 		const repo = "schr2-incremental"
 		const scheduler = createGcScheduler(fx.db.sql, {
 			concurrency: 4,
@@ -383,49 +343,37 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 		})
 		await pushFile(fx, repo, { content: "r2 v1\n" })
 		await ageObjects(fx.db, repo, "1 hour")
-		const first = await scheduler.drainOnce()
-		expect(first.filter((e) => e.repo === repo)).toHaveLength(1)
+		const initialSummary = await scheduler.drainOnce()
+		expect(initialSummary.filter((e) => e.repo === repo)).toHaveLength(1)
 		const coveredRows = await encodingRows(fx.db, repo)
 		expect(coveredRows.length).toBeGreaterThan(0)
 
-		// Self-terminating: nothing pushed since, so pass 2 omits the repo — and the
-		// tier is untouched.
-		const second = await scheduler.drainOnce()
-		expect(second.map((e) => e.repo)).not.toContain(repo)
+		const caughtUpSummary = await scheduler.drainOnce()
+		expect(caughtUpSummary.map((e) => e.repo)).not.toContain(repo)
 		expect(await encodingRows(fx.db, repo)).toEqual(coveredRows)
 
-		// An additive push re-qualifies the repo; the next drain covers ONLY the new
-		// objects. The side branch keeps main's closure reachable, so GC sweeps
-		// nothing and the frozen-rows equality is meaningful.
+		// Keep the original closure reachable on main so any encoding-row change is
+		// attributable to the additive repack work, not GC.
 		const objectsBefore = await countObjects(fx.db, repo)
 		await pushBranch(fx, repo, "side-r2", "r2 side\n")
 		const objectsAfter = await countObjects(fx.db, repo)
 		expect(objectsAfter).toBeGreaterThan(objectsBefore)
 
-		const third = await scheduler.drainOnce()
-		const entry = third.find((e) => e.repo === repo)
+		const incrementalSummary = await scheduler.drainOnce()
+		const entry = incrementalSummary.find((e) => e.repo === repo)
 		if (entry === undefined) throw new Error(`incremental pass omitted ${repo}`)
 		if (entry.repack === null) {
 			throw new Error(`incremental entry for ${repo} carries no repack result`)
 		}
-		const afterRows = await encodingRows(fx.db, repo)
-		// Only the delta was encoded…
+		const incrementalRows = await encodingRows(fx.db, repo)
 		expect(entry.repack.wholes + entry.repack.deltas).toBe(objectsAfter - objectsBefore)
-		expect(afterRows.length).toBe(coveredRows.length + (objectsAfter - objectsBefore))
-		// …and every covered row survived BYTE-IDENTICAL (oid, base, size, md5).
-		for (const line of coveredRows) expect(afterRows).toContain(line)
+		expect(incrementalRows.length).toBe(
+			coveredRows.length + (objectsAfter - objectsBefore),
+		)
+		for (const line of coveredRows) expect(incrementalRows).toContain(line)
 		expect(await encodingViolations(fx.db, repo)).toEqual([])
 	})
 
-	// SCH-R8 (docs/2026-08-25-drain-repack-wiring.md, R-EL′) — the arms are
-	// COUPLED: any pass that runs GC on a repo also runs repack when the phase is
-	// enabled, whatever the repack watermark says. A GC sweep can hole the tier
-	// through the 0008 cascades (a surviving tree's delta whose anchor died with a
-	// rewound chain — pack-encoding/gc's dangling-base shape), and the watermark
-	// alone would strand that hole: an unsettled in-grace pass stamps
-	// last_repack_at, the later sweeping pass would be gc-only, gc settles, and
-	// nothing re-selects the repo until a future push. Coupling keeps coverage
-	// self-healing at the pass where holes can form.
 	it("SCH-R8: a sweeping pass runs repack too — the coupled arm keeps coverage self-healing", async () => {
 		const repo = "schr8-coupled-arms"
 		const scheduler = createGcScheduler(fx.db.sql, {
@@ -434,16 +382,15 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			intervalMs: 30_000,
 			repackEnabled: true,
 		})
-		// Pass 1, IN GRACE: gc runs and does not settle; repack runs and stamps —
-		// encoding everything, the young garbage included (the designed path).
 		await pushFile(fx, repo, { content: "r8 v1\n" })
-		await pushFile(fx, repo, { content: "r8 v2\n", rewind: true }) // v1 is young garbage
-		const first = await scheduler.drainOnce()
-		const e1 = first.find((e) => e.repo === repo)
-		if (e1 === undefined) throw new Error(`drain summary omitted ${repo}`)
-		if (e1.gc === null) throw new Error(`entry for ${repo} carries no GC result`)
-		expect(e1.gc.settled).toBe(false)
-		expect(e1.repack).not.toBeNull()
+		await pushFile(fx, repo, { content: "r8 v2\n", rewind: true })
+		const inGraceSummary = await scheduler.drainOnce()
+		const inGraceEntry = inGraceSummary.find((e) => e.repo === repo)
+		if (inGraceEntry === undefined) throw new Error(`drain summary omitted ${repo}`)
+		if (inGraceEntry.gc === null)
+			throw new Error(`entry for ${repo} carries no GC result`)
+		expect(inGraceEntry.gc.settled).toBe(false)
+		expect(inGraceEntry.repack).not.toBeNull()
 		expect(await repoRepackStamp(fx.db, repo)).not.toBeNull()
 
 		// The push recedes past grace and the orphans age out. The repack WATERMARK
@@ -455,18 +402,17 @@ describe("GC scheduler — end-to-end reclamation through drainOnce (§6: SCH-6,
 			where name = ${repo}`
 		await ageObjects(fx.db, repo, "2 hours")
 
-		// Pass 2: sweeps the aged orphans AND — the coupled arm — repacks in the
-		// same pass: the entry carries BOTH results and the tier stays covered.
-		const second = await scheduler.drainOnce()
-		const e2 = second.find((e) => e.repo === repo)
-		if (e2 === undefined) throw new Error(`second drain summary omitted ${repo}`)
-		if (e2.gc === null) throw new Error(`second entry for ${repo} carries no GC result`)
-		expect(e2.gc.deletedObjects).toBeGreaterThan(0)
-		expect(e2.gc.settled).toBe(true)
-		expect(e2.repack).not.toBeNull() // null under a pure-watermark predicate
+		const sweepingSummary = await scheduler.drainOnce()
+		const sweepingEntry = sweepingSummary.find((e) => e.repo === repo)
+		if (sweepingEntry === undefined)
+			throw new Error(`second drain summary omitted ${repo}`)
+		if (sweepingEntry.gc === null)
+			throw new Error(`second entry for ${repo} carries no GC result`)
+		expect(sweepingEntry.gc.deletedObjects).toBeGreaterThan(0)
+		expect(sweepingEntry.gc.settled).toBe(true)
+		expect(sweepingEntry.repack).not.toBeNull()
 		expect(await encodingViolations(fx.db, repo)).toEqual([])
 
-		// Settled + covered: a third pass omits the repo (both arms quiet).
 		expect((await scheduler.drainOnce()).map((e) => e.repo)).not.toContain(repo)
 	})
 })

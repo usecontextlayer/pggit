@@ -18,35 +18,11 @@ import {
 } from "@/testing/gc-helpers"
 
 /**
- * GC scheduler — server wiring & config (`docs/2026-06-24-gc-scheduler-design.md`
- * §6 "Isolation & robustness"): SCH-9 (disabled = inert) and SCH-10 (standalone
- * server self-GCs; the mounted `createGitApp` path with no scheduler is
- * unchanged). These are BLACK-BOX tests of `startServer` (§4 wires the scheduler
- * over the same `pg`, `start()`s it when enabled, `stop()`s it in `close()`).
- *
- * OBSERVABLE-ONLY (§6): every assertion is on the real `git` oracle
- * (clone/fetch/fsck via `cloneAndFsck`), Postgres rows (`git_object` via
- * `objectOids`, scheduling state via `repoGcState`, and encoding coverage), or — for the
- * mount comparison — the absence of any reclamation. Nothing probes scheduler
- * internals (timer mechanics, the candidate SQL, concurrency choreography); the
- * orphan set is computed from the `git` reachable closures `pushFile` returns.
- * Determinism: orphan eligibility is set by `ageObjects` backdating rows PAST a
- * real grace window, never a wall-clock grace wait. The enabled scheduler runs
- * with a NONZERO grace on purpose: grace is what shields in-flight pushes and
- * fetches from a drain tick's stale-refs scan, and with `graceSeconds: 0` the
- * 50 ms cadence can reclaim a just-pushed closure mid-fetch (observed: a fetch
- * refused with "not our ref" on its own freshly pushed tip). SCH-10's self-GC is
- * the ONE place a real timer is exercised, so it POLLS (bounded) for the
- * observable reclamation effect.
- *
- * The PUBLIC schema on the shared `globalSetup` container: `startServer` builds its
- * own porsager client from `databaseUrl` and sets no per-connection `search_path`, so
- * the isolated-schema `setupGcFixture` (which hides the schema behind `search_path`)
- * cannot back it. We migrate `public` ourselves and keep a raw `postgres(uri)` client
- * (passed as `{ sql }`) for the row helpers. No other test touches `public`, so this
- * stays isolated from the schema-per-file tests sharing the container.
- *
- * These cases pin the server wiring and activity-stamp contracts under §6.
+ * SCH-10 exercises the real server timer with nonzero grace: a zero-grace tick
+ * may scan stale refs while a push or fetch is still using its fresh closure.
+ * The asynchronous drain effect is therefore polled to a bound. `startServer`
+ * also creates its own clients without an isolated `search_path`, so this file
+ * migrates and queries the shared container's `public` schema directly.
  */
 describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 	const POLL_TIMEOUT_MS = 8000
@@ -75,10 +51,7 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		await pg?.end()
 	})
 
-	/** The DB shape the row helpers want (`{ sql }`), backed by our public-schema
-	 * client — `objectOids` / `ageObjects` / `repoGcState` resolve `git_object` and
-	 * `repos` in `public`. */
-	const sqlDb = (): { sql: Sql } => ({ sql: pg })
+	const publicSchemaDb = (): { sql: Sql } => ({ sql: pg })
 
 	/** A `Pick<GcFixture, "server" | "refs">` shape so the gc-helpers' URL builder,
 	 * `pushFile` (including its store-level rewind), and `cloneAndFsck` target one of
@@ -159,26 +132,20 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 
 			// Age every row past the grace cutoff so the drain is free to reclaim the
 			// orphans without any wall-clock grace wait.
-			await ageObjects(sqlDb(), repo, "2 hours")
+			await ageObjects(publicSchemaDb(), repo, "2 hours")
 
-			// The server's own interval must drive a drain that removes the orphans AND
-			// (repack phase, env-default-enabled — the drain-repack doc) brings the
-			// encoding tier to coverage. Polled as a conjunction: repack runs after GC
-			// within a pass, so orphans-gone alone could race the pass's second half.
 			await pollUntil(
 				`${repo} orphans reclaimed + tier covered by the scheduler`,
 				async () => {
-					const survivors = new Set(await objectOids(sqlDb(), repo))
+					const survivors = new Set(await objectOids(publicSchemaDb(), repo))
 					if (!orphans.every((oid) => !survivors.has(oid))) return false
-					return (await encodingViolations(sqlDb(), repo)).length === 0
+					return (await encodingViolations(publicSchemaDb(), repo)).length === 0
 				},
 			)
 
-			// Reclamation happened, the tier covers the survivors, AND the repo still
-			// clones clean at the latest tip.
-			const survivors = new Set(await objectOids(sqlDb(), repo))
+			const survivors = new Set(await objectOids(publicSchemaDb(), repo))
 			for (const oid of orphans) expect(survivors.has(oid)).toBe(false)
-			expect(await encodingViolations(sqlDb(), repo)).toEqual([])
+			expect(await encodingViolations(publicSchemaDb(), repo)).toEqual([])
 			const clone = await cloneAndFsck(at(enabled), repo)
 			expect(clone.head).toBe(head)
 			expect(clone.fileContent).toBe(`${repo} v2\n`)
@@ -197,12 +164,12 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 			const mountRepo = "sch10-mount-unchanged"
 			const mounted = await pushThenRewindOrphan(mountSrv, mountRepo)
 			expect(mounted.orphans.length).toBeGreaterThan(0)
-			await ageObjects(sqlDb(), mountRepo, "1 hour")
+			await ageObjects(publicSchemaDb(), mountRepo, "1 hour")
 
 			// Wait comfortably past the interval a wired scheduler would have fired on,
 			// then assert EVERY orphan still present (no reclamation on the mount path).
 			await waitForSchedulerObservationWindow()
-			const mountSurvivors = new Set(await objectOids(sqlDb(), mountRepo))
+			const mountSurvivors = new Set(await objectOids(publicSchemaDb(), mountRepo))
 			for (const oid of mounted.orphans) expect(mountSurvivors.has(oid)).toBe(true)
 
 			// And the mounted path still serves a clean clone at its latest tip.
@@ -228,16 +195,16 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 			const repo = "sch9-disabled"
 			const { head, orphans } = await pushThenRewindOrphan(disabled, repo)
 			expect(orphans.length).toBeGreaterThan(0)
-			await ageObjects(sqlDb(), repo, "1 hour")
+			await ageObjects(publicSchemaDb(), repo, "1 hour")
 
 			// Wait the same bounded window an enabled server would have GC'd within,
 			// then assert NO object was reclaimed — the drain is off.
 			await waitForSchedulerObservationWindow()
-			const survivors = new Set(await objectOids(sqlDb(), repo))
+			const survivors = new Set(await objectOids(publicSchemaDb(), repo))
 			for (const oid of orphans) expect(survivors.has(oid)).toBe(true)
 
 			// Disabling stops the loop, NOT the stamp: the push still recorded activity.
-			const state = await repoGcState(sqlDb(), repo)
+			const state = await repoGcState(publicSchemaDb(), repo)
 			if (state.kind !== "pushed-never-drained") {
 				throw new Error(`expected pushed, undrained repo ${repo}; got ${state.kind}`)
 			}

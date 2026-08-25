@@ -278,9 +278,7 @@ export type {
 	GcScheduler,
 	GcSchedulerOptions,
 } from "@/store/gc-scheduler"
-// Public GC surface: the per-repo reachability GC primitive (a host may drive it directly on its own schedule) and the self-scheduling background drain that runs the due maintenance phases GC-first (docs/2026-06-24-gc-scheduler-design.md §4; repack extension: docs/2026-08-25-drain-repack-wiring.md).
 export { createGcScheduler } from "@/store/gc-scheduler"
-// Offline repack: builds the stored pack-encoding tier per repo. The GC drain invokes it after GC for due repos; the primitive remains exported for hosts that need a direct pass on their own schedule.
 export type { Repack, RepackResult } from "@/store/repack"
 export { createRepack } from "@/store/repack"
 // Administrative repo lifecycle: exact-name delete + prefix listing, exported for

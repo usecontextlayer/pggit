@@ -21,11 +21,6 @@ const EnvSchema = z.object({
 	PGGIT_GC_GRACE_SECONDS: z.coerce.number().nonnegative().default(60),
 	// Drain cadence — the debounce window a burst of turns coalesces into.
 	PGGIT_GC_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
-	// The drain's repack phase (docs/2026-08-25-drain-repack-wiring.md): nested
-	// under the GC switch — when the drain is off, repack is off with it. Disabling
-	// only skips the phase; pushes still stamp activity and a host can invoke
-	// `repack()` directly, so enabling later just works. Same loud-failure tokens
-	// as PGGIT_GC_ENABLED.
 	PGGIT_GC_REPACK_ENABLED: z
 		.enum(["true", "false", "1", "0"])
 		.default("true")

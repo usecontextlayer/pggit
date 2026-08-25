@@ -2,7 +2,7 @@
 
 > **Rename note (2026-08-21 reorg):** `src/gc-scheduler.ts` now lives at `src/store/gc-scheduler.ts`, `generative/gc-scheduler.spec.test.ts` is `generative/gc-scheduler.test.ts` (the `.spec` infix was dropped repo-wide), and `generative/commands.ts` → `src/testing/repo-commands.ts`. "Snapshot" below is MVCC/force-commit vocabulary, untouched by the rename. Mentions keep the names that were current when this was written.
 
-> **Extension note (2026-08-25):** the drain gained a REPACK phase — per repo, GC then `repack()` over survivors; repack is due on its own `last_repack_at` watermark or whenever GC is due, closing holes a sweep can make in the encoding tier. The switch is `PGGIT_GC_REPACK_ENABLED`, and `DrainEntry` is nested `{ repo, gc, repack }`. The design, its provenance, and the SCH-R1…R8 contract live in `docs/2026-08-25-drain-repack-wiring.md`; this doc's §6 SCH-1…SCH-11 / PBT-S1 stay normative (PBT-S1 gained coverage conjuncts there). §4's "a mounted host … starts its own scheduler" and §5's table read with that phase added.
+> **Extension note (2026-08-25):** the drain gained a REPACK phase — per repo, GC then `repack()` over survivors; repack is due on its own `last_repack_at` watermark or whenever GC is due, closing holes a sweep can make in the encoding tier. The switch is `PGGIT_GC_REPACK_ENABLED`, and `DrainEntry` is nested `{ repo, gc, repack }`. The design, its provenance, and the SCH-R1…R8 contract live in `docs/2026-08-25-drain-repack-wiring.md`. SCH-1…SCH-11 remain normative for the GC arm, while the repack design supersedes §4's flat result shape and §6's GC-only summary-set wording and strengthens PBT-S1.
 
 - **Date:** 2026-06-24
 - **Status:** approved design, pre-implementation. Next step is **tests-first** (behavioural, observable-only — see §7), then implementation.
@@ -66,19 +66,25 @@ There is no window where garbage is both unseen by GC and fails to re-trigger. T
 ## 4. Components & seam
 
 - **`createGc` becomes a public export** (`src/index.ts`) — the primitive a host can also drive directly on its own schedule.
-- **`createGcScheduler(pg, opts)`** (new, e.g. `src/gc-scheduler.ts`) owns all policy:
-  - `drainOnce(): Promise<DrainSummary>` — one poll+sweep pass: select eligible repos (each with a DB `clock_timestamp()` `t0`), then for each (bounded concurrency, per-repo serialized) run `gc(name, { graceSeconds })` and `UPDATE repos SET last_gc_at = t0`. Returns one entry **per eligible repo** `{ repo, deletedObjects, deletedEdges }` (including zero-reclaim repos, so the eligible *set* is observable).
+- **`createGcScheduler(pg, opts)`** (now `src/store/gc-scheduler.ts`) owns all policy:
+  - `drainOnce(): Promise<DrainSummary>` — one poll+sweep pass: select repos owing GC or repack work, then for each (bounded concurrency, per-repo serialized) run the due phases GC-first. Returns `{ repo, gc, repack }` for every candidate where at least one phase produced a result; both phase slots are nullable.
   - `start()` / `stop()` — thin glue: `start` runs `drainOnce` on a `setInterval(intervalMs)` (guarded against overlapping passes); `stop` clears it. **All correctness lives in `drainOnce`**, which tests drive directly — the timer is never in a test's critical path.
-- **`startServer` wires it** (standalone): build the scheduler over the same `pg`, `start()` it when enabled, `stop()` it in `close()`. **A mounted host is unchanged** — it either starts its own scheduler over its `pg` or drives `createGc` itself.
+- **`startServer` wires it** (standalone): build the scheduler over a dedicated maintenance pool, `start()` it when enabled, and `stop()` it in `close()`. **A mounted host is scheduler-free** — it either starts its own scheduler over its `pg` or drives the primitives itself.
 
 ```
 push ──(store txn)──▶ repos.last_pushed_at        createGitApp: UNCHANGED
                               │
             (no in-process coupling — durable signal)
                               ▼
-   createGcScheduler.drainOnce()  ──per eligible repo──▶  createGc().gc(name,{grace})
-                              │                                   │
-                              └── UPDATE repos.last_gc_at = t0 ◀──┘
+   createGcScheduler.drainOnce()
+              │
+              ├── per gc_due repo ─────────▶ createGc().gc(name,{grace})
+              │                                      │
+              │                 UPDATE repos.last_gc_at = t0 when settled
+              │
+              └── per repack_due repo, after GC ─▶ createRepack().repack(name)
+                                                     │
+                                      stamps repos.last_repack_at on success
 ```
 
 **Minor `gc.ts` refinement (motivated here):** skip the `VACUUM (ANALYZE)` + `reindex` maintenance when a pass reclaims **nothing**, so a frequent no-op scan (an eligible repo whose push happened to create no garbage, e.g. a fast-forward) costs only the live-set walk + anti-join, not a VACUUM. Observable-neutral (VACUUM changes no logical state; GC-6 idempotence still holds). Kept a distinct edit so it can be reviewed independently of the scheduler.
@@ -94,9 +100,10 @@ push ──(store txn)──▶ repos.last_pushed_at        createGitApp: UNCHAN
 | `PGGIT_GC_ENABLED` | `true` (standalone) | run the background drain in `startServer`. Host-mount mode opts in by starting its own scheduler. |
 | `PGGIT_GC_INTERVAL_MS` | `30000` | drain cadence (the debounce window — a burst of turns inside it coalesces to one sweep). |
 | `PGGIT_GC_GRACE_SECONDS` | `60` | passed to `gc()`; the storage-overhang dial (minutes, per the GC design — *not* git's days). |
-| `PGGIT_GC_CONCURRENCY` | `4` | max repos GC'd at once per pass, so one large-orphan repo can't head-of-line-block the rest. |
+| `PGGIT_GC_CONCURRENCY` | `4` | max repos drained at once per pass; also bounds concurrent repack memory. |
+| `PGGIT_GC_REPACK_ENABLED` | `true` | run the drain's repack phase; disabling it leaves the original GC-only behavior. |
 
-Disabling only stops the loop; `last_pushed_at` is still stamped (cheap, harmless), so enabling GC later just works.
+Disabling `PGGIT_GC_ENABLED` only stops the loop; `last_pushed_at` is still stamped (cheap, harmless), so enabling GC later just works.
 
 ---
 
@@ -106,7 +113,7 @@ Three observable surfaces, all first-class — **no internals** (timer mechanics
 
 - **Postgres surface** — rows + the two new columns: `repos.last_pushed_at` / `last_gc_at`, and the GC effect on `git_object` / `git_edge`. *What's in Postgres is observable; tests may also control `created_at` (`ageObjects`) and `grace` to probe determinism without wall-clock waits.*
 - **Git-protocol surface** — what stock `git` sees: a `clone` after a scheduled drain is `fsck`-clean with the latest tree. Oracle = the real `git` binary (`testing/spawn-git.ts`).
-- **Scheduler output surface** — `drainOnce()`'s returned `DrainSummary` (which repos it judged eligible and what each reclaimed). A return value, like `gc()`'s, is observable.
+- **Scheduler output surface** — `drainOnce()`'s returned `DrainSummary` (which repos produced a GC or repack result and each phase's outcome). A return value, like `gc()`'s and `repack()`'s, is observable.
 
 Every item must hold and be covered by a test.
 
@@ -117,9 +124,9 @@ Every item must hold and be covered by a test.
 
 **The drain loop**
 
-- **SCH-3 — Drains exactly the eligible set.** `drainOnce()` runs GC on every repo satisfying `needs_gc` and on no other; the returned summary lists exactly those repos. A repo not pushed since its last GC is absent.
-- **SCH-4 — A pass advances `last_gc_at` and is self-terminating.** After `drainOnce()` processes a repo, its `last_gc_at` is set; a second `drainOnce()` with no intervening push to that repo returns an empty summary for it (GCs nothing).
-- **SCH-5 — Idle repos untouched.** A repo never pushed (`last_pushed_at` NULL), or not pushed since its last GC, is never in a drain summary and its `git_object` / `git_edge` rows are unchanged.
+- **SCH-3 — Drains exactly the GC-eligible set.** `drainOnce()` runs GC on every repo satisfying `needs_gc` and on no other; entries with `gc !== null` list exactly those repos. With repack disabled, that is the whole summary; with repack enabled, SCH-R4 permits additional repack-only entries.
+- **SCH-4 — A settled GC advances `last_gc_at` and is self-terminating.** After `drainOnce()` gets a settled GC result for a repo, its `last_gc_at` is set. A second pass with no intervening push does not GC it; with repack disabled, it returns no entry for that repo.
+- **SCH-5 — GC-idle repos untouched by GC.** A repo never pushed (`last_pushed_at` NULL), or not pushed since its last GC, never has a non-null GC result and its `git_object` / `git_edge` rows are unchanged. With repack disabled, it is absent from the summary; SCH-R4 defines repack-only candidacy.
 - **SCH-6 — End-to-end reclamation through the loop.** After force-commits to a repo, one `drainOnce()` with `grace = 0` leaves `git_object` reduced to the current reachable closure and a `clone` `fsck`-clean with the latest tree. Over *K* force-commit-then-drain cycles, row count stays ≈ the reachable-set size (does not grow with *K*). (GC-2 / GC-4 reached *through* the scheduler.)
 - **SCH-7 — No-lost-garbage across a mid-drain push.** A push landing after a pass's GC snapshot re-stamps `last_pushed_at > last_gc_at`, so the next `drainOnce()` re-GCs the repo; afterwards its orphans are gone and a clone is complete + `fsck`-clean. (Durable analog of GC-9.)
 
