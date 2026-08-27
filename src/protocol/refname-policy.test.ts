@@ -1,18 +1,4 @@
-/**
- * Refname policy at the receive boundary:
- * git clients VALIDATE refnames before sending, so only a hostile or non-git
- * client ever ships a funny name — which is exactly why the server must not
- * trust the wire. A funny name that reached storage would poison every later
- * advertisement and status line a real git client parses. Rules mirror git's
- * `check_refname_format` as receive-pack applies it, plus the loose-ref
- * directory/file conflict (`refs/heads/a` vs `refs/heads/a/b`) checked in two
- * phases: existing-namespace clashes, then deepest-wins among the survivors.
- *
- * The two vector lists below are NAMED REGRESSIONS — each string is a rule someone
- * had to discover. The general agreement with canonical git is pinned generatively
- * against a spawned `git check-ref-format` in `src/generative/refname.test.ts`;
- * a new rule learned the hard way still belongs here, by name.
- */
+/** A malformed refname in storage would poison later advertisements and status lines, so receive-pack must not trust the wire. */
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import {
@@ -65,16 +51,15 @@ describe("refNameProblem — git's check_refname_format for full ref names", () 
 	})
 })
 
-type ReceiveBehavior = {
-	existing?: string[]
+type ReceiveFixtureOptions = {
+	initialRefNames?: string[]
 	isAncestor?: ReceiveBackend["isAncestor"]
 	isConnected?: ReceiveBackend["isConnected"]
 	objectType?: ReceiveBackend["objectType"]
 }
 
-/** A behavior-configurable, stateful ref-store fake anchored by the real-Git differentials. */
-function receiveFake(behavior: ReceiveBehavior = {}) {
-	const refs = new Map((behavior.existing ?? []).map((name) => [name, A]))
+function createReceiveFixture(options: ReceiveFixtureOptions = {}) {
+	const refs = new Map((options.initialRefNames ?? []).map((name) => [name, A]))
 	const backend: ReceiveBackend = {
 		applyRefUpdates: async (cmds) => {
 			for (const command of cmds) {
@@ -84,10 +69,10 @@ function receiveFake(behavior: ReceiveBehavior = {}) {
 			return cmds.map(() => true)
 		},
 		ingest: async () => {},
-		isAncestor: behavior.isAncestor ?? (async () => true),
-		isConnected: behavior.isConnected ?? (async () => true),
+		isAncestor: options.isAncestor ?? (async () => true),
+		isConnected: options.isConnected ?? (async () => true),
 		listRefNames: async () => [...refs.keys()],
-		objectType: behavior.objectType ?? (async () => "commit"),
+		objectType: options.objectType ?? (async () => "commit"),
 	}
 	return { backend, refs }
 }
@@ -104,7 +89,7 @@ function push(...lines: string[]): Buffer {
 
 describe("handleReceivePack — funny names get per-ref ng, never a ref", () => {
 	it("rejects a malformed name and applies nothing for it", async () => {
-		const { backend, refs } = receiveFake()
+		const { backend, refs } = createReceiveFixture()
 		const report = pktLineUnpack(
 			await handleReceivePack(push(`${Z} ${A} refs/heads/a..b`), backend),
 		)
@@ -113,7 +98,9 @@ describe("handleReceivePack — funny names get per-ref ng, never a ref", () => 
 	})
 
 	it("rejects a directory/file conflict against an EXISTING ref", async () => {
-		const { backend, refs } = receiveFake({ existing: ["refs/heads/a"] })
+		const { backend, refs } = createReceiveFixture({
+			initialRefNames: ["refs/heads/a"],
+		})
 		const report = pktLineUnpack(
 			await handleReceivePack(push(`${Z} ${A} refs/heads/a/b`), backend),
 		)
@@ -122,10 +109,7 @@ describe("handleReceivePack — funny names get per-ref ng, never a ref", () => 
 	})
 
 	it("within one batch, the DEEPEST name wins the directory/file conflict", async () => {
-		// Canonical git keeps the deepest conflicting new name and ngs every
-		// shorter one, in any wire order (measured on git 2.55; the receive-pack
-		// policy differential pins the agreement end-to-end).
-		const { backend, refs } = receiveFake()
+		const { backend, refs } = createReceiveFixture()
 		const report = pktLineUnpack(
 			await handleReceivePack(
 				push(`${Z} ${A} refs/heads/main`, `${Z} ${A} refs/heads/main/sub`),
@@ -187,13 +171,13 @@ function expectedResult(
 
 describe("handleReceivePack — D/F phase ordering", () => {
 	/** The real-Git DFC differentials anchor the model; this hermetic property explores the survivor combinations and wire permutations that are too expensive to enumerate through two remotes. */
-	it("generatively filters every per-command verdict before deepest-wins", async () => {
+	it("generatively filters every D/F-relevant per-command verdict before deepest-wins", async () => {
 		const lengths = new Map<number, number>()
 		const states = new Map<CommandState, number>()
 		let existingClashComposites = 0
 		let existingRoots = 0
 		let reordered = 0
-		let staleSetComposites = 0
+		let doomedDeeperComposites = 0
 		const bump = <T>(counts: Map<T, number>, key: T): void => {
 			counts.set(key, (counts.get(key) ?? 0) + 1)
 		}
@@ -208,13 +192,17 @@ describe("handleReceivePack — D/F phase ordering", () => {
 					if (order.some((depth, position) => depth !== position)) reordered++
 					if (existingRoot) existingRoots++
 
-					const deepestEligible = existingRoot
+					const deepestPerCommandSurvivorDepth = existingRoot
 						? drawnStates[0] === "eligible"
 							? 0
 							: -1
 						: drawnStates.lastIndexOf("eligible")
-					if (!existingRoot && deepestEligible >= 0 && deepestEligible < length - 1) {
-						staleSetComposites++
+					if (
+						!existingRoot &&
+						deepestPerCommandSurvivorDepth >= 0 &&
+						deepestPerCommandSurvivorDepth < length - 1
+					) {
+						doomedDeeperComposites++
 					}
 					if (
 						existingRoot &&
@@ -230,8 +218,8 @@ describe("handleReceivePack — D/F phase ordering", () => {
 							throw new Error(`no generated command state for ${oid}`)
 						return state
 					}
-					const { backend, refs } = receiveFake({
-						existing: existingRoot ? [chainRef(0)] : [],
+					const { backend, refs } = createReceiveFixture({
+						initialRefNames: existingRoot ? [chainRef(0)] : [],
 						isAncestor: async (_ancestor, descendant) => stateOf(descendant) !== "non-ff",
 						isConnected: async (oid) => stateOf(oid) !== "disconnected",
 						objectType: async (oid) =>
@@ -256,17 +244,22 @@ describe("handleReceivePack — D/F phase ordering", () => {
 								chainRef(depth),
 								drawnStates[depth] as CommandState,
 								existingRoot && depth > 0,
-								drawnStates[depth] === "eligible" && depth < deepestEligible,
+								drawnStates[depth] === "eligible" &&
+									depth < deepestPerCommandSurvivorDepth,
 							),
 						),
 						"0000\n",
 					].join("")
 					expect(report).toBe(expectedReport)
 					const expectedRefs = existingRoot
-						? [`${chainRef(0)} ${deepestEligible === 0 ? commandOid(0) : A}`]
-						: deepestEligible < 0
+						? [
+								`${chainRef(0)} ${deepestPerCommandSurvivorDepth === 0 ? commandOid(0) : A}`,
+							]
+						: deepestPerCommandSurvivorDepth < 0
 							? []
-							: [`${chainRef(deepestEligible)} ${commandOid(deepestEligible)}`]
+							: [
+									`${chainRef(deepestPerCommandSurvivorDepth)} ${commandOid(deepestPerCommandSurvivorDepth)}`,
+								]
 					expect(refState(refs)).toEqual(expectedRefs)
 				},
 			),
@@ -298,8 +291,8 @@ describe("handleReceivePack — D/F phase ordering", () => {
 			"corpus never put an eligible update beside a deeper existing-namespace clash",
 		).toBeGreaterThan(0)
 		expect(
-			staleSetComposites,
-			"corpus never put a doomed deeper command below the deepest eligible command",
+			doomedDeeperComposites,
+			"corpus never put a doomed deeper command below the deepest surviving command",
 		).toBeGreaterThan(0)
 	})
 })

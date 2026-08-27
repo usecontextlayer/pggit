@@ -296,26 +296,7 @@ export async function handleReceivePack(
 				: backend.objectType(c.newOid).then((t) => t === "commit"),
 		),
 	)
-	// Directory/file conflicts, judged LAST, in TWO ORDERED PHASES — the order is
-	// the point. Phase 1 is per-command: a name that prefix-conflicts with the
-	// EXISTING namespace is disqualified at its existing reason precedence (the
-	// existing side includes SYMREF names: `refs/remotes/origin/HEAD` blocks
-	// `refs/remotes/origin/HEAD/x` exactly like a value ref would). Phase 2 is
-	// the batch's only inter-command rule: git keeps the DEEPEST new name and
-	// `ng`s every shorter one, wire-order independent (measured on git 2.55 —
-	// pairs AND three-name chains; the policy differential pins both) — judged
-	// ONLY over phase-1 survivors, so a command doomed against the existing
-	// namespace never reserves it against a valid sibling (DFC-1: git applies
-	// the valid update; judging deepest-wins against a pre-phase-1 set was the
-	// stale-set defect). One ordered pass suffices: the existing namespace is
-	// fixed, so phase 1 is final, and removing a phase-2 loser can never create
-	// a new loss (a chain's deepest survivor defeats every shallower name
-	// directly, by prefix transitivity). Phase 2 carries EVERY per-command verdict
-	// — fast-forward included: an FF-failing deeper sibling
-	// is unreachable in a D/F composite today (a deeper UPDATE implies the
-	// deeper name exists, which dooms the shallower against the existing
-	// namespace first), but leaving FF out would reopen the same stale-set
-	// class under a future policy change.
+	// Directory/file conflicts are judged last in two ordered phases: first disqualify names that conflict with the fixed existing namespace (including symrefs), then keep only the deepest name among the per-command survivors. A rejected command must not reserve the namespace against a valid sibling, so every per-command verdict, including fast-forward, participates in the survivor filter. One pass is sufficient because prefix transitivity lets the deepest survivor defeat every shallower name directly.
 	const existingNames = await backend.listRefNames()
 	for (const [i, c] of commands.entries()) {
 		if (
@@ -341,12 +322,12 @@ export async function handleReceivePack(
 			fastForward[i] === true &&
 			c.newOid !== ZERO_OID,
 	)
-	const survivorNames = commands
+	const perCommandSurvivorNames = commands
 		.filter((_c, i) => perCommandSurvivors[i])
 		.map((c) => c.ref)
 	for (const [i, c] of commands.entries()) {
 		if (!perCommandSurvivors[i]) continue
-		if (survivorNames.some((other) => other.startsWith(`${c.ref}/`))) {
+		if (perCommandSurvivorNames.some((other) => other.startsWith(`${c.ref}/`))) {
 			nameProblem[i] = "funny refname (directory/file conflict)"
 		}
 	}

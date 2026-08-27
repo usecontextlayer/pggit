@@ -686,16 +686,7 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 		})
 	}, 180_000)
 
-	/**
-	 * DFC-1 (docs/2026-08-27-df-composite-and-tag-parent-design.md): the COMPOSITE
-	 * D/F case — a valid UPDATE of an existing ref riding in the same batch as a
-	 * deeper sibling that is itself doomed against the existing namespace. Pure
-	 * parity, both wire orders, fresh remotes per order: per-ref verdict classes
-	 * and the final ref set must equal canonical git's. The generator above can
-	 * never produce this composite (destinations are position-keyed). The pre-fix
-	 * D/F pass judged deepest-wins against an eligibility set frozen BEFORE the
-	 * existing-clash check — the stale-set defect this pins.
-	 */
+	// The position-keyed generator above cannot produce two commands in this D/F relation.
 	it("DFC-1: an update of an existing ref survives its doomed deeper sibling, in both wire orders", async () => {
 		for (const order of ["shallow-first", "deep-first"] as const) {
 			const repo = `policy/dfc1-${order}`
@@ -741,13 +732,6 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 		}
 	}, 180_000)
 
-	/**
-	 * DFC-2: the doomed-deeper generalization — the deeper sibling is doomed by a
-	 * DIFFERENT per-command check (the branch-tip rule: a blob tip under
-	 * refs/heads/). Preservation pin: the pre-fix predicate already excluded it,
-	 * so the shallow create must apply on both remotes; the two-phase reshape must
-	 * preserve that behavior.
-	 */
 	it("DFC-2: a deeper sibling doomed by the branch-tip rule never reserves the namespace", async () => {
 		const repo = "policy/dfc2"
 		await withTempDir("pggit-rppolicy-dfc2-", async (bare) => {
@@ -787,13 +771,6 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 		})
 	}, 180_000)
 
-	/**
-	 * DFC-3: the three-name D/F chain, measured for the first time — the pair
-	 * case above was the corpus's only prior measurement, in one wire order. Pure
-	 * parity over fresh remotes per order; the canonical verdicts are logged so
-	 * each run records the behavior. This differential confirmed the design doc's
-	 * deepest-wins hypothesis and now protects the measured rule.
-	 */
 	it("DFC-3: a three-name D/F chain matches canonical git in both wire orders", async () => {
 		for (const order of ["shallow-first", "deep-first"] as const) {
 			const repo = `policy/dfc3-${order}`

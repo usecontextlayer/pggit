@@ -118,21 +118,7 @@ async function loadObjectMeta(
  * treat a subtree as a leaf and silently skip its descendants. */
 type EdgeExpectation = "commit" | "tree" | "blob"
 
-/** Judge a git_object-probed oid against its edges' expectations (the SET of
- * expectations its referencing edges made — satisfying ANY is enough, so a
- * valid directory edge keeps an object alive even when a second, mistyped
- * edge also names it). Returns:
- * - "corruption": a COMMIT/TAG type here means the derived row is MISSING —
- *   the derived-row invariant is broken, crash loud, NEVER a sweepable
- *   "missing". This is proof-backed, not inferred: a healthy commit resolves
- *   via its row in step 1, and a healthy tag named by a commit edge is
- *   exonerated by step 2's classification probe — only row-less objects reach
- *   this probe with a "commit" expectation.
- * - "violation": the one exception — when ONLY tree/blob edges named the oid,
- *   the OBJECT may be healthy and the EDGE malformed; likewise a TREE/BLOB
- *   type matching none of its expectations ("commit" is never satisfiable
- *   here).
- * - "ok" otherwise. */
+/** Judge an object-metadata fallback against its declared edge types. A commit or tag that reaches this probe with a commit expectation has already missed its required derived-row probes, so it is proven corruption. A commit or tag reached only through tree/blob expectations may be healthy behind a malformed edge, which is a policy violation instead. */
 function judgeProbedType(
 	expectations: ReadonlySet<EdgeExpectation> | undefined,
 	typeCode: number,
@@ -237,18 +223,7 @@ type ClosureResult = { present: Set<string>; missing: Set<string> }
  * origin spares the dominant tree/blob volume the commit/tag row lookups. */
 type ClosureLevel = { commits: string[]; objects: string[]; unknown: string[] }
 
-/**
- * Everything reachable from `roots` — level-synchronous BFS in JS. Per level:
- * commit rows for known-commit + unknown oids, tag rows to classify commit
- * misses and traverse the unknown remainder, then one `git_object` read for the
- * rest that fetches CONTENT ONLY for trees (a `case` guard keeps blob bodies off
- * the wire; presence is all a blob contributes). One tree parse yields both
- * subtrees and blobs. Returns the closure partitioned into present / missing.
- *
- * A commit or tag OBJECT whose derived row is absent is a LOUD error, never a
- * parse-the-body fallback — "every stored commit has its row" is the
- * invariant, and reading through its violation would hide real corruption.
- */
+/** Everything reachable from `roots`, partitioned into present and missing objects. `omitBlobs` omits blob entries reached through trees. A stored commit or tag without its derived row is an invariant failure, never a parse-the-body fallback. */
 export async function fullClosure(
 	db: Kysely<Database>,
 	id: ReposId,
@@ -294,17 +269,11 @@ export async function fullClosure(
 			for (const parent of row.parents) enqueue(next, "commits", parent, "commit")
 		}
 
-		// 2. Tag rows — traversal for unknowns that were not commits, and
-		// CLASSIFICATION for every typed expectation accumulated on a tag hit: a
-		// commit-parent edge naming a stored tag is a typed-edge VIOLATION (the row is healthy —
-		// letting it fall to the object probe would misdiagnose it as derived-row
-		// corruption), judged like every violation on this serve path: the want is
-		// refused, the tag never traversed. A commit-expected miss the tag probe
-		// ALSO misses proceeds to the object probe, where a TAG type code now
-		// proves the derived row absent — genuine corruption, still loud.
-		const tagProbe = level.unknown.filter((oid) => !commitRows.has(oid))
-		const commitMisses = level.commits.filter((oid) => !commitRows.has(oid))
-		const tagRows = await loadTagTargets(db, id, [...tagProbe, ...commitMisses])
+		// 2. Probe commit-row misses as tags before object metadata; see judgeProbedType() for why this order proves corruption.
+		const unknownCommitRowMisses = level.unknown.filter((oid) => !commitRows.has(oid))
+		const commitExpectedRowMisses = level.commits.filter((oid) => !commitRows.has(oid))
+		const tagProbe = [...new Set([...unknownCommitRowMisses, ...commitExpectedRowMisses])]
+		const tagRows = await loadTagTargets(db, id, tagProbe)
 		for (const [oid, target] of tagRows) {
 			if ((expected.get(oid)?.size ?? 0) > 0) {
 				missing.add(oid)
@@ -317,8 +286,8 @@ export async function fullClosure(
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = [
 			...level.objects.filter((oid) => !tagRows.has(oid)),
-			...commitMisses.filter((oid) => !tagRows.has(oid)),
-			...tagProbe.filter((oid) => !tagRows.has(oid)),
+			...commitExpectedRowMisses.filter((oid) => !tagRows.has(oid)),
+			...unknownCommitRowMisses.filter((oid) => !tagRows.has(oid)),
 		]
 		const objectMetadata = await loadObjectMeta(db, id, objectProbe)
 		for (const [oid, metadata] of objectMetadata) {
@@ -478,34 +447,22 @@ export async function originClosure(
 			}
 		}
 
-		// 2. Tag rows — traversal for unknown-bucket misses, and CLASSIFICATION for
-		// every typed role carried by the same oid, notably commit-expected misses
-		// (the tag-parent shape): a healthy tag row proves a typed-edge VIOLATION,
-		// never derived-row corruption.
-		// "reject" fails it like an absent object; "retain" keeps it live AND peels
-		// it — the target traverses with the violator's bits (TP-3′: retain expands
-		// by ACTUAL type, tags included) — while the violation withholds the epoch
-		// either way. A miss here proceeds to the object probe, where a TAG type
-		// code now PROVES the derived row absent — genuine corruption, still loud.
-		const tagProbe = new Map<string, bigint>()
+		// 2. Preserve judgeProbedType()'s classification boundary before applying the origin-aware violation policy.
+		const unknownCommitRowMisses = new Map<string, bigint>()
 		for (const [oid, bits] of level.unknown) {
-			if (!commitRows.has(oid)) tagProbe.set(oid, bits)
+			if (!commitRows.has(oid)) unknownCommitRowMisses.set(oid, bits)
 		}
-		// Keep the bucket roles independent: one oid can carry different origin bits
-		// in several maps. A known tag is judged ONCE from all of those roles: unknown
-		// bits traverse normally, while typed-edge bits make it a violation and are
-		// retained only in retain mode.
-		const commitMisses = new Map<string, bigint>()
+		// Keep bucket roles independent because the same oid can carry different origin bits through unknown and typed edges.
+		const commitExpectedRowMisses = new Map<string, bigint>()
 		for (const [oid, bits] of level.commits) {
-			if (!commitRows.has(oid)) commitMisses.set(oid, bits)
+			if (!commitRows.has(oid)) commitExpectedRowMisses.set(oid, bits)
 		}
-		const tagRows = await loadTagTargets(db, id, [
-			...tagProbe.keys(),
-			...commitMisses.keys(),
-		])
+		const tagProbe = merge(unknownCommitRowMisses, commitExpectedRowMisses)
+		const tagRows = await loadTagTargets(db, id, tagProbe.keys())
 		for (const [oid, target] of tagRows) {
-			const unknownBits = tagProbe.get(oid) ?? 0n
-			const typedBits = (commitMisses.get(oid) ?? 0n) | (level.objects.get(oid) ?? 0n)
+			const unknownBits = unknownCommitRowMisses.get(oid) ?? 0n
+			const typedBits =
+				(commitExpectedRowMisses.get(oid) ?? 0n) | (level.objects.get(oid) ?? 0n)
 			let targetBits = unknownBits
 			if ((expected.get(oid)?.size ?? 0) > 0) {
 				violations.add(oid)
@@ -521,21 +478,13 @@ export async function originClosure(
 
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = merge(
-			new Map([...commitMisses].filter(([oid]) => !tagRows.has(oid))),
-			new Map([...tagProbe].filter(([oid]) => !tagRows.has(oid))),
+			new Map([...commitExpectedRowMisses].filter(([oid]) => !tagRows.has(oid))),
+			new Map([...unknownCommitRowMisses].filter(([oid]) => !tagRows.has(oid))),
 			new Map([...level.objects].filter(([oid]) => !tagRows.has(oid))),
 		)
 		const objectMetadata = await loadObjectMeta(db, id, objectProbe.keys())
-		const retainedTagViolations = new Map<string, bigint>()
+		const retainedTagViolationsToPeel = new Map<string, bigint>()
 		for (const [oid, metadata] of objectMetadata) {
-			// Typed-edge violations: the graph is malformed. "reject" fails
-			// connectivity like an absent object; "retain" keeps the object live
-			// (a valid edge elsewhere must keep it un-sweepable) and expands it
-			// by its ACTUAL type — a retained TAG (a tree entry naming a tag) is
-			// peeled below through its derived row, so its target stays live too
-			// (TP-3′) — either way the violation is recorded and the epoch
-			// withheld. A commit/tag with no derived row stays a LOUD corruption
-			// crash, never a sweepable "missing".
 			const verdict = judgeProbedType(expected.get(oid), metadata.type)
 			if (verdict === "corruption") throwMissingDerivedRow(oid, metadata.type)
 			if (verdict === "violation") {
@@ -546,7 +495,7 @@ export async function originClosure(
 					continue
 				}
 				if (metadata.type === PACK_OBJ_TYPE.TAG) {
-					retainedTagViolations.set(oid, objectProbe.get(oid) as bigint)
+					retainedTagViolationsToPeel.set(oid, objectProbe.get(oid) as bigint)
 					continue
 				}
 			}
@@ -568,12 +517,10 @@ export async function originClosure(
 				}
 			}
 		}
-		// TP-3′'s batched peel: a row missing HERE is genuine, proof-backed
-		// corruption (the classification probes above already exonerated every
-		// healthy tag this level could route wrongly).
-		if (retainedTagViolations.size > 0) {
-			const targets = await loadTagTargets(db, id, retainedTagViolations.keys())
-			for (const [oid, bits] of retainedTagViolations) {
+		// Retained tags expand through their derived targets so GC cannot sweep a reachable target. Because only object-probed tags enter this map, a missing row proves corruption.
+		if (retainedTagViolationsToPeel.size > 0) {
+			const targets = await loadTagTargets(db, id, retainedTagViolationsToPeel.keys())
+			for (const [oid, bits] of retainedTagViolationsToPeel) {
 				const target = targets.get(oid)
 				if (target === undefined) throwMissingDerivedRow(oid, PACK_OBJ_TYPE.TAG)
 				enqueue(next, "unknown", target, bits)

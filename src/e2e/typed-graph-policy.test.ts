@@ -1,29 +1,4 @@
-/**
- * Typed-graph policy. Three layers:
- *
- * 1. Branch tips must be COMMITS — canonical receive-pack rejects a blob or
- *    tree pushed to refs/heads/* per-ref ("invalid new value provided",
- *    probed against git 2.x), while refs/tags/* accepts any type. Real git
- *    is the driver here, so the whole wire path is under test.
- *
- * 2. Typed EDGES — a commit whose `tree` names a blob, or a `40000` tree
- *    entry naming a blob, is a malformed graph git's writers never produce.
- *    The walks judge a mistyped edge like an absent object: connectivity
- *    rejects the push and a serve refuses the want — never an under-walk
- *    that silently skips the mistyped subtree's descendants.
- *
- * 3. The TAG-PARENT family (TPC-1..6, docs/2026-08-27-df-composite-and-
- *    tag-parent-design.md): a commit whose `parent` header names an annotated
- *    tag, and its sibling — a tree entry naming a tag. The tag has a healthy
- *    `git_tag` row, so the verdict must be a typed-edge VIOLATION (reject the
- *    push / refuse the want / keep-and-peel under GC's retain), never the
- *    derived-row corruption crash. The oracle is real `git receive-pack
- *    --stateless-rpc` fed the identical crafted body. FIXTURE RULE: no ref may
- *    ever name the tag in the crash-path cases — a tip-tag sits in the
- *    boundary stop-set (or becomes a walk origin) and takes the already-correct
- *    boundary path, so a tip-tag fixture would green the pre-fix suite and
- *    misread as refuting a real defect.
- */
+/** Except for TPC-2's deliberate boundary variant, fixtures that exercise in-walk tag classification keep the annotated tag off every ref tip because a tip takes the boundary path instead. TPC-1..6 are specified in `docs/2026-08-27-df-composite-and-tag-parent-design.md`. */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -44,12 +19,8 @@ import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const REPO = "policy/typed"
 
-/** The tag-parent object family, content-parameterized by `label` so each test's
- * closure is oid-disjoint from every other's (the corruption tests delete derived
- * rows by bare oid — shared oids would cross-contaminate repos in the schema).
- * `malformed` is a commit whose `parent` names the ANNOTATED TAG — the graph
- * shape git's writers never produce that layer 3 of the header pins. */
-function tagParentObjects(label: string) {
+/** A unique label keeps fixture oids disjoint because the corruption cases delete derived rows without a repo-id predicate. */
+function createTagParentFixture(label: string) {
 	const blob = Buffer.from(`${label}\n`)
 	const blobOid = computeOid("blob", blob)
 	const tree = Buffer.concat([Buffer.from("100644 f\0"), Buffer.from(blobOid, "hex")])
@@ -62,24 +33,21 @@ function tagParentObjects(label: string) {
 		`object ${targetOid}\ntype commit\ntag ${label}\ntagger t <t@t> 1700000001 +0000\n\n${label}\n`,
 	)
 	const tagOid = computeOid("tag", tag)
-	const malformed = Buffer.from(
+	const malformedCommit = Buffer.from(
 		`tree ${treeOid}\nparent ${tagOid}\nauthor t <t@t> 1700000002 +0000\ncommitter t <t@t> 1700000002 +0000\n\n${label}-bad\n`,
 	)
-	const malformedOid = computeOid("commit", malformed)
+	const malformedCommitOid = computeOid("commit", malformedCommit)
 	const objects: PackInputObject[] = [
 		{ content: blob, type: "blob" },
 		{ content: tree, type: "tree" },
 		{ content: target, type: "commit" },
 		{ content: tag, type: "tag" },
-		{ content: malformed, type: "commit" },
+		{ content: malformedCommit, type: "commit" },
 	]
-	return { malformed, malformedOid, objects, tag, tagOid, target, targetOid }
+	return { malformedCommit, malformedCommitOid, objects, tag, tagOid, target, targetOid }
 }
 
-/** Feed one crafted receive-pack body to real `git receive-pack --stateless-rpc`
- * over `bare` — the receive-side twin of upload-pack-oracle.ts. A nonzero exit is
- * an outcome here (a connectivity-failing push may exit either way; the report is
- * the observable), so it is returned, never thrown. */
+/** Receive failures are oracle outcomes, so preserve their report instead of throwing. */
 async function oracleReceive(
 	bare: string,
 	body: Buffer,
@@ -93,15 +61,14 @@ async function oracleReceive(
 	}
 }
 
-/** Store exact object bytes in canonical git and prove its oids match the graph embedded by the fixture. */
 async function writeOracleObjects(
 	bare: string,
 	objects: readonly PackInputObject[],
 ): Promise<string[]> {
 	const oids: string[] = []
-	for (const o of objects) {
-		const oid = await writeLiteralGitObject(bare, o)
-		const expected = computeOid(o.type, o.content)
+	for (const object of objects) {
+		const oid = await writeLiteralGitObject(bare, object)
+		const expected = computeOid(object.type, object.content)
 		if (oid !== expected) {
 			throw new Error(`canonical git assigned ${oid} to fixture object ${expected}`)
 		}
@@ -110,7 +77,7 @@ async function writeOracleObjects(
 	return oids
 }
 
-/** Build the exact client pack with canonical git, not pggit's production serializer. */
+/** Build the fixture pack with canonical git so the oracle does not share pggit's serializer. */
 async function literalGitPack(objects: readonly PackInputObject[]): Promise<Buffer> {
 	return withTempDir("pggit-typed-pack-source-", async (source) => {
 		await spawnGit(["init", "-q", "--bare", source])
@@ -286,22 +253,19 @@ describe("typed-graph policy", () => {
 	})
 
 	it("TPC-1: pushing a commit whose parent is a TAG is a per-ref rejection on both remotes, never a 500", async () => {
-		const fxp = tagParentObjects("tp1")
+		const fixture = createTagParentFixture("tp1")
 		const body = receivePackRequest(
-			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp1\0report-status`],
-			await literalGitPack(fxp.objects),
+			[`${ZERO_OID} ${fixture.malformedCommitOid} refs/heads/tp1\0report-status`],
+			await literalGitPack(fixture.objects),
 		)
 		const res = await postReceivePack(app, "policy/tp1", body)
 		expect(res.status).toBe(200)
 		const report = pktLineUnpack(res.body)
 		expect(report).toContain("ng refs/heads/tp1 missing necessary objects")
 		expect(await deps.refs.listRefs("policy/tp1")).toEqual([])
-		for (const oid of [fxp.malformedOid, fxp.tagOid]) {
+		for (const oid of [fixture.malformedCommitOid, fixture.tagOid]) {
 			expect(await deps.objects.hasObject("policy/tp1", oid), oid).toBe(true)
 		}
-		// The oracle: the identical body into real `git receive-pack`. The observed
-		// verdict is logged — the design doc's hypothesis (a connectivity-class
-		// per-ref rejection) is measured here, not remembered.
 		await withTempDir("pggit-typed-tp1-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
 			const oracle = await oracleReceive(bare, body)
@@ -314,15 +278,14 @@ describe("typed-graph policy", () => {
 	}, 120_000)
 
 	it("TPC-1 variant: the tag pre-stored and UNREFERENCED, only the malformed commit in the pack", async () => {
-		const fxp = tagParentObjects("tp1v")
-		const prerequisites = fxp.objects.filter((o) => o.content !== fxp.malformed)
-		// Pre-store everything but the malformed commit — and deliberately set NO
-		// ref: a tip-tag would take the boundary path and dodge the in-walk verdict
-		// (the header's fixture rule).
+		const fixture = createTagParentFixture("tp1v")
+		const prerequisites = fixture.objects.filter(
+			(object) => object.content !== fixture.malformedCommit,
+		)
 		await deps.objects.putPack("policy/tp1v", prerequisites)
 		const body = receivePackRequest(
-			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp1v\0report-status`],
-			await literalGitPack([{ content: fxp.malformed, type: "commit" }]),
+			[`${ZERO_OID} ${fixture.malformedCommitOid} refs/heads/tp1v\0report-status`],
+			await literalGitPack([{ content: fixture.malformedCommit, type: "commit" }]),
 		)
 		const res = await postReceivePack(app, "policy/tp1v", body)
 		expect(res.status).toBe(200)
@@ -330,7 +293,7 @@ describe("typed-graph policy", () => {
 			"ng refs/heads/tp1v missing necessary objects",
 		)
 		expect(await deps.refs.listRefs("policy/tp1v")).toEqual([])
-		for (const oid of [fxp.malformedOid, fxp.tagOid]) {
+		for (const oid of [fixture.malformedCommitOid, fixture.tagOid]) {
 			expect(await deps.objects.hasObject("policy/tp1v", oid), oid).toBe(true)
 		}
 		await withTempDir("pggit-typed-tp1v-", async (bare) => {
@@ -346,13 +309,15 @@ describe("typed-graph policy", () => {
 	}, 120_000)
 
 	it("TPC-2: the boundary variant — the tag is an existing ref TIP — keeps its clean rejection", async () => {
-		const fxp = tagParentObjects("tp2")
-		const prerequisites = fxp.objects.filter((o) => o.content !== fxp.malformed)
+		const fixture = createTagParentFixture("tp2")
+		const prerequisites = fixture.objects.filter(
+			(object) => object.content !== fixture.malformedCommit,
+		)
 		await deps.objects.putPack("policy/tp2", prerequisites)
-		await deps.refs.setRef("policy/tp2", "refs/tags/anchor", fxp.tagOid)
+		await deps.refs.setRef("policy/tp2", "refs/tags/anchor", fixture.tagOid)
 		const body = receivePackRequest(
-			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp2\0report-status`],
-			await literalGitPack([{ content: fxp.malformed, type: "commit" }]),
+			[`${ZERO_OID} ${fixture.malformedCommitOid} refs/heads/tp2\0report-status`],
+			await literalGitPack([{ content: fixture.malformedCommit, type: "commit" }]),
 		)
 		const res = await postReceivePack(app, "policy/tp2", body)
 		expect(res.status).toBe(200)
@@ -361,11 +326,13 @@ describe("typed-graph policy", () => {
 		expect((await deps.refs.listRefs("policy/tp2")).map((ref) => ref.name)).toEqual([
 			"refs/tags/anchor",
 		])
-		expect(await deps.objects.hasObject("policy/tp2", fxp.malformedOid)).toBe(true)
+		expect(await deps.objects.hasObject("policy/tp2", fixture.malformedCommitOid)).toBe(
+			true,
+		)
 		await withTempDir("pggit-typed-tp2-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
 			await writeOracleObjects(bare, prerequisites)
-			await spawnGit(["update-ref", "refs/tags/anchor", fxp.tagOid], { cwd: bare })
+			await spawnGit(["update-ref", "refs/tags/anchor", fixture.tagOid], { cwd: bare })
 			const oracle = await oracleReceive(bare, body)
 			console.log(
 				`[TPC-2 oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
@@ -376,10 +343,10 @@ describe("typed-graph policy", () => {
 	}, 120_000)
 
 	it("TPC-3: denied-push residue whose parent names a TAG cannot be served", async () => {
-		const fxp = tagParentObjects("tp3")
+		const fixture = createTagParentFixture("tp3")
 		const pushBody = receivePackRequest(
-			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp3\0report-status`],
-			await literalGitPack(fxp.objects),
+			[`${ZERO_OID} ${fixture.malformedCommitOid} refs/heads/tp3\0report-status`],
+			await literalGitPack(fixture.objects),
 		)
 		const pushResponse = await postReceivePack(app, "policy/tp3", pushBody)
 		expect(pushResponse.status).toBe(200)
@@ -387,14 +354,16 @@ describe("typed-graph policy", () => {
 			"ng refs/heads/tp3 missing necessary objects",
 		)
 		expect(await deps.refs.listRefs("policy/tp3")).toEqual([])
-		for (const oid of [fxp.malformedOid, fxp.tagOid]) {
+		for (const oid of [fixture.malformedCommitOid, fixture.tagOid]) {
 			expect(await deps.objects.hasObject("policy/tp3", oid), oid).toBe(true)
 		}
-		expect(await deps.objects.isConnected("policy/tp3", fxp.malformedOid)).toBe(false)
+		expect(await deps.objects.isConnected("policy/tp3", fixture.malformedCommitOid)).toBe(
+			false,
+		)
 		const request = fetchRequest({
 			done: true,
 			objectFormat: "sha1",
-			wants: [fxp.malformedOid],
+			wants: [fixture.malformedCommitOid],
 		})
 		const response = await app.request("/policy/tp3/git-upload-pack", {
 			body: request,
@@ -408,119 +377,115 @@ describe("typed-graph policy", () => {
 			const receive = await oracleReceive(bare, pushBody)
 			expect(receive.report).toContain("ng refs/heads/tp3 missing necessary objects")
 			expect(await allRefsOf(bare)).toEqual([])
-			await writeOracleObjects(bare, fxp.objects)
+			await writeOracleObjects(bare, fixture.objects)
 			expect(
-				(await spawnGit(["cat-file", "-t", fxp.malformedOid], { cwd: bare })).stdout,
+				(await spawnGit(["cat-file", "-t", fixture.malformedCommitOid], { cwd: bare }))
+					.stdout,
 			).toBe("commit\n")
-			// Measured 2026-08-27 (git 2.x): canonical upload-pack ACCEPTS this want
-			// (its `want` check is existence, not closure — the object is present)
-			// and then dies inside pack-objects ("aborting due to possible
-			// repository corruption", exit 128) — a mid-stream hard abort with NO
-			// in-band ERR. pggit deliberately diverges: the closure is judged
-			// before packing, so the refusal is a clean up-front ERR the client can
-			// read. Modeled, not compared — the exit CLASS is pinned; git's stderr
-			// prose is not.
+			// The transcripts deliberately differ: pggit returns an in-band ERR, while canonical git reaches a nonzero exit without one.
 			const oracle = await attemptGit(
 				["upload-pack", "--stateless-rpc", bare],
 				bare,
 				request,
 			)
 			expect(oracle.ok).toBe(false)
+			expect(oracle.stdout).not.toContain("ERR")
 			expect(report).toContain("ERR upload-pack: not our ref")
 		})
 	})
 
 	it("TPC-4: GC over a reachable tag-parent shape completes, keeps the pair, withholds the epoch", async () => {
-		const fxp = tagParentObjects("tp4")
-		await deps.objects.putPack("policy/tp4", fxp.objects)
-		// Reachable only via the non-wire path, and the ref points at the malformed
-		// COMMIT — never the tag (the header's fixture rule).
-		await deps.refs.setRef("policy/tp4", "refs/heads/main", fxp.malformedOid)
+		const fixture = createTagParentFixture("tp4")
+		await deps.objects.putPack("policy/tp4", fixture.objects)
+		await deps.refs.setRef("policy/tp4", "refs/heads/main", fixture.malformedCommitOid)
 		const result = await createGc(db.sql).gc("policy/tp4", { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
-		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+		for (const oid of [fixture.tagOid, fixture.targetOid]) {
 			expect(await deps.objects.hasObject("policy/tp4", oid), oid).toBe(true)
 		}
 		expect(await createGc(db.sql).gc("policy/tp4", { graceSeconds: 0 })).toEqual({
 			deletedObjects: 0,
 			epoch: "cleared",
 		})
-		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+		for (const oid of [fixture.tagOid, fixture.targetOid]) {
 			expect(await deps.objects.hasObject("policy/tp4", oid), oid).toBe(true)
 		}
 	})
 
 	it("TPC-4 overlap: GC still withholds the epoch when the tag is also reached through a valid tag chain", async () => {
 		const repo = "policy/tp4-overlap"
-		const fxp = tagParentObjects("tp4-overlap")
+		const fixture = createTagParentFixture("tp4-overlap")
 		const outerTag = Buffer.from(
-			`object ${fxp.tagOid}\ntype tag\ntag outer\ntagger t <t@t> 1700000004 +0000\n\nouter\n`,
+			`object ${fixture.tagOid}\ntype tag\ntag outer\ntagger t <t@t> 1700000004 +0000\n\nouter\n`,
 		)
 		const outerTagOid = computeOid("tag", outerTag)
-		await deps.objects.putPack(repo, [...fxp.objects, { content: outerTag, type: "tag" }])
-		await deps.refs.setRef(repo, "refs/heads/main", fxp.malformedOid)
+		await deps.objects.putPack(repo, [
+			...fixture.objects,
+			{ content: outerTag, type: "tag" },
+		])
+		await deps.refs.setRef(repo, "refs/heads/main", fixture.malformedCommitOid)
 		await deps.refs.setRef(repo, "refs/tags/outer", outerTagOid)
 		const result = await createGc(db.sql).gc(repo, { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
-		for (const oid of [outerTagOid, fxp.tagOid, fxp.targetOid]) {
+		for (const oid of [outerTagOid, fixture.tagOid, fixture.targetOid]) {
 			expect(await deps.objects.hasObject(repo, oid), oid).toBe(true)
 		}
 	})
 
 	it("TPC-4 object overlap: GC retains one tag reached as both a parent and a tree entry", async () => {
 		const repo = "policy/tp4-object-overlap"
-		const fxp = tagParentObjects("tp4-object-overlap")
-		const tree = Buffer.concat([
+		const fixture = createTagParentFixture("tp4-object-overlap")
+		const tagEntryTree = Buffer.concat([
 			Buffer.from("100644 t\0"),
-			Buffer.from(fxp.tagOid, "hex"),
+			Buffer.from(fixture.tagOid, "hex"),
 		])
-		const treeOid = computeOid("tree", tree)
-		await deps.objects.putPack(repo, [...fxp.objects, { content: tree, type: "tree" }])
-		await deps.refs.setRef(repo, "refs/heads/main", fxp.malformedOid)
-		await deps.refs.setRef(repo, "refs/tags/tree-root", treeOid)
+		const tagEntryTreeOid = computeOid("tree", tagEntryTree)
+		await deps.objects.putPack(repo, [
+			...fixture.objects,
+			{ content: tagEntryTree, type: "tree" },
+		])
+		await deps.refs.setRef(repo, "refs/heads/main", fixture.malformedCommitOid)
+		await deps.refs.setRef(repo, "refs/tags/tree-root", tagEntryTreeOid)
 		const result = await createGc(db.sql).gc(repo, { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
-		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+		for (const oid of [fixture.tagOid, fixture.targetOid]) {
 			expect(await deps.objects.hasObject(repo, oid), oid).toBe(true)
 		}
 	})
 
 	it("TPC-6: a tree entry naming a TAG — GC keeps the tag AND its target (the sibling shape)", async () => {
-		const fxp = tagParentObjects("tp6")
-		// A healthy commit whose tree carries a blob-mode entry naming the TAG.
-		const badTree = Buffer.concat([
+		const fixture = createTagParentFixture("tp6")
+		const tagEntryTree = Buffer.concat([
 			Buffer.from("100644 t\0"),
-			Buffer.from(fxp.tagOid, "hex"),
+			Buffer.from(fixture.tagOid, "hex"),
 		])
-		const badTreeOid = computeOid("tree", badTree)
+		const tagEntryTreeOid = computeOid("tree", tagEntryTree)
 		const tip = Buffer.from(
-			`tree ${badTreeOid}\nauthor t <t@t> 1700000003 +0000\ncommitter t <t@t> 1700000003 +0000\n\ntp6-tip\n`,
+			`tree ${tagEntryTreeOid}\nauthor t <t@t> 1700000003 +0000\ncommitter t <t@t> 1700000003 +0000\n\ntp6-tip\n`,
 		)
 		const tipOid = computeOid("commit", tip)
 		await deps.objects.putPack("policy/tp6", [
-			...fxp.objects.filter((o) => o.content !== fxp.malformed),
-			{ content: badTree, type: "tree" },
+			...fixture.objects.filter((object) => object.content !== fixture.malformedCommit),
+			{ content: tagEntryTree, type: "tree" },
 			{ content: tip, type: "commit" },
 		])
 		await deps.refs.setRef("policy/tp6", "refs/heads/main", tipOid)
 		const result = await createGc(db.sql).gc("policy/tp6", { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
-		// Pre-TP-3′ the tag survives but its TARGET is swept from under the
-		// surviving git_tag row — the data-loss pin.
-		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+		for (const oid of [fixture.tagOid, fixture.targetOid]) {
 			expect(await deps.objects.hasObject("policy/tp6", oid), oid).toBe(true)
 		}
 	})
 
 	it("TPC-5: a tag-parent whose git_tag row is GONE still crashes loud — genuine corruption", async () => {
-		const fxp = tagParentObjects("tp5")
-		await deps.objects.putPack("policy/tp5", fxp.objects)
-		await db.sql`delete from git_tag where oid = ${Buffer.from(fxp.tagOid, "hex")}`
+		const fixture = createTagParentFixture("tp5")
+		await deps.objects.putPack("policy/tp5", fixture.objects)
+		await db.sql`delete from git_tag where oid = ${Buffer.from(fixture.tagOid, "hex")}`
 		await expect(
-			deps.objects.isConnected("policy/tp5", fxp.malformedOid),
+			deps.objects.isConnected("policy/tp5", fixture.malformedCommitOid),
 		).rejects.toThrow(/no derived row/)
 		await expect(
-			deps.objects.buildPack("policy/tp5", [fxp.malformedOid], [], false),
+			deps.objects.buildPack("policy/tp5", [fixture.malformedCommitOid], [], false),
 		).rejects.toThrow(/no derived row/)
 	})
 })
