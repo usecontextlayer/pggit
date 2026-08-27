@@ -30,7 +30,7 @@ import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps, type GitDeps } from "@/index"
 import { computeOid } from "@/object/object"
-import { type PackInputObject, writePack } from "@/pack/write-pack"
+import type { PackInputObject } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
@@ -93,15 +93,35 @@ async function oracleReceive(
 	}
 }
 
-/** Store objects in a bare oracle repo byte-for-byte (`hash-object --literally`
- * is what lets git store arbitrary bytes at all). */
-async function seedOracleObjects(
+/** Store exact object bytes in canonical git and prove its oids match the graph embedded by the fixture. */
+async function writeOracleObjects(
 	bare: string,
 	objects: readonly PackInputObject[],
-): Promise<void> {
+): Promise<string[]> {
+	const oids: string[] = []
 	for (const o of objects) {
-		await writeLiteralGitObject(bare, o)
+		const oid = await writeLiteralGitObject(bare, o)
+		const expected = computeOid(o.type, o.content)
+		if (oid !== expected) {
+			throw new Error(`canonical git assigned ${oid} to fixture object ${expected}`)
+		}
+		oids.push(oid)
 	}
+	return oids
+}
+
+/** Build the exact client pack with canonical git, not pggit's production serializer. */
+async function literalGitPack(objects: readonly PackInputObject[]): Promise<Buffer> {
+	return withTempDir("pggit-typed-pack-source-", async (source) => {
+		await spawnGit(["init", "-q", "--bare", source])
+		const oids = await writeOracleObjects(source, objects)
+		return (
+			await spawnGit(["pack-objects", "--stdout"], {
+				cwd: source,
+				input: `${oids.join("\n")}\n`,
+			})
+		).stdoutBytes
+	})
 }
 
 describe("typed-graph policy", () => {
@@ -269,15 +289,16 @@ describe("typed-graph policy", () => {
 		const fxp = tagParentObjects("tp1")
 		const body = receivePackRequest(
 			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp1\0report-status`],
-			writePack(fxp.objects),
+			await literalGitPack(fxp.objects),
 		)
 		const res = await postReceivePack(app, "policy/tp1", body)
 		expect(res.status).toBe(200)
 		const report = pktLineUnpack(res.body)
 		expect(report).toContain("ng refs/heads/tp1 missing necessary objects")
-		expect(
-			(await deps.refs.listRefs("policy/tp1")).find((r) => r.name === "refs/heads/tp1"),
-		).toBeUndefined()
+		expect(await deps.refs.listRefs("policy/tp1")).toEqual([])
+		for (const oid of [fxp.malformedOid, fxp.tagOid]) {
+			expect(await deps.objects.hasObject("policy/tp1", oid), oid).toBe(true)
+		}
 		// The oracle: the identical body into real `git receive-pack`. The observed
 		// verdict is logged — the design doc's hypothesis (a connectivity-class
 		// per-ref rejection) is measured here, not remembered.
@@ -301,21 +322,26 @@ describe("typed-graph policy", () => {
 		await deps.objects.putPack("policy/tp1v", prerequisites)
 		const body = receivePackRequest(
 			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp1v\0report-status`],
-			writePack([{ content: fxp.malformed, type: "commit" }]),
+			await literalGitPack([{ content: fxp.malformed, type: "commit" }]),
 		)
 		const res = await postReceivePack(app, "policy/tp1v", body)
 		expect(res.status).toBe(200)
 		expect(pktLineUnpack(res.body)).toContain(
 			"ng refs/heads/tp1v missing necessary objects",
 		)
+		expect(await deps.refs.listRefs("policy/tp1v")).toEqual([])
+		for (const oid of [fxp.malformedOid, fxp.tagOid]) {
+			expect(await deps.objects.hasObject("policy/tp1v", oid), oid).toBe(true)
+		}
 		await withTempDir("pggit-typed-tp1v-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
-			await seedOracleObjects(bare, prerequisites)
+			await writeOracleObjects(bare, prerequisites)
 			const oracle = await oracleReceive(bare, body)
 			console.log(
 				`[TPC-1v oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
 			)
 			expect(oracle.report).toContain("ng refs/heads/tp1v missing necessary objects")
+			expect(await allRefsOf(bare)).toEqual([])
 		})
 	}, 120_000)
 
@@ -326,40 +352,82 @@ describe("typed-graph policy", () => {
 		await deps.refs.setRef("policy/tp2", "refs/tags/anchor", fxp.tagOid)
 		const body = receivePackRequest(
 			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp2\0report-status`],
-			writePack([{ content: fxp.malformed, type: "commit" }]),
+			await literalGitPack([{ content: fxp.malformed, type: "commit" }]),
 		)
 		const res = await postReceivePack(app, "policy/tp2", body)
 		expect(res.status).toBe(200)
 		const report = pktLineUnpack(res.body)
 		expect(report).toContain("ng refs/heads/tp2")
+		expect((await deps.refs.listRefs("policy/tp2")).map((ref) => ref.name)).toEqual([
+			"refs/tags/anchor",
+		])
+		expect(await deps.objects.hasObject("policy/tp2", fxp.malformedOid)).toBe(true)
 		await withTempDir("pggit-typed-tp2-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
-			await seedOracleObjects(bare, prerequisites)
+			await writeOracleObjects(bare, prerequisites)
 			await spawnGit(["update-ref", "refs/tags/anchor", fxp.tagOid], { cwd: bare })
 			const oracle = await oracleReceive(bare, body)
 			console.log(
 				`[TPC-2 oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
 			)
 			expect(oracle.report).toBe(report)
+			expect((await allRefsOf(bare)).map((ref) => ref.name)).toEqual(["refs/tags/anchor"])
 		})
 	}, 120_000)
 
-	it("TPC-3: a stored commit whose parent names a TAG fails connectivity and cannot be served", async () => {
+	it("TPC-3: denied-push residue whose parent names a TAG cannot be served", async () => {
 		const fxp = tagParentObjects("tp3")
-		await deps.objects.putPack("policy/tp3", fxp.objects)
+		const pushBody = receivePackRequest(
+			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp3\0report-status`],
+			await literalGitPack(fxp.objects),
+		)
+		const pushResponse = await postReceivePack(app, "policy/tp3", pushBody)
+		expect(pushResponse.status).toBe(200)
+		expect(pktLineUnpack(pushResponse.body)).toContain(
+			"ng refs/heads/tp3 missing necessary objects",
+		)
+		expect(await deps.refs.listRefs("policy/tp3")).toEqual([])
+		for (const oid of [fxp.malformedOid, fxp.tagOid]) {
+			expect(await deps.objects.hasObject("policy/tp3", oid), oid).toBe(true)
+		}
 		expect(await deps.objects.isConnected("policy/tp3", fxp.malformedOid)).toBe(false)
+		const request = fetchRequest({
+			done: true,
+			objectFormat: "sha1",
+			wants: [fxp.malformedOid],
+		})
 		const response = await app.request("/policy/tp3/git-upload-pack", {
-			body: fetchRequest({
-				done: true,
-				objectFormat: "sha1",
-				wants: [fxp.malformedOid],
-			}),
+			body: request,
 			headers: { "Git-Protocol": "version=2" },
 			method: "POST",
 		})
 		expect(response.status).toBe(200)
 		const report = pktLineUnpack(Buffer.from(await response.arrayBuffer()))
-		expect(report).toContain("ERR upload-pack: not our ref")
+		await withTempDir("pggit-typed-tp3-", async (bare) => {
+			await spawnGit(["init", "-q", "--bare", bare])
+			const receive = await oracleReceive(bare, pushBody)
+			expect(receive.report).toContain("ng refs/heads/tp3 missing necessary objects")
+			expect(await allRefsOf(bare)).toEqual([])
+			await writeOracleObjects(bare, fxp.objects)
+			expect(
+				(await spawnGit(["cat-file", "-t", fxp.malformedOid], { cwd: bare })).stdout,
+			).toBe("commit\n")
+			// Measured 2026-08-27 (git 2.x): canonical upload-pack ACCEPTS this want
+			// (its `want` check is existence, not closure — the object is present)
+			// and then dies inside pack-objects ("aborting due to possible
+			// repository corruption", exit 128) — a mid-stream hard abort with NO
+			// in-band ERR. pggit deliberately diverges: the closure is judged
+			// before packing, so the refusal is a clean up-front ERR the client can
+			// read. Modeled, not compared — the exit CLASS is pinned; git's stderr
+			// prose is not.
+			const oracle = await attemptGit(
+				["upload-pack", "--stateless-rpc", bare],
+				bare,
+				request,
+			)
+			expect(oracle.ok).toBe(false)
+			expect(report).toContain("ERR upload-pack: not our ref")
+		})
 	})
 
 	it("TPC-4: GC over a reachable tag-parent shape completes, keeps the pair, withholds the epoch", async () => {
@@ -370,6 +438,13 @@ describe("typed-graph policy", () => {
 		await deps.refs.setRef("policy/tp4", "refs/heads/main", fxp.malformedOid)
 		const result = await createGc(db.sql).gc("policy/tp4", { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
+		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+			expect(await deps.objects.hasObject("policy/tp4", oid), oid).toBe(true)
+		}
+		expect(await createGc(db.sql).gc("policy/tp4", { graceSeconds: 0 })).toEqual({
+			deletedObjects: 0,
+			epoch: "cleared",
+		})
 		for (const oid of [fxp.tagOid, fxp.targetOid]) {
 			expect(await deps.objects.hasObject("policy/tp4", oid), oid).toBe(true)
 		}
