@@ -84,10 +84,10 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 	const gc = createGc(pg)
 	const repack = createRepack(pg)
 	let timer: ReturnType<typeof setInterval> | undefined
-	// The in-flight pass (if any). Doubles as the overlap guard (a tick skips while a
-	// pass runs, so two passes never touch the same repo at once) and the shutdown
+	// The in-flight pass (if any). Doubles as the overlap guard (all callers share
+	// one pass, so two passes never touch the same repo at once) and the shutdown
 	// barrier (`stop()` awaits it).
-	let inFlight: Promise<unknown> | undefined
+	let inFlight: Promise<DrainSummary> | undefined
 
 	/** The eligible repos for this pass — the union of the two phase predicates
 	 * (the GC design's §2 predicate, plus repack's `last_pushed_at >
@@ -177,7 +177,7 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 		}
 	}
 
-	async function drainOnce(): Promise<DrainSummary> {
+	async function runDrainOnce(): Promise<DrainSummary> {
 		const candidates = await selectCandidates()
 		const results = await mapPool(candidates, options.concurrency, drainRepo)
 		const summary: DrainSummary = []
@@ -185,6 +185,14 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 			if (result.outcome === "drained") summary.push(result.entry)
 		}
 		return summary
+	}
+
+	function drainOnce(): Promise<DrainSummary> {
+		if (inFlight) return inFlight
+		inFlight = runDrainOnce().finally(() => {
+			inFlight = undefined
+		})
+		return inFlight
 	}
 
 	/** Run the drain on `intervalMs`. The `inFlight` guard ensures passes never
@@ -196,13 +204,9 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 		if (timer) return
 		timer = setInterval(() => {
 			if (inFlight) return
-			inFlight = drainOnce()
-				.catch((err) => {
-					console.error("pggit gc-scheduler: drain pass failed:", err)
-				})
-				.finally(() => {
-					inFlight = undefined
-				})
+			void drainOnce().catch((err) => {
+				console.error("pggit gc-scheduler: drain pass failed:", err)
+			})
 		}, options.intervalMs)
 		timer.unref()
 	}
@@ -215,7 +219,7 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 			clearInterval(timer)
 			timer = undefined
 		}
-		await inFlight
+		if (inFlight) await Promise.allSettled([inFlight])
 	}
 
 	return { drainOnce, start, stop }
