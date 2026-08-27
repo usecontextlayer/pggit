@@ -36,8 +36,9 @@ import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
-import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { attemptGit, type GitAttempt, spawnGit } from "@/testing/spawn-git"
 import { withTempDir } from "@/testing/temp-dir"
+import { fetchRequest } from "@/testing/wire-fetch"
 import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const REPO = "policy/typed"
@@ -81,18 +82,13 @@ function tagParentObjects(label: string) {
 async function oracleReceive(
 	bare: string,
 	body: Buffer,
-): Promise<{ code: number; report: string }> {
-	try {
-		const run = await spawnGit(["receive-pack", "--stateless-rpc", bare], {
-			cwd: bare,
-			input: body,
-		})
-		return { code: 0, report: pktLineUnpack(run.stdoutBytes) }
-	} catch (error) {
-		if (error instanceof GitCommandError) {
-			return { code: error.code, report: `${error.stdout}\n${error.stderr}` }
-		}
-		throw error
+): Promise<GitAttempt & { report: string }> {
+	const outcome = await attemptGit(["receive-pack", "--stateless-rpc", bare], bare, body)
+	return {
+		...outcome,
+		report: outcome.ok
+			? pktLineUnpack(Buffer.from(outcome.stdout, "utf8"))
+			: `${outcome.stdout}\n${outcome.stderr}`,
 	}
 }
 
@@ -355,9 +351,18 @@ describe("typed-graph policy", () => {
 		const fxp = tagParentObjects("tp3")
 		await deps.objects.putPack("policy/tp3", fxp.objects)
 		expect(await deps.objects.isConnected("policy/tp3", fxp.malformedOid)).toBe(false)
-		await expect(
-			deps.objects.buildPack("policy/tp3", [fxp.malformedOid], [], false),
-		).rejects.toThrow(WantNotFoundError)
+		const response = await app.request("/policy/tp3/git-upload-pack", {
+			body: fetchRequest({
+				done: true,
+				objectFormat: "sha1",
+				wants: [fxp.malformedOid],
+			}),
+			headers: { "Git-Protocol": "version=2" },
+			method: "POST",
+		})
+		expect(response.status).toBe(200)
+		const report = pktLineUnpack(Buffer.from(await response.arrayBuffer()))
+		expect(report).toContain("ERR upload-pack: not our ref")
 	})
 
 	it("TPC-4: GC over a reachable tag-parent shape completes, keeps the pair, withholds the epoch", async () => {

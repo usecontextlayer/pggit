@@ -90,9 +90,13 @@ export type GitAttempt =
 	| { ok: false; code: NonZeroExitCode; stdout: string; stderr: string }
 
 /** Run Git when an ordinary nonzero exit is data, while preserving infrastructure faults. */
-export async function attemptGit(args: string[], cwd?: string): Promise<GitAttempt> {
+export async function attemptGit(
+	args: string[],
+	cwd?: string,
+	input?: Buffer | string,
+): Promise<GitAttempt> {
 	try {
-		const result = await spawnGit(args, { cwd })
+		const result = await spawnGit(args, { cwd, input })
 		return { code: 0, ok: true, stderr: result.stderr, stdout: result.stdout }
 	} catch (error) {
 		if (!(error instanceof GitCommandError) || error.code < 1) throw error
