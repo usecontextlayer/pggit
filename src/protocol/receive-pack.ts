@@ -298,7 +298,7 @@ export async function handleReceivePack(
 	)
 	// Directory/file conflicts, judged LAST, in TWO ORDERED PHASES — the order is
 	// the point. Phase 1 is per-command: a name that prefix-conflicts with the
-	// EXISTING namespace is disqualified like any other per-command failure (the
+	// EXISTING namespace is disqualified at its existing reason precedence (the
 	// existing side includes SYMREF names: `refs/remotes/origin/HEAD` blocks
 	// `refs/remotes/origin/HEAD/x` exactly like a value ref would). Phase 2 is
 	// the batch's only inter-command rule: git keeps the DEEPEST new name and
@@ -310,21 +310,22 @@ export async function handleReceivePack(
 	// stale-set defect). One ordered pass suffices: the existing namespace is
 	// fixed, so phase 1 is final, and removing a phase-2 loser can never create
 	// a new loss (a chain's deepest survivor defeats every shallower name
-	// directly, by prefix transitivity). The eligibility predicate carries EVERY
-	// per-command verdict — fast-forward included: an FF-failing deeper sibling
+	// directly, by prefix transitivity). Phase 2 carries EVERY per-command verdict
+	// — fast-forward included: an FF-failing deeper sibling
 	// is unreachable in a D/F composite today (a deeper UPDATE implies the
 	// deeper name exists, which dooms the shallower against the existing
 	// namespace first), but leaving FF out would reopen the same stale-set
 	// class under a future policy change.
 	const existingNames = await backend.listRefNames()
-	const eligible = (i: number, c: RefCommand): boolean =>
-		nameProblem[i] === null &&
-		connected[i] === true &&
-		validTip[i] === true &&
-		fastForward[i] === true &&
-		c.newOid !== ZERO_OID
 	for (const [i, c] of commands.entries()) {
-		if (!eligible(i, c)) continue
+		if (
+			nameProblem[i] !== null ||
+			!connected[i] ||
+			!validTip[i] ||
+			c.newOid === ZERO_OID
+		) {
+			continue
+		}
 		const clashesExisting = existingNames.some(
 			(other) =>
 				other !== c.ref &&
@@ -332,9 +333,19 @@ export async function handleReceivePack(
 		)
 		if (clashesExisting) nameProblem[i] = "funny refname (directory/file conflict)"
 	}
-	const survivorNames = commands.filter((c, i) => eligible(i, c)).map((c) => c.ref)
+	const perCommandSurvivors = commands.map(
+		(c, i) =>
+			nameProblem[i] === null &&
+			connected[i] === true &&
+			validTip[i] === true &&
+			fastForward[i] === true &&
+			c.newOid !== ZERO_OID,
+	)
+	const survivorNames = commands
+		.filter((_c, i) => perCommandSurvivors[i])
+		.map((c) => c.ref)
 	for (const [i, c] of commands.entries()) {
-		if (!eligible(i, c)) continue
+		if (!perCommandSurvivors[i]) continue
 		if (survivorNames.some((other) => other.startsWith(`${c.ref}/`))) {
 			nameProblem[i] = "funny refname (directory/file conflict)"
 		}

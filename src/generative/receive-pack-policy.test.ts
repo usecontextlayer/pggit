@@ -730,9 +730,10 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 						.join(" ")}`,
 				)
 				for (const c of commands) {
-					expect(observed.get(c.dest), `${c.dest} [${order}]`).toEqual(
-						canonical.get(c.dest),
-					)
+					expect(
+						requireVerdict(observed, c.dest, "pggit"),
+						`${c.dest} [${order}]`,
+					).toEqual(requireVerdict(canonical, c.dest, "canonical git"))
 				}
 				expect(await pggitRefs(refs, repo), order).toEqual(await controlRefs(bare))
 			})
@@ -821,9 +822,10 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 						.join(" ")}`,
 				)
 				for (const c of commands) {
-					expect(observed.get(c.dest), `${c.dest} [${order}]`).toEqual(
-						canonical.get(c.dest),
-					)
+					expect(
+						requireVerdict(observed, c.dest, "pggit"),
+						`${c.dest} [${order}]`,
+					).toEqual(requireVerdict(canonical, c.dest, "canonical git"))
 				}
 				expect(await pggitRefs(refs, repo), order).toEqual(await controlRefs(bare))
 			})

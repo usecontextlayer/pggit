@@ -280,7 +280,7 @@ describe("typed-graph policy", () => {
 		const res = await postReceivePack(app, "policy/tp1", body)
 		expect(res.status).toBe(200)
 		const report = pktLineUnpack(res.body)
-		expect(report).toContain("ng refs/heads/tp1")
+		expect(report).toContain("ng refs/heads/tp1 missing necessary objects")
 		expect(
 			(await deps.refs.listRefs("policy/tp1")).find((r) => r.name === "refs/heads/tp1"),
 		).toBeUndefined()
@@ -293,7 +293,7 @@ describe("typed-graph policy", () => {
 			console.log(
 				`[TPC-1 oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
 			)
-			expect(oracle.report).toContain("ng refs/heads/tp1")
+			expect(oracle.report).toContain("ng refs/heads/tp1 missing necessary objects")
 			const oracleRefs = await spawnGit(["for-each-ref"], { cwd: bare })
 			expect(oracleRefs.stdout.trim()).toBe("")
 		})
@@ -312,7 +312,9 @@ describe("typed-graph policy", () => {
 		)
 		const res = await postReceivePack(app, "policy/tp1v", body)
 		expect(res.status).toBe(200)
-		expect(pktLineUnpack(res.body)).toContain("ng refs/heads/tp1v")
+		expect(pktLineUnpack(res.body)).toContain(
+			"ng refs/heads/tp1v missing necessary objects",
+		)
 		await withTempDir("pggit-typed-tp1v-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
 			await seedOracleObjects(bare, prerequisites)
@@ -320,7 +322,7 @@ describe("typed-graph policy", () => {
 			console.log(
 				`[TPC-1v oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
 			)
-			expect(oracle.report).toContain("ng refs/heads/tp1v")
+			expect(oracle.report).toContain("ng refs/heads/tp1v missing necessary objects")
 		})
 	}, 120_000)
 
@@ -345,7 +347,7 @@ describe("typed-graph policy", () => {
 			console.log(
 				`[TPC-2 oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
 			)
-			expect(oracle.report).toContain("ng refs/heads/tp2")
+			expect(oracle.report).toBe(report)
 		})
 	}, 120_000)
 
@@ -367,6 +369,27 @@ describe("typed-graph policy", () => {
 		const result = await createGc(db.sql).gc("policy/tp4", { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
 		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+			const [row] = await db.sql<{ n: string }[]>`
+				select count(*)::text as n from git_object
+				where oid = ${Buffer.from(oid, "hex")}`
+			if (row === undefined) throw new Error("object count query returned no row")
+			expect(row.n, oid).toBe("1")
+		}
+	})
+
+	it("TPC-4 overlap: GC still withholds the epoch when the tag is also reached through a valid tag chain", async () => {
+		const repo = "policy/tp4-overlap"
+		const fxp = tagParentObjects("tp4-overlap")
+		const outerTag = Buffer.from(
+			`object ${fxp.tagOid}\ntype tag\ntag outer\ntagger t <t@t> 1700000004 +0000\n\nouter\n`,
+		)
+		const outerTagOid = computeOid("tag", outerTag)
+		await deps.objects.putPack(repo, [...fxp.objects, { content: outerTag, type: "tag" }])
+		await deps.refs.setRef(repo, "refs/heads/main", fxp.malformedOid)
+		await deps.refs.setRef(repo, "refs/tags/outer", outerTagOid)
+		const result = await createGc(db.sql).gc(repo, { graceSeconds: 0 })
+		expect(result.epoch).toBe("cleared")
+		for (const oid of [outerTagOid, fxp.tagOid, fxp.targetOid]) {
 			const [row] = await db.sql<{ n: string }[]>`
 				select count(*)::text as n from git_object
 				where oid = ${Buffer.from(oid, "hex")}`
@@ -412,6 +435,9 @@ describe("typed-graph policy", () => {
 		await db.sql`delete from git_tag where oid = ${Buffer.from(fxp.tagOid, "hex")}`
 		await expect(
 			deps.objects.isConnected("policy/tp5", fxp.malformedOid),
+		).rejects.toThrow(/no derived row/)
+		await expect(
+			deps.objects.buildPack("policy/tp5", [fxp.malformedOid], [], false),
 		).rejects.toThrow(/no derived row/)
 	})
 })

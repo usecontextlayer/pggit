@@ -491,9 +491,12 @@ export async function originClosure(
 		for (const [oid, bits] of level.unknown) {
 			if (!commitRows.has(oid)) tagProbe.set(oid, bits)
 		}
+		// Keep the bucket roles independent: one oid can carry different origin bits
+		// in both maps, and a tag hit must traverse the unknown bits while still
+		// classifying the commit bits as a violation.
 		const commitMisses = new Map<string, bigint>()
-		for (const [oid, bits] of commitProbe) {
-			if (!commitRows.has(oid) && !tagProbe.has(oid)) commitMisses.set(oid, bits)
+		for (const [oid, bits] of level.commits) {
+			if (!commitRows.has(oid)) commitMisses.set(oid, bits)
 		}
 		const tagRows = await loadTagTargets(db, id, [
 			...tagProbe.keys(),
