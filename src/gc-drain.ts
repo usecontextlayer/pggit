@@ -6,8 +6,8 @@ import { createGcScheduler, GcSchedulerOptionsSchema } from "@/store/gc-schedule
 // resolution undefined-tolerant: an override key that is absent OR explicitly
 // `undefined` resolves to the default, so a host building overrides from
 // optional env values can never clobber a default by passing `undefined`
-// through (a spread merge over a defaults object would). The required schema in
-// gc-scheduler.ts preserves createGcScheduler's bring-your-own-pool contract.
+// through (a spread merge over a defaults object would). The required
+// `GcSchedulerOptionsSchema` preserves `createGcScheduler`'s resolved-options contract.
 const GcSchedulerOptionsInputSchema = GcSchedulerOptionsSchema.extend({
 	concurrency: GcSchedulerOptionsSchema.shape.concurrency.default(4),
 	graceSeconds: GcSchedulerOptionsSchema.shape.graceSeconds.default(60),
@@ -28,8 +28,8 @@ export type GcSchedulerOptionsInput = z.input<typeof GcSchedulerOptionsInputSche
  * concurrent repo) + 1 for the per-repo bookkeeping queries, and the repack
  * phase rides the same headroom (a repo's repack runs its queries serially, at
  * most one connection at a time). `createGcScheduler` remains the
- * bring-your-own-pool composition for callers (and the test suites) that
- * already hold an `Sql` and carry that sizing responsibility themselves.
+ * bring-your-own-pool composition for callers that already hold an `Sql` and
+ * carry that sizing responsibility themselves.
  *
  * Liveness is the host's: the scheduler's timer is `unref`'d, so the drain runs
  * only while something else (the host's server socket) keeps the process alive

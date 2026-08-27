@@ -50,10 +50,6 @@ export async function startServer(
 		throw new Error("pggit: PGGIT_DATABASE_URL is required to serve")
 	}
 
-	// The drain rides `createGcDrain` (gc-drain.ts), which owns its DEDICATED pool
-	// and the pool's sizing — never this request pool. `enabled` is host policy:
-	// it gates whether the drain is constructed at all. Unset tunables fall
-	// through env to the drain schema's defaults.
 	const gcEnabled = opts.gc?.enabled ?? env.PGGIT_GC_ENABLED
 	const pg = postgres(databaseUrl)
 	const app = createGitApp(createGitDeps(pg))

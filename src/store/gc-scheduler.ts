@@ -65,28 +65,26 @@ export const GcSchedulerOptionsSchema = z
 
 /** Resolved scheduler tunables. `graceSeconds` is passed straight to `gc()`;
  * `intervalMs` is the drain cadence (the debounce window); `concurrency` caps
- * repos drained at once per pass so one large repo cannot head-of-line-block
- * the rest — with repack enabled it is also the memory dial, since each
- * in-flight repack holds roughly its repo's tree bytes in its pass cache
- * (repack.ts). */
+ * repos drained at once per pass; when repack is enabled, it also bounds
+ * aggregate repack memory because each in-flight repack holds roughly its repo's
+ * tree bytes in its pass cache (repack.ts). */
 export type GcSchedulerOptions = z.infer<typeof GcSchedulerOptionsSchema>
 
 export type GcScheduler = ReturnType<typeof createGcScheduler>
 
 /**
- * Build the GC scheduler over a porsager client (the same wire→DB boundary the
- * stores take). `drainOnce()` runs one poll+sweep pass — per repo, GC then (when
- * enabled and due) repack; `start()`/`stop()` drive it on `intervalMs`. GC never
- * deletes reachable objects, and repack only adds derived encoding rows.
+ * Build the GC scheduler over a caller-owned porsager client; the caller owns
+ * its lifecycle, isolation, and sizing. `drainOnce()` joins the active pass or
+ * starts one poll+sweep pass — per repo, GC then (when enabled and due) repack.
+ * `start()` schedules passes on `intervalMs`; `stop()` clears the timer and
+ * awaits the active pass. GC never deletes reachable objects, and repack only
+ * adds derived encoding rows.
  */
 export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 	const options = GcSchedulerOptionsSchema.parse(opts)
 	const gc = createGc(pg)
 	const repack = createRepack(pg)
 	let timer: ReturnType<typeof setInterval> | undefined
-	// The in-flight pass (if any). Doubles as the overlap guard (all callers share
-	// one pass, so two passes never touch the same repo at once) and the shutdown
-	// barrier (`stop()` awaits it).
 	let inFlight: Promise<DrainSummary> | undefined
 
 	/** The eligible repos for this pass — the union of the two phase predicates
@@ -177,7 +175,7 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 		}
 	}
 
-	async function runDrainOnce(): Promise<DrainSummary> {
+	async function executeDrainPass(): Promise<DrainSummary> {
 		const candidates = await selectCandidates()
 		const results = await mapPool(candidates, options.concurrency, drainRepo)
 		const summary: DrainSummary = []
@@ -189,7 +187,7 @@ export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
 
 	function drainOnce(): Promise<DrainSummary> {
 		if (inFlight) return inFlight
-		inFlight = runDrainOnce().finally(() => {
+		inFlight = executeDrainPass().finally(() => {
 			inFlight = undefined
 		})
 		return inFlight
