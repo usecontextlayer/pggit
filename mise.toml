@@ -1,2 +1,5 @@
 [tools]
 node = "24"
+# Must match the root package.json `packageManager` pin. mise is the one pnpm
+# source for dev shells + CI mise-action (corepack stays unused).
+pnpm = "11.22.0"

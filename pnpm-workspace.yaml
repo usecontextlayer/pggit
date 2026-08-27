@@ -1,0 +1,21 @@
+# pnpm 11 reads its settings from this file — the package.json `pnpm` key is no
+# longer read (the 11.x migration moved `patchedDependencies` and the build-script
+# verdicts here). Single-package repo: no `packages` list on purpose.
+
+# The porsager driver patch (patches/postgres.patch): three COPY-settlement seams
+# in connection.js — an ErrorResponse or connection death mid-COPY settles the
+# copy's end-promise instead of stranding it, and a write against an
+# already-nulled socket fails loud instead of throwing an uncatchable TypeError.
+# Without it a cancelled or dying COPY hangs its caller forever.
+patchedDependencies:
+  postgres: patches/postgres.patch
+
+# pnpm 11 defaults `strictDepBuilds` on: every dependency carrying a build script
+# needs an explicit verdict — `true` runs it, `false` reviews it and keeps it
+# unrun (exactly what pnpm 10 did by omission for everything but esbuild).
+allowBuilds:
+  '@datadog/pprof': false
+  cpu-features: false
+  esbuild: true
+  protobufjs: false
+  ssh2: false

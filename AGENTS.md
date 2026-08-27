@@ -3,7 +3,7 @@
 This is a **standalone** repo (NOT a member of the ContextLayer monorepo
 workspace). It mirrors the `@usecontextlayer/` engineering conventions:
 
-- pnpm 10 (`packageManager` pinned), node 24 via mise.
+- pnpm 11 (`packageManager` pinned; mise pins the same version — the one pnpm source, corepack unused). pnpm settings (the driver patch, build-script verdicts) live in `pnpm-workspace.yaml` — pnpm 11 does not read a package.json `pnpm` key.
 - Biome for format + lint (`pnpm run format.fix` / `format.verify`,
   `--error-on-warnings` is load-bearing).
 - tsdown owns the shipped build (`dist/*.mjs` + `dist/*.d.mts`); `tsc -b` is the

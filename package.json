@@ -61,15 +61,7 @@
 	"license": "MIT",
 	"main": "./dist/index.mjs",
 	"name": "@usecontextlayer/pggit",
-	"packageManager": "pnpm@10.34.1",
-	"pnpm": {
-		"onlyBuiltDependencies": [
-			"esbuild"
-		],
-		"patchedDependencies": {
-			"postgres": "patches/postgres.patch"
-		}
-	},
+	"packageManager": "pnpm@11.22.0",
 	"publishConfig": {
 		"access": "public"
 	},
