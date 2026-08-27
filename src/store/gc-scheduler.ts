@@ -54,26 +54,37 @@ type Candidate = { id: string; name: string } & (
 
 const MAX_TIMER_MS = 2_147_483_647
 
+// The ONE default site for the drain's tunables. Per-field `.default()` makes
+// resolution undefined-tolerant: an override key that is absent OR explicitly
+// `undefined` resolves to the default, so a host building overrides from
+// optional env values can never clobber a default by passing `undefined`
+// through (a spread merge over a defaults object would).
 const GcSchedulerOptionsSchema = z
 	.object({
-		concurrency: z.number().int().positive(),
-		graceSeconds: GcGraceSecondsSchema,
-		intervalMs: z.number().int().positive().max(MAX_TIMER_MS),
-		repackEnabled: z.boolean(),
+		concurrency: z.number().int().positive().default(4),
+		graceSeconds: GcGraceSecondsSchema.default(60),
+		intervalMs: z.number().int().positive().max(MAX_TIMER_MS).default(30_000),
+		repackEnabled: z.boolean().default(true),
 	})
 	.strict()
 
-/** Scheduler tunables (resolved from `env` / `startServer` opts). `graceSeconds`
- * is passed straight to `gc()`; `intervalMs` is the drain cadence (the debounce
- * window); `concurrency` caps repos drained at once per pass so one large repo
- * cannot head-of-line-block the rest — with repack enabled it is also the memory
- * dial, since each in-flight repack holds roughly its repo's tree bytes in its
- * pass cache (repack.ts). */
+/** Resolved scheduler tunables. `graceSeconds` is passed straight to `gc()`;
+ * `intervalMs` is the drain cadence (the debounce window); `concurrency` caps
+ * repos drained at once per pass so one large repo cannot head-of-line-block
+ * the rest — with repack enabled it is also the memory dial, since each
+ * in-flight repack holds roughly its repo's tree bytes in its pass cache
+ * (repack.ts). */
 export type GcSchedulerOptions = z.infer<typeof GcSchedulerOptionsSchema>
+
+/** The override shape hosts pass: every field optional, defaults from the
+ * schema above. */
+export type GcSchedulerOptionsInput = z.input<typeof GcSchedulerOptionsSchema>
 
 export type GcScheduler = ReturnType<typeof createGcScheduler>
 
-export function resolveGcSchedulerOptions(opts: GcSchedulerOptions): GcSchedulerOptions {
+export function resolveGcSchedulerOptions(
+	opts: GcSchedulerOptionsInput,
+): GcSchedulerOptions {
 	return GcSchedulerOptionsSchema.parse(opts)
 }
 
@@ -83,11 +94,12 @@ export function resolveGcSchedulerOptions(opts: GcSchedulerOptions): GcScheduler
  * enabled and due) repack; `start()`/`stop()` drive it on `intervalMs`. GC never
  * deletes reachable objects, and repack only adds derived encoding rows.
  */
-export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
+export function createGcScheduler(pg: Sql, opts: GcSchedulerOptionsInput) {
 	return createGcSchedulerFromResolvedOptions(pg, resolveGcSchedulerOptions(opts))
 }
 
-/** Internal composition seam for `startServer`, which resolves before sizing its pool. */
+/** Composition seam for the drain block (`gc-drain.ts`), which resolves first so
+ * it can size its dedicated pool from the resolved concurrency before building. */
 export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerOptions) {
 	const gc = createGc(pg)
 	const repack = createRepack(pg)

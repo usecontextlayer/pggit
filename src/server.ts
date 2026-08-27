@@ -2,12 +2,9 @@ import { serve } from "@hono/node-server"
 import type { Hono } from "hono"
 import postgres from "postgres"
 import { env } from "@/env"
+import { createGcDrain } from "@/gc-drain"
 import { createGitApp, createGitDeps } from "@/index"
-import {
-	createGcSchedulerFromResolvedOptions,
-	type GcSchedulerOptions,
-	resolveGcSchedulerOptions,
-} from "@/store/gc-scheduler"
+import type { GcSchedulerOptions } from "@/store/gc-scheduler"
 
 export type GitServer = {
 	port: number
@@ -42,9 +39,10 @@ export async function startServer(
 		port?: number
 		databaseUrl?: string
 		/** Self-scheduling GC overrides (docs/2026-06-24-gc-scheduler-design.md §4/§5;
-		 * repack phase: docs/2026-08-25-drain-repack-wiring.md). Defaults come from
-		 * `env` (`PGGIT_GC_*`); `enabled` gates the background drain as a whole,
-		 * `repackEnabled` just its repack phase. */
+		 * repack phase: docs/2026-08-25-drain-repack-wiring.md). `enabled` gates the
+		 * background drain as a whole, `repackEnabled` just its repack phase; an
+		 * unset tunable falls through env (`PGGIT_GC_*`) to the scheduler schema's
+		 * own defaults. */
 		gc?: { enabled?: boolean } & Partial<GcSchedulerOptions>
 	} = {},
 ): Promise<GitServer> {
@@ -53,37 +51,32 @@ export async function startServer(
 		throw new Error("pggit: PGGIT_DATABASE_URL is required to serve")
 	}
 
-	// The drain runs on a DEDICATED connection pool, separate from the request path:
-	// each concurrent gc() reserves a connection for its whole live-set plan and sweep,
-	// so sharing the request pool could starve clone/fetch/push under load. GC off the
-	// hot path means off the hot pool — and the repack phase rides this same pool
-	// (a repo's repack runs its queries serially, at most one connection at a time,
-	// inside the headroom below). Sized to `concurrency` (one reservation per
-	// concurrent repo) + 1 for the per-repo bookkeeping queries.
+	// The drain rides `createGcDrain` (gc-drain.ts), which owns its DEDICATED pool
+	// and the pool's sizing — never this request pool. `enabled` is host policy:
+	// it gates whether the drain is constructed at all. Unset tunables fall
+	// through env to the scheduler schema's defaults.
 	const gcEnabled = opts.gc?.enabled ?? env.PGGIT_GC_ENABLED
-	const gcOptions = resolveGcSchedulerOptions({
-		concurrency: opts.gc?.concurrency ?? env.PGGIT_GC_CONCURRENCY,
-		graceSeconds: opts.gc?.graceSeconds ?? env.PGGIT_GC_GRACE_SECONDS,
-		intervalMs: opts.gc?.intervalMs ?? env.PGGIT_GC_INTERVAL_MS,
-		repackEnabled: opts.gc?.repackEnabled ?? env.PGGIT_GC_REPACK_ENABLED,
-	})
 	const pg = postgres(databaseUrl)
 	const app = createGitApp(createGitDeps(pg))
-	const gcPg = gcEnabled
-		? postgres(databaseUrl, { max: gcOptions.concurrency + 1 })
-		: undefined
-	const scheduler = gcPg
-		? createGcSchedulerFromResolvedOptions(gcPg, gcOptions)
+	const drain = gcEnabled
+		? createGcDrain(databaseUrl, {
+				concurrency: opts.gc?.concurrency ?? env.PGGIT_GC_CONCURRENCY,
+				graceSeconds: opts.gc?.graceSeconds ?? env.PGGIT_GC_GRACE_SECONDS,
+				intervalMs: opts.gc?.intervalMs ?? env.PGGIT_GC_INTERVAL_MS,
+				repackEnabled: opts.gc?.repackEnabled ?? env.PGGIT_GC_REPACK_ENABLED,
+			})
 		: undefined
 
 	const server = await serveOnPort(app, opts.port ?? env.PGGIT_PORT)
-	scheduler?.start()
+	drain?.start()
 	return {
 		close: async () => {
-			await scheduler?.stop()
+			// Drain first (awaits any in-flight pass, ends its own pool — safe ahead
+			// of the server close because that pool is exclusively the drain's),
+			// then the listener, then the request pool.
+			await drain?.stop()
 			await server.close()
 			await pg.end()
-			await gcPg?.end()
 		},
 		port: server.port,
 	}

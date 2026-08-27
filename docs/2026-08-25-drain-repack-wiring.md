@@ -114,3 +114,15 @@ Same doctrine as the 2026-06-24 doc §6: three observable surfaces (Postgres row
 
 - PBT-S1's new conjuncts add a per-iteration coverage query and keep the fsck across repos — watch the generative file's runtime against the test-efficiency mission's budgets (`docs/2026-08-20-test-efficiency.md`); if it grows materially, sample the conjuncts rather than asserting every iteration, decided with measured numbers.
 - SCH-10's cadence numbers under full-suite contention: standing guidance (delta doc C2) is to widen the cadence, not chase the flake.
+
+## Addendum (2026-08-27) — the drain becomes an exported block: `createGcDrain`
+
+**Decision (owner: "A. Build it pre-cut"), landing as its own `feat(gc-scheduler)` commit before the v3.0.0 cut.** The mounted-host wiring (W1(c), the ContextLayer platform) was about to copy `startServer`'s composition dance — resolve options, size a dedicated pool `concurrency + 1`, build the scheduler, order start/stop — and the `resolveGcSchedulerOptions`/`createGcSchedulerFromResolvedOptions` seam existed only to serve that dance (consumer graph, verified by codegraph 2026-08-27: `startServer` was its one real consumer; the five scheduler test files drive `createGcScheduler` over their own pools). The block absorbs the dance where it belongs:
+
+- **`createGcDrain(databaseUrl, overrides?)` → `{ start, stop, drainOnce }`** (`src/gc-drain.ts`, exported from `index.ts`): owns the dedicated pool and its sizing, resolves defaults, and `stop()` awaits the in-flight pass then ends its own pool. A boundary-tier file on purpose — driver construction stays out of `store/`, whose modules take `Sql` handles.
+- **The options schema is now the ONE default site** (per-field `.default()`; `GcSchedulerOptionsInput` is the override shape). `env.ts`'s four `PGGIT_GC_*` tunables became optional pass-throughs with their defaults deleted — unset falls through to the schema, so each default value exists in exactly one place. `PGGIT_GC_ENABLED` keeps its env default: it is host policy (construct the drain or don't), not a scheduler tunable.
+- **Resolution is undefined-tolerant by construction** (Zod `.default()` treats an explicitly-`undefined` override as absent), pinned by `src/store/gc-scheduler.test.ts` — the plausible reimplementation, a spread merge over a defaults object, silently clobbers defaults with `undefined`.
+- **`startServer` refactored onto the block** (net-negative there; the dedicated-pool rationale comment moved into `gc-drain.ts` with the logic it explains). Its close order became drain-then-server — safe because the drain's pool is exclusively its own. No logging was added anywhere: the watermark columns remain the drain's observable surface, failures stay loud on stderr.
+- **Naming:** `createGcDrain` beside `createGcScheduler` encodes pool ownership — DSN in / owns its pool and sizing, vs `Sql` in / caller's pool and caller's sizing responsibility. Two concepts, two names.
+
+R-SW / R-EL / R-EL′ / R-DE and the SCH-1…11 + SCH-R1…R8 contracts are untouched — this is composition, not behavior; no contract suite moved.
