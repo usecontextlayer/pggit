@@ -19,9 +19,12 @@ import {
 
 const RUNS = 600
 const REPO = "txn/drain-repack-fault"
-// copyInsert names its staging table in each statement of an encoding flush, so
-// the first observed match is inside that flush regardless of which statement wins the poll.
-const ENCODING_FLUSH_NEEDLE = "copy_stg_git_pack_encoding"
+// Aim at the flush's INSERT (staging → real table): it is SERVER-paced, so a cancel
+// interrupts it reliably. The flush's COPY is client-paced — its duration hangs on
+// node's streaming, and a cancel arriving at its tail can be a no-op, which made a
+// one-shot aim at the staging-table name (matching all three flush statements) miss
+// vacuously whenever the poll caught a COPY with only µs of life left.
+const ENCODING_FLUSH_NEEDLE = "insert into git_pack_encoding"
 const AIM_TIMEOUT_MS = 45_000
 
 describe("regressions/pg-txn — the drain isolates a repack killed mid-pass (SCH-R6)", () => {
