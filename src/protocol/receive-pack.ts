@@ -296,35 +296,46 @@ export async function handleReceivePack(
 				: backend.objectType(c.newOid).then((t) => t === "commit"),
 		),
 	)
-	// Directory/file conflicts, judged LAST and in git's sequential lock order:
-	// only a command that passed every other check occupies its name — a
-	// rejected command must not reserve the namespace against a valid later one
-	// (git applies the valid one). The existing side includes SYMREF names:
-	// `refs/remotes/origin/HEAD` blocks `refs/remotes/origin/HEAD/x` exactly
-	// like a value ref would.
+	// Directory/file conflicts, judged LAST, in TWO ORDERED PHASES — the order is
+	// the point. Phase 1 is per-command: a name that prefix-conflicts with the
+	// EXISTING namespace is disqualified like any other per-command failure (the
+	// existing side includes SYMREF names: `refs/remotes/origin/HEAD` blocks
+	// `refs/remotes/origin/HEAD/x` exactly like a value ref would). Phase 2 is
+	// the batch's only inter-command rule: git keeps the DEEPEST new name and
+	// `ng`s every shorter one, wire-order independent (measured on git 2.55 —
+	// pairs AND three-name chains; the policy differential pins both) — judged
+	// ONLY over phase-1 survivors, so a command doomed against the existing
+	// namespace never reserves it against a valid sibling (DFC-1: git applies
+	// the valid update; judging deepest-wins against a pre-phase-1 set was the
+	// stale-set defect). One ordered pass suffices: the existing namespace is
+	// fixed, so phase 1 is final, and removing a phase-2 loser can never create
+	// a new loss (a chain's deepest survivor defeats every shallower name
+	// directly, by prefix transitivity). The eligibility predicate carries EVERY
+	// per-command verdict — fast-forward included: an FF-failing deeper sibling
+	// is unreachable in a D/F composite today (a deeper UPDATE implies the
+	// deeper name exists, which dooms the shallower against the existing
+	// namespace first), but leaving FF out would reopen the same stale-set
+	// class under a future policy change.
 	const existingNames = await backend.listRefNames()
-	const eligibleNames = commands
-		.filter(
-			(c, i) =>
-				nameProblem[i] === null && connected[i] && validTip[i] && c.newOid !== ZERO_OID,
-		)
-		.map((c) => c.ref)
+	const eligible = (i: number, c: RefCommand): boolean =>
+		nameProblem[i] === null &&
+		connected[i] === true &&
+		validTip[i] === true &&
+		fastForward[i] === true &&
+		c.newOid !== ZERO_OID
 	for (const [i, c] of commands.entries()) {
-		const otherwiseEligible =
-			nameProblem[i] === null && connected[i] && validTip[i] && c.newOid !== ZERO_OID
-		if (!otherwiseEligible) continue
+		if (!eligible(i, c)) continue
 		const clashesExisting = existingNames.some(
 			(other) =>
 				other !== c.ref &&
 				(other.startsWith(`${c.ref}/`) || c.ref.startsWith(`${other}/`)),
 		)
-		// In-batch D/F between NEW names: git keeps the DEEPEST and `ng`s every
-		// shorter one, independent of wire order (measured on git 2.55; the policy
-		// differential pins it) — so a command loses only to a deeper sibling.
-		const losesToDeeper = eligibleNames.some(
-			(other) => other !== c.ref && other.startsWith(`${c.ref}/`),
-		)
-		if (clashesExisting || losesToDeeper) {
+		if (clashesExisting) nameProblem[i] = "funny refname (directory/file conflict)"
+	}
+	const survivorNames = commands.filter((c, i) => eligible(i, c)).map((c) => c.ref)
+	for (const [i, c] of commands.entries()) {
+		if (!eligible(i, c)) continue
+		if (survivorNames.some((other) => other.startsWith(`${c.ref}/`))) {
 			nameProblem[i] = "funny refname (directory/file conflict)"
 		}
 	}
