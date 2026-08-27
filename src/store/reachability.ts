@@ -122,9 +122,12 @@ type EdgeExpectation = "commit" | "tree" | "blob"
  * expectations its referencing edges made — satisfying ANY is enough, so a
  * valid directory edge keeps an object alive even when a second, mistyped
  * edge also names it). Returns:
- * - "corruption": a COMMIT/TAG type here normally means the derived row is
- *   MISSING — the derived-row invariant is broken, crash loud, NEVER a sweepable
- *   "missing" (a healthy commit resolves via its row before this probe).
+ * - "corruption": a COMMIT/TAG type here means the derived row is MISSING —
+ *   the derived-row invariant is broken, crash loud, NEVER a sweepable
+ *   "missing". This is proof-backed, not inferred: a healthy commit resolves
+ *   via its row in step 1, and a healthy tag named by a commit edge is
+ *   exonerated by step 2's classification probe — only row-less objects reach
+ *   this probe with a "commit" expectation.
  * - "violation": the one exception — when ONLY tree/blob edges named the oid,
  *   the OBJECT may be healthy and the EDGE malformed; likewise a TREE/BLOB
  *   type matching none of its expectations ("commit" is never satisfiable
@@ -291,18 +294,31 @@ export async function fullClosure(
 			for (const parent of row.parents) enqueue(next, "commits", parent, "commit")
 		}
 
-		// 2. Tag rows, for unknowns that were not commits.
+		// 2. Tag rows — traversal for unknowns that were not commits, and
+		// CLASSIFICATION for commit-expected misses: a commit-parent edge naming a
+		// stored tag is a typed-edge VIOLATION (the tag's derived row is healthy —
+		// letting it fall to the object probe would misdiagnose it as derived-row
+		// corruption), judged like every violation on this serve path: the want is
+		// refused, the tag never traversed. A commit-expected miss the tag probe
+		// ALSO misses proceeds to the object probe, where a TAG type code now
+		// proves the derived row absent — genuine corruption, still loud.
 		const tagProbe = level.unknown.filter((oid) => !commitRows.has(oid))
-		const tagRows = await loadTagTargets(db, id, tagProbe)
-		for (const [oid, target] of tagRows) {
+		const commitMisses = level.commits.filter((oid) => !commitRows.has(oid))
+		const tagRows = await loadTagTargets(db, id, [...tagProbe, ...commitMisses])
+		for (const oid of tagProbe) {
+			const target = tagRows.get(oid)
+			if (target === undefined) continue
 			present.add(oid)
 			enqueue(next, "unknown", target)
+		}
+		for (const oid of commitMisses) {
+			if (tagRows.has(oid)) missing.add(oid)
 		}
 
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = [
 			...level.objects,
-			...level.commits.filter((oid) => !commitRows.has(oid)),
+			...commitMisses.filter((oid) => !tagRows.has(oid)),
 			...tagProbe.filter((oid) => !tagRows.has(oid)),
 		]
 		const objectMetadata = await loadObjectMeta(db, id, objectProbe)
@@ -463,32 +479,59 @@ export async function originClosure(
 			}
 		}
 
-		// 2. Tag rows, for unknowns that were not commits.
+		// 2. Tag rows — traversal for unknown-bucket misses, and CLASSIFICATION for
+		// commit-expected misses (the tag-parent shape): the tag's derived row is
+		// healthy, so this is a typed-edge VIOLATION, never derived-row corruption.
+		// "reject" fails it like an absent object; "retain" keeps it live AND peels
+		// it — the target traverses with the violator's bits (TP-3′: retain expands
+		// by ACTUAL type, tags included) — while the violation withholds the epoch
+		// either way. A miss here proceeds to the object probe, where a TAG type
+		// code now PROVES the derived row absent — genuine corruption, still loud.
 		const tagProbe = new Map<string, bigint>()
 		for (const [oid, bits] of level.unknown) {
 			if (!commitRows.has(oid)) tagProbe.set(oid, bits)
 		}
-		const tagRows = await loadTagTargets(db, id, tagProbe.keys())
-		for (const [oid, target] of tagRows) {
-			enqueue(next, "unknown", target, tagProbe.get(oid) as bigint)
+		const commitMisses = new Map<string, bigint>()
+		for (const [oid, bits] of commitProbe) {
+			if (!commitRows.has(oid) && !tagProbe.has(oid)) commitMisses.set(oid, bits)
+		}
+		const tagRows = await loadTagTargets(db, id, [
+			...tagProbe.keys(),
+			...commitMisses.keys(),
+		])
+		for (const [oid, bits] of tagProbe) {
+			const target = tagRows.get(oid)
+			if (target !== undefined) enqueue(next, "unknown", target, bits)
+		}
+		for (const [oid, bits] of commitMisses) {
+			const target = tagRows.get(oid)
+			if (target === undefined) continue
+			violations.add(oid)
+			if (onViolation === "reject") {
+				missing.add(oid)
+				masks.delete(oid)
+			} else {
+				enqueue(next, "unknown", target, bits)
+			}
 		}
 
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = merge(
-			new Map(
-				[...commitProbe].filter(([oid]) => !commitRows.has(oid) && !tagProbe.has(oid)),
-			),
+			new Map([...commitMisses].filter(([oid]) => !tagRows.has(oid))),
 			new Map([...tagProbe].filter(([oid]) => !tagRows.has(oid))),
 			level.objects,
 		)
 		const objectMetadata = await loadObjectMeta(db, id, objectProbe.keys())
+		const retainedTagViolations = new Map<string, bigint>()
 		for (const [oid, metadata] of objectMetadata) {
 			// Typed-edge violations: the graph is malformed. "reject" fails
 			// connectivity like an absent object; "retain" keeps the object live
 			// (a valid edge elsewhere must keep it un-sweepable) and expands it
-			// by its ACTUAL type — either way the violation is recorded and the
-			// epoch withheld. A commit/tag with no derived row stays a LOUD
-			// corruption crash, never a sweepable "missing".
+			// by its ACTUAL type — a retained TAG (a tree entry naming a tag) is
+			// peeled below through its derived row, so its target stays live too
+			// (TP-3′) — either way the violation is recorded and the epoch
+			// withheld. A commit/tag with no derived row stays a LOUD corruption
+			// crash, never a sweepable "missing".
 			const verdict = judgeProbedType(expected.get(oid), metadata.type)
 			if (verdict === "corruption") throwMissingDerivedRow(oid, metadata.type)
 			if (verdict === "violation") {
@@ -496,6 +539,10 @@ export async function originClosure(
 				if (onViolation === "reject") {
 					missing.add(oid)
 					masks.delete(oid)
+					continue
+				}
+				if (metadata.type === PACK_OBJ_TYPE.TAG) {
+					retainedTagViolations.set(oid, objectProbe.get(oid) as bigint)
 					continue
 				}
 			}
@@ -515,6 +562,17 @@ export async function originClosure(
 						)
 					}
 				}
+			}
+		}
+		// TP-3′'s batched peel: a row missing HERE is genuine, proof-backed
+		// corruption (the classification probes above already exonerated every
+		// healthy tag this level could route wrongly).
+		if (retainedTagViolations.size > 0) {
+			const targets = await loadTagTargets(db, id, retainedTagViolations.keys())
+			for (const [oid, bits] of retainedTagViolations) {
+				const target = targets.get(oid)
+				if (target === undefined) throwMissingDerivedRow(oid, PACK_OBJ_TYPE.TAG)
+				enqueue(next, "unknown", target, bits)
 			}
 		}
 		for (const oid of objectProbe.keys()) {
