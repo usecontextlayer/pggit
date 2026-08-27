@@ -29,6 +29,18 @@ export function requireGitOid(value: string, context: string): Oid {
 	return value
 }
 
+/** Store exact object bytes in canonical git, including malformed fixtures. */
+export async function writeLiteralGitObject(
+	dir: string,
+	object: PackInputObject,
+): Promise<Oid> {
+	const out = await spawnGit(
+		["hash-object", "-w", "-t", object.type, "--literally", "--stdin"],
+		{ cwd: dir, input: object.content },
+	)
+	return requireGitOid(out.stdout.trim(), "git hash-object --literally")
+}
+
 /** Directional list difference, preserving each input's order and duplicates. */
 export function listDifferences<T>(
 	left: readonly T[],

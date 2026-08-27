@@ -46,6 +46,8 @@ import { describe, expect, it } from "vitest"
 import { GitFormatError } from "@/object/format-error"
 import { deriveCommitRow, deriveTagRow, validateObject } from "@/object/ingest-validation"
 import type { GitObjectType } from "@/object/object"
+import type { PackInputObject } from "@/pack/write-pack"
+import { writeLiteralGitObject } from "@/testing/git-fixtures"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
 import { withTempDir } from "@/testing/temp-dir"
 
@@ -113,33 +115,17 @@ function pggitVerdict(type: GitObjectType, content: Buffer): PggitVerdict {
 	}
 }
 
-type Prerequisite = { content: Buffer; type: GitObjectType }
-
-/** `--literally` is what lets git store a malformed object at all. */
-async function writeObject(
-	dir: string,
-	type: GitObjectType,
-	content: Buffer,
-): Promise<string> {
-	const out = await spawnGit(
-		["hash-object", "-w", "-t", type, "--literally", "--stdin"],
-		{
-			cwd: dir,
-			input: content,
-		},
-	)
-	return out.stdout.trim()
-}
-
 /** A repo holding exactly the canonical objects a candidate will reference (its
  * blob, its root tree, its parent commit), with the oids git assigned them. */
 type Fixture = { dir: string; oids: string[] }
 
-async function createFixture(prerequisites: Prerequisite[]): Promise<Fixture> {
+async function createFixture(prerequisites: PackInputObject[]): Promise<Fixture> {
 	const dir = mkdtempSync(join(tmpdir(), "pggit-fsck-fixture-"))
 	await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
 	const oids: string[] = []
-	for (const p of prerequisites) oids.push(await writeObject(dir, p.type, p.content))
+	for (const object of prerequisites) {
+		oids.push(await writeLiteralGitObject(dir, object))
+	}
 	return { dir, oids }
 }
 
@@ -156,7 +142,7 @@ async function gitVerdict(
 ): Promise<GitVerdict> {
 	return withTempDir("pggit-fsck-parity-", async (dir) => {
 		cpSync(fixture.dir, dir, { recursive: true })
-		await writeObject(dir, type, content)
+		await writeLiteralGitObject(dir, { content, type })
 		const fsck = await attemptGit(["fsck", "--strict"], dir)
 		return parseFsck(`${fsck.stdout}${fsck.stderr}`)
 	})

@@ -19,6 +19,7 @@ import { computeOid } from "@/object/object"
 import { writePack } from "@/pack/write-pack"
 import { createObjectStore, type ObjectStore } from "@/store/object-store"
 import { createRefStore, type RefStore } from "@/store/refs-store"
+import { writeLiteralGitObject } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { EMPTY_TREE, pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
 import { attemptGit, spawnGit } from "@/testing/spawn-git"
@@ -49,15 +50,8 @@ async function gitFsckVerdict(
 ): Promise<{ code: number; oid: string; out: string }> {
 	return withTempDir("pggit-fsck-oracle-", async (dir) => {
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: dir })
-		const write = async (type: string, content: Buffer): Promise<string> =>
-			(
-				await spawnGit(["hash-object", "-w", "-t", type, "--literally", "--stdin"], {
-					cwd: dir,
-					input: content,
-				})
-			).stdout.trim()
-		for (const p of prerequisites) await write(p.type, p.content)
-		const oid = await write(malformed.type, malformed.content)
+		for (const object of prerequisites) await writeLiteralGitObject(dir, object)
+		const oid = await writeLiteralGitObject(dir, malformed)
 		const fsck = await attemptGit(["fsck", "--strict"], dir)
 		return { code: fsck.code, oid, out: `${fsck.stdout}${fsck.stderr}` }
 	})

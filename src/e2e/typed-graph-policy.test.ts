@@ -1,5 +1,5 @@
 /**
- * Typed-graph policy. Two layers:
+ * Typed-graph policy. Three layers:
  *
  * 1. Branch tips must be COMMITS — canonical receive-pack rejects a blob or
  *    tree pushed to refs/heads/* per-ref ("invalid new value provided",
@@ -29,11 +29,12 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps, type GitDeps } from "@/index"
-import { computeOid, type GitObjectType } from "@/object/object"
-import { writePack } from "@/pack/write-pack"
+import { computeOid } from "@/object/object"
+import { type PackInputObject, writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
+import { allRefsOf, writeLiteralGitObject } from "@/testing/git-fixtures"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
 import { pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
 import { attemptGit, type GitAttempt, spawnGit } from "@/testing/spawn-git"
@@ -65,7 +66,7 @@ function tagParentObjects(label: string) {
 		`tree ${treeOid}\nparent ${tagOid}\nauthor t <t@t> 1700000002 +0000\ncommitter t <t@t> 1700000002 +0000\n\n${label}-bad\n`,
 	)
 	const malformedOid = computeOid("commit", malformed)
-	const objects: { content: Buffer; type: GitObjectType }[] = [
+	const objects: PackInputObject[] = [
 		{ content: blob, type: "blob" },
 		{ content: tree, type: "tree" },
 		{ content: target, type: "commit" },
@@ -96,13 +97,10 @@ async function oracleReceive(
  * is what lets git store arbitrary bytes at all). */
 async function seedOracleObjects(
 	bare: string,
-	objects: readonly { content: Buffer; type: GitObjectType }[],
+	objects: readonly PackInputObject[],
 ): Promise<void> {
 	for (const o of objects) {
-		await spawnGit(["hash-object", "-w", "-t", o.type, "--literally", "--stdin"], {
-			cwd: bare,
-			input: o.content,
-		})
+		await writeLiteralGitObject(bare, o)
 	}
 }
 
@@ -290,8 +288,7 @@ describe("typed-graph policy", () => {
 				`[TPC-1 oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
 			)
 			expect(oracle.report).toContain("ng refs/heads/tp1 missing necessary objects")
-			const oracleRefs = await spawnGit(["for-each-ref"], { cwd: bare })
-			expect(oracleRefs.stdout.trim()).toBe("")
+			expect(await allRefsOf(bare)).toEqual([])
 		})
 	}, 120_000)
 
@@ -374,11 +371,7 @@ describe("typed-graph policy", () => {
 		const result = await createGc(db.sql).gc("policy/tp4", { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
 		for (const oid of [fxp.tagOid, fxp.targetOid]) {
-			const [row] = await db.sql<{ n: string }[]>`
-				select count(*)::text as n from git_object
-				where oid = ${Buffer.from(oid, "hex")}`
-			if (row === undefined) throw new Error("object count query returned no row")
-			expect(row.n, oid).toBe("1")
+			expect(await deps.objects.hasObject("policy/tp4", oid), oid).toBe(true)
 		}
 	})
 
@@ -395,11 +388,25 @@ describe("typed-graph policy", () => {
 		const result = await createGc(db.sql).gc(repo, { graceSeconds: 0 })
 		expect(result.epoch).toBe("cleared")
 		for (const oid of [outerTagOid, fxp.tagOid, fxp.targetOid]) {
-			const [row] = await db.sql<{ n: string }[]>`
-				select count(*)::text as n from git_object
-				where oid = ${Buffer.from(oid, "hex")}`
-			if (row === undefined) throw new Error("object count query returned no row")
-			expect(row.n, oid).toBe("1")
+			expect(await deps.objects.hasObject(repo, oid), oid).toBe(true)
+		}
+	})
+
+	it("TPC-4 object overlap: GC retains one tag reached as both a parent and a tree entry", async () => {
+		const repo = "policy/tp4-object-overlap"
+		const fxp = tagParentObjects("tp4-object-overlap")
+		const tree = Buffer.concat([
+			Buffer.from("100644 t\0"),
+			Buffer.from(fxp.tagOid, "hex"),
+		])
+		const treeOid = computeOid("tree", tree)
+		await deps.objects.putPack(repo, [...fxp.objects, { content: tree, type: "tree" }])
+		await deps.refs.setRef(repo, "refs/heads/main", fxp.malformedOid)
+		await deps.refs.setRef(repo, "refs/tags/tree-root", treeOid)
+		const result = await createGc(db.sql).gc(repo, { graceSeconds: 0 })
+		expect(result.epoch).toBe("cleared")
+		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+			expect(await deps.objects.hasObject(repo, oid), oid).toBe(true)
 		}
 	})
 
@@ -426,11 +433,7 @@ describe("typed-graph policy", () => {
 		// Pre-TP-3′ the tag survives but its TARGET is swept from under the
 		// surviving git_tag row — the data-loss pin.
 		for (const oid of [fxp.tagOid, fxp.targetOid]) {
-			const [row] = await db.sql<{ n: string }[]>`
-				select count(*)::text as n from git_object
-				where oid = ${Buffer.from(oid, "hex")}`
-			if (row === undefined) throw new Error("object count query returned no row")
-			expect(row.n, oid).toBe("1")
+			expect(await deps.objects.hasObject("policy/tp6", oid), oid).toBe(true)
 		}
 	})
 

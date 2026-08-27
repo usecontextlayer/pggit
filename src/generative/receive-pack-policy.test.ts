@@ -46,6 +46,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { pathToFileURL } from "node:url"
 import fc from "fast-check"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp } from "@/index"
@@ -488,7 +489,7 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 				const repoId = `policy/batch${run++}`
 				await withTempDir("pggit-rppolicy-ctl-", async (bare) => {
 					await spawnGit(["init", "-q", "--bare", bare])
-					const controlUrl = `file://${bare}`
+					const controlUrl = pathToFileURL(bare).href
 					const pggitUrl = `http://127.0.0.1:${server.port}/${repoId}`
 
 					// Identical seed on both remotes — the precondition the whole comparison
@@ -645,7 +646,7 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 		const repo = "policy/df-pair"
 		await withTempDir("pggit-rppolicy-df-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
-			const controlUrl = `file://${bare}`
+			const controlUrl = pathToFileURL(bare).href
 			const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
 			await spawnGit(["push", "-q", controlUrl, `${fx.b}:refs/heads/base`], {
 				cwd: fx.dir,
@@ -691,16 +692,16 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 	 * deeper sibling that is itself doomed against the existing namespace. Pure
 	 * parity, both wire orders, fresh remotes per order: per-ref verdict classes
 	 * and the final ref set must equal canonical git's. The generator above can
-	 * never produce this composite (destinations are position-keyed), and the
-	 * current D/F pass judges deepest-wins against an eligibility set frozen
-	 * BEFORE the existing-clash check — the stale-set defect this pins.
+	 * never produce this composite (destinations are position-keyed). The pre-fix
+	 * D/F pass judged deepest-wins against an eligibility set frozen BEFORE the
+	 * existing-clash check — the stale-set defect this pins.
 	 */
 	it("DFC-1: an update of an existing ref survives its doomed deeper sibling, in both wire orders", async () => {
 		for (const order of ["shallow-first", "deep-first"] as const) {
 			const repo = `policy/dfc1-${order}`
 			await withTempDir("pggit-rppolicy-dfc1-", async (bare) => {
 				await spawnGit(["init", "-q", "--bare", bare])
-				const controlUrl = `file://${bare}`
+				const controlUrl = pathToFileURL(bare).href
 				const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
 				for (const url of [controlUrl, pggitUrl]) {
 					await spawnGit(["push", "-q", url, `${fx.b}:refs/heads/dfc`], { cwd: fx.dir })
@@ -743,16 +744,15 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 	/**
 	 * DFC-2: the doomed-deeper generalization — the deeper sibling is doomed by a
 	 * DIFFERENT per-command check (the branch-tip rule: a blob tip under
-	 * refs/heads/). Preservation pin: eligibility already excludes it, so the
-	 * shallow create must apply on both remotes. If this reds BEFORE the DF fix,
-	 * the design doc's analysis of the current code was wrong — stop and
-	 * re-derive (the doc's own instruction).
+	 * refs/heads/). Preservation pin: the pre-fix predicate already excluded it,
+	 * so the shallow create must apply on both remotes; the two-phase reshape must
+	 * preserve that behavior.
 	 */
 	it("DFC-2: a deeper sibling doomed by the branch-tip rule never reserves the namespace", async () => {
 		const repo = "policy/dfc2"
 		await withTempDir("pggit-rppolicy-dfc2-", async (bare) => {
 			await spawnGit(["init", "-q", "--bare", bare])
-			const controlUrl = `file://${bare}`
+			const controlUrl = pathToFileURL(bare).href
 			const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
 			const shallow: Command = {
 				census: [],
@@ -791,16 +791,15 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 	 * DFC-3: the three-name D/F chain, measured for the first time — the pair
 	 * case above was the corpus's only prior measurement, in one wire order. Pure
 	 * parity over fresh remotes per order; the canonical verdicts are logged so
-	 * the run records what git actually does with a chain (the design doc's
-	 * deepest-wins extrapolation is a hypothesis, and this differential is its
-	 * arbiter — the fix implements the measured rule, whatever it is).
+	 * each run records the behavior. This differential confirmed the design doc's
+	 * deepest-wins hypothesis and now protects the measured rule.
 	 */
 	it("DFC-3: a three-name D/F chain matches canonical git in both wire orders", async () => {
 		for (const order of ["shallow-first", "deep-first"] as const) {
 			const repo = `policy/dfc3-${order}`
 			await withTempDir("pggit-rppolicy-dfc3-", async (bare) => {
 				await spawnGit(["init", "-q", "--bare", bare])
-				const controlUrl = `file://${bare}`
+				const controlUrl = pathToFileURL(bare).href
 				const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
 				const chain = ["refs/heads/t", "refs/heads/t/u", "refs/heads/t/u/v"].map(
 					(dest): Command => ({

@@ -239,11 +239,11 @@ type ClosureLevel = { commits: string[]; objects: string[]; unknown: string[] }
 
 /**
  * Everything reachable from `roots` — level-synchronous BFS in JS. Per level:
- * commit rows for known-commit + unknown oids, tag rows for the unknown
- * remainder, then one `git_object` read for the rest that fetches CONTENT ONLY
- * for trees (a `case` guard keeps blob bodies off the wire; presence is all a
- * blob contributes). One tree parse yields both subtrees and blobs. Returns the
- * closure partitioned into present / missing.
+ * commit rows for known-commit + unknown oids, tag rows to classify commit
+ * misses and traverse the unknown remainder, then one `git_object` read for the
+ * rest that fetches CONTENT ONLY for trees (a `case` guard keeps blob bodies off
+ * the wire; presence is all a blob contributes). One tree parse yields both
+ * subtrees and blobs. Returns the closure partitioned into present / missing.
  *
  * A commit or tag OBJECT whose derived row is absent is a LOUD error, never a
  * parse-the-body fallback — "every stored commit has its row" is the
@@ -295,8 +295,8 @@ export async function fullClosure(
 		}
 
 		// 2. Tag rows — traversal for unknowns that were not commits, and
-		// CLASSIFICATION for commit-expected misses: a commit-parent edge naming a
-		// stored tag is a typed-edge VIOLATION (the tag's derived row is healthy —
+		// CLASSIFICATION for every typed expectation accumulated on a tag hit: a
+		// commit-parent edge naming a stored tag is a typed-edge VIOLATION (the row is healthy —
 		// letting it fall to the object probe would misdiagnose it as derived-row
 		// corruption), judged like every violation on this serve path: the want is
 		// refused, the tag never traversed. A commit-expected miss the tag probe
@@ -305,19 +305,18 @@ export async function fullClosure(
 		const tagProbe = level.unknown.filter((oid) => !commitRows.has(oid))
 		const commitMisses = level.commits.filter((oid) => !commitRows.has(oid))
 		const tagRows = await loadTagTargets(db, id, [...tagProbe, ...commitMisses])
-		for (const oid of tagProbe) {
-			const target = tagRows.get(oid)
-			if (target === undefined) continue
+		for (const [oid, target] of tagRows) {
+			if ((expected.get(oid)?.size ?? 0) > 0) {
+				missing.add(oid)
+				continue
+			}
 			present.add(oid)
 			enqueue(next, "unknown", target)
-		}
-		for (const oid of commitMisses) {
-			if (tagRows.has(oid)) missing.add(oid)
 		}
 
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = [
-			...level.objects,
+			...level.objects.filter((oid) => !tagRows.has(oid)),
 			...commitMisses.filter((oid) => !tagRows.has(oid)),
 			...tagProbe.filter((oid) => !tagRows.has(oid)),
 		]
@@ -480,8 +479,9 @@ export async function originClosure(
 		}
 
 		// 2. Tag rows — traversal for unknown-bucket misses, and CLASSIFICATION for
-		// commit-expected misses (the tag-parent shape): the tag's derived row is
-		// healthy, so this is a typed-edge VIOLATION, never derived-row corruption.
+		// every typed role carried by the same oid, notably commit-expected misses
+		// (the tag-parent shape): a healthy tag row proves a typed-edge VIOLATION,
+		// never derived-row corruption.
 		// "reject" fails it like an absent object; "retain" keeps it live AND peels
 		// it — the target traverses with the violator's bits (TP-3′: retain expands
 		// by ACTUAL type, tags included) — while the violation withholds the epoch
@@ -492,8 +492,9 @@ export async function originClosure(
 			if (!commitRows.has(oid)) tagProbe.set(oid, bits)
 		}
 		// Keep the bucket roles independent: one oid can carry different origin bits
-		// in both maps, and a tag hit must traverse the unknown bits while still
-		// classifying the commit bits as a violation.
+		// in several maps. A known tag is judged ONCE from all of those roles: unknown
+		// bits traverse normally, while typed-edge bits make it a violation and are
+		// retained only in retain mode.
 		const commitMisses = new Map<string, bigint>()
 		for (const [oid, bits] of level.commits) {
 			if (!commitRows.has(oid)) commitMisses.set(oid, bits)
@@ -502,27 +503,27 @@ export async function originClosure(
 			...tagProbe.keys(),
 			...commitMisses.keys(),
 		])
-		for (const [oid, bits] of tagProbe) {
-			const target = tagRows.get(oid)
-			if (target !== undefined) enqueue(next, "unknown", target, bits)
-		}
-		for (const [oid, bits] of commitMisses) {
-			const target = tagRows.get(oid)
-			if (target === undefined) continue
-			violations.add(oid)
-			if (onViolation === "reject") {
-				missing.add(oid)
-				masks.delete(oid)
-			} else {
-				enqueue(next, "unknown", target, bits)
+		for (const [oid, target] of tagRows) {
+			const unknownBits = tagProbe.get(oid) ?? 0n
+			const typedBits = (commitMisses.get(oid) ?? 0n) | (level.objects.get(oid) ?? 0n)
+			let targetBits = unknownBits
+			if ((expected.get(oid)?.size ?? 0) > 0) {
+				violations.add(oid)
+				if (onViolation === "reject") {
+					missing.add(oid)
+					masks.delete(oid)
+				} else {
+					targetBits |= typedBits
+				}
 			}
+			if (targetBits !== 0n) enqueue(next, "unknown", target, targetBits)
 		}
 
 		// 3. The rest — trees, blobs, and absentees.
 		const objectProbe = merge(
 			new Map([...commitMisses].filter(([oid]) => !tagRows.has(oid))),
 			new Map([...tagProbe].filter(([oid]) => !tagRows.has(oid))),
-			level.objects,
+			new Map([...level.objects].filter(([oid]) => !tagRows.has(oid))),
 		)
 		const objectMetadata = await loadObjectMeta(db, id, objectProbe.keys())
 		const retainedTagViolations = new Map<string, bigint>()

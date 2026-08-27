@@ -226,7 +226,7 @@ export async function handleReceivePack(
 	// check-ref-format rules, is rejected BEFORE ingest — so an all-unstorable
 	// push never ingests a pack (no orphaned objects), and the raw btree error
 	// never escapes as a 500. (Directory/file conflicts are judged LATER, after
-	// every other check — see the sequential-lock-order block below.)
+	// every other check — see the two-phase D/F block below.)
 	const nameProblem = commands.map((c) =>
 		Buffer.byteLength(c.ref, "utf8") > MAX_REF_NAME_BYTES
 			? "funny refname (too long to store)"

@@ -5,8 +5,8 @@
  * trust the wire. A funny name that reached storage would poison every later
  * advertisement and status line a real git client parses. Rules mirror git's
  * `check_refname_format` as receive-pack applies it, plus the loose-ref
- * directory/file conflict (`refs/heads/a` vs `refs/heads/a/b`) checked in
- * git's sequential lock order.
+ * directory/file conflict (`refs/heads/a` vs `refs/heads/a/b`) checked in two
+ * phases: existing-namespace clashes, then deepest-wins among the survivors.
  *
  * The two vector lists below are NAMED REGRESSIONS — each string is a rule someone
  * had to discover. The general agreement with canonical git is pinned generatively

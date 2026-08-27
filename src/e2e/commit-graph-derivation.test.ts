@@ -27,6 +27,7 @@ import type { Migration } from "kysely/migration"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import type { GitServer } from "@/server"
 import type { ObjectStore } from "@/store/object-store"
+import { writeLiteralGitObject } from "@/testing/git-fixtures"
 import {
 	repoUrl,
 	setupGitServerFixture,
@@ -80,11 +81,7 @@ afterAll(() => {
 
 /** Canonical git's oid for these exact bytes. */
 async function gitOid(type: "commit" | "tag", content: Buffer): Promise<string> {
-	const out = await spawnGit(
-		["hash-object", "-w", "-t", type, "--literally", "--stdin"],
-		{ cwd: oracleRepo, input: content },
-	)
-	return out.stdout.trim()
+	return writeLiteralGitObject(oracleRepo, { content, type })
 }
 
 /** Canonical git's reading of a stored commit — tree, parents in CONTENT order,
