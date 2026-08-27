@@ -1,0 +1,87 @@
+# Oracle-divergence fixes — the D/F composite and the tag-parent verdict
+
+**Date:** 2026-08-27 · **Status:** DESIGN, approved in conversation; harness-first mandated (the differentials run red-for-the-right-reason before either fix exists). Both defects live in code landed inside the unreleased `v2.1.0..HEAD` range — receive-pack's directory/file-conflict block and the reachability walks' probed-type verdict — so neither divergence has ever shipped; the fixes should land before the next release cut, as two independent `fix:` commits. Found during a full read of the `v2.1.0..HEAD` production diff, by analysis only: the composite scenarios below were **derived, not observed**, and the existing differential corpus was not read during design — the first implementation step is therefore to check whether an existing test already pins either scenario, and if a passing differential contradicts a defect claim, this doc is amended before anything else happens. The design conversation is Claude Code session `session_01SrHsC2ij2uMYwN4nSpesey` (transcripts are deleted after ~30 days — this doc must stand without it).
+
+## The doctrine this doc is written under
+
+Every behavioral claim about canonical git below is a **hypothesis** until the oracle measures it. The repo's standing rule (AGENTS.md: harness/oracle-first) is the whole method here: extend the differentials, drive real git side-by-side, and let the observed transcript decide. If git's measured behavior contradicts a hypothesis, the affected decision is revisited and this doc amended BEFORE implementation proceeds — the fix target is "match the oracle," never "match the analysis."
+
+## The two defects, each in one paragraph
+
+**DF — the directory/file composite.** `handleReceivePack` (src/protocol/receive-pack.ts) judges D/F conflicts last, correctly, because deepest-wins is the pipeline's only inter-command rule. But `losesToDeeper` is judged against `eligibleNames`, a set frozen BEFORE the existing-namespace clash check runs — so a deep sibling that is itself doomed against an existing ref still defeats a valid shallow command. Composite: `refs/heads/a` exists; one push carries `update a` (clean fast-forward) + `create a/b`. Current pggit: both ng (`a/b` for clashing with existing `a`; `a` for losing to the still-"eligible" `a/b`). Hypothesis for canonical git: `a` ok, `a/b` ng (sequential ref locking — `a/b` fails its lock, `a` updates). The code's own comment states the property this violates: "a rejected command must not reserve the namespace against a valid later one."
+
+**TP — the tag-parent verdict.** A pushed commit whose `parent` header names an annotated tag is a malformed graph (parents must be commits), and because the pack ingests before policy, both objects land in storage — the tag WITH its healthy `git_tag` row. The walks (src/store/reachability.ts) bucket the parent oid as commit-expected; step 2's `git_tag` probe covers only the `unknown` bucket, so the exonerating row is never read; step 3's `git_object` probe finds type TAG, and `judgeProbedType`'s TAG-with-commit-expectation cell returns `"corruption"` → `throwMissingDerivedRow` → an uncaught crash claiming the chunk-1 invariant is broken. It is not: the row exists; the walk just never consulted it. Blast radius: connectivity 500s the push, a have-less serve of the stored orphan 500s, and a GC pass over a reachable instance of the shape crashes. The same shape at a boundary tip is already handled correctly (`boundarySatisfies` → violation → clean rejection) — the in-walk path and the boundary path disagree about one policy. Hypothesis for canonical git: a clean client-readable rejection (rev-list fails to parse a tag as a commit), never a transport fault.
+
+## Decisions
+
+- **DF-1 — Count the concepts: existing-clash is a per-command check; deepest-wins is inter-command.** The fused loop holds two concepts under one judgment and one reason string, and the bug lives at their fused boundary. Split: phase 1 judges `clashesExisting` (depends only on the fixed existing namespace, symrefs included) alongside the other per-command disqualifications; phase 2 judges `losesToDeeper` ONLY over phase-1 survivors. The rejection reason stays `"funny refname (directory/file conflict)"` for both concepts unless the oracle's comparison depth says otherwise (DF-3).
+- **DF-2 — Single ordered pass; no fixed-point iteration.** The dependency is one-directional and the code comment must carry the argument: `clashesExisting` reads only the fixed existing namespace, so filtering by it first is final; deepest-wins over the fixed survivor set is a sound pairwise judgment even for chains (`a`, `a/b`, `a/b/c` all new: `a` and `a/b` each lose to the deeper survivor `a/b/c`, one pass). Removing a loser can never create a new loss, so no iteration is needed.
+- **DF-3 — Report parity is judged at the existing differential's comparison depth.** The policy differential (src/generative/receive-pack-policy.test.ts, the suite the current code's "measured on git 2.55" comment cites) compares per-ref ok/ng at whatever depth it already compares; this fix adopts that depth and does not add wording-level assertions of git's reason text (the repo's standing no-prose-pins stance).
+- **TP-1 — Corruption verdicts must be proof-backed; the fix is in the walk, not the judge.** In `fullClosure` and `originClosure` step 2, the `git_tag` probe extends to commits-bucket misses (oids commit-expected but without a `git_commit` row) as a CLASSIFICATION probe, reusing `loadTagTargets`. Found ⇒ the edge lied: a typed-edge violation, exactly the vocabulary the walks already carry. Not found ⇒ the oid proceeds to the object probe, where a TAG result now PROVES the derived row absent — `judgeProbedType`'s code is untouched; only its comment updates, because its corruption cell has become true by construction.
+- **TP-2 — Reject-mode semantics: the violation takes the existing reject path.** Under `"reject"` (connectivity, and `fullClosure`'s serve semantics where violation ⇒ missing): the oid lands in missing, is never traversed, and the push fails per-ref with the existing "missing necessary objects" channel — the same CLASS of client-readable rejection the oracle is expected to show for git; the differential arbitrates the class.
+- **TP-3 — Retain-mode semantics (flagged as the design's one open decision; approved with the design): the tag stays live and is traversed.** Under `"retain"` (GC): the tag keeps its mask, its target is enqueued (unknown bucket, inheriting the origin bits), the violation is recorded, and the epoch is withheld — mirroring retain's standing stance that an existing, validly-referenced object must never become sweepable over a malformed EDGE, extended to the object behind it.
+- **TP-4 — The boundary path is untouched.** `boundarySatisfies` already returns violation for a TAG meeting a commit expectation; after TP-1 the in-walk and at-boundary verdicts agree, which closes the inconsistency that was the original smell.
+- **TP-5 — Rejected alternative: typing parents at ingest.** Rejecting `parent <tag>` in ingest-validation looks tempting and is wrong twice over: the ingest boundary cannot type a parent (the parent object may be absent — in neither the pack nor the store — which is ordinary, not malformed), and canonical git's DEFAULT receive path does not fsck-type parents either (`receive.fsckObjects` defaults off; connectivity arbitrates). The walk is the correct layer.
+- **Anti-decisions, named.** No catch around `throwMissingDerivedRow` anywhere — a catch would launder REAL corruption (a genuinely missing derived row) into a polite client message, and the loud channel's value is that it fires only on true storage breakage (pinned by TPC-5). No "un-reject the shallower command if its deeper sibling was rejected" special case — the reorder IS the root-cause fix; a compensating branch is the symptom patch this repo's bug-fix protocol exists to prevent.
+
+## The mechanism
+
+**DF.** In `handleReceivePack`, the D/F block restructures from one mutating loop into two: first, each otherwise-eligible command is judged against `existingNames` alone (same prefix test, symrefs included) and disqualified into `nameProblem` on a clash; second, `eligibleNames` is computed from what SURVIVED — every per-command check including the existing-clash — and `losesToDeeper` is judged over that set. Everything downstream (`evaluated`, the decision union, apply/report) is untouched. Expected net line delta ≈ 0: the same predicates, sequenced honestly.
+
+**TP.** In both walks' step 2: alongside `tagProbe` (unknown-bucket misses), compute the commits-bucket misses and include them in the same batched `loadTagTargets` read. A commits-bucket hit is classified, never resolved-as-tag: `fullClosure` adds it to `missing` and does not traverse (its violation-⇒-missing convention); `originClosure` adds it to `violations`, and then per mode — reject: `missing` + mask scrubbed, no traversal; retain: mask kept, target enqueued as unknown with the oid's bits. Commits-bucket tag-hits are excluded from step 3's object probe (they are judged); commits-bucket tag-MISSES flow to step 3 unchanged, where the TAG type code now reaches `judgeProbedType` only when no row exists. `ancestry`'s SQL corrupt-probe and `peelRef` are unaffected: both consult `git_tag` directly by oid, so they never misroute this shape.
+
+## The observable contract (normative — the test spec for the harness-first phase)
+
+Same doctrine as the scheduler docs: observable surfaces only (the git-protocol oracle, Postgres rows, returned results), no internals asserted. Prefixes `DFC-*` / `TPC-*`.
+
+- **DFC-1 — Composite parity.** Repo with existing `refs/heads/a`; one push carrying `update a` (fast-forward) + `create a/b`, in BOTH wire orders: pggit's per-ref report equals canonical git's for the same push (hypothesis: `a` ok, `a/b` ng). This is the defect's direct pin.
+- **DFC-2 — A doomed-deeper never reserves the namespace, whatever doomed it.** Variant where the deeper sibling fails a DIFFERENT per-command check (e.g. connectivity): the shallow valid command still applies. True today by construction; pinned so the reshape cannot regress it.
+- **DFC-3 — In-batch chains preserved.** All-new `a`, `a/b`, `a/b/c` in one push: deepest wins, shallower two ng, wire-order independent — the already-measured behavior the current code implements, kept green through the reshape.
+- **TPC-1 — Push rejection parity.** A push whose pack carries an annotated tag plus a commit naming that tag as `parent`: pggit responds with a client-readable per-ref rejection of the same class the oracle records for canonical git (hypothesis: connectivity failure), and NEVER an HTTP 5xx. Variant: the tag already in the store from a prior push, only the malformed commit in the pack.
+- **TPC-2 — Boundary variant unchanged.** A new commit whose parent is an existing ref TIP that is an annotated tag: the already-correct boundary rejection stays byte-identical.
+- **TPC-3 — Serve refusal, not a crash.** With the malformed pair stored as denied-push residue, a have-less fetch wanting the malformed commit is refused through the existing want-refusal channel (ERR, HTTP 200), not a 500.
+- **TPC-4 — GC survives the shape and withholds the epoch.** Seed the malformed pair REACHABLE (via `insertObjects` + `setRef`, the sanctioned non-wire seeding path — the wire can never create a reachable instance, since connectivity now rejects it): `gc()` completes without throwing; the tag object AND its target survive the sweep; the pass's epoch outcome is `cleared`; the drain's next pass is unaffected.
+- **TPC-5 — Real corruption stays loud.** With a `git_tag` row surgically deleted from under a stored tag object, the walks still crash with the derived-row invariant error. The fix sharpens the trigger; it must not soften the response.
+- **Preservation.** The receive-pack policy differential, the negotiation and served-set differentials, and the full battery — green.
+
+## Verification and the commits (harness-first)
+
+1. **Oracle first.** Extend the policy differential corpus with DFC-1/2/3 and build the TP fixtures; run against canonical git and record the observed transcripts. Red-for-the-right-reason on DFC-1 and TPC-1/3/4 confirms both defects; a green here instead means the analysis was wrong and this doc gets amended before any implementation. Fixture crafting for TP: `git hash-object -w -t commit --stdin --literally` stores the malformed commit body on the oracle side; `git mktag` (or hash-object `-t tag`) the tag; pack via `pack-objects`; the oracle receive side keeps `receive.fsckObjects` at its default (off) so connectivity is the arbiter, and the differential records whatever git actually emits.
+2. **Placement.** Unit tier, bare `*.test.ts` (real-git fixtures over temp dirs are unit tier). Anchors, to be confirmed against the corpus at implementation: DFC beside the in-batch D/F cases in `src/generative/receive-pack-policy.test.ts` and the `src/e2e/push/` family; TPC in the `src/e2e/regressions/pg-corrupt/` family (a malformed-graph concern), with TPC-4 beside the GC suites. Final placement follows each file's existing shape, per the corpus the implementer reads first.
+3. **Implement, two independent commits:** `fix(receive-pack): …` (DF) and `fix(reachability): …` (TP), each carrying its tests. Neither is breaking; both precede the next release cut.
+4. **Gate, in order, per commit:** statics by exit code (`rm -f dist-types/tsconfig.tsbuildinfo`, then `node_modules/.bin/tsc -b tsconfig.json --force`; biome via the installed bin, `--error-on-warnings`; `tsdown`) → full battery (`node_modules/.bin/vitest run`, unrestricted per the standing R-TEST ruling; timing reds arbitrated solo per the repo's documented discipline) → all applychecks groups over the change (read the applychecks SKILL.md before the session's first run) → re-run statics + battery after any codex edits.
+5. **Commit via `gitc`** (never chained; each commit waits on a 1Password click — `failed to fill whole buffer` means the human has not clicked, not breakage; check `git log -1` afterward).
+
+## Out of scope, named
+
+- Every other receive policy behavior (deny-non-FF, deletion denial, branch-tip typing, refname format) — untouched.
+- Ingest-time parent typing (rejected, TP-5) and any `receive.fsckObjects`-equivalent strict mode — a separate feature if ever wanted.
+- Wording-level parity of ng reason strings beyond the differential's existing comparison depth (DF-3).
+- The `v2.1.0..HEAD` API-reshape major and its release sequencing — a separate concern this doc only notes.
+
+## Implementation notes
+
+### Decided — implementation
+
+- `eligibleNames` is computed AFTER existing-clash disqualification; the mid-loop mutation of `nameProblem` for in-batch losses may remain as the write mechanism, but no judgment reads a set that a later filter can invalidate.
+- The TP classification probe reuses `loadTagTargets` verbatim — no new query shape, one extra batched read per level only when commits-bucket misses exist (zero on every healthy graph, since a commit-expected oid with no row is already the anomaly).
+- `judgeProbedType`'s code is untouched; its TAG-with-commit-expectation comment is rewritten to state the now-true precondition (only row-less tags reach it).
+
+### Nuances
+
+- Retain-mode traversal must inherit the violating oid's origin BITS into the enqueued target, or the epoch masks under-count reach — and the epoch is withheld regardless (violations non-empty), so this matters for the live set, not the bitmaps.
+- `fullClosure` has no `violations` set by design; violation-⇒-missing is its standing convention and the TP fix follows it rather than adding one.
+- TPC-4's reachable-shape seeding goes through `insertObjects` + `setRef` only; do not "improve" the fixture by weakening wire-path validation to push it.
+- DFC-2 is a preservation pin, not a new behavior: if it reds before the fix, the analysis of the current code was wrong — stop and re-derive.
+
+### Traps
+
+- The policy differential's oracle transcripts are order-sensitive: DFC-1 must drive both wire orders through the SAME oracle repo state (fresh repo per order), or the second order measures a mutated namespace.
+- Biome reformats SQL template literals when a backtick appears inside a SQL comment (the migration-0008 incident); the TP edits sit near `sql` templates — no backticks in SQL comments.
+- Machine-local tooling: the bare `pnpm` shim is broken on this machine — drive tsc/biome/vitest via `node_modules/.bin/*`; codex (applychecks) is sandboxed and cannot run vitest or `rm` — re-run gates yourself after its edits.
+- `git hash-object --literally` on the ORACLE side only; pggit-side fixtures build the same bytes through the repo's own pack-crafting helpers, whatever the corpus already uses for hand-built objects.
+
+### Concerns
+
+- If the oracle shows git accepting the tag-parent push outright (fsck off AND its connectivity tolerating the parse), TP-2's rejection class is wrong and the fix target moves to "accept and traverse" — a materially different change; the doc gets amended at step 1, which is exactly why the oracle runs first.
+- The TP walk edit touches both closure functions' hottest loop; the serve differentials and the perf probes are the regression net if the extra set arithmetic shows up at scale (expected: zero-cost on healthy graphs, per the Decided note).
