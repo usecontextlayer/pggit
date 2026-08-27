@@ -2,9 +2,8 @@ import { serve } from "@hono/node-server"
 import type { Hono } from "hono"
 import postgres from "postgres"
 import { env } from "@/env"
-import { createGcDrain } from "@/gc-drain"
+import { createGcDrain, type GcSchedulerOptionsInput } from "@/gc-drain"
 import { createGitApp, createGitDeps } from "@/index"
-import type { GcSchedulerOptions } from "@/store/gc-scheduler"
 
 export type GitServer = {
 	port: number
@@ -41,9 +40,9 @@ export async function startServer(
 		/** Self-scheduling GC overrides (docs/2026-06-24-gc-scheduler-design.md §4/§5;
 		 * repack phase: docs/2026-08-25-drain-repack-wiring.md). `enabled` gates the
 		 * background drain as a whole, `repackEnabled` just its repack phase; an
-		 * unset tunable falls through env (`PGGIT_GC_*`) to the scheduler schema's
+		 * unset tunable falls through env (`PGGIT_GC_*`) to the drain schema's
 		 * own defaults. */
-		gc?: { enabled?: boolean } & Partial<GcSchedulerOptions>
+		gc?: { enabled?: boolean } & GcSchedulerOptionsInput
 	} = {},
 ): Promise<GitServer> {
 	const databaseUrl = opts.databaseUrl ?? env.PGGIT_DATABASE_URL
@@ -54,7 +53,7 @@ export async function startServer(
 	// The drain rides `createGcDrain` (gc-drain.ts), which owns its DEDICATED pool
 	// and the pool's sizing — never this request pool. `enabled` is host policy:
 	// it gates whether the drain is constructed at all. Unset tunables fall
-	// through env to the scheduler schema's defaults.
+	// through env to the drain schema's defaults.
 	const gcEnabled = opts.gc?.enabled ?? env.PGGIT_GC_ENABLED
 	const pg = postgres(databaseUrl)
 	const app = createGitApp(createGitDeps(pg))

@@ -54,7 +54,7 @@ type Candidate = { id: string; name: string } & (
 
 const MAX_TIMER_MS = 2_147_483_647
 
-const GcSchedulerOptionsSchema = z
+export const GcSchedulerOptionsSchema = z
 	.object({
 		concurrency: z.number().int().positive(),
 		graceSeconds: GcGraceSecondsSchema,
@@ -62,19 +62,6 @@ const GcSchedulerOptionsSchema = z
 		repackEnabled: z.boolean(),
 	})
 	.strict()
-
-// The ONE default site for the drain's tunables. Per-field `.default()` makes
-// resolution undefined-tolerant: an override key that is absent OR explicitly
-// `undefined` resolves to the default, so a host building overrides from
-// optional env values can never clobber a default by passing `undefined`
-// through (a spread merge over a defaults object would). The required schema
-// above preserves createGcScheduler's existing bring-your-own-pool contract.
-const GcSchedulerOptionsInputSchema = GcSchedulerOptionsSchema.extend({
-	concurrency: GcSchedulerOptionsSchema.shape.concurrency.default(4),
-	graceSeconds: GcSchedulerOptionsSchema.shape.graceSeconds.default(60),
-	intervalMs: GcSchedulerOptionsSchema.shape.intervalMs.default(30_000),
-	repackEnabled: GcSchedulerOptionsSchema.shape.repackEnabled.default(true),
-})
 
 /** Resolved scheduler tunables. `graceSeconds` is passed straight to `gc()`;
  * `intervalMs` is the drain cadence (the debounce window); `concurrency` caps
@@ -84,17 +71,7 @@ const GcSchedulerOptionsInputSchema = GcSchedulerOptionsSchema.extend({
  * (repack.ts). */
 export type GcSchedulerOptions = z.infer<typeof GcSchedulerOptionsSchema>
 
-/** The override shape hosts pass: every field optional, defaults from the
- * schema above. */
-export type GcSchedulerOptionsInput = z.input<typeof GcSchedulerOptionsInputSchema>
-
 export type GcScheduler = ReturnType<typeof createGcScheduler>
-
-export function resolveGcSchedulerOptions(
-	opts: GcSchedulerOptionsInput,
-): GcSchedulerOptions {
-	return GcSchedulerOptionsInputSchema.parse(opts)
-}
 
 /**
  * Build the GC scheduler over a porsager client (the same wire→DB boundary the

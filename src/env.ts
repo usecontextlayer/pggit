@@ -6,7 +6,7 @@ const EnvSchema = z.object({
 	// porsager `postgres` is initialized DSN-only; lazily, per the server design.
 	PGGIT_DATABASE_URL: z.string().min(1).optional(),
 	// The four GC tunables below are OPTIONAL pass-through overrides: unset means
-	// the scheduler options schema's own default (gc-scheduler.ts — the ONE
+	// the drain options schema's own default (gc-drain.ts — the ONE
 	// default site), so the values are deliberately not restated here.
 	// Max repos drained at once per pass; also bounds concurrent repack memory.
 	PGGIT_GC_CONCURRENCY: z.coerce.number().int().positive().optional(),

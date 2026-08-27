@@ -4,6 +4,7 @@ import postgres, { type Sql } from "postgres"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { type Database, initKysely } from "@/database"
 import { applyMigrations } from "@/database/migrate"
+import { createGcDrain } from "@/gc-drain"
 import { createGitApp } from "@/index"
 import { type GitServer, serveOnPort, startServer } from "@/server"
 import { createObjectStore } from "@/store/object-store"
@@ -11,6 +12,7 @@ import { createRefStore, type RefStore } from "@/store/refs-store"
 import {
 	ageObjects,
 	cloneAndFsck,
+	encodingRows,
 	encodingViolations,
 	objectOids,
 	pushFile,
@@ -215,6 +217,43 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 			expect(clone.fileContent).toBe(`${repo} v2\n`)
 		} finally {
 			await disabled.close()
+		}
+	}, 60_000)
+
+	it("createGcDrain defaults explicitly-undefined tunable overrides", async () => {
+		const mountSrv = await serveOnPort(
+			createGitApp({ objects: createObjectStore(pg), refs: createRefStore(pg) }),
+			0,
+		)
+		try {
+			const drain = createGcDrain(baseUrl, {
+				concurrency: undefined,
+				graceSeconds: undefined,
+				intervalMs: undefined,
+				repackEnabled: undefined,
+			})
+			try {
+				const repo = "gc-drain-undefined-overrides"
+				await pushFile(at(mountSrv), repo, { content: "undefined overrides\n" })
+
+				// Default grace keeps this just-pushed repo unsettled, but grace never gates
+				// repack; direct drainOnce also makes the default interval irrelevant.
+				const summary = await drain.drainOnce()
+				const entry = summary.find((candidate) => candidate.repo === repo)
+				if (entry === undefined) throw new Error(`drain summary omitted ${repo}`)
+				if (entry.repack === null) {
+					throw new Error(`drain entry for ${repo} carries no repack result`)
+				}
+
+				const coveredRows = await encodingRows(publicSchemaDb(), repo)
+				expect(coveredRows.length).toBeGreaterThan(0)
+				expect(entry.repack.wholes + entry.repack.deltas).toBe(coveredRows.length)
+				expect(await encodingViolations(publicSchemaDb(), repo)).toEqual([])
+			} finally {
+				await drain.stop()
+			}
+		} finally {
+			await mountSrv.close()
 		}
 	}, 60_000)
 })

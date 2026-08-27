@@ -274,6 +274,7 @@ export { migrateToLatest } from "@/database/migrate"
 // owns its dedicated pool and the pool's sizing — the composition `startServer`
 // itself runs. A host that already holds an `Sql` (and accepts the sizing
 // responsibility) composes `createGcScheduler` instead; see gc-drain.ts.
+export type { GcSchedulerOptionsInput } from "@/gc-drain"
 export { createGcDrain } from "@/gc-drain"
 export type { Gc, GcOptions, GcResult } from "@/store/gc"
 export { createGc } from "@/store/gc"
@@ -282,7 +283,6 @@ export type {
 	DrainSummary,
 	GcScheduler,
 	GcSchedulerOptions,
-	GcSchedulerOptionsInput,
 } from "@/store/gc-scheduler"
 export { createGcScheduler } from "@/store/gc-scheduler"
 export type { Repack, RepackResult } from "@/store/repack"

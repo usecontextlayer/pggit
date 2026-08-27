@@ -1,9 +1,23 @@
 import postgres from "postgres"
-import {
-	createGcScheduler,
-	type GcSchedulerOptionsInput,
-	resolveGcSchedulerOptions,
-} from "@/store/gc-scheduler"
+import type { z } from "zod"
+import { createGcScheduler, GcSchedulerOptionsSchema } from "@/store/gc-scheduler"
+
+// The ONE default site for the drain's tunables. Per-field `.default()` makes
+// resolution undefined-tolerant: an override key that is absent OR explicitly
+// `undefined` resolves to the default, so a host building overrides from
+// optional env values can never clobber a default by passing `undefined`
+// through (a spread merge over a defaults object would). The required schema in
+// gc-scheduler.ts preserves createGcScheduler's bring-your-own-pool contract.
+const GcSchedulerOptionsInputSchema = GcSchedulerOptionsSchema.extend({
+	concurrency: GcSchedulerOptionsSchema.shape.concurrency.default(4),
+	graceSeconds: GcSchedulerOptionsSchema.shape.graceSeconds.default(60),
+	intervalMs: GcSchedulerOptionsSchema.shape.intervalMs.default(30_000),
+	repackEnabled: GcSchedulerOptionsSchema.shape.repackEnabled.default(true),
+})
+
+/** The override shape hosts pass: every field optional, defaults from the
+ * schema above. */
+export type GcSchedulerOptionsInput = z.input<typeof GcSchedulerOptionsInputSchema>
 
 /**
  * The drain as a self-contained unit for a mounted host: DSN in, and the block
@@ -28,7 +42,7 @@ export function createGcDrain(
 	databaseUrl: string,
 	overrides: GcSchedulerOptionsInput = {},
 ) {
-	const opts = resolveGcSchedulerOptions(overrides)
+	const opts = GcSchedulerOptionsInputSchema.parse(overrides)
 	const pg = postgres(databaseUrl, { max: opts.concurrency + 1 })
 	const scheduler = createGcScheduler(pg, opts)
 	return {
