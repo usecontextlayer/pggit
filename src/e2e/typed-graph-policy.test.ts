@@ -11,24 +11,109 @@
  *    The walks judge a mistyped edge like an absent object: connectivity
  *    rejects the push and a serve refuses the want — never an under-walk
  *    that silently skips the mistyped subtree's descendants.
+ *
+ * 3. The TAG-PARENT family (TPC-1..6, docs/2026-08-27-df-composite-and-
+ *    tag-parent-design.md): a commit whose `parent` header names an annotated
+ *    tag, and its sibling — a tree entry naming a tag. The tag has a healthy
+ *    `git_tag` row, so the verdict must be a typed-edge VIOLATION (reject the
+ *    push / refuse the want / keep-and-peel under GC's retain), never the
+ *    derived-row corruption crash. The oracle is real `git receive-pack
+ *    --stateless-rpc` fed the identical crafted body. FIXTURE RULE: no ref may
+ *    ever name the tag in the crash-path cases — a tip-tag sits in the
+ *    boundary stop-set (or becomes a walk origin) and takes the already-correct
+ *    boundary path, so a tip-tag fixture would green the pre-fix suite and
+ *    misread as refuting a real defect.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest"
 import { createGitApp, createGitDeps, type GitDeps } from "@/index"
-import { computeOid } from "@/object/object"
+import { computeOid, type GitObjectType } from "@/object/object"
+import { writePack } from "@/pack/write-pack"
 import { WantNotFoundError } from "@/protocol/errors"
 import { type GitServer, serveOnPort } from "@/server"
 import { createGc } from "@/store/gc"
 import { createIsolatedSchema, type IsolatedDb } from "@/testing/pg"
-import { attemptGit, spawnGit } from "@/testing/spawn-git"
+import { pktLineUnpack, ZERO_OID } from "@/testing/pkt-oracle"
+import { attemptGit, GitCommandError, spawnGit } from "@/testing/spawn-git"
+import { withTempDir } from "@/testing/temp-dir"
+import { postReceivePack, receivePackRequest } from "@/testing/wire-receive"
 
 const REPO = "policy/typed"
+
+/** The tag-parent object family, content-parameterized by `label` so each test's
+ * closure is oid-disjoint from every other's (the corruption tests delete derived
+ * rows by bare oid — shared oids would cross-contaminate repos in the schema).
+ * `malformed` is a commit whose `parent` names the ANNOTATED TAG — the graph
+ * shape git's writers never produce that layer 3 of the header pins. */
+function tagParentObjects(label: string) {
+	const blob = Buffer.from(`${label}\n`)
+	const blobOid = computeOid("blob", blob)
+	const tree = Buffer.concat([Buffer.from("100644 f\0"), Buffer.from(blobOid, "hex")])
+	const treeOid = computeOid("tree", tree)
+	const target = Buffer.from(
+		`tree ${treeOid}\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\n${label}-target\n`,
+	)
+	const targetOid = computeOid("commit", target)
+	const tag = Buffer.from(
+		`object ${targetOid}\ntype commit\ntag ${label}\ntagger t <t@t> 1700000001 +0000\n\n${label}\n`,
+	)
+	const tagOid = computeOid("tag", tag)
+	const malformed = Buffer.from(
+		`tree ${treeOid}\nparent ${tagOid}\nauthor t <t@t> 1700000002 +0000\ncommitter t <t@t> 1700000002 +0000\n\n${label}-bad\n`,
+	)
+	const malformedOid = computeOid("commit", malformed)
+	const objects: { content: Buffer; type: GitObjectType }[] = [
+		{ content: blob, type: "blob" },
+		{ content: tree, type: "tree" },
+		{ content: target, type: "commit" },
+		{ content: tag, type: "tag" },
+		{ content: malformed, type: "commit" },
+	]
+	return { malformed, malformedOid, objects, tag, tagOid, target, targetOid }
+}
+
+/** Feed one crafted receive-pack body to real `git receive-pack --stateless-rpc`
+ * over `bare` — the receive-side twin of upload-pack-oracle.ts. A nonzero exit is
+ * an outcome here (a connectivity-failing push may exit either way; the report is
+ * the observable), so it is returned, never thrown. */
+async function oracleReceive(
+	bare: string,
+	body: Buffer,
+): Promise<{ code: number; report: string }> {
+	try {
+		const run = await spawnGit(["receive-pack", "--stateless-rpc", bare], {
+			cwd: bare,
+			input: body,
+		})
+		return { code: 0, report: pktLineUnpack(run.stdoutBytes) }
+	} catch (error) {
+		if (error instanceof GitCommandError) {
+			return { code: error.code, report: `${error.stdout}\n${error.stderr}` }
+		}
+		throw error
+	}
+}
+
+/** Store objects in a bare oracle repo byte-for-byte (`hash-object --literally`
+ * is what lets git store arbitrary bytes at all). */
+async function seedOracleObjects(
+	bare: string,
+	objects: readonly { content: Buffer; type: GitObjectType }[],
+): Promise<void> {
+	for (const o of objects) {
+		await spawnGit(["hash-object", "-w", "-t", o.type, "--literally", "--stdin"], {
+			cwd: bare,
+			input: o.content,
+		})
+	}
+}
 
 describe("typed-graph policy", () => {
 	let db: IsolatedDb
 	let deps: GitDeps
+	let app: ReturnType<typeof createGitApp>
 	let server: GitServer
 	let src = ""
 	let url = ""
@@ -38,7 +123,8 @@ describe("typed-graph policy", () => {
 	beforeAll(async () => {
 		db = await createIsolatedSchema(inject("pgBaseUrl"))
 		deps = createGitDeps(db.sql)
-		server = await serveOnPort(createGitApp(deps), 0)
+		app = createGitApp(deps)
+		server = await serveOnPort(app, 0)
 		url = `http://127.0.0.1:${server.port}/${REPO}`
 		src = mkdtempSync(join(tmpdir(), "pggit-typed-"))
 		await spawnGit(["init", "-q", "-b", "main"], { cwd: src })
@@ -183,5 +269,149 @@ describe("typed-graph policy", () => {
 			{ content: commit, type: "commit" },
 		])
 		expect(await deps.objects.isConnected(REPO, commitOid)).toBe(false)
+	})
+
+	it("TPC-1: pushing a commit whose parent is a TAG is a per-ref rejection on both remotes, never a 500", async () => {
+		const fxp = tagParentObjects("tp1")
+		const body = receivePackRequest(
+			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp1\0report-status`],
+			writePack(fxp.objects),
+		)
+		const res = await postReceivePack(app, "policy/tp1", body)
+		expect(res.status).toBe(200)
+		const report = pktLineUnpack(res.body)
+		expect(report).toContain("ng refs/heads/tp1")
+		expect(
+			(await deps.refs.listRefs("policy/tp1")).find((r) => r.name === "refs/heads/tp1"),
+		).toBeUndefined()
+		// The oracle: the identical body into real `git receive-pack`. The observed
+		// verdict is logged — the design doc's hypothesis (a connectivity-class
+		// per-ref rejection) is measured here, not remembered.
+		await withTempDir("pggit-typed-tp1-", async (bare) => {
+			await spawnGit(["init", "-q", "--bare", bare])
+			const oracle = await oracleReceive(bare, body)
+			console.log(
+				`[TPC-1 oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
+			)
+			expect(oracle.report).toContain("ng refs/heads/tp1")
+			const oracleRefs = await spawnGit(["for-each-ref"], { cwd: bare })
+			expect(oracleRefs.stdout.trim()).toBe("")
+		})
+	}, 120_000)
+
+	it("TPC-1 variant: the tag pre-stored and UNREFERENCED, only the malformed commit in the pack", async () => {
+		const fxp = tagParentObjects("tp1v")
+		const prerequisites = fxp.objects.filter((o) => o.content !== fxp.malformed)
+		// Pre-store everything but the malformed commit — and deliberately set NO
+		// ref: a tip-tag would take the boundary path and dodge the in-walk verdict
+		// (the header's fixture rule).
+		await deps.objects.putPack("policy/tp1v", prerequisites)
+		const body = receivePackRequest(
+			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp1v\0report-status`],
+			writePack([{ content: fxp.malformed, type: "commit" }]),
+		)
+		const res = await postReceivePack(app, "policy/tp1v", body)
+		expect(res.status).toBe(200)
+		expect(pktLineUnpack(res.body)).toContain("ng refs/heads/tp1v")
+		await withTempDir("pggit-typed-tp1v-", async (bare) => {
+			await spawnGit(["init", "-q", "--bare", bare])
+			await seedOracleObjects(bare, prerequisites)
+			const oracle = await oracleReceive(bare, body)
+			console.log(
+				`[TPC-1v oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
+			)
+			expect(oracle.report).toContain("ng refs/heads/tp1v")
+		})
+	}, 120_000)
+
+	it("TPC-2: the boundary variant — the tag is an existing ref TIP — keeps its clean rejection", async () => {
+		const fxp = tagParentObjects("tp2")
+		const prerequisites = fxp.objects.filter((o) => o.content !== fxp.malformed)
+		await deps.objects.putPack("policy/tp2", prerequisites)
+		await deps.refs.setRef("policy/tp2", "refs/tags/anchor", fxp.tagOid)
+		const body = receivePackRequest(
+			[`${ZERO_OID} ${fxp.malformedOid} refs/heads/tp2\0report-status`],
+			writePack([{ content: fxp.malformed, type: "commit" }]),
+		)
+		const res = await postReceivePack(app, "policy/tp2", body)
+		expect(res.status).toBe(200)
+		const report = pktLineUnpack(res.body)
+		expect(report).toContain("ng refs/heads/tp2")
+		await withTempDir("pggit-typed-tp2-", async (bare) => {
+			await spawnGit(["init", "-q", "--bare", bare])
+			await seedOracleObjects(bare, prerequisites)
+			await spawnGit(["update-ref", "refs/tags/anchor", fxp.tagOid], { cwd: bare })
+			const oracle = await oracleReceive(bare, body)
+			console.log(
+				`[TPC-2 oracle] exit=${oracle.code} report=${oracle.report.replace(/\n/g, " | ")}`,
+			)
+			expect(oracle.report).toContain("ng refs/heads/tp2")
+		})
+	}, 120_000)
+
+	it("TPC-3: a stored commit whose parent names a TAG fails connectivity and cannot be served", async () => {
+		const fxp = tagParentObjects("tp3")
+		await deps.objects.putPack("policy/tp3", fxp.objects)
+		expect(await deps.objects.isConnected("policy/tp3", fxp.malformedOid)).toBe(false)
+		await expect(
+			deps.objects.buildPack("policy/tp3", [fxp.malformedOid], [], false),
+		).rejects.toThrow(WantNotFoundError)
+	})
+
+	it("TPC-4: GC over a reachable tag-parent shape completes, keeps the pair, withholds the epoch", async () => {
+		const fxp = tagParentObjects("tp4")
+		await deps.objects.putPack("policy/tp4", fxp.objects)
+		// Reachable only via the non-wire path, and the ref points at the malformed
+		// COMMIT — never the tag (the header's fixture rule).
+		await deps.refs.setRef("policy/tp4", "refs/heads/main", fxp.malformedOid)
+		const result = await createGc(db.sql).gc("policy/tp4", { graceSeconds: 0 })
+		expect(result.epoch).toBe("cleared")
+		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+			const [row] = await db.sql<{ n: string }[]>`
+				select count(*)::text as n from git_object
+				where oid = ${Buffer.from(oid, "hex")}`
+			if (row === undefined) throw new Error("object count query returned no row")
+			expect(row.n, oid).toBe("1")
+		}
+	})
+
+	it("TPC-6: a tree entry naming a TAG — GC keeps the tag AND its target (the sibling shape)", async () => {
+		const fxp = tagParentObjects("tp6")
+		// A healthy commit whose tree carries a blob-mode entry naming the TAG.
+		const badTree = Buffer.concat([
+			Buffer.from("100644 t\0"),
+			Buffer.from(fxp.tagOid, "hex"),
+		])
+		const badTreeOid = computeOid("tree", badTree)
+		const tip = Buffer.from(
+			`tree ${badTreeOid}\nauthor t <t@t> 1700000003 +0000\ncommitter t <t@t> 1700000003 +0000\n\ntp6-tip\n`,
+		)
+		const tipOid = computeOid("commit", tip)
+		await deps.objects.putPack("policy/tp6", [
+			...fxp.objects.filter((o) => o.content !== fxp.malformed),
+			{ content: badTree, type: "tree" },
+			{ content: tip, type: "commit" },
+		])
+		await deps.refs.setRef("policy/tp6", "refs/heads/main", tipOid)
+		const result = await createGc(db.sql).gc("policy/tp6", { graceSeconds: 0 })
+		expect(result.epoch).toBe("cleared")
+		// Pre-TP-3′ the tag survives but its TARGET is swept from under the
+		// surviving git_tag row — the data-loss pin.
+		for (const oid of [fxp.tagOid, fxp.targetOid]) {
+			const [row] = await db.sql<{ n: string }[]>`
+				select count(*)::text as n from git_object
+				where oid = ${Buffer.from(oid, "hex")}`
+			if (row === undefined) throw new Error("object count query returned no row")
+			expect(row.n, oid).toBe("1")
+		}
+	})
+
+	it("TPC-5: a tag-parent whose git_tag row is GONE still crashes loud — genuine corruption", async () => {
+		const fxp = tagParentObjects("tp5")
+		await deps.objects.putPack("policy/tp5", fxp.objects)
+		await db.sql`delete from git_tag where oid = ${Buffer.from(fxp.tagOid, "hex")}`
+		await expect(
+			deps.objects.isConnected("policy/tp5", fxp.malformedOid),
+		).rejects.toThrow(/no derived row/)
 	})
 })

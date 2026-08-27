@@ -684,4 +684,149 @@ describe("§8.4 generative — receive-pack policy vs canonical git", () => {
 			expect(await pggitRefs(refs, repo)).toEqual(survivors)
 		})
 	}, 180_000)
+
+	/**
+	 * DFC-1 (docs/2026-08-27-df-composite-and-tag-parent-design.md): the COMPOSITE
+	 * D/F case — a valid UPDATE of an existing ref riding in the same batch as a
+	 * deeper sibling that is itself doomed against the existing namespace. Pure
+	 * parity, both wire orders, fresh remotes per order: per-ref verdict classes
+	 * and the final ref set must equal canonical git's. The generator above can
+	 * never produce this composite (destinations are position-keyed), and the
+	 * current D/F pass judges deepest-wins against an eligibility set frozen
+	 * BEFORE the existing-clash check — the stale-set defect this pins.
+	 */
+	it("DFC-1: an update of an existing ref survives its doomed deeper sibling, in both wire orders", async () => {
+		for (const order of ["shallow-first", "deep-first"] as const) {
+			const repo = `policy/dfc1-${order}`
+			await withTempDir("pggit-rppolicy-dfc1-", async (bare) => {
+				await spawnGit(["init", "-q", "--bare", bare])
+				const controlUrl = `file://${bare}`
+				const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
+				for (const url of [controlUrl, pggitUrl]) {
+					await spawnGit(["push", "-q", url, `${fx.b}:refs/heads/dfc`], { cwd: fx.dir })
+				}
+				const update: Command = {
+					census: [],
+					change: { kind: "write", oid: fx.c },
+					dest: "refs/heads/dfc",
+					kind: "fastForward",
+					refspec: `${fx.c}:refs/heads/dfc`,
+				}
+				const deeper: Command = {
+					census: [],
+					change: { kind: "write", oid: fx.c },
+					dest: "refs/heads/dfc/sub",
+					kind: "create",
+					refspec: `${fx.c}:refs/heads/dfc/sub`,
+				}
+				const commands = order === "shallow-first" ? [update, deeper] : [deeper, update]
+				const control = await pushBatch(fx.dir, controlUrl, commands, false)
+				const pggit = await pushBatch(fx.dir, pggitUrl, commands, false)
+				const canonical = parsePorcelain(control.stdout)
+				const observed = parsePorcelain(pggit.stdout)
+				console.log(
+					`[DFC-1 ${order}] canonical: ${[...canonical]
+						.map(([d, v]) => `${d}=${v.kind === "accepted" ? "ok" : v.reason}`)
+						.join(" ")}`,
+				)
+				for (const c of commands) {
+					expect(observed.get(c.dest), `${c.dest} [${order}]`).toEqual(
+						canonical.get(c.dest),
+					)
+				}
+				expect(await pggitRefs(refs, repo), order).toEqual(await controlRefs(bare))
+			})
+		}
+	}, 180_000)
+
+	/**
+	 * DFC-2: the doomed-deeper generalization — the deeper sibling is doomed by a
+	 * DIFFERENT per-command check (the branch-tip rule: a blob tip under
+	 * refs/heads/). Preservation pin: eligibility already excludes it, so the
+	 * shallow create must apply on both remotes. If this reds BEFORE the DF fix,
+	 * the design doc's analysis of the current code was wrong — stop and
+	 * re-derive (the doc's own instruction).
+	 */
+	it("DFC-2: a deeper sibling doomed by the branch-tip rule never reserves the namespace", async () => {
+		const repo = "policy/dfc2"
+		await withTempDir("pggit-rppolicy-dfc2-", async (bare) => {
+			await spawnGit(["init", "-q", "--bare", bare])
+			const controlUrl = `file://${bare}`
+			const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
+			const shallow: Command = {
+				census: [],
+				change: { kind: "write", oid: fx.c },
+				dest: "refs/heads/q",
+				kind: "create",
+				refspec: `${fx.c}:refs/heads/q`,
+			}
+			const deeper: Command = {
+				census: [],
+				change: { kind: "write", oid: fx.blob },
+				dest: "refs/heads/q/deep",
+				kind: "typedTip",
+				refspec: `${fx.blob}:refs/heads/q/deep`,
+			}
+			const commands = [shallow, deeper]
+			const control = await pushBatch(fx.dir, controlUrl, commands, false)
+			const pggit = await pushBatch(fx.dir, pggitUrl, commands, false)
+			const canonical = parsePorcelain(control.stdout)
+			const observed = parsePorcelain(pggit.stdout)
+			for (const [name, report] of [
+				["canonical", canonical],
+				["pggit", observed],
+			] as const) {
+				expect(report.get("refs/heads/q"), name).toEqual({ kind: "accepted" })
+				expect(report.get("refs/heads/q/deep"), name).toEqual({
+					kind: "rejected",
+					reason: "invalid-new-value",
+				})
+			}
+			expect(await pggitRefs(refs, repo)).toEqual(await controlRefs(bare))
+		})
+	}, 180_000)
+
+	/**
+	 * DFC-3: the three-name D/F chain, measured for the first time — the pair
+	 * case above was the corpus's only prior measurement, in one wire order. Pure
+	 * parity over fresh remotes per order; the canonical verdicts are logged so
+	 * the run records what git actually does with a chain (the design doc's
+	 * deepest-wins extrapolation is a hypothesis, and this differential is its
+	 * arbiter — the fix implements the measured rule, whatever it is).
+	 */
+	it("DFC-3: a three-name D/F chain matches canonical git in both wire orders", async () => {
+		for (const order of ["shallow-first", "deep-first"] as const) {
+			const repo = `policy/dfc3-${order}`
+			await withTempDir("pggit-rppolicy-dfc3-", async (bare) => {
+				await spawnGit(["init", "-q", "--bare", bare])
+				const controlUrl = `file://${bare}`
+				const pggitUrl = `http://127.0.0.1:${server.port}/${repo}`
+				const chain = ["refs/heads/t", "refs/heads/t/u", "refs/heads/t/u/v"].map(
+					(dest): Command => ({
+						census: [],
+						change: { kind: "write", oid: fx.c },
+						dest,
+						kind: "create",
+						refspec: `${fx.c}:${dest}`,
+					}),
+				)
+				const commands = order === "shallow-first" ? chain : [...chain].reverse()
+				const control = await pushBatch(fx.dir, controlUrl, commands, false)
+				const pggit = await pushBatch(fx.dir, pggitUrl, commands, false)
+				const canonical = parsePorcelain(control.stdout)
+				const observed = parsePorcelain(pggit.stdout)
+				console.log(
+					`[DFC-3 ${order}] canonical: ${[...canonical]
+						.map(([d, v]) => `${d}=${v.kind === "accepted" ? "ok" : v.reason}`)
+						.join(" ")}`,
+				)
+				for (const c of commands) {
+					expect(observed.get(c.dest), `${c.dest} [${order}]`).toEqual(
+						canonical.get(c.dest),
+					)
+				}
+				expect(await pggitRefs(refs, repo), order).toEqual(await controlRefs(bare))
+			})
+		}
+	}, 180_000)
 })
