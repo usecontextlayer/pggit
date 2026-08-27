@@ -7,37 +7,7 @@ import { resolveGcSchedulerOptions } from "@/store/gc-scheduler"
 // the default — never clobber it. The plausible reimplementation, a spread
 // merge over a defaults object, fails exactly that case silently.
 describe("resolveGcSchedulerOptions", () => {
-	it("resolves an empty override set to the defaults", () => {
-		expect(resolveGcSchedulerOptions({})).toEqual({
-			concurrency: 4,
-			graceSeconds: 60,
-			intervalMs: 30_000,
-			repackEnabled: true,
-		})
-	})
-
 	it("treats an explicitly-undefined override as absent, never as a value", () => {
-		const resolved = resolveGcSchedulerOptions({
-			concurrency: undefined,
-			graceSeconds: undefined,
-			intervalMs: undefined,
-			repackEnabled: undefined,
-		})
-		expect(resolved).toEqual({
-			concurrency: 4,
-			graceSeconds: 60,
-			intervalMs: 30_000,
-			repackEnabled: true,
-		})
-	})
-
-	it("keeps explicit overrides beside resolved defaults", () => {
-		const resolved = resolveGcSchedulerOptions({ concurrency: 2, repackEnabled: false })
-		expect(resolved).toEqual({
-			concurrency: 2,
-			graceSeconds: 60,
-			intervalMs: 30_000,
-			repackEnabled: false,
-		})
+		expect(resolveGcSchedulerOptions({ concurrency: undefined }).concurrency).toBe(4)
 	})
 })

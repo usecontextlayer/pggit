@@ -54,19 +54,27 @@ type Candidate = { id: string; name: string } & (
 
 const MAX_TIMER_MS = 2_147_483_647
 
+const GcSchedulerOptionsSchema = z
+	.object({
+		concurrency: z.number().int().positive(),
+		graceSeconds: GcGraceSecondsSchema,
+		intervalMs: z.number().int().positive().max(MAX_TIMER_MS),
+		repackEnabled: z.boolean(),
+	})
+	.strict()
+
 // The ONE default site for the drain's tunables. Per-field `.default()` makes
 // resolution undefined-tolerant: an override key that is absent OR explicitly
 // `undefined` resolves to the default, so a host building overrides from
 // optional env values can never clobber a default by passing `undefined`
-// through (a spread merge over a defaults object would).
-const GcSchedulerOptionsSchema = z
-	.object({
-		concurrency: z.number().int().positive().default(4),
-		graceSeconds: GcGraceSecondsSchema.default(60),
-		intervalMs: z.number().int().positive().max(MAX_TIMER_MS).default(30_000),
-		repackEnabled: z.boolean().default(true),
-	})
-	.strict()
+// through (a spread merge over a defaults object would). The required schema
+// above preserves createGcScheduler's existing bring-your-own-pool contract.
+const GcSchedulerOptionsInputSchema = GcSchedulerOptionsSchema.extend({
+	concurrency: GcSchedulerOptionsSchema.shape.concurrency.default(4),
+	graceSeconds: GcSchedulerOptionsSchema.shape.graceSeconds.default(60),
+	intervalMs: GcSchedulerOptionsSchema.shape.intervalMs.default(30_000),
+	repackEnabled: GcSchedulerOptionsSchema.shape.repackEnabled.default(true),
+})
 
 /** Resolved scheduler tunables. `graceSeconds` is passed straight to `gc()`;
  * `intervalMs` is the drain cadence (the debounce window); `concurrency` caps
@@ -78,14 +86,14 @@ export type GcSchedulerOptions = z.infer<typeof GcSchedulerOptionsSchema>
 
 /** The override shape hosts pass: every field optional, defaults from the
  * schema above. */
-export type GcSchedulerOptionsInput = z.input<typeof GcSchedulerOptionsSchema>
+export type GcSchedulerOptionsInput = z.input<typeof GcSchedulerOptionsInputSchema>
 
 export type GcScheduler = ReturnType<typeof createGcScheduler>
 
 export function resolveGcSchedulerOptions(
 	opts: GcSchedulerOptionsInput,
 ): GcSchedulerOptions {
-	return GcSchedulerOptionsSchema.parse(opts)
+	return GcSchedulerOptionsInputSchema.parse(opts)
 }
 
 /**
@@ -94,13 +102,8 @@ export function resolveGcSchedulerOptions(
  * enabled and due) repack; `start()`/`stop()` drive it on `intervalMs`. GC never
  * deletes reachable objects, and repack only adds derived encoding rows.
  */
-export function createGcScheduler(pg: Sql, opts: GcSchedulerOptionsInput) {
-	return createGcSchedulerFromResolvedOptions(pg, resolveGcSchedulerOptions(opts))
-}
-
-/** Composition seam for the drain block (`gc-drain.ts`), which resolves first so
- * it can size its dedicated pool from the resolved concurrency before building. */
-export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerOptions) {
+export function createGcScheduler(pg: Sql, opts: GcSchedulerOptions) {
+	const options = GcSchedulerOptionsSchema.parse(opts)
 	const gc = createGc(pg)
 	const repack = createRepack(pg)
 	let timer: ReturnType<typeof setInterval> | undefined
@@ -122,12 +125,12 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 		return pg<Candidate[]>`
 			select r.id::text as id, r.name,
 				(r.last_gc_at is null or r.last_pushed_at > r.last_gc_at) as gc_due,
-				(${opts.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at
+				(${options.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at
 					or r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)) as repack_due
 			from repos r
 			where r.last_pushed_at is not null
 				and ((r.last_gc_at is null or r.last_pushed_at > r.last_gc_at)
-					or (${opts.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at)))
+					or (${options.repackEnabled} and (r.last_repack_at is null or r.last_pushed_at > r.last_repack_at)))
 		`
 	}
 
@@ -151,7 +154,7 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 			try {
 				const [{ t0 }] = await pg<[{ t0: string }]>`select clock_timestamp()::text as t0`
 				const gcResult = await gc.gc(c.name, {
-					graceSeconds: opts.graceSeconds,
+					graceSeconds: options.graceSeconds,
 					maintain: false,
 				})
 				// Settle ONLY when this pass ran past the grace horizon of the repo's
@@ -165,7 +168,7 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 				const settledRows = await pg<{ id: string }[]>`
 					update repos set last_gc_at = ${t0}::timestamptz
 					where id = ${c.id}::bigint
-						and last_pushed_at + make_interval(secs => ${opts.graceSeconds}::float8)
+						and last_pushed_at + make_interval(secs => ${options.graceSeconds}::float8)
 							<= ${t0}::timestamptz
 					returning id::text as id`
 				gcOutcome = { ...gcResult, settled: settledRows.length > 0 }
@@ -199,7 +202,7 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 
 	async function drainOnce(): Promise<DrainSummary> {
 		const candidates = await selectCandidates()
-		const results = await mapPool(candidates, opts.concurrency, drainRepo)
+		const results = await mapPool(candidates, options.concurrency, drainRepo)
 		const summary: DrainSummary = []
 		for (const result of results) {
 			if (result.outcome === "drained") summary.push(result.entry)
@@ -223,7 +226,7 @@ export function createGcSchedulerFromResolvedOptions(pg: Sql, opts: GcSchedulerO
 				.finally(() => {
 					inFlight = undefined
 				})
-		}, opts.intervalMs)
+		}, options.intervalMs)
 		timer.unref()
 	}
 

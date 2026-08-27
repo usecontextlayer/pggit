@@ -29,8 +29,8 @@ const EnvSchema = z.object({
 	PGGIT_GC_INTERVAL_MS: z.coerce.number().int().positive().optional(),
 	PGGIT_GC_REPACK_ENABLED: z
 		.enum(["true", "false", "1", "0"])
-		.optional()
-		.transform((v) => (v === undefined ? undefined : v === "true" || v === "1")),
+		.transform((v) => v === "true" || v === "1")
+		.optional(),
 	PGGIT_PORT: z.coerce.number().int().positive().default(8080),
 })
 

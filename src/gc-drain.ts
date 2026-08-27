@@ -1,6 +1,6 @@
 import postgres from "postgres"
 import {
-	createGcSchedulerFromResolvedOptions,
+	createGcScheduler,
 	type GcSchedulerOptionsInput,
 	resolveGcSchedulerOptions,
 } from "@/store/gc-scheduler"
@@ -30,7 +30,7 @@ export function createGcDrain(
 ) {
 	const opts = resolveGcSchedulerOptions(overrides)
 	const pg = postgres(databaseUrl, { max: opts.concurrency + 1 })
-	const scheduler = createGcSchedulerFromResolvedOptions(pg, opts)
+	const scheduler = createGcScheduler(pg, opts)
 	return {
 		drainOnce: scheduler.drainOnce,
 		start: scheduler.start,
@@ -40,5 +40,3 @@ export function createGcDrain(
 		},
 	}
 }
-
-export type GcDrain = ReturnType<typeof createGcDrain>
