@@ -257,17 +257,12 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 		}
 	}, 60_000)
 
-	// The host's log is the drain's ONLY failure surface (the watermarks are its
-	// success surface, so a healthy pass says nothing) — and a pass MANUFACTURES
-	// Postgres notices: every gc opens with `drop table if exists gc_live` on a
-	// fresh reserved connection, which the server NOTICEs as absent. A pool that
-	// does not silence them hands each to porsager's default handler, `console.log`,
-	// so the drain buries the surface it depends on. Driven end-to-end — real pool,
-	// real Postgres, real notices — because whether a notice prints is the driver's
-	// behaviour over the wire, and a fake of it could only restate this assumption.
-	// Placed LAST on purpose: this pass drains every candidate in the shared
-	// `public` schema, so ahead of SCH-9/SCH-10 it would reclaim their repos and
-	// break their no-reclamation assertions.
+	// Driven end-to-end — real pool, real Postgres, real notices — because whether a
+	// notice prints is the driver's behaviour over the wire, and a fake of it could
+	// only restate the assumption under test (`createGcDrain` carries why the
+	// silence matters). Placed LAST on purpose: this pass drains every candidate in
+	// the shared `public` schema, so ahead of SCH-9/SCH-10 it would reclaim their
+	// repos and break their no-reclamation assertions.
 	it("drains without printing: the pool's Postgres notices never reach the host's log", async () => {
 		const mountSrv = await serveOnPort(
 			createGitApp({ objects: createObjectStore(pg), refs: createRefStore(pg) }),

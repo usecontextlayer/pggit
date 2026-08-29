@@ -180,12 +180,13 @@ export function createGitApp(
 	// surfaces client-side only as `RPC failed; HTTP 400` + `the remote end hung
 	// up unexpectedly` — indistinguishable from a crashed server or a proxy fault.
 	// This line is then the sole record of why the request was refused. It cannot
-	// be routed through the per-ref `ng` channel instead: the refusals that land
-	// here are pre-negotiation (a command line that fails to decode carries the
-	// capabilities too), so no sideband is known to exist yet.
+	// be routed through the per-ref `ng` channel instead: reaching this handler
+	// means the request threw before any report-status was built, and in the
+	// dominant case what failed to decode IS the command list — leaving no refs to
+	// name and no negotiated capabilities to frame them.
 	app.onError((err, c) => {
 		if (err instanceof GitProtocolError) {
-			console.error(`git ${c.req.method} ${c.req.path}: ${err.message}`)
+			console.error(`pggit: ${c.req.method} ${c.req.path} refused: ${err.message}`)
 			return c.text(err.message, 400)
 		}
 		console.error(err)

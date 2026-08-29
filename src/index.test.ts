@@ -154,16 +154,14 @@ describe("createGitApp — server-boundary error responses", () => {
 		expect(await res.text()).toMatch(/Content-Encoding/)
 	})
 
-	// A refused push's diagnosis reaches nobody over HTTP: git DISCARDS a non-200
-	// body on push, so the client sees `RPC failed; HTTP 400` and nothing else —
-	// indistinguishable from a crashed server or a proxy fault. The server-side
-	// log line is then the sole record of WHY, which makes it contract, not
-	// decoration: it must name the method, the WHOLE request path (slash-delimited
-	// repoIds are paths, not segments), and the same reason the body carries —
-	// read off the response here rather than restated, so a reworded message can
-	// never leave log and body disagreeing while this still passes. Exactly one
-	// record, so those three facts are known to be ONE greppable line and a
-	// refusal is not also dumping the 500 branch's error object.
+	// The log line is contract, not decoration — it is the only place a refusal's
+	// reason survives (`createGitApp`'s onError carries why). So it must name the
+	// method, the WHOLE request path (slash-delimited repoIds are paths, not
+	// segments), and the same reason the body carries — read off the response here
+	// rather than restated, so a reworded message can never leave log and body
+	// disagreeing while this still passes. Exactly one record, so those three facts
+	// are known to be ONE greppable line and a refusal is not also dumping the 500
+	// branch's error object.
 	it("logs a refused request server-side with its method, path and reason", async () => {
 		const body = Buffer.concat([
 			encodePktLine(Buffer.from(`${A} refs/heads/main`)), // 2-token (malformed)
