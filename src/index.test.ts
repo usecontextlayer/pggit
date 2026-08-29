@@ -154,6 +154,41 @@ describe("createGitApp — server-boundary error responses", () => {
 		expect(await res.text()).toMatch(/Content-Encoding/)
 	})
 
+	// A refused push's diagnosis reaches nobody over HTTP: git DISCARDS a non-200
+	// body on push, so the client sees `RPC failed; HTTP 400` and nothing else —
+	// indistinguishable from a crashed server or a proxy fault. The server-side
+	// log line is then the sole record of WHY, which makes it contract, not
+	// decoration: it must name the method, the WHOLE request path (slash-delimited
+	// repoIds are paths, not segments), and the same reason the body carries —
+	// read off the response here rather than restated, so a reworded message can
+	// never leave log and body disagreeing while this still passes. Exactly one
+	// record, so those three facts are known to be ONE greppable line and a
+	// refusal is not also dumping the 500 branch's error object.
+	it("logs a refused request server-side with its method, path and reason", async () => {
+		const body = Buffer.concat([
+			encodePktLine(Buffer.from(`${A} refs/heads/main`)), // 2-token (malformed)
+			encodePkt({ type: "flush" }),
+		])
+		const path = `/${SLASHED_REPO}/git-receive-pack`
+
+		const logged: string[] = []
+		const realError = console.error.bind(console)
+		console.error = (...args: unknown[]) => {
+			logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "))
+		}
+		const res = await Promise.resolve(post(path, body)).finally(() => {
+			console.error = realError
+		})
+
+		expect(res.status).toBe(400)
+		const reason = await res.text()
+		expect(logged).toHaveLength(1)
+		const line = logged.join("\n")
+		expect(line).toContain("POST")
+		expect(line).toContain(path)
+		expect(line).toContain(reason)
+	})
+
 	// An INTERNAL failure (here: the unused DB connection fails on a real query
 	// during the want-walk) is NOT a GitProtocolError, so it must map to a clean
 	// 500 with a generic body — never a 400 and never a leaked stack.

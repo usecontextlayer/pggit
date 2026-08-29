@@ -256,4 +256,56 @@ describe("GC scheduler — server wiring & config (§6: SCH-9, SCH-10)", () => {
 			await mountSrv.close()
 		}
 	}, 60_000)
+
+	// The host's log is the drain's ONLY failure surface (the watermarks are its
+	// success surface, so a healthy pass says nothing) — and a pass MANUFACTURES
+	// Postgres notices: every gc opens with `drop table if exists gc_live` on a
+	// fresh reserved connection, which the server NOTICEs as absent. A pool that
+	// does not silence them hands each to porsager's default handler, `console.log`,
+	// so the drain buries the surface it depends on. Driven end-to-end — real pool,
+	// real Postgres, real notices — because whether a notice prints is the driver's
+	// behaviour over the wire, and a fake of it could only restate this assumption.
+	// Placed LAST on purpose: this pass drains every candidate in the shared
+	// `public` schema, so ahead of SCH-9/SCH-10 it would reclaim their repos and
+	// break their no-reclamation assertions.
+	it("drains without printing: the pool's Postgres notices never reach the host's log", async () => {
+		const mountSrv = await serveOnPort(
+			createGitApp({ objects: createObjectStore(pg), refs: createRefStore(pg) }),
+			0,
+		)
+		try {
+			const drain = createGcDrain(baseUrl)
+			try {
+				const repo = "gc-drain-silent-pass"
+				await pushFile(at(mountSrv), repo, { content: "silent pass\n" })
+
+				const printed: string[] = []
+				const realLog = console.log.bind(console)
+				console.log = (...args: unknown[]) => {
+					// Notices arrive as plain objects, so render them: a failure here must
+					// say WHICH notice got through, not `[object Object]`.
+					printed.push(
+						args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "),
+					)
+				}
+				const summary = await drain.drainOnce().finally(() => {
+					console.log = realLog
+				})
+
+				// Silence is evidence only once the pass has actually run the GC arm the
+				// notices come from: a pass that selected nothing is quiet either way.
+				const entry = summary.find((candidate) => candidate.repo === repo)
+				if (entry === undefined) throw new Error(`drain summary omitted ${repo}`)
+				if (entry.gc === null) {
+					throw new Error(`drain pass ran no GC on ${repo}; its silence proves nothing`)
+				}
+
+				expect(printed).toEqual([])
+			} finally {
+				await drain.stop()
+			}
+		} finally {
+			await mountSrv.close()
+		}
+	}, 60_000)
 })
