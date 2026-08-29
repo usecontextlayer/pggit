@@ -104,8 +104,9 @@ describe("race — the in-band refusal path's pkt-line size ceiling", () => {
 	let fetchMs = 0
 	const scratch: string[] = []
 
-	// The app logs internal (500) errors with console.error; capture them so the
-	// underlying server-side cause is attributable without touching the database.
+	// The app console.errors BOTH error branches — the internal (500) error object
+	// and the protocol (400) refusal line; capture them so the underlying
+	// server-side cause is attributable without touching the database.
 	const serverErrors: string[] = []
 	const realError = console.error.bind(console)
 	const drainServerErrors = (): string[] => serverErrors.splice(0, serverErrors.length)
