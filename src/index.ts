@@ -175,8 +175,19 @@ export function createGitApp(
 
 	// A client-caused boundary error (malformed request, unsupported capability) is
 	// a clean 400 with its message; anything else is an internal 500, logged loud.
+	// The 400 is ALSO logged, because the body carrying the diagnosis often never
+	// reaches a human: git discards a non-200 body on push, so a rejected push
+	// surfaces client-side only as `RPC failed; HTTP 400` + `the remote end hung
+	// up unexpectedly` — indistinguishable from a crashed server or a proxy fault.
+	// This line is then the sole record of why the request was refused. It cannot
+	// be routed through the per-ref `ng` channel instead: the refusals that land
+	// here are pre-negotiation (a command line that fails to decode carries the
+	// capabilities too), so no sideband is known to exist yet.
 	app.onError((err, c) => {
-		if (err instanceof GitProtocolError) return c.text(err.message, 400)
+		if (err instanceof GitProtocolError) {
+			console.error(`git ${c.req.method} ${c.req.path}: ${err.message}`)
+			return c.text(err.message, 400)
+		}
 		console.error(err)
 		return c.text("internal server error", 500)
 	})

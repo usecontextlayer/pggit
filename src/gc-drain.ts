@@ -43,7 +43,18 @@ export function createGcDrain(
 	overrides: GcSchedulerOptionsInput = {},
 ) {
 	const opts = GcSchedulerOptionsInputSchema.parse(overrides)
-	const pg = postgres(databaseUrl, { max: opts.concurrency + 1 })
+	// `onnotice` is silenced because the drain MANUFACTURES its own notices: every
+	// gc pass opens with `drop table if exists gc_live` on a fresh reserved
+	// connection, and Postgres NOTICEs each absent-table drop. porsager's default
+	// handler is `console.log`, so an unsilenced pool prints a multi-line notice
+	// object per pass — which on a host whose only drain-failure surface is its
+	// log (the watermark columns are the success surface; failures go to stderr)
+	// drowns the signal it exists to carry. Notices are never errors, and this
+	// pool is exclusively the drain's, so nothing else is muted.
+	const pg = postgres(databaseUrl, {
+		max: opts.concurrency + 1,
+		onnotice: () => {},
+	})
 	const scheduler = createGcScheduler(pg, opts)
 	return {
 		drainOnce: scheduler.drainOnce,
