@@ -53,6 +53,10 @@ export function createGcDrain(
 	// whole NoticeResponse channel, WARNING and INFO included, not just the drop's
 	// NOTICE: acceptable because a failure arrives as ErrorResponse and still
 	// throws, and because the pool is exclusively the drain's.
+	// The empty function is load-bearing, and porsager's own README will tell you
+	// otherwise ("set false to silence NOTICE"): the driver branches on
+	// `onnotice ? onnotice(x) : console.log(x)`, so `false` is falsy and restores
+	// the very default it claims to disable. Only a function silences.
 	const pg = postgres(databaseUrl, {
 		max: opts.concurrency + 1,
 		onnotice: () => {},
